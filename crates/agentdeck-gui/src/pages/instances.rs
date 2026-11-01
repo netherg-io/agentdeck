@@ -168,6 +168,10 @@ fn instance_card<'a>(inst: &'a InstanceRow, rename: Option<&'a Rename>) -> Eleme
         head = head.push(status_pill(&inst.quotas[0]));
     }
     let head = head
+        .push(
+            st::btn(st::Btn::Quiet, fl!(loader(), "instances-cli"))
+                .on_press(Message::LaunchCli(inst.id.clone())),
+        )
         .push(tooltip(
             st::icon_btn(st::Icon::Pencil).on_press(Message::RenameAsk(inst.id.clone())),
             st::body(fl!(loader(), "instances-rename")),

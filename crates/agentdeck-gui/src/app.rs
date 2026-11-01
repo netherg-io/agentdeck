@@ -49,6 +49,8 @@ pub enum Message {
     Loaded(Data),
     SelectPage(Page),
     Add(AddMsg),
+    LaunchCli(String),
+    CliDone(Result<(), String>),
     RenameAsk(String),
     RenameInput(String),
     RenameCancel,
@@ -288,6 +290,29 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             Some(paths) => add_instance::update_wizard(&mut state.add, msg, &paths),
             None => Task::none(),
         },
+        Message::LaunchCli(id) => {
+            let Some(paths) = state.paths.clone() else {
+                return Task::none();
+            };
+            Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        agentdeck_core::launch::launch_cli(&paths, &id)
+                            .map_err(|e| format!("{e:#}"))
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r)
+                },
+                Message::CliDone,
+            )
+        }
+        Message::CliDone(result) => {
+            if let Err(error) = result {
+                state.toast(fl!(loader(), "cli-open-error", what = error), true);
+            }
+            Task::none()
+        }
         Message::RenameAsk(id) => {
             if let Some(inst) = state.data.instances.iter().find(|i| i.id == id) {
                 state.rename = Some(pages::instances::Rename {

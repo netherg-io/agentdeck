@@ -1,4 +1,4 @@
-//! Per-instance terminal wrappers (`claude@second`) and `.desktop` launchers.
+//! Per-instance terminal wrappers (`claude@second`).
 //!
 //! A wrapper is a small POSIX sh script that pins the instance's home dir
 //! (`CLAUDE_CONFIG_DIR` for Claude, `CODEX_HOME` for Codex) and execs the
@@ -9,9 +9,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::changes::{Change, plan_write_file, plan_write_script};
+use crate::changes::{Change, plan_write_script};
 use crate::registry::{Harness, Instance};
 
 /// Script comment line; the full marker is this prefix plus the instance id.
@@ -124,21 +123,6 @@ pub fn script_contents(inst: &Instance, home: &Path) -> anyhow::Result<Vec<u8>> 
     .into_bytes())
 }
 
-/// Render the `.desktop` launcher for an installed wrapper script.
-pub fn desktop_contents(inst: &Instance, wrapper_path: &Path) -> Vec<u8> {
-    let name = if inst.display_name.is_empty() {
-        &inst.id
-    } else {
-        &inst.display_name
-    };
-    format!(
-        "[Desktop Entry]\nName={name}\nExec={exec}\nTerminal=true\nType=Application\n{DESKTOP_KEY}={id}\n",
-        exec = wrapper_path.display(),
-        id = inst.id,
-    )
-    .into_bytes()
-}
-
 fn marker_line(id: &str) -> String {
     format!("{MARKER_PREFIX}{id}")
 }
@@ -164,7 +148,7 @@ fn read_existing(path: &Path) -> Option<Vec<u8>> {
     fs::read(path).ok()
 }
 
-/// Plan installing the wrapper (+ desktop file) for a registry instance.
+/// Plan installing a terminal wrapper without adding an application launcher.
 /// Pure reads plus returned `Change`s; the caller applies them (or prints
 /// them for `--dry-run`). `home` must already be tilde-expanded.
 pub fn plan_install(
@@ -173,7 +157,6 @@ pub fn plan_install(
     bin_dir: &Path,
     apps_dir: &Path,
     name_override: Option<&str>,
-    no_desktop: bool,
 ) -> anyhow::Result<Vec<Change>> {
     let Some(name) = resolve_wrapper_name(inst, name_override)? else {
         anyhow::bail!(
@@ -200,22 +183,11 @@ pub fn plan_install(
         old.as_deref(),
         &script,
     ));
-    if !no_desktop {
-        let desktop_path = apps_dir.join(format!("{name}.desktop"));
-        let desktop = desktop_contents(inst, &wrapper_path);
-        if let Some(old) = read_existing(&desktop_path)
-            && !has_line(&old, &desktop_line(&inst.id))
-        {
-            anyhow::bail!(
-                "refusing to overwrite {}: not managed by agentdeck for {:?}",
-                desktop_path.display(),
-                inst.id
-            );
-        }
-        validate_desktop(&desktop)?;
-        let old = read_existing(&desktop_path);
-        changes.extend(plan_write_file(desktop_path, old.as_deref(), &desktop));
-    }
+    changes.extend(
+        files_with_line(apps_dir, &desktop_line(&inst.id), Some("desktop"))
+            .into_iter()
+            .map(|path| Change::Remove { path }),
+    );
     Ok(changes)
 }
 
@@ -260,32 +232,36 @@ fn files_with_line(dir: &Path, line: &str, extension: Option<&str>) -> Vec<PathB
     out
 }
 
-/// Validate desktop content with `desktop-file-validate` when installed.
-pub fn validate_desktop(contents: &[u8]) -> anyhow::Result<()> {
-    if std::process::Command::new("desktop-file-validate")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        return Ok(());
+/// Retire old managed launchers, including instances no longer in the registry.
+pub fn plan_remove_launchers(apps_dir: &Path) -> anyhow::Result<Vec<Change>> {
+    let entries = match fs::read_dir(apps_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().is_none_or(|ext| ext != "desktop") {
+            continue;
+        }
+        if read_existing(&path).is_some_and(|bytes| {
+            bytes.split(|b| *b == b'\n').any(|line| {
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                std::str::from_utf8(line)
+                    .ok()
+                    .and_then(|s| s.strip_prefix("X-Agentdeck-Instance="))
+                    .is_some_and(|id| crate::registry::check_id(id).is_ok())
+            })
+        }) {
+            files.push(path);
+        }
     }
-    static N: AtomicU64 = AtomicU64::new(0);
-    let tmp = std::env::temp_dir().join(format!(
-        "agentdeck-desktop-validate-{}-{}.desktop",
-        std::process::id(),
-        N.fetch_add(1, Ordering::SeqCst)
-    ));
-    fs::write(&tmp, contents)?;
-    let out = std::process::Command::new("desktop-file-validate")
-        .arg(&tmp)
-        .output();
-    let _ = fs::remove_file(&tmp);
-    let out = out?;
-    if !out.status.success() {
-        let detail = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!("generated .desktop file failed validation: {detail}");
-    }
-    Ok(())
+    files.sort();
+    Ok(files
+        .into_iter()
+        .map(|path| Change::Remove { path })
+        .collect())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,6 +334,7 @@ mod tests {
     use super::*;
     use crate::changes::apply_changes;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static N: AtomicU64 = AtomicU64::new(0);
 
@@ -503,11 +480,11 @@ mod tests {
     }
 
     #[test]
-    fn install_idempotent_executable_and_desktop() {
+    fn install_idempotent_executable_without_desktop() {
         let fx = fixture();
         let claude = inst("claude_second", Harness::Claude);
-        let changes = plan_install(&claude, &fx.home, &fx.bin, &fx.apps, None, false).unwrap();
-        assert_eq!(changes.len(), 2);
+        let changes = plan_install(&claude, &fx.home, &fx.bin, &fx.apps, None).unwrap();
+        assert_eq!(changes.len(), 1);
         // Dry-run purity: planning writes nothing.
         assert!(!fx.bin.exists() && !fx.apps.exists());
         apply_changes(&changes).unwrap();
@@ -515,26 +492,10 @@ mod tests {
         let wrapper = fx.bin.join("claude@second");
         let mode = fs::metadata(&wrapper).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755);
-        let desktop = fs::read_to_string(fx.apps.join("claude@second.desktop")).unwrap();
-        assert!(
-            desktop.contains("Name=claude_second display\n"),
-            "{desktop}"
-        );
-        assert!(
-            desktop.contains(&format!("Exec={}\n", wrapper.display())),
-            "{desktop}"
-        );
-        assert!(
-            desktop.contains("Terminal=true\nType=Application\n"),
-            "{desktop}"
-        );
-        assert!(
-            desktop.contains("X-Agentdeck-Instance=claude_second\n"),
-            "{desktop}"
-        );
+        assert!(!fx.apps.exists(), "wrappers must not create app launchers");
 
         assert!(
-            plan_install(&claude, &fx.home, &fx.bin, &fx.apps, None, false)
+            plan_install(&claude, &fx.home, &fx.bin, &fx.apps, None)
                 .unwrap()
                 .is_empty()
         );
@@ -546,7 +507,6 @@ mod tests {
                 &fx.bin,
                 &fx.apps,
                 None,
-                false
             )
             .is_err()
         );
@@ -558,7 +518,7 @@ mod tests {
         let claude = inst("claude_second", Harness::Claude);
         fs::create_dir_all(&fx.bin).unwrap();
         fs::write(fx.bin.join("claude@second"), "#!/bin/sh\necho foreign\n").unwrap();
-        assert!(plan_install(&claude, &fx.home, &fx.bin, &fx.apps, None, false).is_err());
+        assert!(plan_install(&claude, &fx.home, &fx.bin, &fx.apps, None).is_err());
 
         fs::remove_file(fx.bin.join("claude@second")).unwrap();
         fs::create_dir_all(&fx.apps).unwrap();
@@ -567,15 +527,23 @@ mod tests {
             "[Desktop Entry]\nName=x\n",
         )
         .unwrap();
-        assert!(plan_install(&claude, &fx.home, &fx.bin, &fx.apps, None, false).is_err());
+        let changes = plan_install(&claude, &fx.home, &fx.bin, &fx.apps, None).unwrap();
+        apply_changes(&changes).unwrap();
+        assert!(fx.apps.join("claude@second.desktop").exists());
     }
 
     #[test]
     fn remove_only_ours() {
         let fx = fixture();
         let claude = inst("claude_second", Harness::Claude);
-        let changes = plan_install(&claude, &fx.home, &fx.bin, &fx.apps, None, false).unwrap();
+        let changes = plan_install(&claude, &fx.home, &fx.bin, &fx.apps, None).unwrap();
         apply_changes(&changes).unwrap();
+        fs::create_dir_all(&fx.apps).unwrap();
+        fs::write(
+            fx.apps.join("claude@second.desktop"),
+            "[Desktop Entry]\nX-Agentdeck-Instance=claude_second\n",
+        )
+        .unwrap();
         // Foreign files that must survive a remove.
         fs::write(fx.bin.join("other"), "foreign\n").unwrap();
         fs::write(fx.apps.join("other.desktop"), "[Desktop Entry]\n").unwrap();
@@ -593,11 +561,42 @@ mod tests {
     }
 
     #[test]
-    fn name_override_and_no_desktop() {
+    fn retire_managed_launchers_without_touching_wrappers_or_other_apps() {
+        let fx = fixture();
+        fs::create_dir_all(&fx.apps).unwrap();
+        fs::create_dir_all(&fx.bin).unwrap();
+        fs::write(fx.bin.join("claude@second"), "keep wrapper").unwrap();
+        for (name, content) in [
+            (
+                "old.desktop",
+                "[Desktop Entry]\nX-Agentdeck-Instance=removed_account\n",
+            ),
+            ("foreign.desktop", "[Desktop Entry]\nName=Claude 2\n"),
+            ("agentdeck.desktop", "[Desktop Entry]\nName=Agentdeck\n"),
+            ("invalid.desktop", "X-Agentdeck-Instance=../../bad\n"),
+        ] {
+            fs::write(fx.apps.join(name), content).unwrap();
+        }
+        let changes = plan_remove_launchers(&fx.apps).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(
+            fx.apps.join("old.desktop").exists(),
+            "preview must not write"
+        );
+        apply_changes(&changes).unwrap();
+        assert!(!fx.apps.join("old.desktop").exists());
+        for name in ["foreign.desktop", "agentdeck.desktop", "invalid.desktop"] {
+            assert!(fx.apps.join(name).exists());
+        }
+        assert!(fx.bin.join("claude@second").exists());
+        assert!(plan_remove_launchers(&fx.apps).unwrap().is_empty());
+    }
+
+    #[test]
+    fn name_override() {
         let fx = fixture();
         let claude = inst("claude_second", Harness::Claude);
-        let changes =
-            plan_install(&claude, &fx.home, &fx.bin, &fx.apps, Some("mywrap"), true).unwrap();
+        let changes = plan_install(&claude, &fx.home, &fx.bin, &fx.apps, Some("mywrap")).unwrap();
         assert_eq!(changes.len(), 1);
         apply_changes(&changes).unwrap();
         assert!(fx.bin.join("mywrap").exists());

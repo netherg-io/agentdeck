@@ -1,5 +1,5 @@
 //! `agentdeck wrapper install|remove|list`: per-instance terminal wrappers
-//! (`claude@second`) and `.desktop` launchers.
+//! (`claude@second`) and legacy launcher cleanup.
 
 use std::path::PathBuf;
 
@@ -10,16 +10,13 @@ use super::cmd_claude::expand_tilde;
 
 #[derive(Subcommand)]
 pub enum WrapperCmd {
-    /// Install the wrapper script and .desktop launcher for an instance.
+    /// Install the terminal wrapper script for an instance.
     Install {
         /// Registry instance id.
         id: String,
         /// Wrapper file name (default `<binary>@<suffix>`, e.g. `claude@second`).
         #[arg(long)]
         name: Option<String>,
-        /// Skip the .desktop launcher.
-        #[arg(long)]
-        no_desktop: bool,
         #[arg(long)]
         dry_run: bool,
     },
@@ -28,6 +25,11 @@ pub enum WrapperCmd {
         /// Registry instance id (matched by marker, so registry membership is
         /// not required).
         id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove old Agentdeck provider launchers from the application menu.
+    RemoveLaunchers {
         #[arg(long)]
         dry_run: bool,
     },
@@ -42,25 +44,14 @@ pub fn run(paths: &Paths, cmd: WrapperCmd) -> anyhow::Result<()> {
     let bin_dir = wrappers::bin_dir(&home);
     let apps_dir = wrappers::apps_dir(&home);
     match cmd {
-        WrapperCmd::Install {
-            id,
-            name,
-            no_desktop,
-            dry_run,
-        } => {
+        WrapperCmd::Install { id, name, dry_run } => {
             let reg = Registry::load(paths)?;
             let inst = reg
                 .get(&id)
                 .ok_or_else(|| anyhow::anyhow!("unknown instance id {id:?}"))?;
             let home_dir = expand_tilde(&inst.home, &home);
-            let changes = wrappers::plan_install(
-                inst,
-                &home_dir,
-                &bin_dir,
-                &apps_dir,
-                name.as_deref(),
-                no_desktop,
-            )?;
+            let changes =
+                wrappers::plan_install(inst, &home_dir, &bin_dir, &apps_dir, name.as_deref())?;
             for c in &changes {
                 println!("{c}", c = c.describe());
             }
@@ -89,6 +80,15 @@ pub fn run(paths: &Paths, cmd: WrapperCmd) -> anyhow::Result<()> {
             } else {
                 agentdeck_core::apply_changes(&changes)?;
                 println!("removed wrappers for {id}");
+            }
+        }
+        WrapperCmd::RemoveLaunchers { dry_run } => {
+            let changes = wrappers::plan_remove_launchers(&apps_dir)?;
+            for c in &changes {
+                println!("{}", c.describe());
+            }
+            if !dry_run {
+                agentdeck_core::apply_changes(&changes)?;
             }
         }
         WrapperCmd::List => {

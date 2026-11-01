@@ -273,6 +273,18 @@ fn snapshots_en_ru_and_sidebar_navigation() {
         );
     }
 
+    // Clicking only emits an instance-specific action; the test never launches a terminal.
+    let mut single = data.clone();
+    single.instances.truncate(1);
+    let id = single.instances[0].id.clone();
+    let state = app::State::for_tests(paths.clone(), single);
+    let mut ui = iced_test::simulator(app::view(&state));
+    ui.click("CLI").expect("instance CLI button");
+    assert!(
+        ui.into_messages()
+            .any(|message| matches!(message, Message::LaunchCli(found) if found == id))
+    );
+
     // Sidebar navigation: every page reachable by clicking.
     agentdeck_gui::i18n::set_language("en");
     let mut state = app::State::for_tests(paths, data);

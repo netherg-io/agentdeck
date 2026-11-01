@@ -192,3 +192,6 @@ pool-sort-enabled = Enabled first
 pool-no-match = No models match.
 instances-rename = Rename
 rename-save = Save
+
+instances-cli = CLI
+cli-open-error = Could not open CLI: { $what }

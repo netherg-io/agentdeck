@@ -53,7 +53,7 @@ agentdeck harness       detect binaries, run official updaters/installers
 agentdeck t3            T3 providerInstances status, sync and import
 agentdeck sync          background sync drift status and manual runs
 agentdeck skills | instructions | mcp   shared skills, AGENTS.md links, MCP lists
-agentdeck wrapper       per-instance terminal wrappers and .desktop launchers
+agentdeck wrapper       terminal wrappers and legacy launcher cleanup
 agentdeck service       install/remove/inspect the systemd user unit (never starts it)
 agentdeck plugin        enable/disable built-in plugins (agent-process, ai-usage, router)
 agentdeck route         route a task through the router (route.mjs port)
@@ -83,6 +83,12 @@ registered instance, with search, an instance filter and sorting. New catalog
 entries start disabled; only explicitly enabled entries are routing candidates.
 T3 favorites are not used. Instance names can be edited without changing their
 IDs or T3 thread history. The router reads the current registry directly.
+
+Each instance has a **CLI** button that opens its CLI in a terminal with the
+correct account. From a terminal, use `agentdeck instance run <id> -- <args>`.
+Instance wrappers no longer add application menu entries. To remove legacy
+Agentdeck provider shortcuts, use `agentdeck wrapper remove-launchers` (supports
+`--dry-run`); the wrapper commands themselves are kept.
 
 ## Plugins
 
