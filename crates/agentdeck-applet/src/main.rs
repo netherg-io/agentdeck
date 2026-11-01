@@ -98,14 +98,13 @@ fn reset_text(reset: Option<i64>, timestamp: i64) -> String {
         return String::new();
     }
     let (days, hours, minutes) = (seconds / 86400, seconds % 86400 / 3600, seconds % 3600 / 60);
-    let interval = if days > 0 {
+    if days > 0 {
         format!("{days}д {hours}ч")
     } else if hours > 0 {
         format!("{hours}ч {minutes}м")
     } else {
         format!("{}м", minutes.max(1))
-    };
-    interval
+    }
 }
 
 fn updated_text(updated_at: i64, timestamp: i64) -> String {
