@@ -1010,12 +1010,21 @@ fn sidebar(state: &State) -> Element<'_, Message> {
     ]
     .spacing(look.gap.max(12.0) + 2.0);
     // Scrolls when the window is shorter than the full module list.
-    container(scrollable(col).height(Length::Fill))
-        .width(look.sidebar_width)
-        .height(Length::Fill)
-        .padding([look.page_pad, 10.0])
-        .style(st::sidebar_style)
-        .into()
+    container(
+        scrollable(col)
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::new()
+                    .width(4)
+                    .scroller_width(4)
+                    .spacing(4),
+            ))
+            .height(Length::Fill),
+    )
+    .width(look.sidebar_width)
+    .height(Length::Fill)
+    .padding([look.page_pad, 10.0])
+    .style(st::sidebar_style)
+    .into()
 }
 
 fn page_header<'a>(title: String, action: Option<Element<'a, Message>>) -> Element<'a, Message> {
