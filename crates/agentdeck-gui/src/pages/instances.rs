@@ -144,7 +144,12 @@ fn t3_pill(inst: &InstanceRow) -> Element<'_, Message> {
                 "disabled" | "—" => st::Tone::Neutral,
                 _ => st::Tone::Warn,
             };
-            st::pill(format!("{} {status}", fl!(loader(), "t3-label")), tone)
+            let text = match status {
+                "ready" => fl!(loader(), "t3-ready"),
+                "disabled" => fl!(loader(), "t3-disabled"),
+                other => format!("{} {other}", fl!(loader(), "t3-label")),
+            };
+            st::pill(text, tone)
         }
         None => st::pill(fl!(loader(), "t3-unavailable"), st::Tone::Neutral),
     }
@@ -280,22 +285,19 @@ pub fn limits_view<'a>(data: &'a Data, parallel: Option<&'a Parallel>) -> Elemen
         if i > 0 {
             list = list.push(st::hairline());
         }
-        let mut col = column![st::fit(
-            inst.display_name.as_str(),
-            st::Role::Heading,
-            st::Cut::End
-        )]
-        .spacing(look.row_gap);
+        let name =
+            st::fit(inst.display_name.as_str(), st::Role::Body, st::Cut::End).width(Length::Fill);
+        let mut col = column![].spacing(look.row_gap);
         if let Some(edit) = parallel.filter(|e| e.id == inst.id) {
             col = col.push(
                 row![
-                    st::body(fl!(loader(), "parallel-label")),
+                    name,
                     text_input(&fl!(loader(), "parallel-unlimited"), &edit.value)
                         .id(iced::widget::Id::new(PARALLEL_INPUT))
                         .on_input_maybe((!edit.busy).then_some(Message::ParallelInput))
                         .on_submit_maybe((!edit.busy).then_some(Message::ParallelSave))
                         .size(look.body)
-                        .width(Length::Fill),
+                        .width(160),
                     st::btn(st::Btn::Quiet, fl!(loader(), "rename-save"))
                         .on_press_maybe((!edit.busy).then_some(Message::ParallelSave)),
                     st::icon_btn(st::Icon::X)
@@ -313,11 +315,12 @@ pub fn limits_view<'a>(data: &'a Data, parallel: Option<&'a Parallel>) -> Elemen
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| fl!(loader(), "parallel-unlimited"));
             col = col.push(
-                st::btn(
-                    st::Btn::Quiet,
-                    format!("{}: {limit}", fl!(loader(), "parallel-label")),
-                )
-                .on_press(Message::ParallelAsk(inst.id.clone())),
+                row![
+                    name,
+                    st::btn(st::Btn::Quiet, limit).on_press(Message::ParallelAsk(inst.id.clone())),
+                ]
+                .spacing(st::SPACE_M)
+                .align_y(Alignment::Center),
             );
         }
         list = list.push(col);

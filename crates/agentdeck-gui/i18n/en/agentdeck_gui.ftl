@@ -252,3 +252,5 @@ pool-remove-tip = Remove this custom entry
 usage-api-key = API key
 usage-api-key-placeholder = Leave blank if the variable is already set
 usage-key-write = Set { $var } in { $path } (0600)
+t3-ready = T3 ready
+t3-disabled = T3 disabled

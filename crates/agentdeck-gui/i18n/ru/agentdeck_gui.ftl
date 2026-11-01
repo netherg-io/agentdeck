@@ -259,3 +259,5 @@ pool-remove-tip = Удалить свою запись
 usage-api-key = API-ключ
 usage-api-key-placeholder = Пусто, если переменная уже задана
 usage-key-write = Записать { $var } в { $path } (0600)
+t3-ready = T3 готов
+t3-disabled = T3 выключен

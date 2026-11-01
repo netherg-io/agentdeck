@@ -956,7 +956,7 @@ fn parallel_limit_edit_validate_persist_reload_and_clear() {
         app::Message::SelectPage(agentdeck_gui::Page::Limits),
     );
     let mut ui = iced_test::simulator(app::view(&state));
-    ui.click("Parallel tasks: Unlimited").unwrap();
+    ui.click("Unlimited").unwrap();
     for message in ui.into_messages() {
         let _ = app::update(&mut state, message);
     }
@@ -991,18 +991,14 @@ fn parallel_limit_edit_validate_persist_reload_and_clear() {
             .max_parallel,
         Some(3)
     );
-    iced_test::simulator(app::view(&state))
-        .find("Parallel tasks: 3")
-        .unwrap();
+    iced_test::simulator(app::view(&state)).find("3").unwrap();
     assert_eq!(data::load(&paths).instances[0].max_parallel, Some(3));
 
     // Cancel keeps the stored value; a failed write keeps the editor usable.
     let _ = app::update(&mut state, app::Message::ParallelAsk("claude-main".into()));
     let _ = app::update(&mut state, app::Message::ParallelInput("9".into()));
     let _ = app::update(&mut state, app::Message::Escape);
-    iced_test::simulator(app::view(&state))
-        .find("Parallel tasks: 3")
-        .unwrap();
+    iced_test::simulator(app::view(&state)).find("3").unwrap();
     let _ = app::update(&mut state, app::Message::ParallelAsk("claude-main".into()));
     let task = app::update(
         &mut state,
@@ -1043,7 +1039,7 @@ fn parallel_limit_edit_validate_persist_reload_and_clear() {
         None
     );
     iced_test::simulator(app::view(&state))
-        .find("Parallel tasks: Unlimited")
+        .find("Unlimited")
         .unwrap();
 }
 

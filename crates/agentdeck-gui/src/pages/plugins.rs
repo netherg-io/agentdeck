@@ -6,7 +6,7 @@ use std::collections::HashSet;
 
 use i18n_embed_fl::fl;
 use iced::widget::{button, column, row, toggler, tooltip};
-use iced::{Alignment, Element};
+use iced::{Alignment, Element, Length};
 
 use crate::app::Message;
 use crate::data::{Data, PluginRow};
@@ -113,8 +113,19 @@ fn status_card<'a>(plugin: &'a PluginRow, open: &'a HashSet<String>) -> Element<
     .padding([2, 4])
     .style(st::row_style)
     .on_press(Message::PluginDetail(name.to_string()));
+    let label = match name {
+        agentdeck_core::plugins::PLUGIN_AI_USAGE => fl!(loader(), "nav-group-usage"),
+        agentdeck_core::plugins::PLUGIN_ROUTER => fl!(loader(), "nav-group-router"),
+        agentdeck_core::plugins::PLUGIN_AGENT_PROCESS => fl!(loader(), "nav-group-agents"),
+        other => other.to_string(),
+    };
     let head = row![
-        st::fit(name, st::Role::Muted, st::Cut::End),
+        column![
+            st::fit(label, st::Role::Body, st::Cut::End),
+            st::fit(name, st::Role::MonoMuted, st::Cut::End),
+        ]
+        .spacing(2)
+        .width(Length::Fill),
         st::pill(state, tone),
         expander,
     ]

@@ -990,26 +990,27 @@ fn sidebar(state: &State) -> Element<'_, Message> {
             agentdeck_core::plugins::PLUGIN_ROUTER,
             &[
                 (Page::Pool, st::Icon::Layers),
-                (Page::Limits, st::Icon::Users),
-                (Page::RouterSettings, st::Icon::Compare),
+                (Page::Limits, st::Icon::Gauge),
+                (Page::RouterSettings, st::Icon::Split),
             ],
         ),
         module(
             fl!(loader(), "nav-group-agents"),
             agentdeck_core::plugins::PLUGIN_AGENT_PROCESS,
-            &[(Page::Processes, st::Icon::Activity)],
+            &[(Page::Processes, st::Icon::Terminal)],
         ),
         group(
             fl!(loader(), "nav-group-system"),
             &[
-                (Page::Modules, st::Icon::Plug),
                 (Page::Shared, st::Icon::Share),
                 (Page::Harnesses, st::Icon::Wrench),
+                (Page::Modules, st::Icon::Plug),
             ],
         ),
     ]
-    .spacing(look.gap.max(12.0) + 6.0);
-    container(col)
+    .spacing(look.gap.max(12.0) + 2.0);
+    // Scrolls when the window is shorter than the full module list.
+    container(scrollable(col).height(Length::Fill))
         .width(look.sidebar_width)
         .height(Length::Fill)
         .padding([look.page_pad, 10.0])
