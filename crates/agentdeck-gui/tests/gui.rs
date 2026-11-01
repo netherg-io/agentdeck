@@ -757,6 +757,7 @@ fn fixture_proc(pid: u32, cmd: &str) -> agentdeck_core::processes::ProcInfo {
         start_ticks: 1000,
         scope: None,
         owner_tag: Some("ses1".to_string()),
+        container: None,
     }
 }
 
@@ -779,6 +780,7 @@ fn fixture_groups() -> Vec<agentdeck_core::processes::SessionGroup> {
             read_bytes: Some(8192),
             write_bytes: Some(0),
             scope_mem_bytes: None,
+            container: None,
         },
         SessionGroup {
             kind: GroupKind::T3 {
@@ -795,6 +797,7 @@ fn fixture_groups() -> Vec<agentdeck_core::processes::SessionGroup> {
             read_bytes: None,
             write_bytes: None,
             scope_mem_bytes: None,
+            container: None,
         },
         SessionGroup {
             kind: GroupKind::Agent {
@@ -814,6 +817,7 @@ fn fixture_groups() -> Vec<agentdeck_core::processes::SessionGroup> {
             read_bytes: None,
             write_bytes: None,
             scope_mem_bytes: None,
+            container: None,
         },
     ]
 }

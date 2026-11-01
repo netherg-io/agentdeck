@@ -264,7 +264,8 @@ fn source_pointer(account: &AccountConfig) -> String {
             ..
         } => format!("{command} CODEX_HOME={}", codex_home.display()),
         AccountConfig::Deepseek { api_key_env, .. } => api_key_env.clone(),
-        AccountConfig::Openrouter { api_key_env, .. } => api_key_env.clone(),
+        AccountConfig::Openrouter { api_key_env, .. }
+        | AccountConfig::Vercel { api_key_env, .. } => api_key_env.clone(),
         AccountConfig::Antigravity { token_file, .. } => token_file
             .as_ref()
             .map(|p| p.display().to_string())
@@ -298,7 +299,8 @@ fn usage_entry(account: &AccountConfig, instance: Option<String>) -> anyhow::Res
         }
         AccountConfig::Codex { codex_home, .. } => entry.codex_home = Some(path_string(codex_home)),
         AccountConfig::Deepseek { api_key_env, .. }
-        | AccountConfig::Openrouter { api_key_env, .. } => {
+        | AccountConfig::Openrouter { api_key_env, .. }
+        | AccountConfig::Vercel { api_key_env, .. } => {
             entry.api_key_env = Some(api_key_env.clone());
         }
         AccountConfig::Antigravity { token_file, .. } => {

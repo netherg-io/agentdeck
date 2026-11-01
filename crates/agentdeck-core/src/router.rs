@@ -257,7 +257,11 @@ pub fn router_json_value(reg: &Registry) -> anyhow::Result<Value> {
         "usageStatePath".into(),
         Value::String(USAGE_STATE_PATH.to_string()),
     );
-    if let Some(model) = crate::settings::read(reg).decision_model {
+    let settings = crate::settings::read(reg);
+    if let Some(provider) = settings.decision_provider {
+        root.insert("decisionProvider".into(), Value::String(provider));
+    }
+    if let Some(model) = settings.decision_model {
         root.insert("decisionModel".into(), Value::String(model));
     }
     Ok(Value::Object(root))
@@ -965,7 +969,7 @@ mod tests {
         match kind {
             UsageKind::Claude => e.config_dir = Some("~/.claude".into()),
             UsageKind::Codex => e.codex_home = Some("~/.codex".into()),
-            UsageKind::Deepseek | UsageKind::Openrouter => {
+            UsageKind::Deepseek | UsageKind::Openrouter | UsageKind::Vercel => {
                 e.api_key_env = Some("AGENTDECK_TEST_KEY".into());
             }
             UsageKind::Antigravity | UsageKind::OpencodeGo => {}

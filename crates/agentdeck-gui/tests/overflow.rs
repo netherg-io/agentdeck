@@ -57,6 +57,7 @@ fn proc(pid: u32, argv: &[&str]) -> ProcInfo {
         start_ticks: 1000,
         scope: None,
         owner_tag: None,
+        container: None,
     }
 }
 
@@ -112,27 +113,68 @@ fn data() -> Data {
         ],
         error: None,
         auto_apply: true,
-        processes: vec![SessionGroup {
-            kind: GroupKind::Agent {
-                owner: "claude-d756536e".into(),
-                id: "20261030T184618Z-abcdef".into(),
+        processes: vec![
+            SessionGroup {
+                kind: GroupKind::Agent {
+                    owner: "claude-d756536e".into(),
+                    id: "20261030T184618Z-abcdef".into(),
+                },
+                title: "claude-d756536e (20261030T184618Z-abcdef0123456789-very-long-run)".into(),
+                pid: 100,
+                start_ticks: 1000,
+                pgrp: 100,
+                can_stop: true,
+                processes: vec![
+                    proc(100, &long_cmd),
+                    proc(101, &long_cmd),
+                    proc(102, &["sh"]),
+                ],
+                cpu_percent: 123.4,
+                rss_bytes: 9_999_000_000,
+                read_bytes: None,
+                write_bytes: None,
+                scope_mem_bytes: None,
+                container: None,
             },
-            title: "claude-d756536e (20261030T184618Z-abcdef0123456789-very-long-run)".into(),
-            pid: 100,
-            start_ticks: 1000,
-            pgrp: 100,
-            can_stop: true,
-            processes: vec![
-                proc(100, &long_cmd),
-                proc(101, &long_cmd),
-                proc(102, &["sh"]),
-            ],
-            cpu_percent: 123.4,
-            rss_bytes: 9_999_000_000,
-            read_bytes: None,
-            write_bytes: None,
-            scope_mem_bytes: None,
-        }],
+            SessionGroup {
+                kind: GroupKind::Container {
+                    id: "a".repeat(64),
+                    name: "chicago_drywall_wp".into(),
+                },
+                title: "chicago_drywall_wp (cd-wp)".into(),
+                pid: 200,
+                start_ticks: 2000,
+                pgrp: 200,
+                can_stop: true,
+                processes: vec![
+                    proc(200, &["conmon"]),
+                    proc(201, &["apache2", "-DFOREGROUND"]),
+                ],
+                cpu_percent: 1.5,
+                rss_bytes: 120_000_000,
+                read_bytes: None,
+                write_bytes: None,
+                scope_mem_bytes: None,
+                container: Some("chicago_drywall_wp".into()),
+            },
+            SessionGroup {
+                kind: GroupKind::Harness {
+                    name: "claude".into(),
+                },
+                title: "claude".into(),
+                pid: 300,
+                start_ticks: 3000,
+                pgrp: 300,
+                can_stop: true,
+                processes: vec![proc(300, &["claude"])],
+                cpu_percent: 0.5,
+                rss_bytes: 300_000_000,
+                read_bytes: None,
+                write_bytes: None,
+                scope_mem_bytes: None,
+                container: Some("dev-box".into()),
+            },
+        ],
     }
 }
 

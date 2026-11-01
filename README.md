@@ -79,12 +79,13 @@ The same binary serves the iced GUI (English and Russian): instances with
 quotas, the add wizard with login and the drift view (with the sync auto-apply
 switch). Each module is a sidebar group with its on/off switch and its pages:
 Quotas (sources with API keys, panel widget visibility, polling interval),
-Router (pool, parallel limits, decision model and OpenRouter key) and Agents
-(processes). System → Modules shows each module's technical status. The usage
+Router (pool, parallel limits, decision provider, model and key) and Agents
+(processes, including podman containers started by agents). System → Modules shows each module's technical status. The usage
 daemon re-reads quota sources, polling settings and new keys from `usage.env`
 every cycle, so GUI edits apply without a restart. The GUI shares the registry with the CLI under `flock` and
 works while the daemon is stopped. The Pool page lists every cached model per
-registered instance, with search, an instance filter and sorting. New catalog
+registered instance, with search, an instance filter and sorting; models T3
+marks legacy are hidden unless enabled or shown with the Legacy checkbox. New catalog
 entries start disabled; only explicitly enabled entries are routing candidates.
 T3 favorites are not used. Instance names can be edited without changing their
 IDs or T3 thread history. The router reads the current registry directly.
@@ -95,12 +96,18 @@ Module settings live in `instances.toml`; absent keys use the defaults:
 
 ```toml
 [router]
-decision_model = "~typesafe/jev-latest"   # OpenRouter model that picks targets
+decision_provider = "openrouter"          # or "vercel" (Vercel AI Gateway)
+decision_model = "~typesafe/jev-latest"   # default for OpenRouter; required for vercel
 
 [usage_poll]
 refresh_seconds = 120   # minimum 15
 stale_seconds = 900     # cached quota data older than this is stale
 ```
+
+Decision keys: OpenRouter reads `JEV_OPENROUTER_API_KEY` or
+`~/.config/model-route/openrouter.key`; Vercel AI Gateway reads
+`AI_GATEWAY_API_KEY` or `~/.config/model-route/vercel.key`. Quota sources of
+kind `vercel` show the gateway's credit balance.
 
 **Parallel tasks** on each instance sets its router limit; a blank value means
 unlimited. The limit covers active T3 threads and subagents across every

@@ -45,6 +45,9 @@ fn kind_label(g: &SessionGroup) -> String {
         agentdeck_core::processes::GroupKind::Harness { .. } => {
             fl!(loader(), "processes-kind-harness")
         }
+        agentdeck_core::processes::GroupKind::Container { .. } => {
+            fl!(loader(), "processes-kind-container")
+        }
     }
 }
 
@@ -129,6 +132,7 @@ pub fn visible(data: &Data, filter: &str) -> Vec<usize> {
 }
 
 const CPU_W: f32 = 64.0;
+const COUNT_W: f32 = 84.0;
 const RSS_W: f32 = 64.0;
 const PID_W: f32 = 64.0;
 
@@ -157,16 +161,39 @@ fn group_row<'a>(i: usize, g: &'a SessionGroup, open: bool) -> Element<'a, Messa
                 },
                 look.body + 1.0
             ),
-            st::fit(short_title(&g.title), st::Role::Heading, st::Cut::End),
+            container(st::fit(
+                short_title(&g.title),
+                st::Role::Heading,
+                st::Cut::End
+            ))
+            .width(Length::Fill),
             st::pill(kind_label(g), st::Tone::Neutral),
-            st::nowrap(st::caption(count)),
-            st::nowrap(st::body(format!("{:.1}%", g.cpu_percent)))
-                .width(CPU_W)
-                .align_x(Alignment::End),
-            st::nowrap(st::body(mega(g.rss_bytes)))
-                .width(RSS_W)
-                .align_x(Alignment::End),
         ]
+        .push(
+            // Harness groups running inside a container get the podman mark too.
+            g.container
+                .as_ref()
+                .filter(|_| {
+                    !matches!(
+                        g.kind,
+                        agentdeck_core::processes::GroupKind::Container { .. }
+                    )
+                })
+                .map(|name| st::pill(format!("podman · {name}"), st::Tone::Accent)),
+        )
+        .push(
+            row![
+                st::nowrap(st::caption(count)).width(COUNT_W),
+                st::nowrap(st::body(format!("{:.1}%", g.cpu_percent)))
+                    .width(CPU_W)
+                    .align_x(Alignment::End),
+                st::nowrap(st::body(mega(g.rss_bytes)))
+                    .width(RSS_W)
+                    .align_x(Alignment::End),
+            ]
+            .spacing(st::SPACE_S)
+            .align_y(Alignment::Center),
+        )
         .spacing(st::SPACE_S)
         .align_y(Alignment::Center),
     )
@@ -321,6 +348,7 @@ mod tests {
             start_ticks: 1,
             scope: None,
             owner_tag: None,
+            container: None,
         }
     }
 

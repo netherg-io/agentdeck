@@ -5,7 +5,10 @@
 //! `AI_AGENT_PROCESS_OWNER`/`AI_AGENT_PROCESS_ID`), T3 `t3code-*.scope`
 //! cgroups (mapped to T3 threads read-only when the schema allows, else the
 //! scope name) and harness processes (`claude`, `codex`, `opencode`, `agy`)
-//! with descendants by ancestry. Unreadable counters are `None` (a dash in
+//! with descendants by ancestry. Rootless podman containers (`libpod-<id>.scope`)
+//! form their own group when their `conmon` carries an agent tag or sits in a
+//! T3 scope: conmon inherits the launching agent's env and cgroup, while the
+//! container processes do not. Unreadable counters are `None` (a dash in
 //! the UI), never an error. Only the GUI calls [`stop_group`] (the owner's
 //! click is the approval); the CLI stays read-only and stopping from the CLI
 //! stays `agent-process stop`.
@@ -59,6 +62,9 @@ pub struct ProcInfo {
     pub start_ticks: u64,
     pub scope: Option<String>,
     pub owner_tag: Option<String>,
+    /// Podman container id when the process runs in one.
+    #[serde(default)]
+    pub container: Option<String>,
 }
 
 impl ProcInfo {
@@ -73,9 +79,21 @@ impl ProcInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GroupKind {
-    Agent { owner: String, id: String },
-    T3 { scope: String },
-    Harness { name: String },
+    Agent {
+        owner: String,
+        id: String,
+    },
+    T3 {
+        scope: String,
+    },
+    Harness {
+        name: String,
+    },
+    /// A podman container started by an agent; stopped with `podman stop`.
+    Container {
+        id: String,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +112,9 @@ pub struct SessionGroup {
     pub write_bytes: Option<u64>,
     /// T3 scopes only: cgroup `memory.current` when readable.
     pub scope_mem_bytes: Option<u64>,
+    /// Container name when the group runs in (or is) a podman container.
+    #[serde(default)]
+    pub container: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -191,6 +212,65 @@ fn scope_cgroup(proc: &Path) -> Option<(String, String)> {
     None
 }
 
+/// Podman container id from a `libpod-<64 hex>.scope` cgroup segment.
+fn container_of(proc: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(proc.join("cgroup")).ok()?;
+    text.split(['/', '\n']).find_map(|seg| {
+        let id = seg.strip_prefix("libpod-")?.strip_suffix(".scope")?;
+        (id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_string())
+    })
+}
+
+/// The container a `conmon` process monitors (`-c <id>` / `--cid <id>`).
+fn conmon_container(comm: &str, argv: &[String]) -> Option<String> {
+    if comm != "conmon" {
+        return None;
+    }
+    argv.windows(2)
+        .find(|w| w[0] == "-c" || w[0] == "--cid")
+        .map(|w| w[1].clone())
+}
+
+/// Container names by full id; empty when podman is missing or slow.
+fn podman_names() -> HashMap<String, String> {
+    let Ok(child) = std::process::Command::new("podman")
+        .args(["ps", "--no-trunc", "--format", "{{.ID}} {{.Names}}"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return HashMap::new();
+    };
+    let Ok(out) = child.wait_with_output() else {
+        return HashMap::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(id, name)| (id.to_string(), name.trim().to_string()))
+        .collect()
+}
+
+/// `podman stop` for a container group (grace in seconds, then SIGKILL).
+pub fn stop_container(id: &str, grace: Duration) -> anyhow::Result<StopReport> {
+    if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("not a container id: {id}");
+    }
+    let status = std::process::Command::new("podman")
+        .args(["stop", "-t", &grace.as_secs().to_string(), id])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("podman stop {} failed: {status}", &id[..12]);
+    }
+    Ok(StopReport {
+        signaled: Vec::new(),
+        outcome: StopOutcome::Terminated,
+    })
+}
+
 /// Per-scope resident memory from the cgroup fs; unreadable means `None`
 /// (a dash), never an error.
 fn scope_mem_bytes(cgroup_path: &str) -> Option<u64> {
@@ -279,6 +359,7 @@ fn harness_name(comm: &str, argv: &[String]) -> Option<String> {
 #[derive(Debug, Clone)]
 struct RegEntry {
     id: String,
+    name: String,
     owner: String,
     pid: u32,
     pgid: u32,
@@ -307,6 +388,7 @@ fn read_registry(dir: &Path) -> Vec<RegEntry> {
         };
         out.push(RegEntry {
             id: get("id"),
+            name: get("name"),
             owner: get("owner"),
             pid,
             pgid: v
@@ -341,6 +423,7 @@ struct RawProc {
     id_tag: Option<String>,
     scope: Option<String>,
     scope_path: Option<String>,
+    container: Option<String>,
     cpu: f64,
 }
 
@@ -374,6 +457,7 @@ fn collect_raw(root: &Path, prev: &Sample, curr: &Sample) -> Vec<RawProc> {
                 id_tag: env_tag(&env, "AI_AGENT_PROCESS_ID"),
                 scope,
                 scope_path,
+                container: container_of(&base),
                 cpu,
             });
         }
@@ -397,11 +481,43 @@ fn to_info(root: &Path, raw: &RawProc) -> ProcInfo {
         start_ticks: raw.st.start_ticks,
         scope: raw.scope.clone(),
         owner_tag: raw.owner_tag.clone(),
+        container: raw.container.clone(),
     }
 }
 
-fn snapshot_from_raw(root: &Path, reg_dir: &Path, raw: &[RawProc]) -> Snapshot {
+fn snapshot_from_raw(
+    root: &Path,
+    reg_dir: &Path,
+    raw: &[RawProc],
+    names: &dyn Fn() -> HashMap<String, String>,
+) -> Snapshot {
     let entries = live_entries(root, reg_dir);
+    // Every entry, live or not: `podman compose up -d` exits right away, but
+    // its containers' conmon still carries the entry's id tag.
+    let all_entries = read_registry(reg_dir);
+    // Containers whose conmon was launched by an agent: id -> owner label.
+    let mut agent_containers: HashMap<String, String> = HashMap::new();
+    for r in raw {
+        let Some(id) = conmon_container(&r.st.comm, &r.argv) else {
+            continue;
+        };
+        let owner = r
+            .id_tag
+            .as_deref()
+            .and_then(|t| all_entries.iter().find(|e| e.id == t))
+            .map(|e| e.name.clone())
+            .filter(|n| !n.is_empty())
+            .or_else(|| r.owner_tag.clone())
+            .or_else(|| r.scope.clone().filter(|s| s != "t3code.service"));
+        if let Some(owner) = owner {
+            agent_containers.insert(id, owner);
+        }
+    }
+    let names = if agent_containers.is_empty() {
+        HashMap::new()
+    } else {
+        names()
+    };
     let by_pid: HashMap<u32, &RawProc> = raw.iter().map(|r| (r.pid, r)).collect();
     let tag_by_pid: HashMap<u32, &str> = raw
         .iter()
@@ -467,6 +583,37 @@ fn snapshot_from_raw(root: &Path, reg_dir: &Path, raw: &[RawProc]) -> Snapshot {
     let mut assignment: HashMap<u32, String> = HashMap::new();
     let mut meta: HashMap<String, (GroupKind, u32, u64, u32, bool)> = HashMap::new();
     for r in raw {
+        let cid = r
+            .container
+            .clone()
+            .or_else(|| conmon_container(&r.st.comm, &r.argv));
+        if let Some(cid) = cid.filter(|c| agent_containers.contains_key(c)) {
+            let key = format!("podman:{cid}");
+            let name = names
+                .get(&cid)
+                .cloned()
+                .unwrap_or_else(|| cid[..12.min(cid.len())].to_string());
+            // Leader: the container's conmon (its stable parent), else any member.
+            meta.entry(key.clone()).or_insert_with(|| {
+                (
+                    GroupKind::Container {
+                        id: cid.clone(),
+                        name,
+                    },
+                    r.pid,
+                    r.st.start_ticks,
+                    r.st.pgrp,
+                    true,
+                )
+            });
+            if conmon_container(&r.st.comm, &r.argv).is_some()
+                && let Some(m) = meta.get_mut(&key)
+            {
+                (m.1, m.2, m.3) = (r.pid, r.st.start_ticks, r.st.pgrp);
+            }
+            assignment.insert(r.pid, key);
+            continue;
+        }
         let entry_id = r
             .id_tag
             .as_deref()
@@ -490,7 +637,18 @@ fn snapshot_from_raw(root: &Path, reg_dir: &Path, raw: &[RawProc]) -> Snapshot {
             assignment.insert(r.pid, format!("agent:{id}"));
             continue;
         }
-        if let Some(scope) = &r.scope {
+        // In t3code.service only the launch wrapper of an agent scope is agent
+        // work; the server, browser and tunnel are T3 itself.
+        let scope = match r.scope.as_deref() {
+            Some("t3code.service") => r.argv.iter().find_map(|a| {
+                a.split_whitespace()
+                    .find_map(|w| w.strip_prefix("--unit="))
+                    .filter(|u| u.starts_with("t3code-") && u.ends_with(".scope"))
+                    .map(str::to_string)
+            }),
+            other => other.map(str::to_string),
+        };
+        if let Some(scope) = &scope {
             let label = scope.clone();
             meta.entry(format!("t3:{scope}")).or_insert_with(|| {
                 (
@@ -533,10 +691,37 @@ fn snapshot_from_raw(root: &Path, reg_dir: &Path, raw: &[RawProc]) -> Snapshot {
             v.sort_by_key(|p| p.pid);
             v
         };
+        let container_owner = match &kind {
+            GroupKind::Container { id, .. } => agent_containers.get(id).cloned(),
+            _ => None,
+        };
         let title = match &kind {
-            GroupKind::Agent { owner, id } => format!("{owner} ({id})"),
+            GroupKind::Agent { owner, id } => {
+                // The registered name says what runs; owner/id stay for identity.
+                match entries
+                    .iter()
+                    .find(|e| &e.id == id)
+                    .map(|e| e.name.as_str())
+                {
+                    Some(name) if !name.is_empty() => format!("{name} ({owner} {id})"),
+                    _ => format!("{owner} ({id})"),
+                }
+            }
             GroupKind::T3 { scope } => scope.clone(),
             GroupKind::Harness { name } => name.clone(),
+            GroupKind::Container { name, .. } => match &container_owner {
+                Some(owner) => format!("{name} ({owner})"),
+                None => name.clone(),
+            },
+        };
+        let container = match &kind {
+            GroupKind::Container { name, .. } => Some(name.clone()),
+            _ => infos.iter().find_map(|p| p.container.as_ref()).map(|id| {
+                names
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| id[..12.min(id.len())].to_string())
+            }),
         };
         let sum = |f: fn(&ProcInfo) -> Option<u64>| {
             let mut total = 0u64;
@@ -570,6 +755,7 @@ fn snapshot_from_raw(root: &Path, reg_dir: &Path, raw: &[RawProc]) -> Snapshot {
             read_bytes: sum(|p| p.read_bytes),
             write_bytes: sum(|p| p.write_bytes),
             scope_mem_bytes,
+            container,
             processes: infos,
         });
     }
@@ -582,7 +768,7 @@ fn snapshot_with_roots(root: &Path, reg_dir: &Path) -> Snapshot {
     std::thread::sleep(Duration::from_millis(200));
     let curr = take_sample(root);
     let raw = collect_raw(root, &prev, &curr);
-    snapshot_from_raw(root, reg_dir, &raw)
+    snapshot_from_raw(root, reg_dir, &raw, &podman_names)
 }
 
 /// Live snapshot (two /proc samples 200 ms apart). Read-only, never fails.
@@ -638,6 +824,7 @@ pub fn group_members(
                 start_ticks: s.start_ticks,
                 scope: scope_of(&base),
                 owner_tag: env_tag(&base.join("environ"), "AI_AGENT_PROCESS_OWNER"),
+                container: container_of(&base),
             });
         }
     }
@@ -880,7 +1067,7 @@ mod tests {
         let curr = take_sample(&root);
         let raw = collect_raw(&root, &prev, &curr);
         assert_eq!(raw.len(), 6);
-        let snap = snapshot_from_raw(&root, &reg, &raw);
+        let snap = snapshot_from_raw(&root, &reg, &raw, &HashMap::new);
         assert_eq!(snap.groups.len(), 3);
         let agent = snap
             .groups
@@ -889,7 +1076,7 @@ mod tests {
             .unwrap();
         assert_eq!(agent.processes.len(), 2);
         assert!(agent.can_stop);
-        assert_eq!(agent.title, "ses1 (abc)");
+        assert_eq!(agent.title, "srv (ses1 abc)");
         let t3 = snap
             .groups
             .iter()
@@ -909,13 +1096,86 @@ mod tests {
         // Unreadable IO is None, never an error.
         std::fs::remove_file(root.join("300/io")).unwrap();
         let raw = collect_raw(&root, &prev, &curr);
-        let snap = snapshot_from_raw(&root, &reg, &raw);
+        let snap = snapshot_from_raw(&root, &reg, &raw, &HashMap::new);
         let h = snap
             .groups
             .iter()
             .find(|g| matches!(&g.kind, GroupKind::Harness { .. }))
             .unwrap();
         assert_eq!(h.read_bytes, Some(4096));
+    }
+
+    #[test]
+    fn agent_podman_containers_group_through_conmon() {
+        let (root, _g) = tmpdir("podman");
+        let reg = root.join("reg");
+        std::fs::create_dir_all(&reg).unwrap();
+        let id = "a".repeat(64);
+        let other = "b".repeat(64);
+        let scope = "0::/user.slice/t3code-claude-1.scope\n";
+        // conmon of an agent's container: dead registry entry's tag, T3 scope.
+        fake_proc(
+            &root,
+            "500",
+            &stat_line(500, "conmon", 1, 500, 5000),
+            format!("conmon\0-c\0{id}\0").as_bytes(),
+            b"AI_AGENT_PROCESS_ID=dead1\0AI_AGENT_PROCESS_OWNER=ses9\0",
+            scope,
+        );
+        fake_proc(
+            &root,
+            "501",
+            &stat_line(501, "apache2", 500, 501, 5010),
+            b"apache2\0",
+            b"container=podman\0",
+            &format!("0::/user.slice/libpod-{id}.scope/container\n"),
+        );
+        // The user's own container: untagged conmon outside T3, skipped.
+        fake_proc(
+            &root,
+            "600",
+            &stat_line(600, "conmon", 1, 600, 6000),
+            format!("conmon\0-c\0{other}\0").as_bytes(),
+            b"PATH=/x\0",
+            "0::/user.slice/app.slice\n",
+        );
+        fake_proc(
+            &root,
+            "601",
+            &stat_line(601, "postgres", 600, 601, 6010),
+            b"postgres\0",
+            b"",
+            &format!("0::/user.slice/libpod-{other}.scope/container\n"),
+        );
+        // T3 itself inside t3code.service: not agent work.
+        fake_proc(
+            &root,
+            "700",
+            &stat_line(700, "t3", 1, 700, 7000),
+            b"t3\0serve\0",
+            b"",
+            "0::/user.slice/app-t3code.slice/t3code.service\n",
+        );
+        std::fs::write(
+            reg.join("dead1.json"),
+            r#"{"id":"dead1","name":"cd-wp","owner":"ses9","pid":999,"pgid":999,"start_ticks":"1"}"#,
+        )
+        .unwrap();
+        let prev = take_sample(&root);
+        let curr = take_sample(&root);
+        let raw = collect_raw(&root, &prev, &curr);
+        let id2 = id.clone();
+        let names = move || HashMap::from([(id2.clone(), "cd_wp".to_string())]);
+        let snap = snapshot_from_raw(&root, &reg, &raw, &names);
+        assert_eq!(snap.groups.len(), 1, "{:?}", snap.groups);
+        let g = &snap.groups[0];
+        assert!(
+            matches!(&g.kind, GroupKind::Container { id: i, name } if *i == id && name == "cd_wp")
+        );
+        assert_eq!(g.title, "cd_wp (cd-wp)");
+        assert_eq!(g.pid, 500);
+        assert_eq!(g.container.as_deref(), Some("cd_wp"));
+        assert_eq!(g.processes.len(), 2);
     }
 
     #[test]
@@ -944,7 +1204,7 @@ mod tests {
         unsafe { std::env::set_var("AGENTDECK_CGROUP_DIR", &cg) };
         let prev = take_sample(&root);
         let raw = collect_raw(&root, &prev, &prev);
-        let snap = snapshot_from_raw(&root, &reg, &raw);
+        let snap = snapshot_from_raw(&root, &reg, &raw, &HashMap::new);
         unsafe { std::env::remove_var("AGENTDECK_CGROUP_DIR") };
         assert_eq!(snap.groups.len(), 1);
         assert_eq!(snap.groups[0].scope_mem_bytes, Some(12345678));

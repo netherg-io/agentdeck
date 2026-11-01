@@ -559,12 +559,16 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             // Fresh identity-checked member list for the confirmation; the
             // snapshot rows are the fallback (e.g. the group just exited).
             let pending = state.data.processes.get(i).map(|g| {
-                let members = agentdeck_core::processes::group_members(
-                    &agentdeck_core::processes::proc_root(),
-                    g.pid,
-                    g.start_ticks,
-                )
-                .unwrap_or_else(|_| g.processes.clone());
+                // Container processes have their own process groups; list the snapshot.
+                let members = match g.kind {
+                    agentdeck_core::processes::GroupKind::Container { .. } => g.processes.clone(),
+                    _ => agentdeck_core::processes::group_members(
+                        &agentdeck_core::processes::proc_root(),
+                        g.pid,
+                        g.start_ticks,
+                    )
+                    .unwrap_or_else(|_| g.processes.clone()),
+                };
                 crate::pages::processes::PendingStop {
                     group: i,
                     title: g.title.clone(),
@@ -584,13 +588,19 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 match group.filter(|g| g.can_stop) {
                     Some(g) => Task::perform(
                         async move {
-                            let outcome = tokio::task::spawn_blocking(move || {
-                                agentdeck_core::processes::stop_group(
+                            let outcome = tokio::task::spawn_blocking(move || match &g.kind {
+                                agentdeck_core::processes::GroupKind::Container { id, .. } => {
+                                    agentdeck_core::processes::stop_container(
+                                        id,
+                                        std::time::Duration::from_secs(if force { 5 } else { 10 }),
+                                    )
+                                }
+                                _ => agentdeck_core::processes::stop_group(
                                     g.pid,
                                     g.start_ticks,
                                     std::time::Duration::from_secs(5),
                                     force,
-                                )
+                                ),
                             })
                             .await
                             .map_err(|e| anyhow::anyhow!("{e}"))

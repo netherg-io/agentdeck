@@ -64,6 +64,14 @@ pub enum AccountConfig {
         #[serde(default = "default_openrouter_base_url")]
         base_url: String,
     },
+    /// Vercel AI Gateway credits.
+    Vercel {
+        id: String,
+        name: String,
+        api_key_env: String,
+        #[serde(default = "default_vercel_base_url")]
+        base_url: String,
+    },
     Antigravity {
         id: String,
         name: String,
@@ -87,6 +95,7 @@ impl AccountConfig {
             | Self::Codex { id, .. }
             | Self::Deepseek { id, .. }
             | Self::Openrouter { id, .. }
+            | Self::Vercel { id, .. }
             | Self::Antigravity { id, .. }
             | Self::OpencodeGo { id, .. } => id,
         }
@@ -98,6 +107,7 @@ impl AccountConfig {
             | Self::Codex { name, .. }
             | Self::Deepseek { name, .. }
             | Self::Openrouter { name, .. }
+            | Self::Vercel { name, .. }
             | Self::Antigravity { name, .. }
             | Self::OpencodeGo { name, .. } => name,
         }
@@ -109,6 +119,7 @@ impl AccountConfig {
             Self::Codex { .. } => "codex",
             Self::Deepseek { .. } => "deepseek",
             Self::Openrouter { .. } => "openrouter",
+            Self::Vercel { .. } => "vercel",
             Self::Antigravity { .. } => "antigravity",
             Self::OpencodeGo { .. } => "opencode-go",
         }
@@ -123,6 +134,7 @@ impl AccountConfig {
             Self::Codex { codex_home, .. } => Some(codex_home),
             Self::Deepseek { .. }
             | Self::Openrouter { .. }
+            | Self::Vercel { .. }
             | Self::Antigravity { .. }
             | Self::OpencodeGo { .. } => None,
         }
@@ -149,7 +161,11 @@ pub(crate) fn default_deepseek_base_url() -> String {
     "https://api.deepseek.com".to_owned()
 }
 
-pub(crate) fn default_openrouter_base_url() -> String {
+pub(crate) fn default_vercel_base_url() -> String {
+    "https://ai-gateway.vercel.sh/v1".to_owned()
+}
+
+fn default_openrouter_base_url() -> String {
     "https://openrouter.ai/api/v1".to_owned()
 }
 
@@ -239,6 +255,12 @@ pub fn accounts_from_registry(entries: &[UsageEntry]) -> Result<Vec<AccountConfi
                 name,
                 api_key_env: key_env(e)?,
                 base_url: default_openrouter_base_url(),
+            },
+            UsageKind::Vercel => AccountConfig::Vercel {
+                id: e.id.clone(),
+                name,
+                api_key_env: key_env(e)?,
+                base_url: default_vercel_base_url(),
             },
             UsageKind::Antigravity => AccountConfig::Antigravity {
                 id: e.id.clone(),

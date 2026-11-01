@@ -14,12 +14,13 @@ use crate::data::Data;
 use crate::i18n::loader;
 use crate::style as st;
 
-const KINDS: [UsageKind; 6] = [
+const KINDS: [UsageKind; 7] = [
     UsageKind::Claude,
     UsageKind::Codex,
     UsageKind::Antigravity,
     UsageKind::Deepseek,
     UsageKind::Openrouter,
+    UsageKind::Vercel,
     UsageKind::OpencodeGo,
 ];
 
@@ -121,14 +122,19 @@ fn source_field(kind: UsageKind) -> (&'static str, bool) {
     match kind {
         UsageKind::Claude => ("usage-config-dir", true),
         UsageKind::Codex => ("usage-codex-home", true),
-        UsageKind::Deepseek | UsageKind::Openrouter => ("usage-api-key-env", false),
+        UsageKind::Deepseek | UsageKind::Openrouter | UsageKind::Vercel => {
+            ("usage-api-key-env", false)
+        }
         UsageKind::Antigravity => ("usage-token-file", false),
         UsageKind::OpencodeGo => ("usage-db-file", false),
     }
 }
 
 fn is_key_kind(kind: UsageKind) -> bool {
-    matches!(kind, UsageKind::Deepseek | UsageKind::Openrouter)
+    matches!(
+        kind,
+        UsageKind::Deepseek | UsageKind::Openrouter | UsageKind::Vercel
+    )
 }
 
 /// Env var holding a key-based source's key when the user names none.
@@ -183,7 +189,7 @@ fn entry_of(form: &Form) -> anyhow::Result<UsageEntry> {
     *match kind {
         UsageKind::Claude => &mut entry.config_dir,
         UsageKind::Codex => &mut entry.codex_home,
-        UsageKind::Deepseek | UsageKind::Openrouter => &mut entry.api_key_env,
+        UsageKind::Deepseek | UsageKind::Openrouter | UsageKind::Vercel => &mut entry.api_key_env,
         UsageKind::Antigravity => &mut entry.token_file,
         UsageKind::OpencodeGo => &mut entry.db_file,
     } = source;
@@ -448,6 +454,9 @@ fn status_of<'a>(data: &'a Data, id: &str) -> Option<&'a crate::data::UsageQuota
         .find(|q| q.usage_id == id)
 }
 
+const KIND_W: f32 = 110.0;
+const STATUS_W: f32 = 80.0;
+
 pub fn sources_view<'a>(state: &'a State, data: &'a Data) -> Element<'a, Msg> {
     let look = st::look();
     let mut col = column![].spacing(look.gap.max(st::SPACE_S));
@@ -466,31 +475,34 @@ pub fn sources_view<'a>(state: &'a State, data: &'a Data) -> Element<'a, Msg> {
         }
         let mut identity = column![st::fit(u.display.as_str(), st::Role::Heading, st::Cut::End)]
             .spacing(2)
-            .width(Length::FillPortion(2));
+            .width(Length::FillPortion(3));
         if u.display != u.id {
             identity = identity.push(st::fit(u.id.as_str(), st::Role::MonoMuted, st::Cut::Middle));
         }
-        let mut line = row![identity, st::pill(u.kind.as_str(), st::Tone::Accent)]
-            .spacing(st::SPACE_M)
-            .align_y(Alignment::Center);
-        if let Some(inst) = &u.instance {
-            line = line.push(
-                container(st::fit(inst.as_str(), st::Role::Muted, st::Cut::Middle))
-                    .width(Length::FillPortion(1)),
-            );
-        }
-        if let Some(q) = status_of(data, &u.id) {
+        // Fixed columns so kind, instance and status line up across rows.
+        let status = status_of(data, &u.id).map(|q| {
             let tone = match q.status.as_str() {
                 "ok" => st::Tone::Ok,
                 "stale" | "waiting" => st::Tone::Neutral,
                 _ => st::Tone::Warn,
             };
-            line = line.push(st::pill(q.status.clone(), tone));
-        }
-        line = line.push(
+            st::pill(q.status.clone(), tone)
+        });
+        let line = row![
+            identity,
+            container(st::pill(u.kind.as_str(), st::Tone::Accent)).width(KIND_W),
+            container(u.instance.as_deref().map(|inst| st::fit(
+                inst,
+                st::Role::Muted,
+                st::Cut::Middle
+            )))
+            .width(Length::FillPortion(2)),
+            container(status).width(STATUS_W),
             st::icon_btn(st::Icon::Trash)
                 .on_press_maybe((!state.busy).then(|| Msg::AskRemove(u.id.clone()))),
-        );
+        ]
+        .spacing(st::SPACE_M)
+        .align_y(Alignment::Center);
         list = list.push(line);
     }
     col.push(st::card(list)).into()
