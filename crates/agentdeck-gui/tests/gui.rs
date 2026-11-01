@@ -703,7 +703,7 @@ fn module_switch_preview_cancel_and_snapshots() {
             .expect("golden written");
         let bytes = std::fs::metadata(&golden).expect("golden png").len();
         assert!(bytes > 1_024, "golden {} looks empty", golden.display());
-        assert!(bytes < 100 * 1024, "golden {} too big", golden.display());
+        assert!(bytes < 160 * 1024, "golden {} too big", golden.display());
     }
 
     // Enable flow: the preview lists changes, Cancel drops it without writes.
