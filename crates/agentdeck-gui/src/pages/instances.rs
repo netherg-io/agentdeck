@@ -11,6 +11,9 @@ use crate::i18n::loader;
 use crate::overlay::Modal;
 use crate::style as st;
 
+pub const RENAME_INPUT: &str = "rename-input";
+pub const PARALLEL_INPUT: &str = "parallel-input";
+
 #[derive(Debug, Clone)]
 pub struct Rename {
     pub id: String,
@@ -207,6 +210,7 @@ fn instance_card<'a>(inst: &'a InstanceRow, rename: Option<&'a Rename>) -> Eleme
         col = col.push(
             row![
                 text_input(&fl!(loader(), "add-display-name"), &edit.name)
+                    .id(iced::widget::Id::new(RENAME_INPUT))
                     .on_input_maybe((!edit.busy).then_some(Message::RenameInput))
                     .on_submit_maybe((!edit.busy).then_some(Message::RenameSave))
                     .size(look.body)
@@ -287,6 +291,7 @@ pub fn limits_view<'a>(data: &'a Data, parallel: Option<&'a Parallel>) -> Elemen
                 row![
                     st::body(fl!(loader(), "parallel-label")),
                     text_input(&fl!(loader(), "parallel-unlimited"), &edit.value)
+                        .id(iced::widget::Id::new(PARALLEL_INPUT))
                         .on_input_maybe((!edit.busy).then_some(Message::ParallelInput))
                         .on_submit_maybe((!edit.busy).then_some(Message::ParallelSave))
                         .size(look.body)

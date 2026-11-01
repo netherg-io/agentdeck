@@ -1295,7 +1295,14 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     }
     state.insert("models".into(), Value::Object(models));
     let mut request = serde_json::Map::new();
-    request.insert("model".into(), Value::from("~typesafe/jev-latest"));
+    request.insert(
+        "model".into(),
+        Value::from(
+            cfg.decision_model
+                .as_deref()
+                .unwrap_or(agentdeck_core::settings::DEFAULT_DECISION_MODEL),
+        ),
+    );
     request.insert("state".into(), Value::Object(state));
     request.insert("questions".into(), Value::Object(questions));
     let request_value = Value::Object(request);

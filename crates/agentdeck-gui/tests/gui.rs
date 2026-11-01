@@ -634,7 +634,7 @@ fn drift_fix_then_reenable_offer_and_snapshots() {
     agentdeck_gui::i18n::set_language("en");
 }
 
-/// Module switches: a module page with its status card, enable preview + cancel, EN/RU snapshots.
+/// Module switches: the Modules page with every status card, enable preview + cancel, EN/RU snapshots.
 ///
 /// HOME and XDG_CONFIG_HOME point at a temp dir so the status/probe reads are
 /// deterministic (launcher missing, unit not installed) and read-only.
@@ -665,15 +665,17 @@ fn module_switch_preview_cancel_and_snapshots() {
     std::fs::create_dir_all(SNAPSHOTS).unwrap();
     let home = fakehome;
 
-    // A module page ends with its status card; snapshot EN + RU.
+    // System → Modules lists every module's status card; snapshot EN + RU.
     agentdeck_gui::i18n::set_language("en");
     let mut state = app::State::for_tests(paths.clone(), data.clone());
+    let _ = app::update(
+        &mut state,
+        app::Message::SelectPage(agentdeck_gui::Page::Modules),
+    );
     let mut ui = iced_test::simulator(app::view(&state));
-    ui.click("Limits").expect("limits nav button");
-    for message in ui.into_messages() {
-        let _ = app::update(&mut state, message);
+    for name in ["ai-usage", "router", "agent-process"] {
+        ui.find(name).expect("module status card");
     }
-    assert!(matches!(state.page(), agentdeck_gui::Page::Limits));
     let _ = app::update(&mut state, app::Message::PluginDetail("router".into()));
     for (lang, stem) in [("en", "modules_en"), ("ru", "modules_ru")] {
         agentdeck_gui::i18n::set_language(lang);

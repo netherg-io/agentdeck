@@ -141,6 +141,8 @@ pub struct RouterConfig {
     pub pool: Vec<Value>,
     pub instance_limits: HashMap<String, u32>,
     pub usage_state_path: Option<String>,
+    /// Jev judge model; `None` uses the built-in default.
+    pub decision_model: Option<String>,
     pub account: HashMap<String, String>,
     pub usage_id: HashMap<String, String>,
     /// Insertion-ordered, like `Object.entries` on the JSON object.
@@ -297,6 +299,10 @@ fn parse_router_config(data: Value, source: &str) -> anyhow::Result<RouterConfig
         instance_limits,
         usage_state_path: data
             .get("usageStatePath")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        decision_model: data
+            .get("decisionModel")
             .and_then(|v| v.as_str())
             .map(str::to_string),
         account,

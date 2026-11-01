@@ -37,18 +37,25 @@ pub async fn run(paths: &Paths, args: DaemonArgs) -> anyhow::Result<()> {
     // Sources are re-read every cycle so GUI/CLI edits apply without a restart;
     // a broken registry keeps the last good list instead of stopping polling.
     let mut accounts = accounts;
+    let mut poll = agentdeck_core::Registry::load(paths)
+        .map(|reg| agentdeck_core::settings::usage_poll(&reg))
+        .unwrap_or((defaults.refresh_seconds, defaults.stale_seconds as u64));
     let result = daemon::run_daemon(&dpaths, daemon::old_service_active, || {
-        match agentdeck_core::Registry::load(paths)
-            .and_then(|reg| agentdeck_usage::config::accounts_from_registry(&reg.usage))
-        {
-            Ok(fresh) => accounts = fresh,
+        match agentdeck_core::Registry::load(paths).and_then(|reg| {
+            Ok((
+                agentdeck_usage::config::accounts_from_registry(&reg.usage)?,
+                agentdeck_core::settings::usage_poll(&reg),
+            ))
+        }) {
+            Ok((fresh, fresh_poll)) => (accounts, poll) = (fresh, fresh_poll),
             Err(e) => eprintln!("usage sources not reloaded, keeping previous: {e:#}"),
         }
-        Ok((
-            accounts.clone(),
-            defaults.refresh_seconds,
-            defaults.stale_seconds,
-        ))
+        // shortcut: only keys new to the process are picked up; changing an
+        // existing key's value still needs a daemon restart.
+        if let Err(e) = daemon::load_agentdeck_secrets(&paths.config_dir) {
+            eprintln!("usage.env not reloaded: {e:#}");
+        }
+        Ok((accounts.clone(), poll.0, poll.1 as i64))
     })
     .await;
     sync_task.abort();

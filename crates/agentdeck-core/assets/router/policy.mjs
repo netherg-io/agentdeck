@@ -48,7 +48,7 @@ function loadRouterJson() {
       }
     }
   }
-  return { file, version: data.version ?? 1, pool: data.pool, usageStatePath: data.usageStatePath, ACCOUNT, USAGE_ID, META };
+  return { file, version: data.version ?? 1, pool: data.pool, usageStatePath: data.usageStatePath, decisionModel: data.decisionModel, ACCOUNT, USAGE_ID, META };
 }
 // The OpenCode instance mixes OpenRouter credits with the OpenCode Go subscription; the model prefix decides.
 export const accountOf = (instance, model) => {

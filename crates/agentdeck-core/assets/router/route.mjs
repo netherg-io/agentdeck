@@ -297,7 +297,7 @@ for (const f of favorites) questions[keyOf(f)] = {
   instructions: `Using the capability profile in context.models.${keyOf(f)}, rate expected result quality for context.task independently of other models. Distinguish adequate capability from a substantial practical quality advantage for this task. Routine file search, summaries and bounded edits do not require a frontier leader; a missing specialty or short track record alone is not a capability gap. All candidates have file and shell tools. Ignore the native tool's model field and prices.`,
   criteria: CAPABILITY,
 };
-const request = { model: '~typesafe/jev-latest', state: { task, models: criteria }, questions };
+const request = { model: routerJson.decisionModel || '~typesafe/jev-latest', state: { task, models: criteria }, questions };
 const complete = a => validAnswer(a?.size, false) && validAnswer(a?.difficulty, false)
   && favorites.every(f => validAnswer(a[keyOf(f)]));
 // A delegate validation re-asks Jev about the same task; a fresh sample can reverse an A->B redirect and

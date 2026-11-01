@@ -1,6 +1,6 @@
 //! Module switches and status. Each module (ai-usage, router, agent-process)
-//! is a sidebar group whose header carries its on/off switch; its pages end
-//! with a status card. Enable/disable always goes through a [`Change`] preview.
+//! is a sidebar group whose header carries its on/off switch; System → Modules
+//! lists their technical status. Enable/disable always goes through a [`Change`] preview.
 
 use std::collections::HashSet;
 
@@ -68,16 +68,25 @@ pub fn switch<'a>(data: &'a Data, name: &'static str) -> Element<'a, Message> {
     }
 }
 
-/// Module state plus its technical status behind an expander; ends each module page.
-pub fn status_card<'a>(
-    data: &'a Data,
-    name: &'static str,
-    open: &'a HashSet<String>,
-) -> Element<'a, Message> {
+/// Every module's state with its technical status behind an expander.
+pub fn view<'a>(data: &'a Data, open: &'a HashSet<String>) -> Element<'a, Message> {
+    let mut col = column![].spacing(st::look().gap.max(st::SPACE_S));
+    if let Some(error) = &data.error {
+        col = col.push(st::card(st::muted(fl!(
+            loader(),
+            "load-error",
+            what = error
+        ))));
+    }
+    for plugin in &data.plugins {
+        col = col.push(status_card(plugin, open));
+    }
+    col.into()
+}
+
+fn status_card<'a>(plugin: &'a PluginRow, open: &'a HashSet<String>) -> Element<'a, Message> {
     let look = st::look();
-    let Some(plugin) = find(data, name) else {
-        return column![].into();
-    };
+    let name = plugin.name.as_str();
     let (state, tone) = if !plugin.available {
         (fl!(loader(), "plugins-unavailable"), st::Tone::Neutral)
     } else if plugin.enabled {

@@ -307,9 +307,21 @@ fn every_page_fits_at_min_size_with_long_names() {
             Message::Usage(usage::Msg::Kind(usage::Kind(UsageKind::Claude))),
         );
         shot(&state, lang, "usage_add");
+        update(
+            &mut state,
+            Message::Usage(usage::Msg::Kind(usage::Kind(UsageKind::Openrouter))),
+        );
+        shot(&state, lang, "usage_add_key");
         update(&mut state, Message::Usage(usage::Msg::CloseAdd));
         update(&mut state, Message::SelectPage(Page::UsageWidget));
         shot(&state, lang, "usage_widget");
+        update(&mut state, Message::SelectPage(Page::UsagePoll));
+        shot(&state, lang, "usage_poll");
+        update(&mut state, Message::SelectPage(Page::RouterSettings));
+        shot(&state, lang, "router_settings");
+        update(&mut state, Message::SelectPage(Page::Modules));
+        update(&mut state, Message::PluginDetail("agent-process".into()));
+        shot(&state, lang, "modules");
 
         update(&mut state, Message::SelectPage(Page::Shared));
         let target = |name: &str, status: &str| shared::Target {

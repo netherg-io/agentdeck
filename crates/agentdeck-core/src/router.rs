@@ -257,6 +257,9 @@ pub fn router_json_value(reg: &Registry) -> anyhow::Result<Value> {
         "usageStatePath".into(),
         Value::String(USAGE_STATE_PATH.to_string()),
     );
+    if let Some(model) = crate::settings::read(reg).decision_model {
+        root.insert("decisionModel".into(), Value::String(model));
+    }
     Ok(Value::Object(root))
 }
 
