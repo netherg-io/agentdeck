@@ -170,6 +170,7 @@ fn terminal_command(
     exe: &Path,
     id: &str,
     paths: &Paths,
+    path_env: &OsStr,
 ) -> Vec<OsString> {
     let mut argv = Vec::new();
     argv.push(terminal.as_os_str().to_owned());
@@ -185,6 +186,9 @@ fn terminal_command(
         value.push(path);
         argv.push(value);
     }
+    let mut inherited_path = OsString::from("PATH=");
+    inherited_path.push(path_env);
+    argv.push(inherited_path);
     argv.push(exe.as_os_str().to_owned());
     argv.push(OsString::from("instance"));
     argv.push(OsString::from("run"));
@@ -237,7 +241,7 @@ pub fn launch_cli(paths: &crate::Paths, id: &str) -> anyhow::Result<()> {
     })?;
     let exe = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("cannot find the running agentdeck executable: {e}"))?;
-    let argv = terminal_command(&terminal, prefix, &exe, &inst.id, paths);
+    let argv = terminal_command(&terminal, prefix, &exe, &inst.id, paths, &path_env);
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         .stdin(Stdio::null())
@@ -445,7 +449,7 @@ mod tests {
             find_terminal(dir.as_os_str()).expect("cosmic-term fallback must be found");
         assert_eq!(term, dir.join("cosmic-term"));
         assert_eq!(
-            terminal_command(&term, prefix, &exe, "cx", &paths),
+            terminal_command(&term, prefix, &exe, "cx", &paths, dir.as_os_str()),
             vec![
                 dir.join("cosmic-term").into_os_string(),
                 OsString::from("-e"),
@@ -455,6 +459,7 @@ mod tests {
                     paths.config_dir.display()
                 )),
                 OsString::from(format!("AGENTDECK_STATE_DIR={}", paths.state_dir.display())),
+                OsString::from(format!("PATH={}", dir.display())),
                 OsString::from("/opt/agentdeck/agentdeck"),
                 OsString::from("instance"),
                 OsString::from("run"),
