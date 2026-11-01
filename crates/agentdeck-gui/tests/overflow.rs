@@ -7,11 +7,12 @@
 use std::path::PathBuf;
 
 use agentdeck_core::processes::{GroupKind, ProcInfo, SessionGroup};
+use agentdeck_core::usage::{UsageEntry, UsageKind};
 use agentdeck_core::{Paths, PoolEntry};
 use agentdeck_gui::app::{self, Message, Page};
 use agentdeck_gui::data::{Data, InstanceRow, PluginRow, QuotaBar, T3Info, UsageQuotas};
 use agentdeck_gui::pages::add_instance::AddMsg;
-use agentdeck_gui::pages::{drift, harnesses, pool, shared};
+use agentdeck_gui::pages::{drift, harnesses, pool, shared, usage};
 
 const LONG_ID: &str = "claude-d756536e-very-long-instance-identifier-for-overflow-checks";
 const LONG_NAME: &str =
@@ -97,7 +98,7 @@ fn data() -> Data {
         }],
         plugins: vec![
             PluginRow {
-                name: "agent-process-with-a-long-plugin-name-for-overflow".into(),
+                name: "agent-process".into(),
                 enabled: true,
                 available: true,
                 detail: vec![format!("link {LONG_PATH}/agent-process -> agentdeck")],
@@ -110,6 +111,7 @@ fn data() -> Data {
             },
         ],
         error: None,
+        auto_apply: true,
         processes: vec![SessionGroup {
             kind: GroupKind::Agent {
                 owner: "claude-d756536e".into(),
@@ -223,6 +225,7 @@ fn every_page_fits_at_min_size_with_long_names() {
 
         update(&mut state, Message::SelectPage(Page::Processes));
         update(&mut state, Message::ProcToggle(100, 1000));
+        update(&mut state, Message::PluginDetail("agent-process".into()));
         shot(&state, lang, "processes");
 
         update(&mut state, Message::SelectPage(Page::Drift));
@@ -267,12 +270,46 @@ fn every_page_fits_at_min_size_with_long_names() {
         shot(&state, lang, "pool_add");
         update(&mut state, Message::Pool(pool::Msg::CloseAdd));
 
-        update(&mut state, Message::SelectPage(Page::Plugins));
+        update(&mut state, Message::SelectPage(Page::Limits));
+        update(&mut state, Message::ParallelAsk(LONG_ID.into()));
+        shot(&state, lang, "limits");
+        update(&mut state, Message::ParallelCancel);
+
+        update(&mut state, Message::SelectPage(Page::UsageSources));
+        let source = |id: &str, kind, instance: Option<&str>| UsageEntry {
+            id: id.into(),
+            kind,
+            instance: instance.map(Into::into),
+            display: format!("{id} with a long display name for overflow"),
+            config_dir: None,
+            codex_home: None,
+            token_file: None,
+            api_key_env: None,
+            db_file: None,
+            extra: Default::default(),
+        };
         update(
             &mut state,
-            Message::PluginDetail("agent-process-with-a-long-plugin-name-for-overflow".into()),
+            Message::Usage(usage::Msg::Loaded(usage::Loaded {
+                sources: vec![
+                    source(LONG_ID, UsageKind::Claude, Some(LONG_ID)),
+                    source("openrouter-main", UsageKind::Openrouter, None),
+                ],
+                instances: vec![LONG_ID.into()],
+                hidden: ["openrouter".to_string()].into(),
+                error: None,
+            })),
         );
-        shot(&state, lang, "plugins");
+        shot(&state, lang, "usage_sources");
+        update(&mut state, Message::Usage(usage::Msg::OpenAdd));
+        update(
+            &mut state,
+            Message::Usage(usage::Msg::Kind(usage::Kind(UsageKind::Claude))),
+        );
+        shot(&state, lang, "usage_add");
+        update(&mut state, Message::Usage(usage::Msg::CloseAdd));
+        update(&mut state, Message::SelectPage(Page::UsageWidget));
+        shot(&state, lang, "usage_widget");
 
         update(&mut state, Message::SelectPage(Page::Shared));
         let target = |name: &str, status: &str| shared::Target {

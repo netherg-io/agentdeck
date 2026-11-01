@@ -2,7 +2,6 @@ app-title = Agentdeck
 
 nav-instances = Инстансы
 nav-drift = Расхождения
-nav-plugins = Плагины
 nav-processes = Процессы
 
 loading = Загрузка…
@@ -50,7 +49,6 @@ drift-preview = Предпросмотр
 drift-working = Выполняется…
 drift-group-t3 = Инстансы провайдера T3
 drift-not-in-registry = Нет в реестре.
-plugins-title = Плагины
 processes-title = Процессы
 processes-empty = Нет запущенных процессов агентов.
 processes-stop = Остановить
@@ -69,7 +67,6 @@ processes-stop-running = всё ещё работают после ожидан�
 processes-stop-result = { $title }: { $what }
 coming-soon = Появится в следующих юнитах.
 
-plugins-empty = Нет доступных плагинов.
 plugins-confirm = Подтвердить
 plugins-cancel = Отмена
 plugins-enabled = включён
@@ -204,3 +201,38 @@ cli-open-error = Не удалось открыть CLI: { $what }
 parallel-label = Параллельные задачи
 parallel-unlimited = Без ограничений
 parallel-invalid = Введите целое число от 1 до 4294967295 или оставьте поле пустым для снятия ограничения.
+nav-group-usage = Квоты
+nav-group-router = Роутер
+nav-group-agents = Агенты
+nav-usage-sources = Источники
+nav-usage-widget = Панель
+nav-limits = Лимиты
+usage-sources-title = Источники квот
+usage-widget-title = Виджет на панели
+limits-title = Параллельные задачи
+usage-add = Добавить источник
+usage-add-title = Новый источник квот
+usage-preview-add = Предпросмотр
+usage-preview-title = Изменения источников квот
+usage-kind = Провайдер
+usage-kind-missing = Выберите провайдера.
+usage-id = ID
+usage-display = Отображаемое имя
+usage-config-dir = Каталог конфигурации Claude
+usage-codex-home = Каталог CODEX_HOME
+usage-api-key-env = Переменная с API-ключом
+usage-api-key-hint = Сам ключ положите в ~/.config/agentdeck/usage.env.
+usage-token-file = Файл токена
+usage-db-file = База OpenCode
+usage-optional = { $what } (необязательно)
+usage-instance = Инстанс
+usage-instance-none = Не привязан
+usage-empty = Нет источников квот.
+usage-widget-scope = Скрытые провайдеры пропадают только с панели COSMIC; опрос и роутинг их по-прежнему используют.
+usage-sources-count = { $count ->
+        [one] { $count } источник
+        [few] { $count } источника
+        [many] { $count } источников
+       *[other] { $count } источников
+    }
+sync-auto-apply = Автоприменение

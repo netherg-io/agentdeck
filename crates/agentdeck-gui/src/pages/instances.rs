@@ -161,11 +161,7 @@ fn remove_btn(inst: &InstanceRow) -> Element<'_, Message> {
         .into()
 }
 
-fn instance_card<'a>(
-    inst: &'a InstanceRow,
-    rename: Option<&'a Rename>,
-    parallel: Option<&'a Parallel>,
-) -> Element<'a, Message> {
+fn instance_card<'a>(inst: &'a InstanceRow, rename: Option<&'a Rename>) -> Element<'a, Message> {
     let look = st::look();
     let single = inst.quotas.len() == 1;
     let editing = rename.filter(|r| r.id == inst.id);
@@ -228,39 +224,6 @@ fn instance_card<'a>(
     if let Some(error) = editing.and_then(|edit| edit.error.as_ref()) {
         col = col.push(st::body(error.as_str()));
     }
-    if let Some(edit) = parallel.filter(|e| e.id == inst.id) {
-        col = col.push(
-            row![
-                st::body(fl!(loader(), "parallel-label")),
-                text_input(&fl!(loader(), "parallel-unlimited"), &edit.value)
-                    .on_input_maybe((!edit.busy).then_some(Message::ParallelInput))
-                    .on_submit_maybe((!edit.busy).then_some(Message::ParallelSave))
-                    .size(look.body)
-                    .width(Length::Fill),
-                st::btn(st::Btn::Quiet, fl!(loader(), "rename-save"))
-                    .on_press_maybe((!edit.busy).then_some(Message::ParallelSave)),
-                st::icon_btn(st::Icon::X)
-                    .on_press_maybe((!edit.busy).then_some(Message::ParallelCancel)),
-            ]
-            .spacing(st::SPACE_XS)
-            .align_y(Alignment::Center),
-        );
-        if let Some(error) = &edit.error {
-            col = col.push(st::body(error.as_str()));
-        }
-    } else {
-        let limit = inst
-            .max_parallel
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| fl!(loader(), "parallel-unlimited"));
-        col = col.push(
-            st::btn(
-                st::Btn::Quiet,
-                format!("{}: {limit}", fl!(loader(), "parallel-label")),
-            )
-            .on_press(Message::ParallelAsk(inst.id.clone())),
-        );
-    }
     for u in &inst.quotas {
         col = col.push(quotas_view(u, !single));
     }
@@ -272,14 +235,6 @@ pub fn view(data: &Data) -> Element<'_, Message> {
 }
 
 pub fn view_with_rename<'a>(data: &'a Data, rename: Option<&'a Rename>) -> Element<'a, Message> {
-    view_with_edits(data, rename, None)
-}
-
-pub fn view_with_edits<'a>(
-    data: &'a Data,
-    rename: Option<&'a Rename>,
-    parallel: Option<&'a Parallel>,
-) -> Element<'a, Message> {
     let look = st::look();
     let mut col = column![].spacing(look.gap.max(st::SPACE_S));
     if let Some(error) = &data.error {
@@ -291,7 +246,7 @@ pub fn view_with_edits<'a>(
         col = col.push(st::card(st::muted(fl!(loader(), "instances-empty"))));
     } else {
         for inst in &data.instances {
-            col = col.push(instance_card(inst, rename, parallel));
+            col = col.push(instance_card(inst, rename));
         }
     }
     if !data.standalone.is_empty() {
@@ -308,6 +263,61 @@ pub fn view_with_edits<'a>(
         );
     }
     col.into()
+}
+
+/// Router limits: per-instance parallel task caps the router enforces.
+pub fn limits_view<'a>(data: &'a Data, parallel: Option<&'a Parallel>) -> Element<'a, Message> {
+    let look = st::look();
+    if data.instances.is_empty() {
+        return st::card(st::muted(fl!(loader(), "instances-empty")));
+    }
+    let mut list = column![].spacing(look.row_gap);
+    for (i, inst) in data.instances.iter().enumerate() {
+        if i > 0 {
+            list = list.push(st::hairline());
+        }
+        let mut col = column![st::fit(
+            inst.display_name.as_str(),
+            st::Role::Heading,
+            st::Cut::End
+        )]
+        .spacing(look.row_gap);
+        if let Some(edit) = parallel.filter(|e| e.id == inst.id) {
+            col = col.push(
+                row![
+                    st::body(fl!(loader(), "parallel-label")),
+                    text_input(&fl!(loader(), "parallel-unlimited"), &edit.value)
+                        .on_input_maybe((!edit.busy).then_some(Message::ParallelInput))
+                        .on_submit_maybe((!edit.busy).then_some(Message::ParallelSave))
+                        .size(look.body)
+                        .width(Length::Fill),
+                    st::btn(st::Btn::Quiet, fl!(loader(), "rename-save"))
+                        .on_press_maybe((!edit.busy).then_some(Message::ParallelSave)),
+                    st::icon_btn(st::Icon::X)
+                        .on_press_maybe((!edit.busy).then_some(Message::ParallelCancel)),
+                ]
+                .spacing(st::SPACE_XS)
+                .align_y(Alignment::Center),
+            );
+            if let Some(error) = &edit.error {
+                col = col.push(st::body(error.as_str()));
+            }
+        } else {
+            let limit = inst
+                .max_parallel
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| fl!(loader(), "parallel-unlimited"));
+            col = col.push(
+                st::btn(
+                    st::Btn::Quiet,
+                    format!("{}: {limit}", fl!(loader(), "parallel-label")),
+                )
+                .on_press(Message::ParallelAsk(inst.id.clone())),
+            );
+        }
+        list = list.push(col);
+    }
+    st::card(list)
 }
 
 pub fn remove_modal(ask: &RemoveAsk) -> Modal<'_, Message> {

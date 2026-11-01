@@ -76,6 +76,8 @@ pub struct Data {
     /// Registry-level failure (unreadable file); per-source gaps stay silent.
     pub error: Option<String>,
     pub processes: Vec<processes::SessionGroup>,
+    /// `[sync] auto_apply`: background sync applies additive drift itself.
+    pub auto_apply: bool,
 }
 
 fn now_secs() -> i64 {
@@ -198,6 +200,7 @@ pub fn load(paths: &Paths) -> Data {
         .collect();
     // Read-only /proc snapshot; gaps become dashes, never an error.
     data.processes = processes::snapshot().groups;
+    data.auto_apply = agentdeck_core::sync::auto_apply_enabled(paths);
     data
 }
 

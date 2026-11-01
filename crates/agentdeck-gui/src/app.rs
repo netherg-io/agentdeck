@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use i18n_embed_fl::fl;
-use iced::widget::{button, column, container, row, scrollable, text};
+use iced::widget::{button, column, container, row, scrollable, text, toggler};
 use iced::{Alignment, Element, Length, Subscription, Task, Theme};
 
 use crate::data::{self, Data};
@@ -12,7 +12,7 @@ use crate::overlay::{self, Modal, Toast};
 use crate::pages::add_instance::{self, AddMsg};
 use crate::pages::drift::{self, Ctx as DriftCtx};
 use crate::pages::plugins::Pending;
-use crate::pages::{self, harnesses, pool, shared};
+use crate::pages::{self, harnesses, pool, shared, usage};
 use crate::style as st;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -21,7 +21,9 @@ pub enum Page {
     Instances,
     AddInstance,
     Drift,
-    Plugins,
+    UsageSources,
+    UsageWidget,
+    Limits,
     Processes,
     Pool,
     Shared,
@@ -34,7 +36,9 @@ impl Page {
             Self::Instances => fl!(loader(), "nav-instances"),
             Self::AddInstance => fl!(loader(), "add-title"),
             Self::Drift => fl!(loader(), "nav-drift"),
-            Self::Plugins => fl!(loader(), "nav-plugins"),
+            Self::UsageSources => fl!(loader(), "nav-usage-sources"),
+            Self::UsageWidget => fl!(loader(), "nav-usage-widget"),
+            Self::Limits => fl!(loader(), "nav-limits"),
             Self::Processes => fl!(loader(), "nav-processes"),
             Self::Pool => fl!(loader(), "nav-pool"),
             Self::Shared => fl!(loader(), "nav-shared"),
@@ -88,6 +92,9 @@ pub enum Message {
     Pool(pages::pool::Msg),
     Shared(pages::shared::Msg),
     Harnesses(pages::harnesses::Msg),
+    Usage(usage::Msg),
+    AutoApply(bool),
+    AutoApplyDone(Result<(), String>),
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +155,7 @@ pub struct State {
     pool: pool::State,
     shared: shared::State,
     harnesses: harnesses::State,
+    usage: usage::State,
     toasts: Vec<Toast>,
     next_toast: u64,
     dark: bool,
@@ -195,6 +203,7 @@ impl State {
                 pool: pool::State::default(),
                 shared: shared::State::default(),
                 harnesses: harnesses::State::default(),
+                usage: usage::State::default(),
                 toasts: Vec::new(),
                 next_toast: 0,
                 dark: true,
@@ -228,6 +237,7 @@ impl State {
             pool: pool::State::default(),
             shared: shared::State::default(),
             harnesses: harnesses::State::default(),
+            usage: usage::State::default(),
             toasts: Vec::new(),
             next_toast: 0,
             dark: true,
@@ -279,6 +289,9 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     Task::perform(async move { shared::load(&ctx) }, Message::Shared)
                 }
                 (Page::Harnesses, _) => Task::perform(harnesses::load(), Message::Harnesses),
+                (Page::UsageSources | Page::UsageWidget, Some(paths)) => {
+                    Task::perform(async move { usage::load(&paths) }, Message::Usage)
+                }
                 _ => Task::none(),
             }
         }
@@ -639,6 +652,41 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             task
         }
+        Message::Usage(msg) => {
+            let task = match state.paths.clone() {
+                Some(paths) => usage::update(&mut state.usage, paths, msg).map(Message::Usage),
+                None => Task::none(),
+            };
+            if let Some((text, error)) = state.usage.result.take() {
+                state.toast(text, error);
+            }
+            task
+        }
+        Message::AutoApply(on) => match state.paths.clone() {
+            Some(paths) => Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        agentdeck_core::sync::set_auto_apply(&paths, on, false)
+                            .map(|_| ())
+                            .map_err(|e| format!("{e:#}"))
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r)
+                },
+                Message::AutoApplyDone,
+            ),
+            None => Task::none(),
+        },
+        Message::AutoApplyDone(result) => {
+            if let Err(error) = result {
+                state.toast(error, true);
+            }
+            match state.paths.clone() {
+                Some(paths) => load_data(paths),
+                None => Task::none(),
+            }
+        }
         Message::PluginDetail(name) => {
             if !state.plugin_open.remove(&name) {
                 state.plugin_open.insert(name);
@@ -807,6 +855,9 @@ pub fn subscription(state: &State) -> Subscription<Message> {
 
 /// The dialog open on the current page, if any.
 fn modal(state: &State) -> Option<Modal<'_, Message>> {
+    if let Some(p) = &state.pending {
+        return Some(pages::plugins::modal(p));
+    }
     match state.page {
         Page::Instances => state.remove.as_ref().map(pages::instances::remove_modal),
         Page::Processes => state
@@ -814,12 +865,14 @@ fn modal(state: &State) -> Option<Modal<'_, Message>> {
             .pending
             .as_ref()
             .map(|p| pages::processes::stop_modal(p, state.proc_ui.force)),
-        Page::Plugins => state.pending.as_ref().map(pages::plugins::modal),
+        Page::UsageSources | Page::UsageWidget => {
+            usage::modal(&state.usage).map(|m| m.map(Message::Usage))
+        }
         Page::Drift => drift::modal(&state.drift).map(|m| m.map(Message::Drift)),
         Page::Pool => pool::modal(&state.pool).map(|m| m.map(Message::Pool)),
         Page::Shared => shared::modal(&state.shared).map(|m| m.map(Message::Shared)),
         Page::Harnesses => harnesses::modal(&state.harnesses).map(|m| m.map(Message::Harnesses)),
-        Page::AddInstance => None,
+        Page::AddInstance | Page::Limits => None,
     }
 }
 
@@ -867,6 +920,22 @@ fn sidebar(state: &State) -> Element<'_, Message> {
         }
         col
     };
+    // A module group: its name, its on/off switch, then its pages.
+    let module = |label: String, plugin: &'static str, items: &[(Page, st::Icon)]| {
+        let mut col = column![
+            row![
+                container(st::caption(label)).width(Length::Fill),
+                pages::plugins::switch(&state.data, plugin),
+            ]
+            .align_y(Alignment::Center)
+            .padding([0, 10])
+        ]
+        .spacing(2);
+        for &(page, icon) in items {
+            col = col.push(nav_item(state, page, icon));
+        }
+        col
+    };
     let col = column![
         container(st::heading(fl!(loader(), "app-title"))).padding([4, 10]),
         group(
@@ -874,16 +943,34 @@ fn sidebar(state: &State) -> Element<'_, Message> {
             &[
                 (Page::Instances, st::Icon::Users),
                 (Page::Drift, st::Icon::Compare),
-                (Page::Pool, st::Icon::Layers),
             ],
+        ),
+        module(
+            fl!(loader(), "nav-group-usage"),
+            agentdeck_core::plugins::PLUGIN_AI_USAGE,
+            &[
+                (Page::UsageSources, st::Icon::Activity),
+                (Page::UsageWidget, st::Icon::Square),
+            ],
+        ),
+        module(
+            fl!(loader(), "nav-group-router"),
+            agentdeck_core::plugins::PLUGIN_ROUTER,
+            &[
+                (Page::Pool, st::Icon::Layers),
+                (Page::Limits, st::Icon::Users),
+            ],
+        ),
+        module(
+            fl!(loader(), "nav-group-agents"),
+            agentdeck_core::plugins::PLUGIN_AGENT_PROCESS,
+            &[(Page::Processes, st::Icon::Activity)],
         ),
         group(
             fl!(loader(), "nav-group-system"),
             &[
-                (Page::Plugins, st::Icon::Plug),
                 (Page::Shared, st::Icon::Share),
                 (Page::Harnesses, st::Icon::Wrench),
-                (Page::Processes, st::Icon::Activity),
             ],
         ),
     ]
@@ -927,12 +1014,30 @@ fn header(state: &State) -> Element<'_, Message> {
                     .into(),
             ),
         ),
-        Page::Drift => (t("drift-title"), None),
+        Page::Drift => (
+            t("drift-title"),
+            Some(
+                row![
+                    st::nowrap(st::caption(t("sync-auto-apply"))),
+                    toggler(state.data.auto_apply)
+                        .size(16)
+                        .on_toggle(Message::AutoApply),
+                ]
+                .spacing(st::SPACE_S)
+                .align_y(Alignment::Center)
+                .into(),
+            ),
+        ),
+        Page::UsageSources => (
+            t("usage-sources-title"),
+            Some(usage::header_action(&state.usage).map(Message::Usage)),
+        ),
+        Page::UsageWidget => (t("usage-widget-title"), None),
+        Page::Limits => (t("limits-title"), None),
         Page::Pool => (
             t("pool-title"),
             Some(pool::header_actions(&state.pool).map(Message::Pool)),
         ),
-        Page::Plugins => (t("plugins-title"), None),
         Page::Shared => (t("shared-title"), None),
         Page::Harnesses => (t("harness-title"), None),
         Page::Processes => (
@@ -946,16 +1051,34 @@ fn header(state: &State) -> Element<'_, Message> {
 pub fn view(state: &State) -> Element<'_, Message> {
     let look = st::look();
     let content: Element<'_, Message> = match state.page {
-        Page::Instances => pages::instances::view_with_edits(
-            &state.data,
-            state.rename.as_ref(),
-            state.parallel.as_ref(),
-        ),
+        Page::Instances => pages::instances::view_with_rename(&state.data, state.rename.as_ref()),
         Page::AddInstance => add_instance::view(&state.add),
         Page::Drift => drift::view(&state.drift).map(Message::Drift),
-        Page::Plugins => pages::plugins::view(&state.data, &state.plugin_open),
-        Page::Processes => pages::processes::view(&state.data, &state.proc_ui),
-        Page::Pool => pool::view(&state.pool).map(Message::Pool),
+        Page::UsageSources => with_status(
+            state,
+            usage::sources_view(&state.usage, &state.data).map(Message::Usage),
+            agentdeck_core::plugins::PLUGIN_AI_USAGE,
+        ),
+        Page::UsageWidget => with_status(
+            state,
+            usage::widget_view(&state.usage).map(Message::Usage),
+            agentdeck_core::plugins::PLUGIN_AI_USAGE,
+        ),
+        Page::Limits => with_status(
+            state,
+            pages::instances::limits_view(&state.data, state.parallel.as_ref()),
+            agentdeck_core::plugins::PLUGIN_ROUTER,
+        ),
+        Page::Processes => with_status(
+            state,
+            pages::processes::view(&state.data, &state.proc_ui),
+            agentdeck_core::plugins::PLUGIN_AGENT_PROCESS,
+        ),
+        Page::Pool => with_status(
+            state,
+            pool::view(&state.pool).map(Message::Pool),
+            agentdeck_core::plugins::PLUGIN_ROUTER,
+        ),
         Page::Shared => shared::view(&state.shared).map(Message::Shared),
         Page::Harnesses => harnesses::view(&state.harnesses).map(Message::Harnesses),
     };
@@ -984,6 +1107,20 @@ pub fn view(state: &State) -> Element<'_, Message> {
         overlay::toasts(&state.toasts, Message::ToastClose),
         modal(state),
     )
+}
+
+/// A module page ends with the module's own state, so a page never hides that its module is off.
+fn with_status<'a>(
+    state: &'a State,
+    page: Element<'a, Message>,
+    plugin: &'static str,
+) -> Element<'a, Message> {
+    column![
+        page,
+        pages::plugins::status_card(&state.data, plugin, &state.plugin_open)
+    ]
+    .spacing(st::look().gap.max(st::SPACE_S))
+    .into()
 }
 
 /// Palette following the system dark/light preference.
