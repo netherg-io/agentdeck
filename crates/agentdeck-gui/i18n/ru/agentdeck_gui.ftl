@@ -135,9 +135,7 @@ pool-model = Модель
 pool-no-models = Для этого инстанса нет кеша моделей: введите id модели.
 pool-options = Опции (k=v через запятую)
 pool-preview-add = Предпросмотр
-pool-import = Импорт избранного T3
 pool-preview-title = Предпросмотр изменения пула
-pool-import-count = К импорту избранных: { $count }.
 pool-warning = Предупреждение: { $what }
 
 shared-title = Общее
@@ -161,8 +159,6 @@ harness-result = { $name }: { $what }
 
 nav-group-accounts = Аккаунты
 nav-group-system = Система
-instances-purpose = Логины харнессов, их статус в T3 и окна квот.
-processes-purpose = Группы процессов агентов, которые можно остановить. Сессии T3 не показаны.
 processes-filter = Фильтр по имени или команде
 processes-no-match = Ни одна группа не подходит под фильтр.
 processes-count = { $count ->
@@ -172,26 +168,19 @@ processes-count = { $count ->
 }
 remove-done = { $id } удалён.
 
-drift-purpose = Инстансы, чьи настройки, MCP-серверы или записи T3 расходятся с основным.
 drift-loading = Проверяю расхождения…
 drift-all-clear = Всё в порядке: расхождений нет.
-pool-purpose = Модели, из которых выбирает роутер, по инстансам.
 pool-add = Добавить
 pool-col-options = Опции
 pool-col-on = Вкл.
-plugins-purpose = Встроенные интеграции; перед включением или выключением показываются изменения.
 plugins-details = Технический статус
 plugins-no-details = Нет подробностей.
-shared-purpose = Навыки, файлы инструкций и MCP-серверы, общие для харнессов.
-shared-summary = Каталогов навыков: { $skills } · файлов инструкций: { $instr } · MCP-серверов: { $mcp }
 shared-ok-count = в порядке: { $count }
 shared-todo-count = к синхронизации: { $count }
 shared-skills-none = Каталоги навыков не найдены.
 shared-instr-none = Файлы инструкций не найдены.
 shared-mcp-servers = Канонические серверы
 shared-mcp-targets = Цели
-harness-purpose = Установленные CLI агентов, их версии и способ обновления.
-add-purpose = Зарегистрируйте новый вход, проверьте изменения и войдите.
 add-step-details = Данные
 add-step-preview = Проверка
 add-step-login = Вход
@@ -200,4 +189,12 @@ add-next = Далее
 add-edit = Назад
 add-done = Готово
 add-added = Добавлен { $id }.
-add-finish-note = Дополнительные шаги; пропустите их, если не нужны.
+
+pool-search = Поиск моделей и инстансов
+pool-all-instances = Все инстансы
+pool-sort-instance = По инстансу
+pool-sort-model = По модели
+pool-sort-enabled = Сначала включённые
+pool-no-match = Модели не найдены.
+instances-rename = Переименовать
+rename-save = Сохранить

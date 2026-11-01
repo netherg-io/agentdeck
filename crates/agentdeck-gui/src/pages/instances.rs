@@ -2,7 +2,7 @@
 //! threads, aligned quota bars) and standalone usage sources below.
 
 use i18n_embed_fl::fl;
-use iced::widget::{column, row};
+use iced::widget::{column, row, text_input};
 use iced::{Alignment, Element, Length};
 
 use crate::app::{Message, RemoveAsk};
@@ -10,6 +10,14 @@ use crate::data::{Data, InstanceRow, QuotaBar, UsageQuotas};
 use crate::i18n::loader;
 use crate::overlay::Modal;
 use crate::style as st;
+
+#[derive(Debug, Clone)]
+pub struct Rename {
+    pub id: String,
+    pub name: String,
+    pub busy: bool,
+    pub error: Option<String>,
+}
 
 fn account_status(status: &str) -> String {
     match status {
@@ -129,13 +137,39 @@ fn remove_btn(inst: &InstanceRow) -> Element<'_, Message> {
         .into()
 }
 
-fn instance_card(inst: &InstanceRow) -> Element<'_, Message> {
+fn instance_card<'a>(inst: &'a InstanceRow, rename: Option<&'a Rename>) -> Element<'a, Message> {
     let look = st::look();
     let single = inst.quotas.len() == 1;
+    let editing = rename.filter(|r| r.id == inst.id);
+    let name: Element<'_, Message> = match editing {
+        Some(edit) => row![
+            text_input(&fl!(loader(), "add-display-name"), &edit.name)
+                .on_input_maybe((!edit.busy).then_some(Message::RenameInput))
+                .on_submit_maybe((!edit.busy).then_some(Message::RenameSave))
+                .size(look.body)
+                .width(Length::Fill),
+            st::btn(st::Btn::Quiet, fl!(loader(), "rename-save")).on_press_maybe(
+                (!edit.busy && !edit.name.trim().is_empty()).then_some(Message::RenameSave)
+            ),
+            st::icon_btn(st::Icon::X).on_press_maybe((!edit.busy).then_some(Message::RenameCancel)),
+        ]
+        .spacing(st::SPACE_XS)
+        .align_y(Alignment::Center)
+        .into(),
+        None => row![
+            st::fit(inst.display_name.as_str(), st::Role::Heading, st::Cut::End)
+                .width(Length::Fill),
+            st::btn(st::Btn::Quiet, fl!(loader(), "instances-rename"))
+                .on_press(Message::RenameAsk(inst.id.clone())),
+        ]
+        .spacing(st::SPACE_XS)
+        .align_y(Alignment::Center)
+        .into(),
+    };
     let mut head = row![
         column![
-            st::fit(inst.display_name.as_str(), st::Role::Heading, st::Cut::End),
-            st::fit(inst.id.as_str(), st::Role::MonoMuted, st::Cut::Middle),
+            name,
+            st::fit(inst.id.as_str(), st::Role::MonoMuted, st::Cut::Middle)
         ]
         .spacing(2)
         .width(Length::Fill),
@@ -154,6 +188,9 @@ fn instance_card(inst: &InstanceRow) -> Element<'_, Message> {
     }
     let head = head.push(remove_btn(inst));
     let mut col = column![head].spacing(look.row_gap + 4.0);
+    if let Some(error) = editing.and_then(|edit| edit.error.as_ref()) {
+        col = col.push(st::body(error.as_str()));
+    }
     for u in &inst.quotas {
         col = col.push(quotas_view(u, !single));
     }
@@ -161,6 +198,10 @@ fn instance_card(inst: &InstanceRow) -> Element<'_, Message> {
 }
 
 pub fn view(data: &Data) -> Element<'_, Message> {
+    view_with_rename(data, None)
+}
+
+pub fn view_with_rename<'a>(data: &'a Data, rename: Option<&'a Rename>) -> Element<'a, Message> {
     let look = st::look();
     let mut col = column![].spacing(look.gap.max(st::SPACE_S));
     if let Some(error) = &data.error {
@@ -172,7 +213,7 @@ pub fn view(data: &Data) -> Element<'_, Message> {
         col = col.push(st::card(st::muted(fl!(loader(), "instances-empty"))));
     } else {
         for inst in &data.instances {
-            col = col.push(instance_card(inst));
+            col = col.push(instance_card(inst, rename));
         }
     }
     if !data.standalone.is_empty() {

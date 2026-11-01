@@ -982,7 +982,6 @@ pub fn view(wiz: &Wizard) -> Element<'_, Message> {
             ],
         ),
         Step::Finish => column![
-            st::muted(fl!(loader(), "add-finish-note")),
             optional_section(
                 fl!(loader(), "add-wrapper-title"),
                 &wiz.wrapper,

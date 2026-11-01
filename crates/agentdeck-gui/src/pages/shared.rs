@@ -368,13 +368,6 @@ pub fn view(state: &State) -> Element<'_, Msg> {
             what = error
         ))));
     }
-    col = col.push(st::muted(fl!(
-        loader(),
-        "shared-summary",
-        skills = count(snap.skills.len()),
-        instr = count(snap.instructions.len()),
-        mcp = count(snap.mcp_servers.len())
-    )));
     let tab = |kind: Kind, label: String| {
         button(st::nowrap(st::body(label)))
             .padding(look.button_pad)

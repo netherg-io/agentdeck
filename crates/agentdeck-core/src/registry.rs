@@ -272,6 +272,27 @@ impl Registry {
         Ok(self.instances.remove(pos))
     }
 
+    pub fn rename(&mut self, id: &str, name: &str) -> anyhow::Result<()> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().any(char::is_control) {
+            anyhow::bail!("display name must be non-empty and on one line");
+        }
+        let inst = self
+            .instances
+            .iter_mut()
+            .find(|i| i.id == id)
+            .ok_or_else(|| anyhow::anyhow!("unknown instance id {id:?}"))?;
+        let old = std::mem::replace(&mut inst.display_name, name.to_string());
+        for usage in &mut self.usage {
+            if usage.instance.as_deref() == Some(id)
+                && (usage.display == old || usage.display == id)
+            {
+                usage.display = name.to_string();
+            }
+        }
+        Ok(())
+    }
+
     pub fn set_enabled(&mut self, id: &str, enabled: bool) -> anyhow::Result<()> {
         let inst = self
             .instances
@@ -423,6 +444,19 @@ pub fn remove_instance(
         })?;
     }
     Ok((changes, home))
+}
+
+pub fn rename_instance(
+    paths: &Paths,
+    id: &str,
+    name: &str,
+    dry_run: bool,
+) -> anyhow::Result<Vec<Change>> {
+    let (changes, _) = preview(paths, |reg| reg.rename(id, name))?;
+    if !dry_run {
+        Registry::update(paths, |reg| reg.rename(id, name))?;
+    }
+    Ok(changes)
 }
 
 pub fn set_enabled(

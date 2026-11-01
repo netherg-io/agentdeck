@@ -215,6 +215,9 @@ fn every_page_fits_at_min_size_with_long_names() {
             Message::Drift(drift::Message::SnapshotLoaded(drift_snapshot())),
         );
         shot(&state, lang, "instances");
+        update(&mut state, Message::RenameAsk(LONG_ID.into()));
+        shot(&state, lang, "instance_rename");
+        update(&mut state, Message::RenameCancel);
 
         update(&mut state, Message::SelectPage(Page::Processes));
         update(&mut state, Message::ProcToggle(100, 1000));
@@ -246,7 +249,7 @@ fn every_page_fits_at_min_size_with_long_names() {
                     entry("codex-second", "gpt-5", false),
                 ],
                 instances: vec![LONG_ID.into(), "codex-second".into()],
-                error: None,
+                ..Default::default()
             })),
         );
         shot(&state, lang, "pool");

@@ -170,7 +170,14 @@ enum InstanceCmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Change instance flags (ids are immutable; there is no rename).
+    /// Change the display name without changing the instance id.
+    Rename {
+        id: String,
+        name: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Change instance flags.
     Set {
         id: String,
         #[arg(long, action = clap::ArgAction::Set)]
@@ -379,6 +386,19 @@ async fn async_main(paths: &Paths, cmd: Cmd) -> anyhow::Result<()> {
                     println!("dry-run: registry unchanged");
                 } else {
                     println!("removed {id} (home dir kept: {home})");
+                }
+            }
+            InstanceCmd::Rename { id, name, dry_run } => {
+                let root = agentdeck_core::t3::t3_root().ok();
+                let changes = agentdeck_core::t3::rename_instance(
+                    paths,
+                    root.as_deref(),
+                    &id,
+                    &name,
+                    dry_run,
+                )?;
+                for c in changes {
+                    println!("{}", c.describe());
                 }
             }
             InstanceCmd::Set {

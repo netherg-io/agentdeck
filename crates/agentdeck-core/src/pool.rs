@@ -181,8 +181,60 @@ impl Registry {
     }
 }
 
+/// Available model ids from the instance catalog; missing caches leave saved entries usable.
+pub fn cached_models(t3_root: Option<&Path>, instance: &str) -> anyhow::Result<Vec<String>> {
+    let Some(root) = t3_root else {
+        return Ok(Vec::new());
+    };
+    let file = root.join("caches").join(format!("{instance}.json"));
+    let raw = match std::fs::read(&file) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(anyhow::anyhow!("{}: {e}", file.display())),
+    };
+    let catalog: serde_json::Value =
+        serde_json::from_slice(&raw).map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+    let models = catalog
+        .get("models")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("{}: missing model catalog", file.display()))?;
+    let mut out: Vec<String> = models
+        .iter()
+        .filter_map(|m| m.get("slug").and_then(|v| v.as_str()))
+        .filter(|m| !m.is_empty())
+        .map(str::to_owned)
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// The whole catalog is visible; only explicit pool selections can be routed.
+pub fn catalog_pool(reg: &Registry, t3_root: Option<&Path>) -> anyhow::Result<Vec<PoolEntry>> {
+    let mut entries = reg.pool.clone();
+    for instance in &reg.instances {
+        for model in cached_models(t3_root, &instance.id)? {
+            if !entries
+                .iter()
+                .any(|e| e.instance == instance.id && e.model == model && e.options.is_empty())
+            {
+                entries.push(PoolEntry {
+                    instance: instance.id.clone(),
+                    model,
+                    options: BTreeMap::new(),
+                    enabled: false,
+                });
+            }
+        }
+    }
+    entries.sort_by(|a, b| {
+        (&a.instance, &a.model, &a.options).cmp(&(&b.instance, &b.model, &b.options))
+    });
+    Ok(entries)
+}
+
 pub fn list_pool(paths: &Paths) -> anyhow::Result<Vec<PoolEntry>> {
-    Ok(Registry::load(paths)?.pool)
+    catalog_pool(&Registry::load(paths)?, t3_dir().as_deref())
 }
 
 pub fn pool_json(paths: &Paths) -> anyhow::Result<String> {
@@ -255,6 +307,22 @@ pub fn set_pool_enabled(
     enabled: bool,
     dry_run: bool,
 ) -> anyhow::Result<Vec<Change>> {
+    let reg = Registry::load(paths)?;
+    if !reg
+        .pool
+        .iter()
+        .any(|e| e.instance == instance && e.model == model && &e.options == options)
+    {
+        let mut entry = catalog_pool(&reg, t3_dir().as_deref())?
+            .into_iter()
+            .find(|e| e.instance == instance && e.model == model && &e.options == options)
+            .ok_or_else(|| anyhow::anyhow!("unknown pool entry {instance:?} {model:?}"))?;
+        if !enabled {
+            return Ok(Vec::new());
+        }
+        entry.enabled = true;
+        return add_pool_entry(paths, entry, dry_run).map(|(changes, _)| changes);
+    }
     let (changes, _) = preview_pool(paths, |reg| {
         reg.set_pool_enabled(instance, model, options, enabled)?;
         Ok(None)
@@ -274,214 +342,6 @@ pub fn set_pool_enabled(
         })?;
     }
     Ok(changes)
-}
-
-/// One favorite from T3 `settings.json`: provider id, exact model, options.
-#[derive(Debug, Clone)]
-pub struct Favorite {
-    pub provider: String,
-    pub model: String,
-    pub options: BTreeMap<String, PoolValue>,
-    pub enabled: bool,
-}
-
-fn favorite_enabled(
-    instances: Option<&serde_json::Map<String, serde_json::Value>>,
-    legacy: Option<&serde_json::Map<String, serde_json::Value>>,
-    provider: &str,
-) -> bool {
-    instances
-        .and_then(|m| m.get(provider))
-        .and_then(|p| p.get("enabled"))
-        .and_then(|e| e.as_bool())
-        .or_else(|| {
-            legacy
-                .and_then(|m| m.get(provider))
-                .and_then(|p| p.get("enabled"))
-                .and_then(|e| e.as_bool())
-        })
-        .unwrap_or(true)
-}
-
-/// Read T3 favorites (read-only; never edited). `t3_root` is injectable so
-/// tests use a temp dir; production passes `t3::t3_root()?`.
-pub fn read_favorites(t3_root: &Path) -> anyhow::Result<Vec<Favorite>> {
-    let file = t3_root.join("userdata/settings.json");
-    let raw =
-        std::fs::read(&file).map_err(|e| anyhow::anyhow!("cannot read {}: {e}", file.display()))?;
-    let v: serde_json::Value = serde_json::from_slice(&raw)
-        .map_err(|e| anyhow::anyhow!("T3 settings.json is not valid JSON: {e}"))?;
-    let favs = v
-        .get("favorites")
-        .and_then(|f| f.as_array())
-        .ok_or_else(|| anyhow::anyhow!("T3 settings.json has no favorites array"))?;
-    let instances = v.get("providerInstances").and_then(|p| p.as_object());
-    let legacy = v.get("providers").and_then(|p| p.as_object());
-    let mut out = Vec::new();
-    for fav in favs {
-        let (Some(provider), Some(model)) = (
-            fav.get("provider").and_then(|p| p.as_str()),
-            fav.get("model").and_then(|m| m.as_str()),
-        ) else {
-            continue;
-        };
-        if provider.is_empty() || model.is_empty() {
-            continue;
-        }
-        let mut options = BTreeMap::new();
-        if let Some(map) = fav.get("options").and_then(|o| o.as_object()) {
-            for (k, val) in map {
-                match val {
-                    serde_json::Value::Bool(b) => {
-                        options.insert(k.clone(), PoolValue::Bool(*b));
-                    }
-                    serde_json::Value::String(s) => {
-                        options.insert(k.clone(), PoolValue::String(s.clone()));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        out.push(Favorite {
-            provider: provider.to_string(),
-            model: model.to_string(),
-            options,
-            enabled: favorite_enabled(instances, legacy, provider),
-        });
-    }
-    Ok(out)
-}
-
-/// Read-only T3 favorites import into `[[pool]]`: exact instance ids, models
-/// and options (`enabled` follows `providerInstances`); the T3 favorites are
-/// never edited. Idempotent: a second run adds nothing. Returns the registry
-/// change plus the added count and skip notes.
-pub fn import_favorites(
-    paths: &Paths,
-    t3_root: &Path,
-    dry_run: bool,
-) -> anyhow::Result<(Vec<Change>, usize, Vec<String>)> {
-    let settings = t3_root.join("userdata/settings.json");
-    let raw = std::fs::read(&settings)
-        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", settings.display()))?;
-    let v: serde_json::Value = serde_json::from_slice(&raw)
-        .map_err(|e| anyhow::anyhow!("T3 settings.json is not valid JSON: {e}"))?;
-    let favs = v
-        .get("favorites")
-        .and_then(|f| f.as_array())
-        .ok_or_else(|| anyhow::anyhow!("T3 settings.json has no favorites array"))?;
-    let instances = v
-        .get("providerInstances")
-        .and_then(|p| p.as_object())
-        .ok_or_else(|| anyhow::anyhow!("T3 settings.json has no providerInstances object"))?;
-    let legacy = v.get("providers").and_then(|p| p.as_object());
-    let mut reg = Registry::load(paths)?;
-    let mut added = 0;
-    let mut skipped = Vec::new();
-    for fav in favs {
-        let (Some(provider), Some(model)) = (
-            fav.get("provider").and_then(|p| p.as_str()),
-            fav.get("model").and_then(|m| m.as_str()),
-        ) else {
-            skipped.push("favorite without provider/model".to_string());
-            continue;
-        };
-        if provider.is_empty() || model.is_empty() {
-            skipped.push(format!("{provider}/{model}: empty provider or model"));
-            continue;
-        }
-        let enabled = instances
-            .get(provider)
-            .and_then(|p| p.get("enabled"))
-            .and_then(|e| e.as_bool())
-            .or_else(|| {
-                legacy
-                    .and_then(|l| l.get(provider))
-                    .and_then(|p| p.get("enabled"))
-                    .and_then(|e| e.as_bool())
-            })
-            .unwrap_or(true);
-        let mut options = BTreeMap::new();
-        if let Some(map) = fav.get("options").and_then(|o| o.as_object()) {
-            for (k, val) in map {
-                match val {
-                    serde_json::Value::Bool(b) => {
-                        options.insert(k.clone(), PoolValue::Bool(*b));
-                    }
-                    serde_json::Value::String(s) => {
-                        options.insert(k.clone(), PoolValue::String(s.clone()));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let entry = PoolEntry {
-            instance: provider.to_string(),
-            model: model.to_string(),
-            options,
-            enabled,
-        };
-        if reg.pool.iter().any(|e| e.key_eq(&entry)) {
-            continue;
-        }
-        if reg.get(&entry.instance).is_none() {
-            skipped.push(format!(
-                "{} {}: unknown instance (add it with `agentdeck t3 import` first)",
-                entry.instance, entry.model
-            ));
-            continue;
-        }
-        reg.pool.push(entry);
-        added += 1;
-    }
-    reg.validate()?;
-    let new_text = reg.render()?;
-    let old = std::fs::read(paths.registry_file()).ok();
-    let changes = plan_write_file(paths.registry_file(), old.as_deref(), new_text.as_bytes())
-        .map(|c| vec![c])
-        .unwrap_or_default();
-    if !dry_run {
-        Registry::update(paths, |reg| {
-            let raw = std::fs::read(&settings)
-                .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", settings.display()))?;
-            let v: serde_json::Value = serde_json::from_slice(&raw)
-                .map_err(|e| anyhow::anyhow!("T3 settings.json is not valid JSON: {e}"))?;
-            let favs = v
-                .get("favorites")
-                .and_then(|f| f.as_array())
-                .ok_or_else(|| anyhow::anyhow!("T3 settings.json has no favorites array"))?;
-            for fav in favs {
-                let (Some(provider), Some(model)) = (
-                    fav.get("provider").and_then(|p| p.as_str()),
-                    fav.get("model").and_then(|m| m.as_str()),
-                ) else {
-                    continue;
-                };
-                let enabled = v
-                    .get("providerInstances")
-                    .and_then(|p| p.get(provider))
-                    .and_then(|p| p.get("enabled"))
-                    .and_then(|e| e.as_bool())
-                    .unwrap_or(true);
-                let entry = PoolEntry {
-                    instance: provider.to_string(),
-                    model: model.to_string(),
-                    options: BTreeMap::new(),
-                    enabled,
-                };
-                if reg.pool.iter().any(|e| e.key_eq(&entry)) {
-                    continue;
-                }
-                if reg.get(&entry.instance).is_none() || entry.model.is_empty() {
-                    continue;
-                }
-                reg.pool.push(entry);
-            }
-            reg.validate()?;
-            Ok(())
-        })?;
-    }
-    Ok((changes, added, skipped))
 }
 
 #[cfg(test)]
@@ -655,36 +515,42 @@ mod tests {
     }
 
     #[test]
-    fn import_favorites_adds_once_and_skips_unknown() {
-        let (paths, _g) = test_paths("import");
-        let t3 = _g.0.join("t3");
-        std::fs::create_dir_all(t3.join("userdata")).unwrap();
-        std::fs::write(
-            t3.join("userdata/settings.json"),
-            serde_json::json!({
-                "favorites": [
-                    {"provider": "codex", "model": "gpt-x"},
-                    {"provider": "ghost", "model": "m"},
-                ],
-                "providerInstances": {"codex": {"enabled": true}},
-            })
-            .to_string(),
+    fn catalog_includes_all_models_without_changing_selections() {
+        let (paths, guard) = test_paths("catalog");
+        let t3 = guard.0.join("t3");
+        fs::create_dir_all(t3.join("caches")).unwrap();
+        fs::write(
+            t3.join("caches/a.json"),
+            r#"{"models":[{"slug":"old"},{"slug":"new"},{"slug":"new"}]}"#,
         )
         .unwrap();
-        Registry::update(&paths, |r| r.add(spec("codex"))).unwrap();
-        let (changes, added, skipped) = import_favorites(&paths, &t3, true).unwrap();
-        assert_eq!(added, 1);
-        assert_eq!(changes.len(), 1);
-        assert_eq!(skipped.len(), 1);
-        // Dry run writes nothing.
-        assert!(Registry::load(&paths).unwrap().pool.is_empty());
-        let (_, added, _) = import_favorites(&paths, &t3, false).unwrap();
-        assert_eq!(added, 1);
-        assert_eq!(Registry::load(&paths).unwrap().pool.len(), 1);
-        // A second run adds nothing and plans no changes.
-        let (changes2, added2, _) = import_favorites(&paths, &t3, false).unwrap();
-        assert_eq!(added2, 0);
-        assert!(changes2.is_empty());
+        fs::write(
+            t3.join("caches/ghost.json"),
+            r#"{"models":[{"slug":"ghost"}]}"#,
+        )
+        .unwrap();
+        Registry::update(&paths, |r| {
+            r.add(spec("a"))?;
+            r.add_pool(entry("a", "old"))?;
+            r.add_pool(entry("a", "custom"))?;
+            Ok(())
+        })
+        .unwrap();
+        let before = fs::read(paths.registry_file()).unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        let models = catalog_pool(&reg, Some(&t3)).unwrap();
+        assert_eq!(models.len(), 3);
+        assert!(models.iter().any(|e| e.model == "old" && e.enabled));
+        assert!(models.iter().any(|e| e.model == "new" && !e.enabled));
+        assert!(models.iter().any(|e| e.model == "custom" && e.enabled));
+        assert_eq!(fs::read(paths.registry_file()).unwrap(), before);
+        fs::write(t3.join("caches/a.json"), "bad JSON").unwrap();
+        assert!(
+            catalog_pool(&reg, Some(&t3))
+                .unwrap_err()
+                .to_string()
+                .contains("a.json")
+        );
     }
 
     #[test]

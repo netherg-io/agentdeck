@@ -178,6 +178,78 @@ fn provider_icon(provider: &str) -> widget::icon::Handle {
     widget::icon::from_svg_bytes(bytes).symbolic(true)
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct VisibilityFile {
+    #[serde(default)]
+    hidden: Vec<String>,
+}
+
+fn visibility_path() -> PathBuf {
+    if let Some(dir) = std::env::var_os("AGENTDECK_CONFIG_DIR").map(PathBuf::from) {
+        return dir.join("ai-usage-visibility.json");
+    }
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
+        return dir.join("agentdeck").join("ai-usage-visibility.json");
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        return home.join(".config/agentdeck/ai-usage-visibility.json");
+    }
+    std::env::temp_dir().join("agentdeck-ai-usage-visibility.json")
+}
+
+fn parse_visibility(bytes: &[u8]) -> Result<HashSet<String>, String> {
+    let file: VisibilityFile = serde_json::from_slice(bytes)
+        .map_err(|e| format!("Не удалось прочитать настройки: {e}"))?;
+    Ok(file.hidden.into_iter().collect())
+}
+
+fn load_visibility_from(path: &PathBuf) -> Result<HashSet<String>, String> {
+    match std::fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
+        Err(e) => Err(format!("Не удалось прочитать настройки: {e}")),
+        Ok(bytes) => parse_visibility(&bytes),
+    }
+}
+
+fn save_visibility_to(path: &PathBuf, hidden: &HashSet<String>) -> Result<(), String> {
+    let mut sorted: Vec<&String> = hidden.iter().collect();
+    sorted.sort();
+    let file = VisibilityFile {
+        hidden: sorted.into_iter().cloned().collect(),
+    };
+    let data = serde_json::to_vec_pretty(&file)
+        .map_err(|e| format!("Не удалось сохранить настройки: {e}"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Не удалось сохранить настройки: {e}"))?;
+    }
+    // Atomic write: malformed config is never truncated on failure.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &data).map_err(|e| format!("Не удалось сохранить настройки: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("Не удалось сохранить настройки: {e}"))?;
+    Ok(())
+}
+
+fn visible_accounts<'a>(
+    accounts: &'a [AccountState],
+    hidden: &HashSet<String>,
+) -> Vec<&'a AccountState> {
+    accounts
+        .iter()
+        .filter(|a| !hidden.contains(&a.provider))
+        .collect()
+}
+
+fn providers_of(accounts: &[AccountState]) -> Vec<String> {
+    let mut set: HashSet<&str> = HashSet::new();
+    for account in accounts {
+        set.insert(account.provider.as_str());
+    }
+    let mut out: Vec<String> = set.into_iter().map(str::to_owned).collect();
+    out.sort();
+    out
+}
+
 fn new_state_path() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -235,6 +307,8 @@ struct App {
     state: Result<AppState, String>,
     popup: Option<window::Id>,
     revealed: HashSet<String>,
+    hidden: HashSet<String>,
+    prefs_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +317,7 @@ enum Message {
     TogglePopup(Rectangle<i32>),
     CloseRequested(window::Id),
     Reveal(String),
+    ToggleProvider(String),
 }
 
 impl cosmic::Application for App {
@@ -257,12 +332,18 @@ impl cosmic::Application for App {
         &mut self.core
     }
     fn init(core: app::Core, _: ()) -> (Self, app::Task<Message>) {
+        let (hidden, prefs_error) = match load_visibility_from(&visibility_path()) {
+            Ok(hidden) => (hidden, None),
+            Err(error) => (HashSet::new(), Some(error)),
+        };
         (
             Self {
                 core,
                 state: read_state(),
                 popup: None,
                 revealed: HashSet::new(),
+                hidden,
+                prefs_error,
             },
             Task::none(),
         )
@@ -279,6 +360,19 @@ impl cosmic::Application for App {
             Message::Reveal(id) => {
                 if !self.revealed.remove(&id) {
                     self.revealed.insert(id);
+                }
+            }
+            Message::ToggleProvider(provider) => {
+                let mut hidden = self.hidden.clone();
+                if !hidden.remove(&provider) {
+                    hidden.insert(provider);
+                }
+                match save_visibility_to(&visibility_path(), &hidden) {
+                    Ok(()) => {
+                        self.hidden = hidden;
+                        self.prefs_error = None;
+                    }
+                    Err(error) => self.prefs_error = Some(error),
                 }
             }
             Message::CloseRequested(id) => {
@@ -317,7 +411,9 @@ impl cosmic::Application for App {
         let timestamp = now();
         let mut row = widget::row(vec![]).spacing(12).align_y(Alignment::Center);
         if let Ok(state) = &self.state {
-            for account in &state.accounts {
+            let mut shown = 0;
+            for account in visible_accounts(&state.accounts, &self.hidden) {
+                shown += 1;
                 row = row.push(
                     widget::row(vec![])
                         .spacing(4)
@@ -326,7 +422,7 @@ impl cosmic::Application for App {
                         .push(widget::text(headline(account, timestamp)).size(14)),
                 );
             }
-            if state.accounts.is_empty() {
+            if shown == 0 {
                 row = row.push(widget::text("AI —").size(14));
             }
         } else {
@@ -362,7 +458,8 @@ impl cosmic::Application for App {
                 content = content.push(widget::text("Нет настроенных аккаунтов"))
             }
             Ok(state) => {
-                for (index, account) in state.accounts.iter().enumerate() {
+                let visible = visible_accounts(&state.accounts, &self.hidden);
+                for (index, account) in visible.iter().enumerate() {
                     if index > 0 {
                         content = content.push(widget::divider::horizontal::default());
                     }
@@ -430,7 +527,32 @@ impl cosmic::Application for App {
                         content = content.push(widget::text(error));
                     }
                 }
+                if !state.accounts.is_empty() {
+                    content = content.push(widget::divider::horizontal::default());
+                    for provider in providers_of(&state.accounts) {
+                        let label = if self.hidden.contains(&provider) {
+                            "Показать"
+                        } else {
+                            "Скрыть"
+                        };
+                        content = content.push(
+                            widget::row(vec![])
+                                .spacing(10)
+                                .align_y(Alignment::Center)
+                                .push(widget::icon(provider_icon(&provider)).size(16))
+                                .push(widget::text(provider.clone()).size(14).width(Length::Fill))
+                                .push(
+                                    widget::button::custom(widget::text(label).size(14))
+                                        .on_press(Message::ToggleProvider(provider))
+                                        .class(cosmic::theme::Button::Text),
+                                ),
+                        );
+                    }
+                }
             }
+        }
+        if let Some(error) = &self.prefs_error {
+            content = content.push(widget::text(error.clone()).size(13));
         }
         self.core
             .applet
@@ -505,5 +627,67 @@ mod tests {
         assert_eq!(masked_email("name@example.com"), "n•••@example.com");
         assert_eq!(money("0.0123", "USD"), "$0.0123");
         assert_eq!(reset_text(Some(999), 1000), "");
+    }
+
+    fn test_account(id: &str, provider: &str) -> AccountState {
+        AccountState::error(id, id, provider, "")
+    }
+
+    fn temp_visibility_path(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agentdeck-applet-visibility-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("ai-usage-visibility.json")
+    }
+
+    #[test]
+    fn visibility_round_trips_through_atomic_config() {
+        let path = temp_visibility_path("roundtrip");
+        let mut hidden = HashSet::new();
+        hidden.insert("codex".to_owned());
+        hidden.insert("claude".to_owned());
+        save_visibility_to(&path, &hidden).unwrap();
+        assert_eq!(load_visibility_from(&path).unwrap(), hidden);
+        // Toggle off one provider persists as well.
+        hidden.remove("codex");
+        save_visibility_to(&path, &hidden).unwrap();
+        assert_eq!(load_visibility_from(&path).unwrap(), hidden);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn malformed_visibility_config_errors_without_truncating_file() {
+        let path = temp_visibility_path("malformed");
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(load_visibility_from(&path).is_err());
+        // Previous bytes stay intact for the user to fix; we never rewrite here.
+        assert_eq!(std::fs::read(&path).unwrap(), b"{not json");
+        assert!(parse_visibility(b"{not json").is_err());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn hidden_providers_are_filtered_but_stay_recoverable() {
+        let accounts = vec![
+            test_account("a", "codex"),
+            test_account("b", "claude"),
+            test_account("c", "codex"),
+        ];
+        let mut hidden = HashSet::new();
+        hidden.insert("codex".to_owned());
+        let visible = visible_accounts(&accounts, &hidden);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].provider, "claude");
+        // Controls list every provider, including hidden ones.
+        assert_eq!(providers_of(&accounts), vec!["claude", "codex"]);
+        // All hidden: nothing in the panel, but recovery list is complete.
+        hidden.insert("claude".to_owned());
+        assert!(visible_accounts(&accounts, &hidden).is_empty());
+        assert_eq!(providers_of(&accounts).len(), 2);
     }
 }
