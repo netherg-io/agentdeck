@@ -282,7 +282,7 @@ fn snapshots_en_ru_and_sidebar_navigation() {
     ui.click("CLI").expect("instance CLI button");
     assert!(
         ui.into_messages()
-            .any(|message| matches!(message, Message::LaunchCli(found) if found == id))
+            .any(|message| matches!(message, app::Message::LaunchCli(found) if found == id))
     );
 
     // Sidebar navigation: every page reachable by clicking.
