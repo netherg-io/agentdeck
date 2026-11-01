@@ -166,10 +166,13 @@ mod tests {
     struct Fixture(std::path::PathBuf);
     impl Fixture {
         fn new() -> Self {
+            // Parallel tests can share pid and timestamp; the counter keeps dirs apart.
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let dir = std::env::temp_dir().join(format!(
-                "agentdeck-admission-{}-{}",
+                "agentdeck-admission-{}-{}-{}",
                 std::process::id(),
-                now()
+                now(),
+                N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             ));
             std::fs::create_dir_all(dir.join(".t3/userdata")).unwrap();
             let fx = Self(dir);
