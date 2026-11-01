@@ -182,7 +182,7 @@ add-edit = Back
 add-done = Done
 add-added = Added { $id }.
 
-pool-search = Search models or instances
+pool-search = Search
 pool-all-instances = All instances
 pool-sort-instance = By instance
 pool-sort-model = By model

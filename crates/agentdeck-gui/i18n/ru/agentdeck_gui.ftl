@@ -187,7 +187,7 @@ add-edit = Назад
 add-done = Готово
 add-added = Добавлен { $id }.
 
-pool-search = Поиск моделей и инстансов
+pool-search = Поиск
 pool-all-instances = Все инстансы
 pool-sort-instance = По инстансу
 pool-sort-model = По модели
