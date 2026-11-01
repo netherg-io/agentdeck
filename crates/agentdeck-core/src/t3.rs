@@ -433,6 +433,48 @@ pub fn sync_t3(paths: &Paths, t3_root: &Path, dry_run: bool) -> anyhow::Result<V
     Ok(entries)
 }
 
+/// Update just the display name; provider ids, config and thread history stay intact.
+pub fn rename_instance(
+    paths: &Paths,
+    root: Option<&Path>,
+    id: &str,
+    name: &str,
+    dry_run: bool,
+) -> anyhow::Result<Vec<crate::Change>> {
+    let mut reg = Registry::load(paths)?;
+    reg.rename(id, name)?;
+    let inst = reg.get(id).expect("rename validated the instance");
+    let mut settings = None;
+    if inst.t3
+        && let Some(root) = root
+        && settings_file(root).exists()
+    {
+        let raw = fs::read(settings_file(root))?;
+        let mut value = parse_settings_strict(&raw)?;
+        if let Some(provider) = value
+            .get_mut("providerInstances")
+            .and_then(|p| p.get_mut(id))
+        {
+            let object = provider
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("invalid T3 instance {id:?}"))?;
+            if object.get("displayName").and_then(Value::as_str) != Some(&inst.display_name) {
+                object.insert(
+                    "displayName".into(),
+                    Value::String(inst.display_name.clone()),
+                );
+                settings = Some((root, value, detect_indent(&String::from_utf8_lossy(&raw))));
+            }
+        }
+    }
+    let changes = crate::registry::rename_instance(paths, id, name, dry_run)?;
+    if !dry_run && let Some((root, value, indent)) = settings {
+        write_settings_verified(root, &value, &indent, &paths.backup_dir())
+            .map_err(|e| anyhow::anyhow!("name saved in Agentdeck; T3 update failed: {e}"))?;
+    }
+    Ok(changes)
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheHealth {
     pub status: String,
@@ -964,6 +1006,61 @@ mod tests {
   }
 }
 "##;
+
+    #[test]
+    fn rename_keeps_ids_config_and_other_instances() {
+        let dir = std::env::temp_dir().join(format!("t3-rename-{}", std::process::id()));
+        let paths = Paths::new(dir.join("config"), dir.join("state"));
+        let root = dir.join("t3");
+        Registry::update(&paths, |r| {
+            r.add(crate::AddSpec {
+                id: "a".into(),
+                harness: Harness::Codex,
+                display_name: Some("Old".into()),
+                home: "/fake/a".into(),
+                binary: None,
+                no_t3: false,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+        fs::create_dir_all(root.join("userdata")).unwrap();
+        let old = serde_json::json!({"providerInstances":{"a":{"driver":"codex","displayName":"Old","config":{"customModels":["m"]}},"b":{"displayName":"Other"}},"favorites":[]});
+        fs::write(settings_file(&root), old.to_string()).unwrap();
+        rename_instance(&paths, Some(&root), "a", "  Новое имя  ", true).unwrap();
+        assert_eq!(
+            Registry::load(&paths)
+                .unwrap()
+                .get("a")
+                .unwrap()
+                .display_name,
+            "Old"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(settings_file(&root)).unwrap()).unwrap(),
+            old
+        );
+        rename_instance(&paths, Some(&root), "a", "Новое имя", false).unwrap();
+        let after: Value =
+            serde_json::from_slice(&fs::read(settings_file(&root)).unwrap()).unwrap();
+        let mut expected = old;
+        expected["providerInstances"]["a"]["displayName"] = Value::from("Новое имя");
+        assert_eq!(after, expected);
+        let reg = Registry::load(&paths).unwrap();
+        assert_eq!(reg.get("a").unwrap().display_name, "Новое имя");
+        assert!(rename_instance(&paths, Some(&root), "a", "   ", false).is_err());
+        fs::write(settings_file(&root), "bad json").unwrap();
+        assert!(rename_instance(&paths, Some(&root), "a", "Not saved", false).is_err());
+        assert_eq!(
+            Registry::load(&paths)
+                .unwrap()
+                .get("a")
+                .unwrap()
+                .display_name,
+            "Новое имя"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn merge_preserves_unknown_fields_order_and_foreign() {

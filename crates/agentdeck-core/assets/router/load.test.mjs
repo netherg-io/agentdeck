@@ -84,6 +84,9 @@ try {
   turn('turn-x', 'pt-codex', null, 'running');
   turn('turn-x-kid', 'pt-codex-kid', null, 'running');
   child('codex-kid', 'codex', 'run-x', 'pt-codex-kid', 'running', 'gpt-6-astra');
+  // Running is projected before the provider's first turn: the branch still occupies a slot.
+  pthread('pt-warm', 'codex', 'sx', 'active');
+  run('run-warm', 'codex', 'pt-warm', 'running', 'gpt-6.1-sol');
   db.close();
 
   const before = fs.readFileSync(file);
@@ -98,8 +101,9 @@ try {
     'run-c-next': { id: 'run-c-next', provider: 'claudeAgent', model: 'claude-sonnet-5-5' },
     'pt-codex': { id: 'pt-codex', provider: 'codex', model: 'gpt-6.1-sol' },
     'pt-codex-kid': { id: 'pt-codex-kid', provider: 'codex', model: 'gpt-6-astra' },
+    'run-warm': { id: 'run-warm', provider: 'codex', model: 'gpt-6.1-sol' },
   });
-  assert.equal(load.agents.length, 7);
+  assert.equal(load.agents.length, 8);
   assert.deepEqual(fs.readFileSync(file), before);
 
   const missing = path.join(dir, 'missing.sqlite');

@@ -273,6 +273,18 @@ fn snapshots_en_ru_and_sidebar_navigation() {
         );
     }
 
+    // Clicking only emits an instance-specific action; the test never launches a terminal.
+    let mut single = data.clone();
+    single.instances.truncate(1);
+    let id = single.instances[0].id.clone();
+    let state = app::State::for_tests(paths.clone(), single);
+    let mut ui = iced_test::simulator(app::view(&state));
+    ui.click("CLI").expect("instance CLI button");
+    assert!(
+        ui.into_messages()
+            .any(|message| matches!(message, app::Message::LaunchCli(found) if found == id))
+    );
+
     // Sidebar navigation: every page reachable by clicking.
     agentdeck_gui::i18n::set_language("en");
     let mut state = app::State::for_tests(paths, data);
@@ -903,4 +915,124 @@ fn snapshots_processes_en_ru_and_stop_dialog() {
         let _ = app::update(&mut state, message);
     }
     assert!(state.proc_ui().pending.is_none());
+}
+
+/// Execute only task output messages; these flows have no window/runtime effects.
+fn finish_tasks(state: &mut app::State, task: iced::Task<app::Message>) {
+    use iced::futures::StreamExt;
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut pending = vec![task];
+            while let Some(task) = pending.pop() {
+                if let Some(mut stream) = iced_test::runtime::task::into_stream(task) {
+                    while let Some(action) = stream.next().await {
+                        if let iced_test::runtime::Action::Output(message) = action {
+                            pending.push(app::update(state, message));
+                        } else {
+                            panic!("unexpected GUI runtime effect");
+                        }
+                    }
+                }
+            }
+        });
+}
+
+#[test]
+fn parallel_limit_edit_validate_persist_reload_and_clear() {
+    let env = lock_env();
+    let (initial, paths, _guard) = load_with_fixtures("parallel", &env);
+    agentdeck_gui::i18n::set_language("en");
+    let mut state = app::State::for_tests(paths.clone(), initial);
+    let mut ui = iced_test::simulator(app::view(&state));
+    ui.click("Parallel tasks: Unlimited").unwrap();
+    for message in ui.into_messages() {
+        let _ = app::update(&mut state, message);
+    }
+    for value in ["0", "-1", "1.5", "4294967296"] {
+        let _ = app::update(&mut state, app::Message::ParallelInput(value.into()));
+        let task = app::update(&mut state, app::Message::ParallelSave);
+        finish_tasks(&mut state, task);
+        let mut ui = iced_test::simulator(app::view(&state));
+        ui.find("Enter a whole number from 1 to 4294967295, or leave blank for unlimited.")
+            .unwrap();
+        assert_eq!(
+            Registry::load(&paths)
+                .unwrap()
+                .get("claude-main")
+                .unwrap()
+                .max_parallel,
+            None
+        );
+    }
+    let _ = app::update(&mut state, app::Message::ParallelInput(" 3 ".into()));
+    let mut ui = iced_test::simulator(app::view(&state));
+    ui.click("Save").unwrap();
+    for message in ui.into_messages() {
+        let task = app::update(&mut state, message);
+        finish_tasks(&mut state, task);
+    }
+    assert_eq!(
+        Registry::load(&paths)
+            .unwrap()
+            .get("claude-main")
+            .unwrap()
+            .max_parallel,
+        Some(3)
+    );
+    iced_test::simulator(app::view(&state))
+        .find("Parallel tasks: 3")
+        .unwrap();
+    assert_eq!(data::load(&paths).instances[0].max_parallel, Some(3));
+
+    // Cancel keeps the stored value; a failed write keeps the editor usable.
+    let _ = app::update(&mut state, app::Message::ParallelAsk("claude-main".into()));
+    let _ = app::update(&mut state, app::Message::ParallelInput("9".into()));
+    let _ = app::update(&mut state, app::Message::Escape);
+    iced_test::simulator(app::view(&state))
+        .find("Parallel tasks: 3")
+        .unwrap();
+    let _ = app::update(&mut state, app::Message::ParallelAsk("claude-main".into()));
+    let task = app::update(
+        &mut state,
+        app::Message::ParallelDone(Err("write failed".into())),
+    );
+    finish_tasks(&mut state, task);
+    iced_test::simulator(app::view(&state))
+        .find("write failed")
+        .unwrap();
+    for lang in ["en", "ru"] {
+        agentdeck_gui::i18n::set_language(lang);
+        for dark in [false, true] {
+            let mut ui = iced_test::Simulator::with_size(
+                iced::Settings::default(),
+                (960.0, 600.0),
+                app::view(&state),
+            );
+            let snapshot = ui
+                .snapshot(&agentdeck_gui::style::theme(dark))
+                .expect("headless parallel editor render");
+            if let Some(dir) = std::env::var_os("AGENTDECK_SHOTS").map(PathBuf::from) {
+                std::fs::create_dir_all(&dir).unwrap();
+                let stem = dir.join(format!("parallel_{lang}_{dark}.png"));
+                assert!(snapshot.matches_image(stem).unwrap());
+            }
+        }
+    }
+    agentdeck_gui::i18n::set_language("en");
+    let _ = app::update(&mut state, app::Message::ParallelInput(" ".into()));
+    let task = app::update(&mut state, app::Message::ParallelSave);
+    finish_tasks(&mut state, task);
+    assert_eq!(
+        Registry::load(&paths)
+            .unwrap()
+            .get("claude-main")
+            .unwrap()
+            .max_parallel,
+        None
+    );
+    iced_test::simulator(app::view(&state))
+        .find("Parallel tasks: Unlimited")
+        .unwrap();
 }

@@ -107,7 +107,7 @@ fn update(state: &mut app::State, message: Message) {
 }
 
 #[test]
-fn pool_page_add_preview_import_and_apply() {
+fn pool_page_catalog_search_sort_and_apply() {
     let fx = fixture("pool");
     add_instance(
         &fx.paths,
@@ -190,21 +190,35 @@ fn pool_page_add_preview_import_and_apply() {
     }
     update(&mut state, Message::Pool(pool::Msg::Cancel));
 
-    // Import previews the favorite; applying it (as Confirm does) adds it.
-    update(&mut state, Message::Pool(pool::Msg::AskImport));
-    let op = {
-        let mut ui = iced_test::simulator(app::view(&state));
-        ui.find("Apply").expect("import apply button");
-        // The same op Confirm would run.
-        pool::Op::Import
+    let pool::Msg::Loaded(loaded) = pool::load(&ctx) else {
+        panic!("loaded")
     };
-    pool::apply(&ctx, &op).unwrap();
-    let reg = Registry::load(&fx.paths).unwrap();
+    assert_eq!(loaded.entries.len(), 3);
+    let mut page = pool::State {
+        data: loaded,
+        ..Default::default()
+    };
+    page.search = "OPUS".into();
+    let (index, entry) = pool::visible_entries(&page)[0];
+    assert_eq!(entry.model, "opus-5");
+    assert!(!entry.enabled);
+    pool::apply(&ctx, &pool::Op::Toggle(page.data.entries[index].clone())).unwrap();
     assert!(
-        reg.pool.iter().any(|e| e.model == "opus-5"),
-        "{:?}",
-        reg.pool
+        Registry::load(&fx.paths)
+            .unwrap()
+            .pool
+            .iter()
+            .any(|e| e.model == "opus-5" && e.enabled)
     );
+    page.search = "gpt".into();
+    page.filter_instance = Some("claude-main".into());
+    assert!(pool::visible_entries(&page).is_empty());
+    page.search.clear();
+    page.filter_instance = None;
+    page.sort = pool::Sort::Enabled;
+    assert!(pool::visible_entries(&page)[0].1.enabled);
+    let mut ui = iced_test::simulator(app::view(&state));
+    assert!(ui.find("Import T3 favorites").is_err());
 }
 
 #[test]

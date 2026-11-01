@@ -73,6 +73,7 @@ fn data() -> Data {
                 display_name: LONG_NAME.into(),
                 harness: "claude".into(),
                 enabled: false,
+                max_parallel: Some(u32::MAX),
                 t3: Some(T3Info {
                     status: Some("ready".into()),
                     threads: Some(1234),
@@ -84,6 +85,7 @@ fn data() -> Data {
                 display_name: "Codex second".into(),
                 harness: "codex".into(),
                 enabled: true,
+                max_parallel: None,
                 t3: None,
                 quotas: vec![quotas("Codex", "stale"), quotas(LONG_NAME, "error")],
             },
@@ -215,6 +217,9 @@ fn every_page_fits_at_min_size_with_long_names() {
             Message::Drift(drift::Message::SnapshotLoaded(drift_snapshot())),
         );
         shot(&state, lang, "instances");
+        update(&mut state, Message::RenameAsk(LONG_ID.into()));
+        shot(&state, lang, "instance_rename");
+        update(&mut state, Message::RenameCancel);
 
         update(&mut state, Message::SelectPage(Page::Processes));
         update(&mut state, Message::ProcToggle(100, 1000));
@@ -246,10 +251,18 @@ fn every_page_fits_at_min_size_with_long_names() {
                     entry("codex-second", "gpt-5", false),
                 ],
                 instances: vec![LONG_ID.into(), "codex-second".into()],
-                error: None,
+                ..Default::default()
             })),
         );
         shot(&state, lang, "pool");
+        update(&mut state, Message::Pool(pool::Msg::Search("gpt".into())));
+        shot(&state, lang, "pool_search");
+        update(
+            &mut state,
+            Message::Pool(pool::Msg::Search("missing-model".into())),
+        );
+        shot(&state, lang, "pool_empty_search");
+        update(&mut state, Message::Pool(pool::Msg::Search(String::new())));
         update(&mut state, Message::Pool(pool::Msg::OpenAdd));
         shot(&state, lang, "pool_add");
         update(&mut state, Message::Pool(pool::Msg::CloseAdd));

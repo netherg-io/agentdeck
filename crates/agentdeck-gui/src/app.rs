@@ -49,6 +49,18 @@ pub enum Message {
     Loaded(Data),
     SelectPage(Page),
     Add(AddMsg),
+    LaunchCli(String),
+    CliDone(Result<(), String>),
+    ParallelAsk(String),
+    ParallelInput(String),
+    ParallelCancel,
+    ParallelSave,
+    ParallelDone(Result<(), String>),
+    RenameAsk(String),
+    RenameInput(String),
+    RenameCancel,
+    RenameSave,
+    RenameDone(Result<(), String>),
     RemoveAsk(String),
     RemoveCancel,
     RemoveConfirm,
@@ -127,6 +139,8 @@ pub struct State {
     paths: Option<agentdeck_core::Paths>,
     add: add_instance::Wizard,
     remove: Option<RemoveAsk>,
+    rename: Option<pages::instances::Rename>,
+    parallel: Option<pages::instances::Parallel>,
     pending: Option<Pending>,
     proc_ui: crate::pages::processes::ProcUi,
     /// Plugins whose technical status is expanded.
@@ -173,6 +187,8 @@ impl State {
                 paths,
                 add: add_instance::Wizard::default(),
                 remove: None,
+                rename: None,
+                parallel: None,
                 pending: None,
                 proc_ui: crate::pages::processes::ProcUi::default(),
                 plugin_open: Default::default(),
@@ -204,6 +220,8 @@ impl State {
             paths: Some(paths),
             add: add_instance::Wizard::default(),
             remove: None,
+            rename: None,
+            parallel: None,
             pending: None,
             proc_ui: crate::pages::processes::ProcUi::default(),
             plugin_open: Default::default(),
@@ -245,6 +263,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             state.page = page;
             state.pending = None;
             state.remove = None;
+            state.rename = None;
+            state.parallel = None;
             if page == Page::AddInstance {
                 state.add = add_instance::Wizard::default();
             }
@@ -279,6 +299,171 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             Some(paths) => add_instance::update_wizard(&mut state.add, msg, &paths),
             None => Task::none(),
         },
+        Message::LaunchCli(id) => {
+            let Some(paths) = state.paths.clone() else {
+                return Task::none();
+            };
+            Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        agentdeck_core::launch::launch_cli(&paths, &id)
+                            .map_err(|e| format!("{e:#}"))
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r)
+                },
+                Message::CliDone,
+            )
+        }
+        Message::CliDone(result) => {
+            if let Err(error) = result {
+                state.toast(fl!(loader(), "cli-open-error", what = error), true);
+            }
+            Task::none()
+        }
+        Message::ParallelAsk(id) => {
+            if state.parallel.as_ref().is_some_and(|edit| edit.busy) {
+                return Task::none();
+            }
+            if let Some(inst) = state.data.instances.iter().find(|i| i.id == id) {
+                state.parallel = Some(pages::instances::Parallel {
+                    id,
+                    value: inst.max_parallel.map(|n| n.to_string()).unwrap_or_default(),
+                    busy: false,
+                    error: None,
+                });
+            }
+            Task::none()
+        }
+        Message::ParallelInput(value) => {
+            if let Some(edit) = state.parallel.as_mut().filter(|e| !e.busy) {
+                edit.value = value;
+                edit.error = None;
+            }
+            Task::none()
+        }
+        Message::ParallelCancel => {
+            if state.parallel.as_ref().is_none_or(|e| !e.busy) {
+                state.parallel = None;
+            }
+            Task::none()
+        }
+        Message::ParallelSave => {
+            let Some(edit) = state.parallel.as_mut().filter(|e| !e.busy) else {
+                return Task::none();
+            };
+            let limit = match pages::instances::parse_parallel(&edit.value) {
+                Ok(limit) => limit,
+                Err(()) => {
+                    edit.error = Some(fl!(loader(), "parallel-invalid"));
+                    return Task::none();
+                }
+            };
+            let Some(paths) = state.paths.clone() else {
+                return Task::none();
+            };
+            edit.busy = true;
+            edit.error = None;
+            let id = edit.id.clone();
+            Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        agentdeck_core::registry::set_max_parallel(&paths, &id, limit, false)
+                            .map(|_| ())
+                            .map_err(|e| format!("{e:#}"))
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r)
+                },
+                Message::ParallelDone,
+            )
+        }
+        Message::ParallelDone(result) => {
+            match result {
+                Ok(()) => state.parallel = None,
+                Err(error) => {
+                    if let Some(edit) = state.parallel.as_mut() {
+                        edit.busy = false;
+                        edit.error = Some(error);
+                    }
+                }
+            }
+            match state.paths.clone() {
+                Some(paths) => load_data(paths),
+                None => Task::none(),
+            }
+        }
+        Message::RenameAsk(id) => {
+            if let Some(inst) = state.data.instances.iter().find(|i| i.id == id) {
+                state.rename = Some(pages::instances::Rename {
+                    id,
+                    name: inst.display_name.clone(),
+                    busy: false,
+                    error: None,
+                });
+            }
+            Task::none()
+        }
+        Message::RenameInput(value) => {
+            if let Some(rename) = state.rename.as_mut().filter(|r| !r.busy) {
+                rename.name = value;
+            }
+            Task::none()
+        }
+        Message::RenameCancel => {
+            if state.rename.as_ref().is_none_or(|r| !r.busy) {
+                state.rename = None;
+            }
+            Task::none()
+        }
+        Message::RenameSave => {
+            let Some(rename) = state.rename.as_mut().filter(|r| !r.busy) else {
+                return Task::none();
+            };
+            let Some(paths) = state.paths.clone() else {
+                return Task::none();
+            };
+            rename.busy = true;
+            let id = rename.id.clone();
+            let name = rename.name.clone();
+            Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        let root = agentdeck_core::t3::t3_root().ok();
+                        agentdeck_core::t3::rename_instance(
+                            &paths,
+                            root.as_deref(),
+                            &id,
+                            &name,
+                            false,
+                        )
+                        .map(|_| ())
+                        .map_err(|e| format!("{e:#}"))
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r)
+                },
+                Message::RenameDone,
+            )
+        }
+        Message::RenameDone(result) => {
+            match result {
+                Ok(()) => state.rename = None,
+                Err(error) => {
+                    if let Some(rename) = state.rename.as_mut() {
+                        rename.busy = false;
+                        rename.error = Some(error);
+                    }
+                }
+            }
+            match state.paths.clone() {
+                Some(paths) => load_data(paths),
+                None => Task::none(),
+            }
+        }
         Message::RemoveAsk(id) => {
             // Read-only thread count for the confirmation; core refuses the
             // removal itself when pool/usage entries still reference the id.
@@ -428,7 +613,9 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
                 None => Task::none(),
             };
-            if let Some((text, error)) = state.pool.result.take() {
+            if let Some((text, error)) = state.pool.result.take()
+                && (error || !text.is_empty())
+            {
                 state.toast(text, error);
             }
             task
@@ -469,6 +656,8 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             Task::none()
         }
         // Keys act on the open modal only; its messages decide what happens.
+        Message::Escape if state.parallel.is_some() => update(state, Message::ParallelCancel),
+        Message::Escape if state.rename.is_some() => update(state, Message::RenameCancel),
         Message::Escape => match modal(state).map(|m| m.on_cancel) {
             Some(msg) => update(state, msg),
             None => Task::none(),
@@ -707,22 +896,13 @@ fn sidebar(state: &State) -> Element<'_, Message> {
         .into()
 }
 
-/// Fixed page header: title, one-line purpose, primary action on the right.
-fn page_header<'a>(
-    title: String,
-    purpose: String,
-    action: Option<Element<'a, Message>>,
-) -> Element<'a, Message> {
+fn page_header<'a>(title: String, action: Option<Element<'a, Message>>) -> Element<'a, Message> {
     let look = st::look();
     container(
-        row![
-            column![st::title(title), st::muted(purpose)]
-                .spacing(2)
-                .width(Length::Fill),
-        ]
-        .push(action)
-        .spacing(st::SPACE_M)
-        .align_y(Alignment::Center),
+        row![container(st::title(title)).width(Length::Fill)]
+            .push(action)
+            .spacing(st::SPACE_M)
+            .align_y(Alignment::Center),
     )
     .padding([look.page_pad * 0.7, look.page_pad])
     .into()
@@ -730,11 +910,9 @@ fn page_header<'a>(
 
 fn header(state: &State) -> Element<'_, Message> {
     let t = |key: &str| loader().get(key);
-    let (title, purpose, action): (String, String, Option<Element<'_, Message>>) = match state.page
-    {
+    let (title, action): (String, Option<Element<'_, Message>>) = match state.page {
         Page::Instances => (
             t("instances-title"),
-            t("instances-purpose"),
             Some(
                 st::btn_icon(st::Btn::Primary, st::Icon::Plus, t("instances-add"))
                     .on_press(Message::SelectPage(Page::AddInstance))
@@ -743,35 +921,36 @@ fn header(state: &State) -> Element<'_, Message> {
         ),
         Page::AddInstance => (
             t("add-title"),
-            t("add-purpose"),
             Some(
                 st::btn_icon(st::Btn::Quiet, st::Icon::ArrowLeft, t("add-back"))
                     .on_press(Message::SelectPage(Page::Instances))
                     .into(),
             ),
         ),
-        Page::Drift => (t("drift-title"), t("drift-purpose"), None),
+        Page::Drift => (t("drift-title"), None),
         Page::Pool => (
             t("pool-title"),
-            t("pool-purpose"),
             Some(pool::header_actions(&state.pool).map(Message::Pool)),
         ),
-        Page::Plugins => (t("plugins-title"), t("plugins-purpose"), None),
-        Page::Shared => (t("shared-title"), t("shared-purpose"), None),
-        Page::Harnesses => (t("harness-title"), t("harness-purpose"), None),
+        Page::Plugins => (t("plugins-title"), None),
+        Page::Shared => (t("shared-title"), None),
+        Page::Harnesses => (t("harness-title"), None),
         Page::Processes => (
             t("processes-title"),
-            t("processes-purpose"),
             Some(pages::processes::filter_input(&state.proc_ui)),
         ),
     };
-    page_header(title, purpose, action)
+    page_header(title, action)
 }
 
 pub fn view(state: &State) -> Element<'_, Message> {
     let look = st::look();
     let content: Element<'_, Message> = match state.page {
-        Page::Instances => pages::instances::view(&state.data),
+        Page::Instances => pages::instances::view_with_edits(
+            &state.data,
+            state.rename.as_ref(),
+            state.parallel.as_ref(),
+        ),
         Page::AddInstance => add_instance::view(&state.add),
         Page::Drift => drift::view(&state.drift).map(Message::Drift),
         Page::Plugins => pages::plugins::view(&state.data, &state.plugin_open),

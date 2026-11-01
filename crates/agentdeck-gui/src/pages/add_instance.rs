@@ -346,7 +346,6 @@ pub async fn preview_wrapper(paths: Paths, id: String) -> Result<Vec<String>, St
         &agentdeck_core::wrappers::bin_dir(&real_home),
         &agentdeck_core::wrappers::apps_dir(&real_home),
         None,
-        false,
     )
     .map_err(err)?;
     Ok(changes.iter().map(|c| c.describe()).collect())
@@ -368,7 +367,6 @@ pub async fn apply_wrapper(paths: Paths, id: String) -> Result<Vec<String>, Stri
         &agentdeck_core::wrappers::bin_dir(&real_home),
         &agentdeck_core::wrappers::apps_dir(&real_home),
         None,
-        false,
     )
     .map_err(err)?;
     let lines: Vec<String> = changes.iter().map(|c| c.describe()).collect();
@@ -982,7 +980,6 @@ pub fn view(wiz: &Wizard) -> Element<'_, Message> {
             ],
         ),
         Step::Finish => column![
-            st::muted(fl!(loader(), "add-finish-note")),
             optional_section(
                 fl!(loader(), "add-wrapper-title"),
                 &wiz.wrapper,

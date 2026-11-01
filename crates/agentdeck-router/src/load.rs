@@ -37,7 +37,8 @@ const ACTIVE_AGENTS_SQL: &str = "
       FROM orchestration_v2_projection_runs r
       LEFT JOIN orchestration_v2_projection_provider_threads p USING (provider_thread_id)
       LEFT JOIN orchestration_v2_projection_provider_sessions s USING (provider_session_id)
-      WHERE r.status IN ('queued', 'preparing', 'starting', 'waiting')
+      WHERE r.status IN ('queued', 'preparing', 'starting', 'waiting', 'running')
+        AND NOT (r.status = 'running' AND EXISTS (SELECT 1 FROM active_turns live WHERE live.id = r.provider_thread_id))
         AND NOT EXISTS (
           SELECT 1 FROM orchestration_v2_projection_provider_turns v
           JOIN orchestration_v2_projection_run_attempts a ON a.attempt_id = v.run_attempt_id

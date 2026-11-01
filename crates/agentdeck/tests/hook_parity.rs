@@ -373,6 +373,98 @@ fn delegate_input(
 }
 
 #[test]
+fn instance_capacity_blocks_launch_override_and_recommends_another_instance() {
+    if !node_available() {
+        eprintln!("SKIP: node is absent (SQLite fixture builder)");
+        return;
+    }
+    let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+    let path = fx.dir.join("router.json");
+    let mut cfg: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    cfg["instanceLimits"] = serde_json::json!({"codex": 1});
+    std::fs::write(path, cfg.to_string()).unwrap();
+    let sql = |file: &Path, schema: &str| {
+        let status = Command::new("node").arg("-e")
+            .arg("const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync(process.argv[1]);db.exec(process.argv[2]);db.close();")
+            .arg(file).arg(schema).status().unwrap();
+        assert!(status.success());
+    };
+    let t3 = fx.dir.join(".t3/userdata/statev2.sqlite");
+    sql(&t3, "CREATE TABLE orchestration_v2_projection_subagents (
+        subagent_id TEXT, provider_instance_id TEXT, payload_json TEXT, started_at TEXT,
+        origin TEXT, status TEXT, provider_thread_id TEXT, run_id TEXT, child_thread_id TEXT);
+        CREATE TABLE orchestration_v2_projection_provider_threads (
+        provider_thread_id TEXT, provider_instance_id TEXT, provider_session_id TEXT, status TEXT);
+        CREATE TABLE orchestration_v2_projection_provider_sessions (provider_session_id TEXT, model TEXT, status TEXT);
+        CREATE TABLE orchestration_v2_projection_provider_turns (provider_thread_id TEXT, run_attempt_id TEXT, status TEXT);
+        CREATE TABLE orchestration_v2_projection_runs (run_id TEXT, provider_instance_id TEXT, provider_thread_id TEXT, payload_json TEXT, status TEXT, thread_id TEXT);
+        CREATE TABLE orchestration_v2_projection_run_attempts (attempt_id TEXT, run_id TEXT);");
+    let input = |task: &str| {
+        delegate_input(
+            "delegate_task",
+            &format!("{task}\n\n{}", shared_hint()),
+            serde_json::json!({"providerInstanceId":"codex","model":"gpt-6.1-sol", "options":{"reasoningEffort":"medium"}}),
+            serde_json::json!({"source":"codex"}),
+        )
+    };
+    let verdict = |input: serde_json::Value| {
+        let (code, out, err) = run_rust(&fx, "shell", &input.to_string());
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+    assert_eq!(verdict(input("Fix typo"))["decision"], "allow");
+    let denied = verdict(input("Another task"));
+    assert_eq!(denied["decision"], "deny");
+    assert!(
+        denied["reason"]
+            .as_str()
+            .unwrap()
+            .contains("instance parallel limit")
+    );
+    let rows = decisions(&fx.dir);
+    assert_eq!(
+        rows.last().unwrap()["target"]["providerInstanceId"],
+        "claudeAgent"
+    );
+    let ranking = rows.last().unwrap()["ranking"].as_array().unwrap();
+    let codex = ranking.iter().find(|r| r["provider"] == "codex").unwrap();
+    assert_eq!(codex["eligible"], false);
+    assert_eq!(codex["pendingLaunches"], 1);
+    assert_eq!(codex["instanceActiveAgents"], 0);
+    assert_eq!(codex["allowed"], true); // Quota is sufficient, capacity is not.
+    // A deliberate model override still cannot exceed an instance's capacity.
+    assert_eq!(
+        verdict(input("[route:user-choice] Use GPT-6.1 Sol"))["decision"],
+        "deny"
+    );
+    assert_eq!(
+        decisions(&fx.dir).last().unwrap()["decision"],
+        "deny:capacity"
+    );
+    sql(
+        &fx.dir.join(".local/state/model-route/admissions.sqlite"),
+        "UPDATE pending SET created = 0",
+    );
+    assert_eq!(
+        verdict(input("Retry after failed dispatch"))["decision"],
+        "allow"
+    );
+    sql(
+        &fx.dir.join(".local/state/model-route/admissions.sqlite"),
+        "DELETE FROM pending",
+    );
+    // An ordinary queued branch occupies the same instance slot, without a subagent.
+    sql(
+        &t3,
+        "INSERT INTO orchestration_v2_projection_runs VALUES ('branch', 'codex', NULL, '{\"modelSelection\":{\"model\":\"gpt-6-astra\"}}', 'queued', 'branch')",
+    );
+    assert_eq!(verdict(input("With ordinary branch"))["decision"], "deny");
+    std::fs::remove_file(&t3).unwrap();
+    assert_eq!(verdict(input("Unknown load"))["decision"], "deny");
+}
+
+#[test]
 fn hook_parity_with_node() {
     if !node_available() {
         eprintln!("SKIP: node is absent, cannot differentially test the hook");

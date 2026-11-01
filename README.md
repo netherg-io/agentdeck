@@ -41,8 +41,8 @@ Then add **agentdeck** in the COSMIC panel settings. The applet reads the same
 ## CLI overview
 
 ```text
-agentdeck instance      registry instances in instances.toml (list/add/remove)
-agentdeck pool          [[pool]] model pool
+agentdeck instance      registry instances in instances.toml (list/add/rename/remove)
+agentdeck pool          model catalog and explicit routing selections
 agentdeck usage         [[usage]] quota sources (once/doctor/hooks plan)
 agentdeck daemon        usage polling daemon (single writer)
 agentdeck login <id>    official login CLI for an instance inside a PTY
@@ -53,7 +53,7 @@ agentdeck harness       detect binaries, run official updaters/installers
 agentdeck t3            T3 providerInstances status, sync and import
 agentdeck sync          background sync drift status and manual runs
 agentdeck skills | instructions | mcp   shared skills, AGENTS.md links, MCP lists
-agentdeck wrapper       per-instance terminal wrappers and .desktop launchers
+agentdeck wrapper       terminal wrappers and legacy launcher cleanup
 agentdeck service       install/remove/inspect the systemd user unit (never starts it)
 agentdeck plugin        enable/disable built-in plugins (agent-process, ai-usage, router)
 agentdeck route         route a task through the router (route.mjs port)
@@ -78,7 +78,26 @@ systemctl --user enable --now agentdeck-daemon.service   # owner's call
 The same binary serves the iced GUI (English and Russian): instances with
 quotas, the add wizard with login, the drift view, the plugins page and the
 processes page. The GUI shares the registry with the CLI under `flock` and
-works while the daemon is stopped.
+works while the daemon is stopped. The Pool page lists every cached model per
+registered instance, with search, an instance filter and sorting. New catalog
+entries start disabled; only explicitly enabled entries are routing candidates.
+T3 favorites are not used. Instance names can be edited without changing their
+IDs or T3 thread history. The router reads the current registry directly.
+
+**Parallel tasks** on each instance sets its router limit; a blank value means
+unlimited. The limit covers active T3 threads and subagents across every
+coordinator and model on that instance, including queued and waiting runs.
+Limits are stored as `max_parallel` in `[[instance]]`. Routing excludes full
+instances, and the launch hook reserves a slot before dispatch. Failed dispatch
+reservations expire after two minutes. If T3 load cannot be read, launches on
+limited instances are blocked. Workflows only enforce dependencies; legacy
+`concurrency` values are accepted and ignored.
+
+Each instance has a **CLI** button that opens its CLI in a terminal with the
+correct account. From a terminal, use `agentdeck instance run <id> -- <args>`.
+Instance wrappers no longer add application menu entries. To remove legacy
+Agentdeck provider shortcuts, use `agentdeck wrapper remove-launchers` (supports
+`--dry-run`); the wrapper commands themselves are kept.
 
 ## Plugins
 

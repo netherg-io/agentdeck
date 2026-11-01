@@ -55,12 +55,6 @@ pub enum PoolCmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Import T3 favorites into [[pool]] once (read-only; favorites never
-    /// edited). A second run adds nothing.
-    ImportFavorites {
-        #[arg(long)]
-        dry_run: bool,
-    },
 }
 
 pub fn run(paths: &Paths, cmd: PoolCmd) -> anyhow::Result<()> {
@@ -153,23 +147,6 @@ pub fn run(paths: &Paths, cmd: PoolCmd) -> anyhow::Result<()> {
                 println!("{instance} {model}: already disabled");
             } else {
                 println!("disabled pool entry {instance} {model}");
-            }
-        }
-        PoolCmd::ImportFavorites { dry_run } => {
-            let t3_root = agentdeck_core::t3::t3_root()?;
-            let (changes, added, skipped) = pool::import_favorites(paths, &t3_root, dry_run)?;
-            for c in &changes {
-                println!("{c}", c = c.describe());
-            }
-            for s in &skipped {
-                eprintln!("warning: {s}");
-            }
-            if dry_run {
-                println!("dry-run: would import {added} pool entries (registry unchanged)");
-            } else if added == 0 {
-                println!("nothing to import");
-            } else {
-                println!("imported {added} pool entries");
             }
         }
     }

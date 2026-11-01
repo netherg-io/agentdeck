@@ -1,8 +1,7 @@
-//! Pool page: `[[pool]]` entries with add / enable / remove and the T3
-//! favorites import. Every change shows the core preview first; the apply
-//! runs off the UI thread through the same core functions as `agentdeck pool`.
+//! Full instance catalogs with explicit routing selections.
 
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use agentdeck_core::{Paths, PoolEntry, Registry, pool};
 use i18n_embed_fl::fl;
@@ -24,7 +23,6 @@ pub enum Op {
     Add(PoolEntry),
     Remove(PoolEntry),
     Toggle(PoolEntry),
-    Import,
 }
 
 #[derive(Debug, Clone)]
@@ -38,12 +36,17 @@ pub struct Pending {
 pub struct Loaded {
     pub entries: Vec<PoolEntry>,
     pub instances: Vec<String>,
+    pub names: BTreeMap<String, String>,
+    pub saved: Vec<PoolEntry>,
     pub error: Option<String>,
 }
 
 #[derive(Default)]
 pub struct State {
     pub data: Loaded,
+    pub search: String,
+    pub filter_instance: Option<String>,
+    pub sort: Sort,
     /// Model slugs from the T3 cache of the chosen instance.
     pub models: Vec<String>,
     pub instance: Option<String>,
@@ -68,19 +71,61 @@ pub enum Msg {
     AskAdd,
     AskRemove(usize),
     AskToggle(usize),
-    AskImport,
+    Search(String),
+    FilterInstance(InstanceChoice),
+    Sort(Sort),
     Confirm,
     Cancel,
     Done(Result<String, String>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceChoice {
+    pub id: Option<String>,
+    pub label: String,
+}
+
+impl std::fmt::Display for InstanceChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sort {
+    #[default]
+    Instance,
+    Model,
+    Enabled,
+}
+
+impl std::fmt::Display for Sort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&match self {
+            Self::Instance => fl!(loader(), "pool-sort-instance"),
+            Self::Model => fl!(loader(), "pool-sort-model"),
+            Self::Enabled => fl!(loader(), "pool-sort-enabled"),
+        })
+    }
+}
+
 pub fn load(ctx: &Ctx) -> Msg {
     Msg::Loaded(match Registry::load(&ctx.paths) {
-        Ok(reg) => Loaded {
-            entries: reg.pool.clone(),
-            instances: reg.instances.iter().map(|i| i.id.clone()).collect(),
-            error: None,
-        },
+        Ok(reg) => {
+            let catalog = pool::catalog_pool(&reg, ctx.t3_root.as_deref());
+            let error = catalog.as_ref().err().map(|e| format!("{e:#}"));
+            Loaded {
+                entries: catalog.unwrap_or_else(|_| reg.pool.clone()),
+                instances: reg.instances.iter().map(|i| i.id.clone()).collect(),
+                names: reg
+                    .instances
+                    .iter()
+                    .map(|i| (i.id.clone(), i.display_name.clone()))
+                    .collect(),
+                saved: reg.pool,
+                error,
+            }
+        }
         Err(e) => Loaded {
             error: Some(format!("{e:#}")),
             ..Loaded::default()
@@ -88,24 +133,68 @@ pub fn load(ctx: &Ctx) -> Msg {
     })
 }
 
-/// Model slugs T3 cached for `instance` (empty when there is no cache).
-fn cached_models(t3_root: Option<&Path>, instance: &str) -> Vec<String> {
-    let Some(root) = t3_root else {
-        return Vec::new();
-    };
-    std::fs::read(root.join("caches").join(format!("{instance}.json")))
-        .ok()
-        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
-        .and_then(|v| {
-            Some(
-                v.get("models")?
-                    .as_array()?
+/// Keep original indices so filtering and sorting cannot target another entry.
+pub fn visible_entries(state: &State) -> Vec<(usize, &PoolEntry)> {
+    let query = state.search.to_lowercase();
+    let terms: Vec<_> = query.split_whitespace().collect();
+    let mut entries: Vec<_> = state
+        .data
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            if state
+                .filter_instance
+                .as_ref()
+                .is_some_and(|i| i != &e.instance)
+            {
+                return false;
+            }
+            let name = state
+                .data
+                .names
+                .get(&e.instance)
+                .map(String::as_str)
+                .unwrap_or("");
+            let text = format!(
+                "{} {} {} {}",
+                e.instance,
+                name,
+                e.model,
+                e.options
                     .iter()
-                    .filter_map(|m| m.get("slug")?.as_str().map(str::to_string))
-                    .collect(),
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
             )
+            .to_lowercase();
+            terms.iter().all(|term| text.contains(term))
         })
-        .unwrap_or_default()
+        .collect();
+    entries.sort_by(|(_, a), (_, b)| {
+        let name = |e: &PoolEntry| {
+            state
+                .data
+                .names
+                .get(&e.instance)
+                .unwrap_or(&e.instance)
+                .to_lowercase()
+        };
+        let order = match state.sort {
+            Sort::Instance => name(a)
+                .cmp(&name(b))
+                .then(a.instance.cmp(&b.instance))
+                .then(a.model.cmp(&b.model)),
+            Sort::Model => a.model.cmp(&b.model).then(name(a).cmp(&name(b))),
+            Sort::Enabled => b
+                .enabled
+                .cmp(&a.enabled)
+                .then(name(a).cmp(&name(b)))
+                .then(a.model.cmp(&b.model)),
+        };
+        order.then(a.options.cmp(&b.options))
+    });
+    entries
 }
 
 fn form_entry(state: &State) -> anyhow::Result<PoolEntry> {
@@ -150,29 +239,7 @@ fn preview(ctx: &Ctx, op: &Op) -> anyhow::Result<Vec<String>> {
             &e.options,
             true,
         )?)),
-        Op::Toggle(e) => Ok(lines_of(&pool::set_pool_enabled(
-            &ctx.paths,
-            &e.instance,
-            &e.model,
-            &e.options,
-            !e.enabled,
-            true,
-        )?)),
-        Op::Import => {
-            let root = ctx
-                .t3_root
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("T3 directory unknown"))?;
-            let (changes, added, skipped) = pool::import_favorites(&ctx.paths, root, true)?;
-            let mut lines = vec![fl!(
-                loader(),
-                "pool-import-count",
-                count = i64::try_from(added).unwrap_or(0)
-            )];
-            lines.extend(lines_of(&changes));
-            lines.extend(skipped);
-            Ok(lines)
-        }
+        Op::Toggle(e) => toggle(ctx, e, true).map(|changes| lines_of(&changes)),
     }
 }
 
@@ -182,23 +249,44 @@ pub fn apply(ctx: &Ctx, op: &Op) -> anyhow::Result<String> {
         Op::Remove(e) => {
             pool::remove_pool_entry(&ctx.paths, &e.instance, &e.model, &e.options, false)?
         }
-        Op::Toggle(e) => pool::set_pool_enabled(
-            &ctx.paths,
-            &e.instance,
-            &e.model,
-            &e.options,
-            !e.enabled,
-            false,
-        )?,
-        Op::Import => {
-            let root = ctx
-                .t3_root
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("T3 directory unknown"))?;
-            pool::import_favorites(&ctx.paths, root, false)?.0
-        }
+        Op::Toggle(e) => toggle(ctx, e, false)?,
     };
     Ok(lines_of(&changes).join("\n"))
+}
+
+fn toggle(
+    ctx: &Ctx,
+    entry: &PoolEntry,
+    dry_run: bool,
+) -> anyhow::Result<Vec<agentdeck_core::Change>> {
+    let reg = Registry::load(&ctx.paths)?;
+    if reg.pool.iter().any(|e| e.key_eq(entry)) {
+        pool::set_pool_enabled(
+            &ctx.paths,
+            &entry.instance,
+            &entry.model,
+            &entry.options,
+            !entry.enabled,
+            dry_run,
+        )
+    } else {
+        let mut selected = entry.clone();
+        selected.enabled = !entry.enabled;
+        pool::add_pool_entry(&ctx.paths, selected, dry_run).map(|(changes, _)| changes)
+    }
+}
+
+fn run(state: &mut State, ctx: Ctx, op: Op) -> Task<Msg> {
+    state.busy = true;
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || apply(&ctx, &op).map_err(|e| format!("{e:#}")))
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r)
+        },
+        Msg::Done,
+    )
 }
 
 pub fn update(state: &mut State, ctx: Ctx, msg: Msg) -> Task<Msg> {
@@ -208,7 +296,7 @@ pub fn update(state: &mut State, ctx: Ctx, msg: Msg) -> Task<Msg> {
             Task::none()
         }
         Msg::Instance(id) => {
-            state.models = cached_models(ctx.t3_root.as_deref(), &id);
+            state.models = pool::cached_models(ctx.t3_root.as_deref(), &id).unwrap_or_default();
             state.instance = Some(id);
             state.model.clear();
             Task::none()
@@ -244,33 +332,28 @@ pub fn update(state: &mut State, ctx: Ctx, msg: Msg) -> Task<Msg> {
             Task::none()
         }
         Msg::AskToggle(i) => {
-            let op = state.data.entries.get(i).cloned().map(Op::Toggle);
-            ask(
-                state,
-                &ctx,
-                op.ok_or_else(|| anyhow::anyhow!("entry vanished")),
-            );
+            if state.busy {
+                return Task::none();
+            }
+            match state.data.entries.get(i).cloned() {
+                Some(e) => run(state, ctx, Op::Toggle(e)),
+                None => Task::none(),
+            }
+        }
+        Msg::Search(value) => {
+            state.search = value;
             Task::none()
         }
-        Msg::AskImport => {
-            ask(state, &ctx, Ok(Op::Import));
+        Msg::FilterInstance(value) => {
+            state.filter_instance = value.id;
+            Task::none()
+        }
+        Msg::Sort(sort) => {
+            state.sort = sort;
             Task::none()
         }
         Msg::Confirm => match state.pending.take().and_then(|p| p.op) {
-            Some(op) => {
-                state.busy = true;
-                Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            apply(&ctx, &op).map_err(|e| format!("{e:#}"))
-                        })
-                        .await
-                        .map_err(|e| e.to_string())
-                        .and_then(|r| r)
-                    },
-                    Msg::Done,
-                )
-            }
+            Some(op) => run(state, ctx, op),
             None => Task::none(),
         },
         Msg::Cancel => {
@@ -280,7 +363,7 @@ pub fn update(state: &mut State, ctx: Ctx, msg: Msg) -> Task<Msg> {
         Msg::Done(result) => {
             state.busy = false;
             state.result = Some(match result {
-                Ok(text) => (text, false),
+                Ok(_) => (String::new(), false),
                 Err(e) => (e, true),
             });
             Task::done(load(&ctx))
@@ -385,16 +468,10 @@ pub fn modal(state: &State) -> Option<crate::overlay::Modal<'_, Msg>> {
     })
 }
 
-/// Header actions: Import favorites and Add, both opening modals.
+/// Add a custom model or an option variant.
 pub fn header_actions(state: &State) -> Element<'_, Msg> {
     let idle = !state.busy;
     row![
-        st::btn_icon(
-            st::Btn::Quiet,
-            st::Icon::Download,
-            fl!(loader(), "pool-import")
-        )
-        .on_press_maybe(idle.then_some(Msg::AskImport)),
         st::btn_icon(st::Btn::Primary, st::Icon::Plus, fl!(loader(), "pool-add"))
             .on_press_maybe(idle.then_some(Msg::OpenAdd)),
     ]
@@ -407,7 +484,54 @@ const REMOVE_W: f32 = 28.0;
 
 pub fn view(state: &State) -> Element<'_, Msg> {
     let look = st::look();
-    let mut col = column![].spacing(look.gap.max(st::SPACE_S));
+    let mut instances: Vec<_> = state
+        .data
+        .instances
+        .iter()
+        .map(|id| {
+            let name = state.data.names.get(id).unwrap_or(id);
+            InstanceChoice {
+                id: Some(id.clone()),
+                label: if name == id {
+                    id.clone()
+                } else {
+                    format!("{name} ({id})")
+                },
+            }
+        })
+        .collect();
+    instances.sort_by_key(|i| i.label.to_lowercase());
+    instances.insert(
+        0,
+        InstanceChoice {
+            id: None,
+            label: fl!(loader(), "pool-all-instances"),
+        },
+    );
+    let selected = instances
+        .iter()
+        .find(|i| i.id == state.filter_instance)
+        .cloned();
+    let controls = row![
+        text_input(&fl!(loader(), "pool-search"), &state.search)
+            .on_input(Msg::Search)
+            .size(look.body)
+            .width(Length::Fill),
+        pick_list(instances, selected, Msg::FilterInstance)
+            .placeholder(fl!(loader(), "pool-all-instances"))
+            .text_size(look.body)
+            .width(190),
+        pick_list(
+            vec![Sort::Instance, Sort::Model, Sort::Enabled],
+            Some(state.sort),
+            Msg::Sort
+        )
+        .text_size(look.body)
+        .width(170),
+    ]
+    .spacing(st::SPACE_S)
+    .align_y(Alignment::Center);
+    let mut col = column![controls].spacing(look.gap.max(st::SPACE_S));
     if let Some(error) = &state.data.error {
         col = col.push(st::card(st::muted(fl!(
             loader(),
@@ -433,7 +557,11 @@ pub fn view(state: &State) -> Element<'_, Msg> {
     ]
     .spacing(st::SPACE_M);
     let mut table = column![header].spacing(look.row_gap);
-    for (i, e) in state.data.entries.iter().enumerate() {
+    let visible = visible_entries(state);
+    if visible.is_empty() {
+        return col.push(st::muted(fl!(loader(), "pool-no-match"))).into();
+    }
+    for (i, e) in visible {
         let options = e
             .options
             .iter()
@@ -442,8 +570,17 @@ pub fn view(state: &State) -> Element<'_, Msg> {
             .join(" ");
         table = table.push(st::hairline()).push(
             row![
-                st::fit(e.instance.as_str(), st::Role::Body, st::Cut::Middle)
-                    .width(Length::FillPortion(2)),
+                st::fit(
+                    state
+                        .data
+                        .names
+                        .get(&e.instance)
+                        .unwrap_or(&e.instance)
+                        .as_str(),
+                    st::Role::Body,
+                    st::Cut::Middle
+                )
+                .width(Length::FillPortion(2)),
                 st::fit(e.model.as_str(), st::Role::Mono, st::Cut::Middle)
                     .width(Length::FillPortion(3)),
                 st::fit(options, st::Role::MonoMuted, st::Cut::End).width(Length::FillPortion(2)),
@@ -453,8 +590,14 @@ pub fn view(state: &State) -> Element<'_, Msg> {
                         .on_toggle_maybe((!state.busy).then_some(move |_| Msg::AskToggle(i))),
                 )
                 .width(TOGGLE_W),
-                st::icon_btn(st::Icon::Trash)
-                    .on_press_maybe((!state.busy).then_some(Msg::AskRemove(i))),
+                if state.data.saved.iter().any(|saved| saved.key_eq(e)) {
+                    Element::from(
+                        st::icon_btn(st::Icon::Trash)
+                            .on_press_maybe((!state.busy).then_some(Msg::AskRemove(i))),
+                    )
+                } else {
+                    Element::from(Space::new().width(REMOVE_W))
+                },
             ]
             .spacing(st::SPACE_M)
             .align_y(Alignment::Center),

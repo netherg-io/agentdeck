@@ -5,6 +5,7 @@ pub mod changes;
 pub mod claude;
 pub mod codex;
 pub mod harness;
+pub mod launch;
 pub mod login;
 pub mod opencode;
 pub mod paths;

@@ -70,10 +70,7 @@ pub fn update(state: &mut State, msg: Msg) -> Task<Msg> {
             };
             state.pending = Some(Pending {
                 name,
-                lines: vec![
-                    format!("+ {}", argv.join(" ")),
-                    fl!(loader(), "harness-note"),
-                ],
+                lines: vec![format!("+ {}", argv.join(" "))],
                 argv,
             });
             Task::none()

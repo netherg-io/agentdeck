@@ -131,9 +131,7 @@ pool-model = Model
 pool-no-models = No cached models for this instance: type a model id.
 pool-options = Options (k=v, comma separated)
 pool-preview-add = Preview add
-pool-import = Import T3 favorites
 pool-preview-title = Preview pool change
-pool-import-count = { $count } favorites to import.
 pool-warning = Warning: { $what }
 
 shared-title = Shared
@@ -152,13 +150,10 @@ harness-not-installed = not installed
 harness-update = Update
 harness-install = Install
 harness-run-title = Run this command?
-harness-note = The command runs as shown; nothing else is touched.
 harness-result = { $name }: { $what }
 
 nav-group-accounts = Accounts
 nav-group-system = System
-instances-purpose = Harness logins, their T3 status and quota windows.
-processes-purpose = Agent-owned process groups you can stop. T3 sessions are not listed.
 processes-filter = Filter by name or command
 processes-no-match = No process group matches the filter.
 processes-count = { $count ->
@@ -167,26 +162,19 @@ processes-count = { $count ->
 }
 remove-done = Removed { $id }.
 
-drift-purpose = Instances whose settings, MCP servers or T3 entries differ from the primary.
 drift-loading = Checking for drift…
 drift-all-clear = All clear: every instance matches.
-pool-purpose = Models the router can pick, per instance.
 pool-add = Add
 pool-col-options = Options
 pool-col-on = On
-plugins-purpose = Built-in integrations; turning one on or off shows its changes first.
 plugins-details = Technical status
 plugins-no-details = No details.
-shared-purpose = Skills, instruction files and MCP servers shared across harnesses.
-shared-summary = { $skills } skill dirs · { $instr } instruction files · { $mcp } MCP servers
 shared-ok-count = { $count } ok
 shared-todo-count = { $count } to sync
 shared-skills-none = No skill directories found.
 shared-instr-none = No instruction files found.
 shared-mcp-servers = Canonical servers
 shared-mcp-targets = Targets
-harness-purpose = Installed agent CLIs, their versions and how they update.
-add-purpose = Register a new login, preview the changes, then sign in.
 add-step-details = Details
 add-step-preview = Preview
 add-step-login = Login
@@ -195,4 +183,19 @@ add-next = Next
 add-edit = Back
 add-done = Done
 add-added = Added { $id }.
-add-finish-note = Optional extras; skip them if you do not need them.
+
+pool-search = Search models or instances
+pool-all-instances = All instances
+pool-sort-instance = By instance
+pool-sort-model = By model
+pool-sort-enabled = Enabled first
+pool-no-match = No models match.
+instances-rename = Rename
+rename-save = Save
+
+instances-cli = CLI
+cli-open-error = Could not open CLI: { $what }
+
+parallel-label = Parallel tasks
+parallel-unlimited = Unlimited
+parallel-invalid = Enter a whole number from 1 to 4294967295, or leave blank for unlimited.

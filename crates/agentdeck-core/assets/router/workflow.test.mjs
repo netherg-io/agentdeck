@@ -19,11 +19,11 @@ const diamond = { title: 'Diamond', concurrency: 2, steps: [
 assert.throws(() => validatePlan({ ...diamond, steps: [{ id: 'a', task: 'x', needs: ['b'] }, { id: 'b', task: 'y', needs: ['a'] }] }), /cycle/);
 assert.throws(() => validatePlan({ ...diamond, steps: [{ id: 'a', task: 'x' }, { id: 'a', task: 'y' }] }), /duplicate/);
 assert.throws(() => validatePlan({ ...diamond, steps: [{ id: 'a', task: 'x', needs: ['zz'] }] }), /unknown need/);
-assert.throws(() => validatePlan({ ...diamond, concurrency: 0 }), /concurrency/);
+assert.equal(validatePlan({ ...diamond, concurrency: 0 }).concurrency, undefined);
 assert.throws(() => validatePlan({ ...diamond, steps: [{ id: '__proto__', task: 'x' }] }), /slug/);
 assert.throws(() => validatePlan({ ...diamond, steps: [{ id: 'a', task: 'x', role: 'boss' }] }), /role/);
 assert.throws(() => validatePlan({ ...diamond, script: 'rm -rf' }), /unknown key/);
-assert.equal(validatePlan({ title: 't', steps: [{ id: 'a', task: 'x' }] }).concurrency, 2);
+assert.equal(validatePlan({ title: 't', steps: [{ id: 'a', task: 'x' }] }).concurrency, undefined);
 assert.throws(() => validatePlan({ title: 'x'.repeat(510), steps: [{ id: 'a', task: 'x' }] }), /title limit/);
 assert.equal(validatePlan({ title: 'x'.repeat(509), steps: [{ id: 'a', task: 'x' }] }).title.length, 509);
 assert.throws(() => validatePlan({ title: 'x'.repeat(509), steps: [{ id: 'ab', task: 'x' }] }), /title limit/);
@@ -43,7 +43,7 @@ assert.equal(untouchedRouter.calls.length, 0);
 assert.equal(large.progress[2].state, 'pending');
 assert.deepEqual(next(large).ready, ['join']);
 
-// Diamond DAG: dependency results flow in full, capacity limits parallel launches.
+// Diamond DAG: dependencies determine readiness.
 const s = newState(diamond, 'thread-1');
 assert.deepEqual(next(s).ready, ['a']);
 const router = routeTo();
@@ -102,11 +102,11 @@ record(s, 'd', done('t-d', 'D'));
 assert.equal(next(s).complete, true);
 assert.throws(() => release(s, 'a', true), /unaccepted prepared/);
 
-// Capacity: three independent steps, concurrency 2.
-const wide = newState({ title: 'w', steps: ['x', 'y', 'z'].map(id => ({ id, task: id })) }, 'th');
-assert.deepEqual(next(wide).ready, ['x', 'y']);
+// Readiness has no coordinator-wide cap, including old saved plans.
+const wide = newState({ title: 'w', concurrency: 1, steps: ['x', 'y', 'z'].map(id => ({ id, task: id })) }, 'th');
+assert.deepEqual(next(wide).ready, ['x', 'y', 'z']);
 prepare(wide, 'x', 'src', router); prepare(wide, 'y', 'src', router);
-assert.throws(() => prepare(wide, 'z', 'src', router), /concurrency/);
+prepare(wide, 'z', 'src', router);
 
 // The composite hint is appended once and must fit without reserving capacity on failure.
 const hinted = newState({ title: 'h', steps: [{ id: 'u', task: 'build ui' }] }, 'th');

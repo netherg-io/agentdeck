@@ -139,6 +139,7 @@ pub struct RouterConfig {
     pub file: String,
     pub version: Value,
     pub pool: Vec<Value>,
+    pub instance_limits: HashMap<String, u32>,
     pub usage_state_path: Option<String>,
     pub account: HashMap<String, String>,
     pub usage_id: HashMap<String, String>,
@@ -147,23 +148,39 @@ pub struct RouterConfig {
 }
 
 pub fn router_config() -> anyhow::Result<RouterConfig> {
-    let file = match std::env::var("MODEL_ROUTE_ROUTER_JSON") {
-        Ok(file) => file,
-        Err(_) => agentdeck_core::router::router_json_path(&agentdeck_core::Paths::from_env()?)
-            .display()
-            .to_string(),
-    };
-    load_router_json(&file)
+    if let Ok(file) = std::env::var("MODEL_ROUTE_ROUTER_JSON") {
+        return load_router_json(&file);
+    }
+    registry_config(&agentdeck_core::Paths::from_env()?)
+}
+
+fn registry_config(paths: &agentdeck_core::Paths) -> anyhow::Result<RouterConfig> {
+    let reg = agentdeck_core::Registry::load(paths)?;
+    parse_router_config(
+        agentdeck_core::router::router_json_value(&reg)?,
+        "instances.toml",
+    )
 }
 
 pub fn load_router_json(file: &str) -> anyhow::Result<RouterConfig> {
-    let fail = |why: String| {
+    let fail = |why| {
         anyhow::anyhow!(
             "model-route: router JSON unusable at {file}: {why}; regenerate it with `agentdeck router json`"
         )
     };
     let text = std::fs::read_to_string(file).map_err(|e| fail(e.to_string()))?;
-    let data: Value = serde_json::from_str(&text).map_err(|e| fail(e.to_string()))?;
+    parse_router_config(
+        serde_json::from_str(&text).map_err(|e| fail(e.to_string()))?,
+        file,
+    )
+}
+
+fn parse_router_config(data: Value, source: &str) -> anyhow::Result<RouterConfig> {
+    let fail = |why: String| {
+        anyhow::anyhow!(
+            "model-route: router JSON unusable at {source}: {why}; regenerate it with `agentdeck router json`"
+        )
+    };
     let pool = data
         .get("pool")
         .and_then(Value::as_array)
@@ -187,6 +204,19 @@ pub fn load_router_json(file: &str) -> anyhow::Result<RouterConfig> {
     }
     if data.get("usageStatePath").is_some_and(|v| !v.is_string()) {
         return Err(fail("bad usageStatePath".into()));
+    }
+    let mut instance_limits = HashMap::new();
+    if let Some(limits) = data.get("instanceLimits") {
+        for (id, limit) in limits
+            .as_object()
+            .ok_or_else(|| fail("bad instanceLimits".into()))?
+        {
+            let n = limit
+                .as_u64()
+                .filter(|n| *n > 0 && *n <= u32::MAX as u64)
+                .ok_or_else(|| fail(format!("bad instanceLimits for {id}")))?;
+            instance_limits.insert(id.clone(), n as u32);
+        }
     }
     let mut account = HashMap::new();
     let mut usage_id = HashMap::new();
@@ -261,9 +291,10 @@ pub fn load_router_json(file: &str) -> anyhow::Result<RouterConfig> {
         meta.push((name.clone(), am));
     }
     Ok(RouterConfig {
-        file: file.to_string(),
+        file: source.to_string(),
         version: data.get("version").cloned().unwrap_or(Value::from(1)),
         pool,
+        instance_limits,
         usage_state_path: data
             .get("usageStatePath")
             .and_then(|v| v.as_str())
@@ -753,6 +784,77 @@ pub fn validate_target(ranking: &[Ranked], provider: &str, model: &str) -> Valid
 mod generated_config_tests {
     use super::*;
 
+    #[test]
+    fn routing_reads_live_pool_even_when_snapshot_is_stale() {
+        let dir = std::env::temp_dir().join(format!("router-live-{}", std::process::id()));
+        let paths = agentdeck_core::Paths::new(dir.join("config"), dir.join("state"));
+        agentdeck_core::Registry::update(&paths, |reg| {
+            reg.add(agentdeck_core::AddSpec {
+                id: "a".into(),
+                harness: agentdeck_core::Harness::Codex,
+                display_name: None,
+                home: "/fake/a".into(),
+                binary: None,
+                no_t3: true,
+            })?;
+            reg.add_pool(agentdeck_core::PoolEntry {
+                instance: "a".into(),
+                model: "m".into(),
+                options: Default::default(),
+                enabled: true,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+        let reg = agentdeck_core::Registry::load(&paths).unwrap();
+        agentdeck_core::apply_changes(
+            &agentdeck_core::router::plan_router_files(&paths, &reg).unwrap(),
+        )
+        .unwrap();
+        let first = registry_config(&paths).unwrap();
+        agentdeck_core::pool::set_pool_enabled(&paths, "a", "m", &Default::default(), false, false)
+            .unwrap();
+        agentdeck_core::registry::set_max_parallel(&paths, "a", Some(3), false).unwrap();
+        let latest = registry_config(&paths).unwrap();
+        assert!(first.instance_limits.is_empty());
+        assert_eq!(latest.instance_limits["a"], 3);
+        assert_eq!(first.pool[0]["enabled"], true);
+        assert_eq!(latest.pool[0]["enabled"], false);
+        assert_ne!(latest.version, first.version);
+        let stale = load_router_json(
+            agentdeck_core::router::router_json_path(&paths)
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stale.pool[0]["enabled"], true);
+        assert!(stale.instance_limits.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_instance_limits_fail_closed() {
+        for limit in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(4294967296u64),
+            Value::Null,
+            serde_json::json!("2"),
+        ] {
+            let cfg =
+                serde_json::json!({"pool": [], "accounts": {}, "instanceLimits": {"codex": limit}});
+            assert!(parse_router_config(cfg, "test").is_err());
+        }
+        assert!(
+            parse_router_config(
+                serde_json::json!({"pool": [], "accounts": {}, "instanceLimits": []}),
+                "test"
+            )
+            .is_err()
+        );
+    }
+
     /// The real shape: a shared opencode instance with a prefix account.
     #[test]
     fn loader_accepts_what_the_generator_writes() {
@@ -764,6 +866,7 @@ id = "opencode"
 harness = "opencode"
 display_name = "opencode"
 home = "~/.local/share/opencode"
+max_parallel = 4
 [[pool]]
 instance = "opencode"
 model = "opencode-go/m"
@@ -787,6 +890,7 @@ display = "Go"
         std::fs::write(&file, value.to_string()).unwrap();
         let config = load_router_json(file.to_str().unwrap()).unwrap();
         assert_eq!(config.meta.len(), 2);
+        assert_eq!(config.instance_limits["opencode"], 4);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

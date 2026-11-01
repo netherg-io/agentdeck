@@ -1425,6 +1425,18 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     usage = parse_usage_state(&usage_path)
         .map_err(|e| anyhow::anyhow!("cannot read usage state {}: {e}", usage_path.display()))?;
     load = read_active_agents(&env.home.join(".t3/userdata/statev2.sqlite"));
+    let current_cfg = load_router_config(&env)?;
+    let mut pending = std::collections::HashMap::new();
+    let mut capacity_error = None;
+    if !current_cfg.instance_limits.is_empty() {
+        match crate::admission::snapshot(&env.home, &env.state_home) {
+            Ok((fresh, reservations)) => {
+                load = fresh;
+                pending = reservations;
+            }
+            Err(e) => capacity_error = Some(format!("cannot check instance limit: {e}")),
+        }
+    }
     let catalog = read_catalog(&env.state_home).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let size = (answers
@@ -1456,11 +1468,24 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                 ),
             };
         let fam = family_of(model);
-        let policy_ban = if fam.as_ref().is_some_and(|f| f.no_review) && is_review_task(&task) {
+        let mut policy_ban = if fam.as_ref().is_some_and(|f| f.no_review) && is_review_task(&task) {
             Some(NO_REVIEW_BAN.to_string())
         } else {
             None
         };
+        if let Some(limit) = current_cfg.instance_limits.get(provider) {
+            policy_ban = capacity_error
+                .clone()
+                .or_else(|| {
+                    crate::admission::reason(
+                        &load,
+                        pending.get(provider).copied().unwrap_or_default(),
+                        provider,
+                        *limit,
+                    )
+                })
+                .or(policy_ban);
+        }
         let probs = a.get("probabilities");
         let fit = if profile.is_some() {
             probs
@@ -1510,7 +1535,14 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     let best = ranking.iter().find(|r| r.eligible);
     let blocked: Vec<String> = ranking
         .iter()
-        .filter(|r| !r.candidate.allowed && r.candidate.fit >= MIN_FIT)
+        .filter(|r| {
+            (!r.candidate.allowed
+                || (current_cfg
+                    .instance_limits
+                    .contains_key(&r.candidate.provider)
+                    && r.candidate.policy_ban.is_some()))
+                && r.candidate.fit >= MIN_FIT
+        })
         .map(|r| format!("{}/{}", r.candidate.provider, r.candidate.model))
         .collect();
     let selected_conf = best.map(|b| b.candidate.confidence).unwrap_or(0.0);
@@ -1542,9 +1574,9 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         }
         if c.no_review {
             m.insert("noReview".into(), Value::from(true));
-            if let Some(b) = &c.policy_ban {
-                m.insert("policyBan".into(), Value::from(b.clone()));
-            }
+        }
+        if let Some(b) = &c.policy_ban {
+            m.insert("policyBan".into(), Value::from(b.clone()));
         }
         m.insert("fit".into(), num(c.fit));
         m.insert("quality".into(), num(c.quality));
@@ -1558,6 +1590,22 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         );
         m.insert("quota".into(), Value::from(c.quota_note.clone()));
         m.insert("activeAgents".into(), Value::from(c.active_agents as u64));
+        if let Some(limit) = current_cfg.instance_limits.get(&c.provider) {
+            m.insert("maxParallel".into(), Value::from(*limit));
+            m.insert(
+                "instanceActiveAgents".into(),
+                Value::from(
+                    load.agents
+                        .iter()
+                        .filter(|a| a.provider == c.provider)
+                        .count() as u64,
+                ),
+            );
+            m.insert(
+                "pendingLaunches".into(),
+                Value::from(pending.get(&c.provider).copied().unwrap_or_default() as u64),
+            );
+        }
         m.insert(
             "account".into(),
             r.account.clone().map(Value::from).unwrap_or(Value::Null),
@@ -1609,7 +1657,9 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     }
     out.insert(
         "reason".into(),
-        Value::from(if best.is_none() {
+        Value::from(if best.is_none() && !current_cfg.instance_limits.is_empty() {
+            "no adequate model with enough quota and an available instance slot"
+        } else if best.is_none() {
             "no adequate model with enough quota"
         } else {
             "highest estimated quality with enough quota, after shared-quota and paid-credit penalties and cheap-model bonus"

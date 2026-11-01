@@ -81,7 +81,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: cmd_migrate::MigrateCmd,
     },
-    /// Per-instance terminal wrappers (claude@second) and .desktop launchers.
+    /// Per-instance terminal wrappers (claude@second).
     Wrapper {
         #[command(subcommand)]
         cmd: cmd_wrapper::WrapperCmd,
@@ -170,7 +170,20 @@ enum InstanceCmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Change instance flags (ids are immutable; there is no rename).
+    /// Run the instance CLI in the current terminal.
+    Run {
+        id: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
+    /// Change the display name without changing the instance id.
+    Rename {
+        id: String,
+        name: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Change instance flags.
     Set {
         id: String,
         #[arg(long, action = clap::ArgAction::Set)]
@@ -234,6 +247,12 @@ fn main() -> anyhow::Result<()> {
         return run_gui();
     };
     let paths = Paths::from_env()?;
+    if let Cmd::Instance {
+        cmd: InstanceCmd::Run { id, args },
+    } = &cmd
+    {
+        return agentdeck_core::launch::run_cli(&paths, id, args);
+    }
     // Providers write cooldowns/snapshots via util::persistent_state_dir();
     // point it at the new tree before anything runs. Unset, everything keeps
     // the old ai-usage paths (old binary, compat copies, migrator sources).
@@ -379,6 +398,20 @@ async fn async_main(paths: &Paths, cmd: Cmd) -> anyhow::Result<()> {
                     println!("dry-run: registry unchanged");
                 } else {
                     println!("removed {id} (home dir kept: {home})");
+                }
+            }
+            InstanceCmd::Run { .. } => unreachable!("CLI runs before the async runtime"),
+            InstanceCmd::Rename { id, name, dry_run } => {
+                let root = agentdeck_core::t3::t3_root().ok();
+                let changes = agentdeck_core::t3::rename_instance(
+                    paths,
+                    root.as_deref(),
+                    &id,
+                    &name,
+                    dry_run,
+                )?;
+                for c in changes {
+                    println!("{}", c.describe());
                 }
             }
             InstanceCmd::Set {

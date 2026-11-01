@@ -93,7 +93,6 @@ pub struct Step {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plan {
     pub title: String,
-    pub concurrency: u32,
     pub steps: Vec<Step>,
 }
 
@@ -158,12 +157,7 @@ pub fn validate_plan(plan: &Value) -> Result<Plan, WfError> {
         .and_then(Value::as_str)
         .filter(|t| !t.trim().is_empty())
         .ok_or_else(|| WfError::usage("plan.title must be a non-empty string"))?;
-    let concurrency = o.get("concurrency").map_or(Ok(2), |c| {
-        c.as_u64()
-            .filter(|_| c.is_u64() && c.as_f64().unwrap().fract() == 0.0)
-            .and_then(|n| (1..=20).contains(&n).then_some(n as u32))
-            .ok_or_else(|| WfError::usage("plan.concurrency must be an integer 1..20"))
-    })?;
+    // Accept old plans, but admission limits belong to router instances.
     let steps = o
         .get("steps")
         .and_then(Value::as_array)
@@ -264,7 +258,6 @@ pub fn validate_plan(plan: &Value) -> Result<Plan, WfError> {
     }
     Ok(Plan {
         title: title.to_string(),
-        concurrency,
         steps: out,
     })
 }
@@ -351,14 +344,6 @@ fn prog_of_mut<'a>(state: &'a mut State, id: &str) -> &'a mut Progress {
     state.progress.iter_mut().find(|p| p.id == id).unwrap()
 }
 
-fn busy(state: &State) -> usize {
-    state
-        .progress
-        .iter()
-        .filter(|p| p.state == "prepared" || p.state == "running")
-        .count()
-}
-
 fn is_blocked(state: &State, id: &str, blocked: &mut Vec<String>) -> bool {
     if blocked.contains(&id.to_string()) {
         return true;
@@ -401,7 +386,6 @@ fn deps_done(state: &State, id: &str) -> bool {
 
 pub fn next(state: &State) -> Value {
     let blocked = blocked_ids(state);
-    let free = state.plan.concurrency as usize - busy(state).min(state.plan.concurrency as usize);
     let ready: Vec<Value> = if state.stopped {
         vec![]
     } else {
@@ -409,7 +393,6 @@ pub fn next(state: &State) -> Value {
             .progress
             .iter()
             .filter(|p| p.state == "pending" && !blocked.contains(&p.id) && deps_done(state, &p.id))
-            .take(free)
             .map(|p| Value::from(p.id.clone()))
             .collect()
     };
@@ -582,9 +565,6 @@ pub fn prepare(
         return Err(WfError::usage(format!(
             "step {id} has unfinished or unsuccessful dependencies"
         )));
-    }
-    if busy(state) >= state.plan.concurrency as usize {
-        return Err(WfError::usage("no free concurrency slot"));
     }
     let mut task = build_task(state, id)?;
     if js_len(&task) > MAX_TASK {
