@@ -154,7 +154,6 @@ harness-not-installed = не установлен
 harness-update = Обновить
 harness-install = Установить
 harness-run-title = Выполнить эту команду?
-harness-note = Команда выполняется как показано, больше ничего не затрагивается.
 harness-result = { $name }: { $what }
 
 nav-group-accounts = Аккаунты

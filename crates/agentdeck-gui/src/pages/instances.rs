@@ -2,7 +2,7 @@
 //! threads, aligned quota bars) and standalone usage sources below.
 
 use i18n_embed_fl::fl;
-use iced::widget::{column, row, text_input};
+use iced::widget::{column, row, text_input, tooltip};
 use iced::{Alignment, Element, Length};
 
 use crate::app::{Message, RemoveAsk};
@@ -141,42 +141,23 @@ fn instance_card<'a>(inst: &'a InstanceRow, rename: Option<&'a Rename>) -> Eleme
     let look = st::look();
     let single = inst.quotas.len() == 1;
     let editing = rename.filter(|r| r.id == inst.id);
-    let name: Element<'_, Message> = match editing {
-        Some(edit) => row![
-            text_input(&fl!(loader(), "add-display-name"), &edit.name)
-                .on_input_maybe((!edit.busy).then_some(Message::RenameInput))
-                .on_submit_maybe((!edit.busy).then_some(Message::RenameSave))
-                .size(look.body)
-                .width(Length::Fill),
-            st::btn(st::Btn::Quiet, fl!(loader(), "rename-save")).on_press_maybe(
-                (!edit.busy && !edit.name.trim().is_empty()).then_some(Message::RenameSave)
-            ),
-            st::icon_btn(st::Icon::X).on_press_maybe((!edit.busy).then_some(Message::RenameCancel)),
-        ]
-        .spacing(st::SPACE_XS)
-        .align_y(Alignment::Center)
-        .into(),
-        None => row![
-            st::fit(inst.display_name.as_str(), st::Role::Heading, st::Cut::End)
-                .width(Length::Fill),
-            st::btn(st::Btn::Quiet, fl!(loader(), "instances-rename"))
-                .on_press(Message::RenameAsk(inst.id.clone())),
-        ]
-        .spacing(st::SPACE_XS)
-        .align_y(Alignment::Center)
-        .into(),
-    };
-    let mut head = row![
-        column![
-            name,
-            st::fit(inst.id.as_str(), st::Role::MonoMuted, st::Cut::Middle)
-        ]
-        .spacing(2)
-        .width(Length::Fill),
-        st::pill(inst.harness.as_str(), st::Tone::Accent),
-    ]
-    .spacing(st::SPACE_S)
-    .align_y(Alignment::Center);
+    let mut identity = column![st::fit(
+        inst.display_name.as_str(),
+        st::Role::Heading,
+        st::Cut::End
+    )]
+    .spacing(2)
+    .width(Length::Fill);
+    if inst.display_name != inst.id {
+        identity = identity.push(st::fit(
+            inst.id.as_str(),
+            st::Role::MonoMuted,
+            st::Cut::Middle,
+        ));
+    }
+    let mut head = row![identity, st::pill(inst.harness.as_str(), st::Tone::Accent),]
+        .spacing(st::SPACE_S)
+        .align_y(Alignment::Center);
     if !inst.enabled {
         head = head.push(st::pill(fl!(loader(), "status-disabled"), st::Tone::Warn));
     }
@@ -186,8 +167,32 @@ fn instance_card<'a>(inst: &'a InstanceRow, rename: Option<&'a Rename>) -> Eleme
     if single {
         head = head.push(status_pill(&inst.quotas[0]));
     }
-    let head = head.push(remove_btn(inst));
+    let head = head
+        .push(tooltip(
+            st::icon_btn(st::Icon::Pencil).on_press(Message::RenameAsk(inst.id.clone())),
+            st::body(fl!(loader(), "instances-rename")),
+            tooltip::Position::Bottom,
+        ))
+        .push(remove_btn(inst));
     let mut col = column![head].spacing(look.row_gap + 4.0);
+    if let Some(edit) = editing {
+        col = col.push(
+            row![
+                text_input(&fl!(loader(), "add-display-name"), &edit.name)
+                    .on_input_maybe((!edit.busy).then_some(Message::RenameInput))
+                    .on_submit_maybe((!edit.busy).then_some(Message::RenameSave))
+                    .size(look.body)
+                    .width(Length::Fill),
+                st::btn(st::Btn::Quiet, fl!(loader(), "rename-save")).on_press_maybe(
+                    (!edit.busy && !edit.name.trim().is_empty()).then_some(Message::RenameSave)
+                ),
+                st::icon_btn(st::Icon::X)
+                    .on_press_maybe((!edit.busy).then_some(Message::RenameCancel)),
+            ]
+            .spacing(st::SPACE_XS)
+            .align_y(Alignment::Center),
+        );
+    }
     if let Some(error) = editing.and_then(|edit| edit.error.as_ref()) {
         col = col.push(st::body(error.as_str()));
     }

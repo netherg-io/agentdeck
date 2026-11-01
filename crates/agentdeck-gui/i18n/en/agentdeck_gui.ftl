@@ -150,7 +150,6 @@ harness-not-installed = not installed
 harness-update = Update
 harness-install = Install
 harness-run-title = Run this command?
-harness-note = The command runs as shown; nothing else is touched.
 harness-result = { $name }: { $what }
 
 nav-group-accounts = Accounts

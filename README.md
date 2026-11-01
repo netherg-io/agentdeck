@@ -41,8 +41,8 @@ Then add **agentdeck** in the COSMIC panel settings. The applet reads the same
 ## CLI overview
 
 ```text
-agentdeck instance      registry instances in instances.toml (list/add/remove)
-agentdeck pool          [[pool]] model pool
+agentdeck instance      registry instances in instances.toml (list/add/rename/remove)
+agentdeck pool          model catalog and explicit routing selections
 agentdeck usage         [[usage]] quota sources (once/doctor/hooks plan)
 agentdeck daemon        usage polling daemon (single writer)
 agentdeck login <id>    official login CLI for an instance inside a PTY
@@ -78,7 +78,11 @@ systemctl --user enable --now agentdeck-daemon.service   # owner's call
 The same binary serves the iced GUI (English and Russian): instances with
 quotas, the add wizard with login, the drift view, the plugins page and the
 processes page. The GUI shares the registry with the CLI under `flock` and
-works while the daemon is stopped.
+works while the daemon is stopped. The Pool page lists every cached model per
+registered instance, with search, an instance filter and sorting. New catalog
+entries start disabled; only explicitly enabled entries are routing candidates.
+T3 favorites are not used. Instance names can be edited without changing their
+IDs or T3 thread history. The router reads the current registry directly.
 
 ## Plugins
 

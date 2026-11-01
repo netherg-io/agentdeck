@@ -26,9 +26,9 @@ optional built-in plugins. License: GPLv3 (ai-usage moves in with its git histor
   in global instruction files (symlinked files written once). Phase 1: the Node router is copied into this repo and
   extracted from the binary on enable (to agentdeck's data dir); later it is
   ported to Rust (`agentdeck route`).
-- Model pool lives in agentdeck (instance ID + exact model + options + enabled), not in T3 favorites. T3 favorites stay
-  UI-only and untouched; current favorites are imported once. agentdeck generates one JSON for the router (pool +
-  account/usage maps), replacing hardcoded `ACCOUNT`/`USAGE_ID`.
+- Model pool lives in agentdeck (instance ID + exact model + options + enabled). Its UI shows all cached models;
+  new entries start disabled and T3 favorites have no effect. The Rust router derives its pool and account/usage
+  maps from the current registry; generated JSON remains an explicit compatibility export.
 - ai-usage plugin: quotas derived from registry instances; API-key accounts (OpenRouter, DeepSeek, OpenCode Go) are a
   separate "usage source" type. Only the COSMIC applet stays (separate binary).
 - Optional systemd user service `agentdeck daemon`: quota polling + background sync. Additive changes auto-apply;

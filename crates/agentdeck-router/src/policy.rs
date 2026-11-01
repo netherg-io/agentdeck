@@ -277,7 +277,7 @@ fn parse_router_config(data: Value, source: &str) -> anyhow::Result<RouterConfig
         meta.push((name.clone(), am));
     }
     Ok(RouterConfig {
-        file: file.to_string(),
+        file: source.to_string(),
         version: data.get("version").cloned().unwrap_or(Value::from(1)),
         pool,
         usage_state_path: data

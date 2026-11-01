@@ -253,6 +253,14 @@ fn every_page_fits_at_min_size_with_long_names() {
             })),
         );
         shot(&state, lang, "pool");
+        update(&mut state, Message::Pool(pool::Msg::Search("gpt".into())));
+        shot(&state, lang, "pool_search");
+        update(
+            &mut state,
+            Message::Pool(pool::Msg::Search("missing-model".into())),
+        );
+        shot(&state, lang, "pool_empty_search");
+        update(&mut state, Message::Pool(pool::Msg::Search(String::new())));
         update(&mut state, Message::Pool(pool::Msg::OpenAdd));
         shot(&state, lang, "pool_add");
         update(&mut state, Message::Pool(pool::Msg::CloseAdd));

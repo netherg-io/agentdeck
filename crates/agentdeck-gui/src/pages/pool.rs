@@ -72,11 +72,23 @@ pub enum Msg {
     AskRemove(usize),
     AskToggle(usize),
     Search(String),
-    FilterInstance(String),
+    FilterInstance(InstanceChoice),
     Sort(Sort),
     Confirm,
     Cancel,
     Done(Result<String, String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceChoice {
+    pub id: Option<String>,
+    pub label: String,
+}
+
+impl std::fmt::Display for InstanceChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -333,7 +345,7 @@ pub fn update(state: &mut State, ctx: Ctx, msg: Msg) -> Task<Msg> {
             Task::none()
         }
         Msg::FilterInstance(value) => {
-            state.filter_instance = state.data.instances.contains(&value).then_some(value);
+            state.filter_instance = value.id;
             Task::none()
         }
         Msg::Sort(sort) => {
@@ -472,21 +484,43 @@ const REMOVE_W: f32 = 28.0;
 
 pub fn view(state: &State) -> Element<'_, Msg> {
     let look = st::look();
-    let mut instances = vec![fl!(loader(), "pool-all-instances")];
-    instances.extend(state.data.instances.iter().cloned());
+    let mut instances: Vec<_> = state
+        .data
+        .instances
+        .iter()
+        .map(|id| {
+            let name = state.data.names.get(id).unwrap_or(id);
+            InstanceChoice {
+                id: Some(id.clone()),
+                label: if name == id {
+                    id.clone()
+                } else {
+                    format!("{name} ({id})")
+                },
+            }
+        })
+        .collect();
+    instances.sort_by_key(|i| i.label.to_lowercase());
+    instances.insert(
+        0,
+        InstanceChoice {
+            id: None,
+            label: fl!(loader(), "pool-all-instances"),
+        },
+    );
+    let selected = instances
+        .iter()
+        .find(|i| i.id == state.filter_instance)
+        .cloned();
     let controls = row![
         text_input(&fl!(loader(), "pool-search"), &state.search)
             .on_input(Msg::Search)
             .size(look.body)
             .width(Length::Fill),
-        pick_list(
-            instances,
-            state.filter_instance.clone(),
-            Msg::FilterInstance
-        )
-        .placeholder(fl!(loader(), "pool-all-instances"))
-        .text_size(look.body)
-        .width(190),
+        pick_list(instances, selected, Msg::FilterInstance)
+            .placeholder(fl!(loader(), "pool-all-instances"))
+            .text_size(look.body)
+            .width(190),
         pick_list(
             vec![Sort::Instance, Sort::Model, Sort::Enabled],
             Some(state.sort),

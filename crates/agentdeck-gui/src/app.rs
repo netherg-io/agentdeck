@@ -506,10 +506,10 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
                 None => Task::none(),
             };
-            if let Some((text, error)) = state.pool.result.take() {
-                if error || !text.is_empty() {
-                    state.toast(text, error);
-                }
+            if let Some((text, error)) = state.pool.result.take()
+                && (error || !text.is_empty())
+            {
+                state.toast(text, error);
             }
             task
         }
