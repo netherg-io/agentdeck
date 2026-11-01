@@ -290,7 +290,7 @@ fn add_form(form: &Form, instances: &[String]) -> crate::overlay::Modal<'static,
         };
         body.push(field(
             fl!(loader(), "usage-id"),
-            input("deepseek-main", &form.id, Msg::Id),
+            input(&format!("{}-main", kind.as_str()), &form.id, Msg::Id),
         ));
         body.push(field(
             fl!(loader(), "usage-display"),
@@ -379,7 +379,7 @@ pub fn sources_view<'a>(state: &'a State, data: &'a Data) -> Element<'a, Msg> {
         }
         let mut identity = column![st::fit(u.display.as_str(), st::Role::Heading, st::Cut::End)]
             .spacing(2)
-            .width(Length::Fill);
+            .width(Length::FillPortion(2));
         if u.display != u.id {
             identity = identity.push(st::fit(u.id.as_str(), st::Role::MonoMuted, st::Cut::Middle));
         }
@@ -387,7 +387,10 @@ pub fn sources_view<'a>(state: &'a State, data: &'a Data) -> Element<'a, Msg> {
             .spacing(st::SPACE_M)
             .align_y(Alignment::Center);
         if let Some(inst) = &u.instance {
-            line = line.push(st::nowrap(st::caption(inst.as_str())));
+            line = line.push(
+                container(st::fit(inst.as_str(), st::Role::Muted, st::Cut::Middle))
+                    .width(Length::FillPortion(1)),
+            );
         }
         if let Some(q) = status_of(data, &u.id) {
             let tone = match q.status.as_str() {
