@@ -110,7 +110,7 @@ assert.throws(() => prepare(wide, 'z', 'src', router), /concurrency/);
 
 // The composite hint is appended once and must fit without reserving capacity on failure.
 const hinted = newState({ title: 'h', steps: [{ id: 'u', task: 'build ui' }] }, 'th');
-const hint = 'Delegated-agent rule: never ask questions; end with BLOCKED:.\n\nSkill hint: test.';
+const hint = 'Delegated-agent rule: never ask questions; end with BLOCKED:.\n\nLong commands: test.';
 const hintRouter = (task, source) => ({ target: T, briefHint: hint, reason: 'r' });
 const ph = prepare(hinted, 'u', 'src', hintRouter);
 assert.equal(ph.payload.task, 'build ui\n\n' + hint);
