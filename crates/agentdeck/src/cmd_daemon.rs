@@ -31,11 +31,19 @@ pub async fn run(paths: &Paths, args: DaemonArgs) -> anyhow::Result<()> {
         println!("dry-run: state unchanged");
         return Ok(());
     }
-    // Re-read policy: at start only (restart to apply).
     // Background sync watches beside quota polling; its failure is logged
     // inside the task and never stops the poller.
     let sync_task = tokio::spawn(sync_watch::run(paths.clone()));
+    // Sources are re-read every cycle so GUI/CLI edits apply without a restart;
+    // a broken registry keeps the last good list instead of stopping polling.
+    let mut accounts = accounts;
     let result = daemon::run_daemon(&dpaths, daemon::old_service_active, || {
+        match agentdeck_core::Registry::load(paths)
+            .and_then(|reg| agentdeck_usage::config::accounts_from_registry(&reg.usage))
+        {
+            Ok(fresh) => accounts = fresh,
+            Err(e) => eprintln!("usage sources not reloaded, keeping previous: {e:#}"),
+        }
         Ok((
             accounts.clone(),
             defaults.refresh_seconds,

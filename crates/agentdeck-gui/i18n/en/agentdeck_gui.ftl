@@ -2,7 +2,6 @@ app-title = Agentdeck
 
 nav-instances = Instances
 nav-drift = Drift
-nav-plugins = Plugins
 nav-processes = Processes
 
 loading = Loading…
@@ -48,7 +47,6 @@ drift-preview = Preview
 drift-working = Working…
 drift-group-t3 = T3 provider instances
 drift-not-in-registry = Not in the registry.
-plugins-title = Plugins
 processes-title = Processes
 processes-empty = No agent processes running.
 processes-stop = Stop
@@ -67,7 +65,6 @@ processes-stop-running = still running after the grace period
 processes-stop-result = { $title }: { $what }
 coming-soon = Coming in a later unit.
 
-plugins-empty = No plugins available.
 plugins-confirm = Confirm
 plugins-cancel = Cancel
 plugins-enabled = enabled
@@ -199,3 +196,36 @@ cli-open-error = Could not open CLI: { $what }
 parallel-label = Parallel tasks
 parallel-unlimited = Unlimited
 parallel-invalid = Enter a whole number from 1 to 4294967295, or leave blank for unlimited.
+nav-group-usage = Quotas
+nav-group-router = Router
+nav-group-agents = Agents
+nav-usage-sources = Sources
+nav-usage-widget = Panel
+nav-limits = Limits
+usage-sources-title = Quota sources
+usage-widget-title = Panel widget
+limits-title = Parallel limits
+usage-add = Add source
+usage-add-title = New quota source
+usage-preview-add = Preview add
+usage-preview-title = Quota source changes
+usage-kind = Provider
+usage-kind-missing = Choose a provider.
+usage-id = ID
+usage-display = Display name
+usage-config-dir = Claude config directory
+usage-codex-home = CODEX_HOME directory
+usage-api-key-env = API key variable
+usage-api-key-hint = Put the key itself in ~/.config/agentdeck/usage.env.
+usage-token-file = Token file
+usage-db-file = OpenCode database
+usage-optional = { $what } (optional)
+usage-instance = Instance
+usage-instance-none = Not bound
+usage-empty = No quota sources.
+usage-widget-scope = Hidden providers leave the COSMIC panel only; polling and routing still use them.
+usage-sources-count = { $count ->
+        [one] { $count } source
+       *[other] { $count } sources
+    }
+sync-auto-apply = Auto-apply

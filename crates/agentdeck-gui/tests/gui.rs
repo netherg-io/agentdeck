@@ -290,7 +290,8 @@ fn snapshots_en_ru_and_sidebar_navigation() {
     let mut state = app::State::for_tests(paths, data);
     for (button, page) in [
         ("Drift", agentdeck_gui::Page::Drift),
-        ("Plugins", agentdeck_gui::Page::Plugins),
+        ("Sources", agentdeck_gui::Page::UsageSources),
+        ("Limits", agentdeck_gui::Page::Limits),
         ("Processes", agentdeck_gui::Page::Processes),
         ("Instances", agentdeck_gui::Page::Instances),
     ] {
@@ -633,12 +634,12 @@ fn drift_fix_then_reenable_offer_and_snapshots() {
     agentdeck_gui::i18n::set_language("en");
 }
 
-/// Plugins page: three rows, enable/disable preview + cancel, EN/RU snapshots.
+/// Module switches: a module page with its status card, enable preview + cancel, EN/RU snapshots.
 ///
 /// HOME and XDG_CONFIG_HOME point at a temp dir so the status/probe reads are
 /// deterministic (launcher missing, unit not installed) and read-only.
 #[test]
-fn plugins_page_preview_cancel_and_snapshots() {
+fn module_switch_preview_cancel_and_snapshots() {
     let env = lock_env();
     // Deterministic HOME *before* loading: status reads stay inside the
     // temp dir (launcher missing, unit not installed) and are read-only.
@@ -664,16 +665,17 @@ fn plugins_page_preview_cancel_and_snapshots() {
     std::fs::create_dir_all(SNAPSHOTS).unwrap();
     let home = fakehome;
 
-    // Navigate to the Plugins page and snapshot EN + RU.
+    // A module page ends with its status card; snapshot EN + RU.
     agentdeck_gui::i18n::set_language("en");
     let mut state = app::State::for_tests(paths.clone(), data.clone());
     let mut ui = iced_test::simulator(app::view(&state));
-    ui.click("Plugins").expect("plugins nav button");
+    ui.click("Limits").expect("limits nav button");
     for message in ui.into_messages() {
         let _ = app::update(&mut state, message);
     }
-    assert!(matches!(state.page(), agentdeck_gui::Page::Plugins));
-    for (lang, stem) in [("en", "plugins_en"), ("ru", "plugins_ru")] {
+    assert!(matches!(state.page(), agentdeck_gui::Page::Limits));
+    let _ = app::update(&mut state, app::Message::PluginDetail("router".into()));
+    for (lang, stem) in [("en", "modules_en"), ("ru", "modules_ru")] {
         agentdeck_gui::i18n::set_language(lang);
         let mut ui = iced_test::Simulator::with_size(
             iced::Settings::default(),
@@ -702,7 +704,7 @@ fn plugins_page_preview_cancel_and_snapshots() {
 
     // Enable flow: the preview lists changes, Cancel drops it without writes.
     agentdeck_gui::i18n::set_language("en");
-    // The card's toggle sends this.
+    // The sidebar switch sends this; its preview opens on any page.
     let _ = app::update(
         &mut state,
         app::Message::EnablePlugin("agent-process".into()),
@@ -945,6 +947,10 @@ fn parallel_limit_edit_validate_persist_reload_and_clear() {
     let (initial, paths, _guard) = load_with_fixtures("parallel", &env);
     agentdeck_gui::i18n::set_language("en");
     let mut state = app::State::for_tests(paths.clone(), initial);
+    let _ = app::update(
+        &mut state,
+        app::Message::SelectPage(agentdeck_gui::Page::Limits),
+    );
     let mut ui = iced_test::simulator(app::view(&state));
     ui.click("Parallel tasks: Unlimited").unwrap();
     for message in ui.into_messages() {
@@ -1035,4 +1041,89 @@ fn parallel_limit_edit_validate_persist_reload_and_clear() {
     iced_test::simulator(app::view(&state))
         .find("Parallel tasks: Unlimited")
         .unwrap();
+}
+
+#[test]
+fn quota_module_hides_providers_and_adds_and_removes_sources() {
+    use agentdeck_core::usage::UsageKind;
+    use agentdeck_gui::pages::usage::{Kind, Msg};
+    let env = lock_env();
+    let (initial, paths, _guard) = load_with_fixtures("usage", &env);
+    agentdeck_gui::i18n::set_language("en");
+    let mut state = app::State::for_tests(paths.clone(), initial);
+    let run = |state: &mut app::State, msg: Msg| {
+        let task = app::update(state, app::Message::Usage(msg));
+        finish_tasks(state, task);
+    };
+    let task = app::update(
+        &mut state,
+        app::Message::SelectPage(agentdeck_gui::Page::UsageWidget),
+    );
+    finish_tasks(&mut state, task);
+
+    // The applet reads this file beside instances.toml.
+    let visibility = paths.config_dir.join("ai-usage-visibility.json");
+    run(&mut state, Msg::Show("codex".into(), false));
+    let hidden = agentdeck_usage::visibility::load(&visibility).unwrap();
+    assert!(hidden.contains("codex"), "{hidden:?}");
+    run(&mut state, Msg::Show("codex".into(), true));
+    assert!(
+        agentdeck_usage::visibility::load(&visibility)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Add goes through a preview; nothing is written before Apply.
+    run(&mut state, Msg::OpenAdd);
+    run(&mut state, Msg::Kind(Kind(UsageKind::Deepseek)));
+    run(&mut state, Msg::Id("deepseek-gui".into()));
+    run(&mut state, Msg::Source("DEEPSEEK_GUI_KEY".into()));
+    run(&mut state, Msg::AskAdd);
+    iced_test::simulator(app::view(&state))
+        .find("Apply")
+        .unwrap();
+    assert!(
+        Registry::load(&paths)
+            .unwrap()
+            .usage
+            .iter()
+            .all(|u| u.id != "deepseek-gui")
+    );
+    run(&mut state, Msg::Confirm);
+    let reg = Registry::load(&paths).unwrap();
+    let added = reg
+        .usage
+        .iter()
+        .find(|u| u.id == "deepseek-gui")
+        .expect("added");
+    assert_eq!(added.api_key_env.as_deref(), Some("DEEPSEEK_GUI_KEY"));
+
+    // A refused add (missing required field) shows the reason and no Apply.
+    run(&mut state, Msg::OpenAdd);
+    run(&mut state, Msg::Kind(Kind(UsageKind::Claude)));
+    run(&mut state, Msg::Id("claude-gui".into()));
+    run(&mut state, Msg::AskAdd);
+    iced_test::simulator(app::view(&state))
+        .find(r#"usage "claude-gui" (kind claude): missing "config_dir""#)
+        .unwrap();
+    run(&mut state, Msg::Confirm);
+    assert!(
+        Registry::load(&paths)
+            .unwrap()
+            .usage
+            .iter()
+            .all(|u| u.id != "claude-gui")
+    );
+    run(&mut state, Msg::Cancel);
+    run(&mut state, Msg::CloseAdd);
+
+    run(&mut state, Msg::AskRemove("deepseek-gui".into()));
+    run(&mut state, Msg::Confirm);
+    assert!(
+        Registry::load(&paths)
+            .unwrap()
+            .usage
+            .iter()
+            .all(|u| u.id != "deepseek-gui")
+    );
 }

@@ -76,8 +76,11 @@ systemctl --user enable --now agentdeck-daemon.service   # owner's call
 ## GUI
 
 The same binary serves the iced GUI (English and Russian): instances with
-quotas, the add wizard with login, the drift view, the plugins page and the
-processes page. The GUI shares the registry with the CLI under `flock` and
+quotas, the add wizard with login and the drift view (with the sync auto-apply
+switch). Each module is a sidebar group with its on/off switch, its pages and
+its technical status: Quotas (sources, panel widget visibility), Router (pool,
+parallel limits) and Agents (processes). The usage daemon re-reads quota
+sources every cycle, so GUI edits apply without a restart. The GUI shares the registry with the CLI under `flock` and
 works while the daemon is stopped. The Pool page lists every cached model per
 registered instance, with search, an instance filter and sorting. New catalog
 entries start disabled; only explicitly enabled entries are routing candidates.

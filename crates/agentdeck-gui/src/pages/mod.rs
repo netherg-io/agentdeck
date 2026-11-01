@@ -8,3 +8,4 @@ pub mod plugins;
 pub mod pool;
 pub mod processes;
 pub mod shared;
+pub mod usage;
