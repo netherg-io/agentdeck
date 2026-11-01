@@ -590,10 +590,14 @@ pub fn view(state: &State) -> Element<'_, Msg> {
                         .on_toggle_maybe((!state.busy).then_some(move |_| Msg::AskToggle(i))),
                 )
                 .width(TOGGLE_W),
-                st::icon_btn(st::Icon::Trash).on_press_maybe(
-                    (!state.busy && state.data.saved.iter().any(|saved| saved.key_eq(e)))
-                        .then_some(Msg::AskRemove(i))
-                ),
+                if state.data.saved.iter().any(|saved| saved.key_eq(e)) {
+                    Element::from(
+                        st::icon_btn(st::Icon::Trash)
+                            .on_press_maybe((!state.busy).then_some(Msg::AskRemove(i))),
+                    )
+                } else {
+                    Element::from(Space::new().width(REMOVE_W))
+                },
             ]
             .spacing(st::SPACE_M)
             .align_y(Alignment::Center),
