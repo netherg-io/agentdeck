@@ -33,6 +33,31 @@ fn shared_hint() -> String {
     roster["briefHint"].as_str().unwrap().to_string()
 }
 
+#[test]
+fn embedded_muse_hint_matches_the_runtime_asset() {
+    let roster: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            workspace_root().join("crates/agentdeck-core/assets/router/roster.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let family = roster["families"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["match"] == "muse-spark")
+        .unwrap();
+    let hint = family["briefHint"].as_str().unwrap();
+    assert!(hint.starts_with("Long commands:"));
+    assert!(hint.contains("PARTIAL:"));
+    assert!(!hint.to_lowercase().contains("skill"));
+    assert_eq!(
+        agentdeck_router::policy::hint_of("opencode-go/muse-spark-1.3-contributor"),
+        Some(format!("{}\n\n{hint}", shared_hint()))
+    );
+}
+
 struct Fixture {
     dir: PathBuf,
     mock_jev: PathBuf,

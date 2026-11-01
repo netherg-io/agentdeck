@@ -166,7 +166,7 @@ try {
   assert.equal(run({ tool: 'delegate_task', args: { task: 'Missing target' } }).decision, 'deny');
   // The shared policy and family hint must both reach the child, unchanged.
   const commonHint = 'Delegated-agent rule: never ask questions; end with BLOCKED:.';
-  const familyHint = 'Skill hint: test.';
+  const familyHint = 'Long commands: test.';
   const hint = commonHint + '\n\n' + familyHint;
   const hinted = { ...route, requestedBriefHint: hint };
   for (const harness of ['codex', 'claude', 'agy', 'opencode', 'shell']) {

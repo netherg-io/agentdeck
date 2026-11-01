@@ -4,6 +4,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+const productionRoster = JSON.parse(fs.readFileSync(new URL('./roster.json', import.meta.url), 'utf8'));
+const museHint = productionRoster.families.find(f => f.match === 'muse-spark').briefHint;
+assert.match(museHint, /^Long commands:/);
+assert.match(museHint, /PARTIAL:/);
+for (const hint of [productionRoster.briefHint, ...productionRoster.families.map(f => f.briefHint)].filter(Boolean))
+  assert.doesNotMatch(hint, /\bskills?\b|скилл/iu);
+
 // Jev answer cache through the actual CLI: isolated home and runtime dir, mocked fetch, no paid calls.
 // Router files are copied so the roster profile can change without touching the real roster.
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'model-route-jev-cache-test-'));
@@ -126,12 +133,12 @@ try {
   const rosterFile = path.join(code, 'roster.json');
   const roster = JSON.parse(fs.readFileSync(rosterFile, 'utf8'));
   roster.families.find(f => f.match === 'claude-opus').profile += ' Changed.';
-  roster.families.find(f => f.match === 'claude-opus').briefHint = 'Skill hint: fixture.';
+  roster.families.find(f => f.match === 'claude-opus').briefHint = 'Long commands: fixture.';
   fs.writeFileSync(rosterFile, JSON.stringify(roster));
   out = run(['--source', 'claudeAgent', task], prefersOpus, true);
-  assert.equal(out.briefHint, commonHint + '\n\nSkill hint: fixture.');
+  assert.equal(out.briefHint, commonHint + '\n\nLong commands: fixture.');
   out = run(validate('codex/gpt-6.1-sol'), prefersOpus, false);
-  assert.equal(out.briefHint, commonHint + '\n\nSkill hint: fixture.');
+  assert.equal(out.briefHint, commonHint + '\n\nLong commands: fixture.');
   assert.equal(out.requestedBriefHint, commonHint);
   out = run(validate('claudeAgent/claude-opus-5-5'), prefersOpus, false);
   assert.equal(out.requestedBriefHint, out.briefHint);
