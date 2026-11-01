@@ -672,9 +672,11 @@ fn module_switch_preview_cancel_and_snapshots() {
         &mut state,
         app::Message::SelectPage(agentdeck_gui::Page::Modules),
     );
-    let mut ui = iced_test::simulator(app::view(&state));
-    for name in ["ai-usage", "router", "agent-process"] {
-        ui.find(name).expect("module status card");
+    {
+        let mut ui = iced_test::simulator(app::view(&state));
+        for name in ["ai-usage", "router", "agent-process"] {
+            ui.find(name).expect("module status card");
+        }
     }
     let _ = app::update(&mut state, app::Message::PluginDetail("router".into()));
     for (lang, stem) in [("en", "modules_en"), ("ru", "modules_ru")] {
