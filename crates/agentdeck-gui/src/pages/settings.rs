@@ -1,4 +1,4 @@
-//! Module settings forms: the router's decision model with its OpenRouter key,
+//! Module settings forms: the router's decision provider, model and key,
 //! and the quota polling interval / staleness threshold.
 
 use std::path::PathBuf;
@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use agentdeck_core::settings::{self, Settings};
 use agentdeck_core::{Paths, Registry};
 use i18n_embed_fl::fl;
-use iced::widget::{column, row, text_input};
+use iced::widget::{column, pick_list, row, text_input};
 use iced::{Alignment, Element, Length, Task};
 
 use crate::i18n::loader;
@@ -15,13 +15,15 @@ use crate::style as st;
 #[derive(Debug, Clone, Default)]
 pub struct Loaded {
     pub settings: Option<Settings>,
-    pub key_set: bool,
+    /// Whether a key is available, per provider (OpenRouter, Vercel).
+    pub key_set: (bool, bool),
     pub error: Option<String>,
 }
 
 #[derive(Default)]
 pub struct State {
     pub loaded: Loaded,
+    pub provider: Provider,
     pub decision_model: String,
     pub key: String,
     pub refresh: String,
@@ -34,6 +36,7 @@ pub struct State {
 #[derive(Debug, Clone)]
 pub enum Msg {
     Loaded(Loaded),
+    Provider(Provider),
     DecisionModel(String),
     Key(String),
     Refresh(String),
@@ -43,17 +46,51 @@ pub enum Msg {
     Done(Result<(), String>),
 }
 
-/// The router reads `JEV_OPENROUTER_API_KEY` first, then this file.
-fn key_file() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default()
-        .join(".config/model-route/openrouter.key")
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Provider {
+    #[default]
+    OpenRouter,
+    Vercel,
+}
+
+impl std::fmt::Display for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::OpenRouter => "OpenRouter",
+            Self::Vercel => "Vercel AI Gateway",
+        })
+    }
+}
+
+impl Provider {
+    /// The router reads this env var first, then [`Provider::key_file`].
+    fn key_env(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "JEV_OPENROUTER_API_KEY",
+            Self::Vercel => "AI_GATEWAY_API_KEY",
+        }
+    }
+
+    fn key_file(self) -> PathBuf {
+        let name = match self {
+            Self::OpenRouter => "openrouter.key",
+            Self::Vercel => "vercel.key",
+        };
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join(".config/model-route")
+            .join(name)
+    }
+
+    fn key_set(self) -> bool {
+        std::env::var(self.key_env()).is_ok_and(|k| !k.is_empty())
+            || std::fs::read_to_string(self.key_file()).is_ok_and(|k| !k.trim().is_empty())
+    }
 }
 
 pub fn load(paths: &Paths) -> Msg {
-    let key_set = std::env::var("JEV_OPENROUTER_API_KEY").is_ok_and(|k| !k.is_empty())
-        || std::fs::read_to_string(key_file()).is_ok_and(|k| !k.trim().is_empty());
+    let key_set = (Provider::OpenRouter.key_set(), Provider::Vercel.key_set());
     Msg::Loaded(match Registry::load(paths) {
         Ok(reg) => Loaded {
             settings: Some(settings::read(&reg)),
@@ -102,11 +139,21 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
     match msg {
         Msg::Loaded(loaded) => {
             if let Some(s) = &loaded.settings {
+                state.provider =
+                    if s.decision_provider.as_deref() == Some(settings::PROVIDER_VERCEL) {
+                        Provider::Vercel
+                    } else {
+                        Provider::OpenRouter
+                    };
                 state.decision_model = s.decision_model.clone().unwrap_or_default();
                 state.refresh = s.refresh_seconds.map(|n| n.to_string()).unwrap_or_default();
                 state.stale = s.stale_seconds.map(|n| n.to_string()).unwrap_or_default();
             }
             state.loaded = loaded;
+            Task::none()
+        }
+        Msg::Provider(p) => {
+            state.provider = p;
             Task::none()
         }
         Msg::DecisionModel(v) => {
@@ -126,22 +173,31 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
             Task::none()
         }
         Msg::SaveRouter => {
-            state.busy = true;
             let model = Some(state.decision_model.trim().to_string()).filter(|m| !m.is_empty());
+            let provider = state.provider;
+            if provider == Provider::Vercel && model.is_none() {
+                state.result = Some((fl!(loader(), "settings-model-required"), true));
+                return Task::none();
+            }
+            state.busy = true;
             let key = std::mem::take(&mut state.key);
             let key = key.trim().to_string();
             if !key.is_empty()
                 && let Err(e) = agentdeck_usage::util::atomic_write_mode(
-                    &key_file(),
+                    &provider.key_file(),
                     key.as_bytes(),
                     Some(0o600),
                 )
             {
                 state.busy = false;
-                state.result = Some((format!("{}: {e:#}", key_file().display()), true));
+                state.result = Some((format!("{}: {e:#}", provider.key_file().display()), true));
                 return Task::none();
             }
-            save(paths, move |s| s.decision_model = model)
+            save(paths, move |s| {
+                s.decision_provider =
+                    (provider == Provider::Vercel).then(|| settings::PROVIDER_VERCEL.to_string());
+                s.decision_model = model;
+            })
         }
         Msg::SavePoll => {
             let (refresh, stale) = match (seconds(&state.refresh), seconds(&state.stale)) {
@@ -196,23 +252,53 @@ fn save_row(state: &State, msg: Msg) -> Element<'_, Msg> {
 
 pub fn router_view(state: &State) -> Element<'_, Msg> {
     let size = st::look().body;
-    let key_hint = if state.loaded.key_set {
+    let key_set = match state.provider {
+        Provider::OpenRouter => state.loaded.key_set.0,
+        Provider::Vercel => state.loaded.key_set.1,
+    };
+    let (model_placeholder, model_hint) = match state.provider {
+        Provider::OpenRouter => (
+            settings::DEFAULT_DECISION_MODEL,
+            fl!(loader(), "settings-decision-model-hint"),
+        ),
+        Provider::Vercel => (
+            "provider/model",
+            fl!(loader(), "settings-decision-model-vercel"),
+        ),
+    };
+    let key_hint = if key_set {
         fl!(loader(), "settings-key-set")
     } else {
         fl!(loader(), "settings-key-missing")
     };
     let form = column![
         field(
+            fl!(loader(), "settings-decision-provider"),
+            pick_list(
+                [Provider::OpenRouter, Provider::Vercel],
+                Some(state.provider),
+                Msg::Provider
+            )
+            .text_size(size)
+            .width(Length::Fill)
+            .into(),
+            None,
+        ),
+        field(
             fl!(loader(), "settings-decision-model"),
-            text_input(settings::DEFAULT_DECISION_MODEL, &state.decision_model)
+            text_input(model_placeholder, &state.decision_model)
                 .on_input(Msg::DecisionModel)
                 .on_submit(Msg::SaveRouter)
                 .size(size)
                 .into(),
-            Some(fl!(loader(), "settings-decision-model-hint")),
+            Some(model_hint),
         ),
         field(
-            fl!(loader(), "settings-openrouter-key"),
+            fl!(
+                loader(),
+                "settings-key",
+                provider = state.provider.to_string()
+            ),
             text_input(&fl!(loader(), "settings-key-placeholder"), &state.key)
                 .secure(true)
                 .on_input(Msg::Key)

@@ -922,7 +922,89 @@ fn detect_source(settings: &Value) -> Option<String> {
 
 // --- Jev ---------------------------------------------------------------------
 
-async fn jev_fetch(request_body: &str) -> anyhow::Result<(Value, Option<f64>)> {
+/// Reads a key from `env` or `~/.config/model-route/<file>`.
+fn decision_key(env: &str, file: &str) -> anyhow::Result<String> {
+    let key_file = home_dir()?.join(".config/model-route").join(file);
+    std::env::var(env)
+        .ok()
+        .filter(|k| !k.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string(&key_file)
+                .ok()
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "decision key not found: set {env} or write {}",
+                key_file.display()
+            )
+        })
+}
+
+/// The same questions as OpenRouter's decisions API, asked as one JSON
+/// chat completion (Vercel AI Gateway has no decisions endpoint).
+fn gateway_body(request: &Value) -> Value {
+    let system = "You answer routing questions for an AI agent router. Reply with one JSON object and nothing else. \
+For every key of `questions` return {\"score\": n, \"confidence\": c, \"probabilities\": {\"0\": p0, \"1\": p1, \"2\": p2, \"3\": p3}}: \
+n is the index (0-3) of the best-matching entry in that question's `criteria`, c in [0,1] is your confidence, \
+and the probabilities over the four criteria sum to 1. Follow each question's `instructions`; `state` is the context.";
+    let user = serde_json::json!({
+        "state": request.get("state"),
+        "questions": request.get("questions"),
+    });
+    serde_json::json!({
+        "model": request.get("model"),
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user.to_string()},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0,
+    })
+}
+
+/// Answers from a chat completion's message content; tolerates a ```json fence.
+fn gateway_answers(response: &Value) -> anyhow::Result<Value> {
+    let content = response
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("gateway response has no message content"))?;
+    let json = content
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    serde_json::from_str(json).map_err(|e| anyhow::anyhow!("gateway answer is not JSON: {e}"))
+}
+
+async fn post_json(url: &str, key: &str, body: String) -> anyhow::Result<Value> {
+    let res = reqwest::Client::new()
+        .post(url)
+        .timeout(std::time::Duration::from_secs(30))
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Jev request failed: {e}"))?;
+    if !res.status().is_success() {
+        let status = res.status().as_u16();
+        let text = res.text().await.unwrap_or_default();
+        let snippet: String = text.chars().take(300).collect();
+        return Err(anyhow::anyhow!("Jev HTTP {status}: {snippet}"));
+    }
+    res.json()
+        .await
+        .map_err(|e| anyhow::anyhow!("Jev returned invalid JSON: {e}"))
+}
+
+async fn jev_fetch(
+    provider: Option<&str>,
+    request: &Value,
+    request_body: &str,
+) -> anyhow::Result<(Value, Option<f64>)> {
     if let Ok(mock) = std::env::var("AGENTDECK_ROUTE_MOCK_JEV") {
         let text = std::fs::read_to_string(mock)?;
         let v: Value = serde_json::from_str(&text)?;
@@ -933,43 +1015,24 @@ async fn jev_fetch(request_body: &str) -> anyhow::Result<(Value, Option<f64>)> {
                 .and_then(Value::as_f64),
         ));
     }
-    let home = home_dir()?;
-    let key_file = home.join(".config/model-route/openrouter.key");
-    let key = std::env::var("JEV_OPENROUTER_API_KEY")
-        .ok()
-        .filter(|k| !k.is_empty())
-        .or_else(|| {
-            std::fs::read_to_string(&key_file)
-                .ok()
-                .map(|k| k.trim().to_string())
-                .filter(|k| !k.is_empty())
-        });
-    let Some(key) = key else {
-        return Err(anyhow::anyhow!(
-            "Jev OpenRouter key not found: set JEV_OPENROUTER_API_KEY or write {}",
-            key_file.display()
-        ));
-    };
-    let client = reqwest::Client::new();
-    let res = client
-        .post("https://openrouter.ai/api/alpha/decisions")
-        .timeout(std::time::Duration::from_secs(30))
-        .header("Authorization", format!("Bearer {key}"))
-        .header("Content-Type", "application/json")
-        .body(request_body.to_string())
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Jev request failed: {e}"))?;
-    if !res.status().is_success() {
-        let status = res.status().as_u16();
-        let text = res.text().await.unwrap_or_default();
-        let snippet: String = text.chars().take(300).collect();
-        return Err(anyhow::anyhow!("Jev HTTP {status}: {snippet}"));
+    if provider == Some(agentdeck_core::settings::PROVIDER_VERCEL) {
+        let key = decision_key("AI_GATEWAY_API_KEY", "vercel.key")?;
+        let v = post_json(
+            "https://ai-gateway.vercel.sh/v1/chat/completions",
+            &key,
+            gateway_body(request).to_string(),
+        )
+        .await?;
+        // shortcut: the gateway's cost is not read, so Jev cost reports as unknown.
+        return Ok((gateway_answers(&v)?, None));
     }
-    let v: Value = res
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Jev returned invalid JSON: {e}"))?;
+    let key = decision_key("JEV_OPENROUTER_API_KEY", "openrouter.key")?;
+    let v = post_json(
+        "https://openrouter.ai/api/alpha/decisions",
+        &key,
+        request_body.to_string(),
+    )
+    .await?;
     Ok((
         v.get("answers").cloned().unwrap_or(Value::Null),
         v.get("usage")
@@ -1295,6 +1358,13 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     }
     state.insert("models".into(), Value::Object(models));
     let mut request = serde_json::Map::new();
+    if cfg.decision_provider.as_deref() == Some(agentdeck_core::settings::PROVIDER_VERCEL)
+        && cfg.decision_model.is_none()
+    {
+        return Err(anyhow::anyhow!(
+            "decision provider vercel needs [router] decision_model"
+        ));
+    }
     request.insert(
         "model".into(),
         Value::from(
@@ -1347,9 +1417,10 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     let (answers, cost) = match cached {
         Some(a) => (a, Some(0.0)),
         None => {
-            let (answers, cost) = jev_fetch(&body_json)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (answers, cost) =
+                jev_fetch(cfg.decision_provider.as_deref(), &request_value, &body_json)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
             if !complete(&answers) {
                 return Err(anyhow::anyhow!(
                     "Jev returned incomplete or out-of-range routing answers"
@@ -1789,5 +1860,27 @@ fn format_js(v: f64) -> String {
         format!("{}", r as i64)
     } else {
         format!("{r}")
+    }
+}
+
+#[cfg(test)]
+mod gateway_tests {
+    use super::*;
+
+    #[test]
+    fn gateway_round_trip_shapes() {
+        let req = serde_json::json!({"model": "openai/gpt-x", "state": {"task": "t"}, "questions": {"size": {}}});
+        let body = gateway_body(&req);
+        assert_eq!(body["model"], "openai/gpt-x");
+        assert!(
+            body["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("\"task\":\"t\"")
+        );
+        let resp = serde_json::json!({"choices": [{"message": {"content": "```json\n{\"size\": {\"score\": 1, \"confidence\": 0.8}}\n```"}}]});
+        let a = gateway_answers(&resp).unwrap();
+        assert!(valid_answer(&a["size"], false));
+        assert!(gateway_answers(&serde_json::json!({})).is_err());
     }
 }

@@ -5,7 +5,9 @@ use std::path::PathBuf;
 
 use agentdeck_core::{Paths, PoolEntry, Registry, pool};
 use i18n_embed_fl::fl;
-use iced::widget::{Space, column, container, pick_list, row, text_input, toggler, tooltip};
+use iced::widget::{
+    Space, checkbox, column, container, pick_list, row, text_input, toggler, tooltip,
+};
 use iced::{Alignment, Element, Length, Task};
 
 use crate::i18n::loader;
@@ -40,6 +42,8 @@ pub struct Loaded {
     /// Saved entries the catalog does not provide (custom model or options):
     /// only these can be deleted; catalog models are just switched off.
     pub custom: Vec<PoolEntry>,
+    /// (instance, model) pairs T3 marks legacy; hidden unless shown or enabled.
+    pub legacy: std::collections::HashSet<(String, String)>,
     pub error: Option<String>,
 }
 
@@ -49,6 +53,7 @@ pub struct State {
     pub search: String,
     pub filter_instance: Option<String>,
     pub sort: Sort,
+    pub show_legacy: bool,
     /// Model slugs from the T3 cache of the chosen instance.
     pub models: Vec<String>,
     pub instance: Option<String>,
@@ -76,6 +81,7 @@ pub enum Msg {
     Search(String),
     FilterInstance(InstanceChoice),
     Sort(Sort),
+    ShowLegacy(bool),
     Confirm,
     Cancel,
     Done(Result<String, String>),
@@ -135,6 +141,16 @@ pub fn load(ctx: &Ctx) -> Msg {
                     })
                     .cloned()
                     .collect(),
+                legacy: reg
+                    .instances
+                    .iter()
+                    .flat_map(|i| {
+                        pool::legacy_models(ctx.t3_root.as_deref(), &i.id)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|m| (i.id.clone(), m))
+                    })
+                    .collect(),
                 error,
             }
         }
@@ -146,6 +162,13 @@ pub fn load(ctx: &Ctx) -> Msg {
 }
 
 /// Keep original indices so filtering and sorting cannot target another entry.
+fn is_legacy(state: &State, e: &PoolEntry) -> bool {
+    state
+        .data
+        .legacy
+        .contains(&(e.instance.clone(), e.model.clone()))
+}
+
 pub fn visible_entries(state: &State) -> Vec<(usize, &PoolEntry)> {
     let query = state.search.to_lowercase();
     let terms: Vec<_> = query.split_whitespace().collect();
@@ -155,6 +178,10 @@ pub fn visible_entries(state: &State) -> Vec<(usize, &PoolEntry)> {
         .iter()
         .enumerate()
         .filter(|(_, e)| {
+            // An enabled legacy entry stays visible: it is still routed.
+            if !state.show_legacy && !e.enabled && is_legacy(state, e) {
+                return false;
+            }
             if state
                 .filter_instance
                 .as_ref()
@@ -364,6 +391,10 @@ pub fn update(state: &mut State, ctx: Ctx, msg: Msg) -> Task<Msg> {
             state.sort = sort;
             Task::none()
         }
+        Msg::ShowLegacy(on) => {
+            state.show_legacy = on;
+            Task::none()
+        }
         Msg::Confirm => match state.pending.take().and_then(|p| p.op) {
             Some(op) => run(state, ctx, op),
             None => Task::none(),
@@ -540,6 +571,19 @@ pub fn view(state: &State) -> Element<'_, Msg> {
         )
         .text_size(look.body)
         .width(170),
+        checkbox(state.show_legacy)
+            .label(fl!(
+                loader(),
+                "pool-show-legacy",
+                count = state
+                    .data
+                    .entries
+                    .iter()
+                    .filter(|e| !e.enabled && is_legacy(state, e))
+                    .count()
+            ))
+            .text_size(look.body)
+            .on_toggle(Msg::ShowLegacy),
     ]
     .spacing(st::SPACE_S)
     .align_y(Alignment::Center);
@@ -618,4 +662,35 @@ pub fn view(state: &State) -> Element<'_, Msg> {
         );
     }
     col.push(st::card(table)).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_hidden_unless_shown_or_enabled() {
+        let entry = |model: &str, enabled| PoolEntry {
+            instance: "c".into(),
+            model: model.into(),
+            options: Default::default(),
+            enabled,
+        };
+        let mut state = State::default();
+        state.data.entries = vec![
+            entry("new", false),
+            entry("old", false),
+            entry("old-on", true),
+        ];
+        state.data.legacy = [("c".into(), "old".into()), ("c".into(), "old-on".into())].into();
+        let models = |s: &State| {
+            visible_entries(s)
+                .into_iter()
+                .map(|(_, e)| e.model.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(models(&state), ["new", "old-on"]);
+        state.show_legacy = true;
+        assert_eq!(models(&state).len(), 3);
+    }
 }

@@ -26,6 +26,7 @@ pub enum UsageKind {
     Antigravity,
     Deepseek,
     Openrouter,
+    Vercel,
     #[serde(rename = "opencode-go")]
     OpencodeGo,
 }
@@ -38,9 +39,10 @@ impl UsageKind {
             "antigravity" => Ok(Self::Antigravity),
             "deepseek" => Ok(Self::Deepseek),
             "openrouter" => Ok(Self::Openrouter),
+            "vercel" => Ok(Self::Vercel),
             "opencode-go" => Ok(Self::OpencodeGo),
             other => anyhow::bail!(
-                "bad usage kind {other:?}: expected claude, codex, antigravity, deepseek, openrouter or opencode-go"
+                "bad usage kind {other:?}: expected claude, codex, antigravity, deepseek, openrouter, vercel or opencode-go"
             ),
         }
     }
@@ -52,6 +54,7 @@ impl UsageKind {
             Self::Antigravity => "antigravity",
             Self::Deepseek => "deepseek",
             Self::Openrouter => "openrouter",
+            Self::Vercel => "vercel",
             Self::OpencodeGo => "opencode-go",
         }
     }
@@ -136,7 +139,7 @@ impl UsageEntry {
                 no("api_key_env", &self.api_key_env)?;
                 no("db_file", &self.db_file)?;
             }
-            UsageKind::Deepseek | UsageKind::Openrouter => {
+            UsageKind::Deepseek | UsageKind::Openrouter | UsageKind::Vercel => {
                 // Keys live in the 0600 env file; the schema only holds the var name.
                 req("api_key_env", &self.api_key_env)?;
                 no("config_dir", &self.config_dir)?;
@@ -320,7 +323,7 @@ mod tests {
         match kind {
             UsageKind::Claude => e.config_dir = Some("~/.claude".into()),
             UsageKind::Codex => e.codex_home = Some("~/.codex".into()),
-            UsageKind::Deepseek | UsageKind::Openrouter => {
+            UsageKind::Deepseek | UsageKind::Openrouter | UsageKind::Vercel => {
                 e.api_key_env = Some("AGENTDECK_TEST_KEY".into());
             }
             UsageKind::Antigravity | UsageKind::OpencodeGo => {}

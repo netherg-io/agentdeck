@@ -143,6 +143,8 @@ pub struct RouterConfig {
     pub usage_state_path: Option<String>,
     /// Jev judge model; `None` uses the built-in default.
     pub decision_model: Option<String>,
+    /// `"vercel"` sends the judgment through Vercel AI Gateway; else OpenRouter.
+    pub decision_provider: Option<String>,
     pub account: HashMap<String, String>,
     pub usage_id: HashMap<String, String>,
     /// Insertion-ordered, like `Object.entries` on the JSON object.
@@ -303,6 +305,10 @@ fn parse_router_config(data: Value, source: &str) -> anyhow::Result<RouterConfig
             .map(str::to_string),
         decision_model: data
             .get("decisionModel")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        decision_provider: data
+            .get("decisionProvider")
             .and_then(|v| v.as_str())
             .map(str::to_string),
         account,

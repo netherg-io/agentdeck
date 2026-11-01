@@ -4,6 +4,7 @@ pub mod codex;
 pub mod deepseek;
 pub mod opencode_go;
 pub mod openrouter;
+pub mod vercel;
 
 use crate::config::AccountConfig;
 use crate::model::AccountState;
@@ -39,6 +40,12 @@ pub async fn fetch(account: AccountConfig, stale_seconds: i64) -> AccountState {
             api_key_env,
             base_url,
         } => openrouter::fetch(&id, &name, &api_key_env, &base_url).await,
+        AccountConfig::Vercel {
+            id,
+            name,
+            api_key_env,
+            base_url,
+        } => vercel::fetch(&id, &name, &api_key_env, &base_url).await,
         AccountConfig::Antigravity {
             id,
             name,

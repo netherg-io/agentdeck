@@ -171,6 +171,7 @@ fn provider_icon(provider: &str) -> widget::icon::Handle {
         "antigravity" => include_bytes!("../icons/ai-usage-antigravity-symbolic.svg"),
         "deepseek" => include_bytes!("../icons/ai-usage-deepseek-symbolic.svg"),
         "openrouter" => include_bytes!("../icons/ai-usage-openrouter-symbolic.svg"),
+        "vercel" => include_bytes!("../icons/ai-usage-vercel-symbolic.svg"),
         "opencode-go" => include_bytes!("../icons/ai-usage-opencode-go-symbolic.svg"),
         _ => return widget::icon::from_name("dialog-information-symbolic").into(),
     };

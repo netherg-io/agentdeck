@@ -183,6 +183,23 @@ impl Registry {
 
 /// Available model ids from the instance catalog; missing caches leave saved entries usable.
 pub fn cached_models(t3_root: Option<&Path>, instance: &str) -> anyhow::Result<Vec<String>> {
+    Ok(catalog_models(t3_root, instance)?
+        .into_iter()
+        .map(|(slug, _)| slug)
+        .collect())
+}
+
+/// Catalog models T3 marks `isLegacy` (superseded versions).
+pub fn legacy_models(t3_root: Option<&Path>, instance: &str) -> anyhow::Result<Vec<String>> {
+    Ok(catalog_models(t3_root, instance)?
+        .into_iter()
+        .filter(|(_, legacy)| *legacy)
+        .map(|(slug, _)| slug)
+        .collect())
+}
+
+/// (slug, isLegacy) from the instance's T3 model cache, sorted and deduplicated.
+fn catalog_models(t3_root: Option<&Path>, instance: &str) -> anyhow::Result<Vec<(String, bool)>> {
     let Some(root) = t3_root else {
         return Ok(Vec::new());
     };
@@ -198,14 +215,19 @@ pub fn cached_models(t3_root: Option<&Path>, instance: &str) -> anyhow::Result<V
         .get("models")
         .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow::anyhow!("{}: missing model catalog", file.display()))?;
-    let mut out: Vec<String> = models
+    let mut out: Vec<(String, bool)> = models
         .iter()
-        .filter_map(|m| m.get("slug").and_then(|v| v.as_str()))
-        .filter(|m| !m.is_empty())
-        .map(str::to_owned)
+        .filter_map(|m| {
+            let slug = m
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())?;
+            let legacy = m.get("isLegacy").and_then(|v| v.as_bool()).unwrap_or(false);
+            Some((slug.to_owned(), legacy))
+        })
         .collect();
     out.sort();
-    out.dedup();
+    out.dedup_by(|a, b| a.0 == b.0);
     Ok(out)
 }
 

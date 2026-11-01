@@ -35,8 +35,13 @@ pub fn run(args: PsArgs) -> anyhow::Result<()> {
             .scope_mem_bytes
             .map(|m| format!("  scope {}", mega(m)))
             .unwrap_or_default();
+        let podman = g
+            .container
+            .as_deref()
+            .map(|c| format!("  [podman {c}]"))
+            .unwrap_or_default();
         println!(
-            "{}  CPU {:.1}%  RSS {}  IO {}/{}{scope}",
+            "{}{podman}  CPU {:.1}%  RSS {}  IO {}/{}{scope}",
             g.title,
             g.cpu_percent,
             mega(g.rss_bytes),

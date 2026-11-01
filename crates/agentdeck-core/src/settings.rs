@@ -1,12 +1,17 @@
 //! Module settings kept in `instances.toml` beside the registry:
-//! `[router] decision_model` and `[usage_poll] refresh_seconds / stale_seconds`.
+//! `[router] decision_provider / decision_model` and
+//! `[usage_poll] refresh_seconds / stale_seconds`.
 //! Absent keys mean the built-in defaults.
 
 use crate::paths::Paths;
 use crate::registry::Registry;
 
-/// Router's judge model when `[router] decision_model` is unset.
+/// Router's judge model when `[router] decision_model` is unset (OpenRouter only).
 pub const DEFAULT_DECISION_MODEL: &str = "~typesafe/jev-latest";
+/// `[router] decision_provider` values; absent means OpenRouter's decisions API.
+pub const PROVIDER_OPENROUTER: &str = "openrouter";
+/// Vercel AI Gateway chat completions; it has no default model.
+pub const PROVIDER_VERCEL: &str = "vercel";
 pub const DEFAULT_REFRESH_SECONDS: u64 = 120;
 pub const DEFAULT_STALE_SECONDS: u64 = 900;
 /// Faster polling spawns a Codex subprocess per account every cycle.
@@ -14,6 +19,7 @@ pub const MIN_REFRESH_SECONDS: u64 = 15;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
+    pub decision_provider: Option<String>,
     pub decision_model: Option<String>,
     pub refresh_seconds: Option<u64>,
     pub stale_seconds: Option<u64>,
@@ -29,6 +35,10 @@ fn positive(v: Option<&toml::Value>) -> Option<u64> {
 
 pub fn read(reg: &Registry) -> Settings {
     Settings {
+        decision_provider: get(reg, "router", "decision_provider")
+            .and_then(|v| v.as_str())
+            .filter(|s| *s == PROVIDER_VERCEL || *s == PROVIDER_OPENROUTER)
+            .map(str::to_string),
         decision_model: get(reg, "router", "decision_model")
             .and_then(|v| v.as_str())
             .map(str::trim)
@@ -61,7 +71,21 @@ pub fn write(paths: &Paths, s: &Settings) -> anyhow::Result<()> {
     {
         anyhow::bail!("decision_model must not contain spaces");
     }
+    if let Some(p) = s.decision_provider.as_deref() {
+        if p != PROVIDER_OPENROUTER && p != PROVIDER_VERCEL {
+            anyhow::bail!("decision_provider must be {PROVIDER_OPENROUTER} or {PROVIDER_VERCEL}");
+        }
+        if p == PROVIDER_VERCEL && s.decision_model.is_none() {
+            anyhow::bail!("Vercel AI Gateway needs a decision model, e.g. provider/model");
+        }
+    }
     Registry::update(paths, |reg| {
+        set(
+            reg,
+            "router",
+            "decision_provider",
+            s.decision_provider.clone().map(toml::Value::String),
+        );
         set(
             reg,
             "router",

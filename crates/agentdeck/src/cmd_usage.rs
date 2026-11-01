@@ -72,6 +72,7 @@ pub enum UsageKindArg {
     Antigravity,
     Deepseek,
     Openrouter,
+    Vercel,
     OpencodeGo,
 }
 
@@ -116,6 +117,7 @@ impl UsageKindArg {
             Self::Antigravity => UsageKind::Antigravity,
             Self::Deepseek => UsageKind::Deepseek,
             Self::Openrouter => UsageKind::Openrouter,
+            Self::Vercel => UsageKind::Vercel,
             Self::OpencodeGo => UsageKind::OpencodeGo,
         }
     }

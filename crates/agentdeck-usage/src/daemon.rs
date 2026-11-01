@@ -470,6 +470,7 @@ pub fn doctor(
                 AccountConfig::Openrouter { api_key_env, .. } => {
                     ("openrouter", api_key_env.clone())
                 }
+                AccountConfig::Vercel { api_key_env, .. } => ("vercel", api_key_env.clone()),
                 AccountConfig::Antigravity { token_file, .. } => (
                     "antigravity",
                     token_file
