@@ -369,6 +369,7 @@ mod tests {
 
     fn inst(id: &str, harness: Harness) -> Instance {
         Instance {
+            max_parallel: None,
             id: id.to_string(),
             harness,
             display_name: format!("{id} display"),

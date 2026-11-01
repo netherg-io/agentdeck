@@ -75,6 +75,9 @@ pub struct Instance {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub t3: bool,
+    /// Maximum live T3 runs across all models and coordinators; absent means unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel: Option<u32>,
     /// Unknown keys are preserved verbatim so a rewrite never loses them.
     #[serde(flatten, default)]
     pub extra: toml::map::Map<String, toml::Value>,
@@ -133,6 +136,9 @@ impl Registry {
             check_id(&inst.id)?;
             if !seen.insert(inst.id.clone()) {
                 anyhow::bail!("duplicate instance id {:?}", inst.id);
+            }
+            if inst.max_parallel == Some(0) {
+                anyhow::bail!("instance {:?}: max_parallel must be positive", inst.id);
             }
             if inst.home.is_empty() {
                 anyhow::bail!("instance {:?} has an empty home", inst.id);
@@ -234,6 +240,7 @@ impl Registry {
             binary: spec.binary,
             enabled: true,
             t3: !spec.no_t3,
+            max_parallel: None,
             extra: Default::default(),
         });
         self.validate()
@@ -290,6 +297,18 @@ impl Registry {
                 usage.display = name.to_string();
             }
         }
+        Ok(())
+    }
+
+    pub fn set_max_parallel(&mut self, id: &str, limit: Option<u32>) -> anyhow::Result<()> {
+        if limit == Some(0) {
+            anyhow::bail!("max_parallel must be positive");
+        }
+        self.instances
+            .iter_mut()
+            .find(|i| i.id == id)
+            .ok_or_else(|| anyhow::anyhow!("unknown instance id {id:?}"))?
+            .max_parallel = limit;
         Ok(())
     }
 
@@ -459,6 +478,19 @@ pub fn rename_instance(
     Ok(changes)
 }
 
+pub fn set_max_parallel(
+    paths: &Paths,
+    id: &str,
+    limit: Option<u32>,
+    dry_run: bool,
+) -> anyhow::Result<Vec<Change>> {
+    let (changes, _) = preview(paths, |reg| reg.set_max_parallel(id, limit))?;
+    if !dry_run {
+        Registry::update(paths, |reg| reg.set_max_parallel(id, limit))?;
+    }
+    Ok(changes)
+}
+
 pub fn set_enabled(
     paths: &Paths,
     id: &str,
@@ -522,6 +554,50 @@ mod tests {
             binary: None,
             no_t3: false,
         }
+    }
+
+    #[test]
+    fn parallel_limit_roundtrip_dry_run_clear_and_validation() {
+        let (paths, _g) = test_paths("parallel");
+        add_instance(&paths, spec("a-main"), false).unwrap();
+        assert_eq!(
+            Registry::load(&paths)
+                .unwrap()
+                .get("a-main")
+                .unwrap()
+                .max_parallel,
+            None
+        );
+        set_max_parallel(&paths, "a-main", Some(2), true).unwrap();
+        assert_eq!(
+            Registry::load(&paths)
+                .unwrap()
+                .get("a-main")
+                .unwrap()
+                .max_parallel,
+            None
+        );
+        set_max_parallel(&paths, "a-main", Some(2), false).unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        assert_eq!(reg.get("a-main").unwrap().max_parallel, Some(2));
+        let exported = crate::router::router_json_value(&reg).unwrap();
+        assert_eq!(exported["instanceLimits"]["a-main"], 2);
+        assert!(set_max_parallel(&paths, "a-main", Some(0), false).is_err());
+        assert!(set_max_parallel(&paths, "missing", Some(1), false).is_err());
+        assert!(
+            Registry::from_toml(
+                &reg.render()
+                    .unwrap()
+                    .replace("max_parallel = 2", "max_parallel = 0")
+            )
+            .is_err()
+        );
+        set_max_parallel(&paths, "a-main", None, false).unwrap();
+        let cleared = Registry::load(&paths).unwrap();
+        assert_eq!(cleared.get("a-main").unwrap().max_parallel, None);
+        let cleared_json = crate::router::router_json_value(&cleared).unwrap();
+        assert!(cleared_json.get("instanceLimits").is_none());
+        assert_ne!(cleared_json["version"], exported["version"]);
     }
 
     #[test]

@@ -84,6 +84,15 @@ entries start disabled; only explicitly enabled entries are routing candidates.
 T3 favorites are not used. Instance names can be edited without changing their
 IDs or T3 thread history. The router reads the current registry directly.
 
+**Parallel tasks** on each instance sets its router limit; a blank value means
+unlimited. The limit covers active T3 threads and subagents across every
+coordinator and model on that instance, including queued and waiting runs.
+Limits are stored as `max_parallel` in `[[instance]]`. Routing excludes full
+instances, and the launch hook reserves a slot before dispatch. Failed dispatch
+reservations expire after two minutes. If T3 load cannot be read, launches on
+limited instances are blocked. Workflows only enforce dependencies; legacy
+`concurrency` values are accepted and ignored.
+
 Each instance has a **CLI** button that opens its CLI in a terminal with the
 correct account. From a terminal, use `agentdeck instance run <id> -- <args>`.
 Instance wrappers no longer add application menu entries. To remove legacy

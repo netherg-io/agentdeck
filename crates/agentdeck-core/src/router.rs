@@ -232,10 +232,18 @@ pub fn router_json_value(reg: &Registry) -> anyhow::Result<Value> {
         o.insert("modelPrefix".into(), Value::from("opencode-go/"));
         accounts.insert("opencode-go".into(), Value::Object(o));
     }
-    let version = content_version(&pool, &accounts);
+    let limits: BTreeMap<String, u32> = reg
+        .instances
+        .iter()
+        .filter_map(|i| i.max_parallel.map(|limit| (i.id.clone(), limit)))
+        .collect();
+    let version = content_version(&pool, &accounts, &limits);
     let mut root = Map::new();
     root.insert("version".into(), Value::from(version));
     root.insert("pool".into(), Value::Array(pool));
+    if !limits.is_empty() {
+        root.insert("instanceLimits".into(), serde_json::to_value(limits)?);
+    }
     // A prefix account refines an instance another account maps, and the router
     // validates in file order: prefix accounts go last.
     let (prefixed, plain): (Vec<_>, Vec<_>) = accounts
@@ -253,9 +261,15 @@ pub fn router_json_value(reg: &Registry) -> anyhow::Result<Value> {
 }
 
 /// Stable version that busts the Jev cache whenever pool/accounts change.
-fn content_version(pool: &[Value], accounts: &BTreeMap<String, Value>) -> u64 {
-    let text = serde_json::to_string(&serde_json::json!({"pool": pool, "accounts": accounts}))
-        .unwrap_or_default();
+fn content_version(
+    pool: &[Value],
+    accounts: &BTreeMap<String, Value>,
+    limits: &BTreeMap<String, u32>,
+) -> u64 {
+    let text = serde_json::to_string(
+        &serde_json::json!({"pool": pool, "accounts": accounts, "instanceLimits": limits}),
+    )
+    .unwrap_or_default();
     let mut h: u64 = 0xcbf29ce484222325;
     for b in text.bytes() {
         h ^= b as u64;

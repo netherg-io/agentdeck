@@ -19,6 +19,30 @@ pub struct Rename {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct Parallel {
+    pub id: String,
+    pub value: String,
+    pub busy: bool,
+    pub error: Option<String>,
+}
+
+pub(crate) fn parse_parallel(value: &str) -> Result<Option<u32>, ()> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|n| *n > 0)
+        .map(Some)
+        .ok_or(())
+}
+
 fn account_status(status: &str) -> String {
     match status {
         "ok" => fl!(loader(), "account-ok"),
@@ -137,7 +161,11 @@ fn remove_btn(inst: &InstanceRow) -> Element<'_, Message> {
         .into()
 }
 
-fn instance_card<'a>(inst: &'a InstanceRow, rename: Option<&'a Rename>) -> Element<'a, Message> {
+fn instance_card<'a>(
+    inst: &'a InstanceRow,
+    rename: Option<&'a Rename>,
+    parallel: Option<&'a Parallel>,
+) -> Element<'a, Message> {
     let look = st::look();
     let single = inst.quotas.len() == 1;
     let editing = rename.filter(|r| r.id == inst.id);
@@ -200,6 +228,39 @@ fn instance_card<'a>(inst: &'a InstanceRow, rename: Option<&'a Rename>) -> Eleme
     if let Some(error) = editing.and_then(|edit| edit.error.as_ref()) {
         col = col.push(st::body(error.as_str()));
     }
+    if let Some(edit) = parallel.filter(|e| e.id == inst.id) {
+        col = col.push(
+            row![
+                st::body(fl!(loader(), "parallel-label")),
+                text_input(&fl!(loader(), "parallel-unlimited"), &edit.value)
+                    .on_input_maybe((!edit.busy).then_some(Message::ParallelInput))
+                    .on_submit_maybe((!edit.busy).then_some(Message::ParallelSave))
+                    .size(look.body)
+                    .width(Length::Fill),
+                st::btn(st::Btn::Quiet, fl!(loader(), "rename-save"))
+                    .on_press_maybe((!edit.busy).then_some(Message::ParallelSave)),
+                st::icon_btn(st::Icon::X)
+                    .on_press_maybe((!edit.busy).then_some(Message::ParallelCancel)),
+            ]
+            .spacing(st::SPACE_XS)
+            .align_y(Alignment::Center),
+        );
+        if let Some(error) = &edit.error {
+            col = col.push(st::body(error.as_str()));
+        }
+    } else {
+        let limit = inst
+            .max_parallel
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| fl!(loader(), "parallel-unlimited"));
+        col = col.push(
+            st::btn(
+                st::Btn::Quiet,
+                format!("{}: {limit}", fl!(loader(), "parallel-label")),
+            )
+            .on_press(Message::ParallelAsk(inst.id.clone())),
+        );
+    }
     for u in &inst.quotas {
         col = col.push(quotas_view(u, !single));
     }
@@ -211,6 +272,14 @@ pub fn view(data: &Data) -> Element<'_, Message> {
 }
 
 pub fn view_with_rename<'a>(data: &'a Data, rename: Option<&'a Rename>) -> Element<'a, Message> {
+    view_with_edits(data, rename, None)
+}
+
+pub fn view_with_edits<'a>(
+    data: &'a Data,
+    rename: Option<&'a Rename>,
+    parallel: Option<&'a Parallel>,
+) -> Element<'a, Message> {
     let look = st::look();
     let mut col = column![].spacing(look.gap.max(st::SPACE_S));
     if let Some(error) = &data.error {
@@ -222,7 +291,7 @@ pub fn view_with_rename<'a>(data: &'a Data, rename: Option<&'a Rename>) -> Eleme
         col = col.push(st::card(st::muted(fl!(loader(), "instances-empty"))));
     } else {
         for inst in &data.instances {
-            col = col.push(instance_card(inst, rename));
+            col = col.push(instance_card(inst, rename, parallel));
         }
     }
     if !data.standalone.is_empty() {
@@ -264,5 +333,22 @@ pub fn remove_modal(ask: &RemoveAsk) -> Modal<'_, Message> {
         ],
         on_cancel: Message::RemoveCancel,
         on_submit: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_parallel;
+
+    #[test]
+    fn parallel_limit_accepts_blank_or_positive_u32() {
+        for blank in ["", "  ", "\t"] {
+            assert_eq!(parse_parallel(blank), Ok(None));
+        }
+        assert_eq!(parse_parallel(" 1 "), Ok(Some(1)));
+        assert_eq!(parse_parallel("4294967295"), Ok(Some(u32::MAX)));
+        for invalid in ["0", "-1", "+1", "1.5", "1e2", "abc", "4294967296"] {
+            assert_eq!(parse_parallel(invalid), Err(()), "{invalid}");
+        }
     }
 }

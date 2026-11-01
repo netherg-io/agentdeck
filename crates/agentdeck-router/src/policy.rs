@@ -139,6 +139,7 @@ pub struct RouterConfig {
     pub file: String,
     pub version: Value,
     pub pool: Vec<Value>,
+    pub instance_limits: HashMap<String, u32>,
     pub usage_state_path: Option<String>,
     pub account: HashMap<String, String>,
     pub usage_id: HashMap<String, String>,
@@ -203,6 +204,19 @@ fn parse_router_config(data: Value, source: &str) -> anyhow::Result<RouterConfig
     }
     if data.get("usageStatePath").is_some_and(|v| !v.is_string()) {
         return Err(fail("bad usageStatePath".into()));
+    }
+    let mut instance_limits = HashMap::new();
+    if let Some(limits) = data.get("instanceLimits") {
+        for (id, limit) in limits
+            .as_object()
+            .ok_or_else(|| fail("bad instanceLimits".into()))?
+        {
+            let n = limit
+                .as_u64()
+                .filter(|n| *n > 0 && *n <= u32::MAX as u64)
+                .ok_or_else(|| fail(format!("bad instanceLimits for {id}")))?;
+            instance_limits.insert(id.clone(), n as u32);
+        }
     }
     let mut account = HashMap::new();
     let mut usage_id = HashMap::new();
@@ -280,6 +294,7 @@ fn parse_router_config(data: Value, source: &str) -> anyhow::Result<RouterConfig
         file: source.to_string(),
         version: data.get("version").cloned().unwrap_or(Value::from(1)),
         pool,
+        instance_limits,
         usage_state_path: data
             .get("usageStatePath")
             .and_then(|v| v.as_str())

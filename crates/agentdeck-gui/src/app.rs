@@ -51,6 +51,11 @@ pub enum Message {
     Add(AddMsg),
     LaunchCli(String),
     CliDone(Result<(), String>),
+    ParallelAsk(String),
+    ParallelInput(String),
+    ParallelCancel,
+    ParallelSave,
+    ParallelDone(Result<(), String>),
     RenameAsk(String),
     RenameInput(String),
     RenameCancel,
@@ -135,6 +140,7 @@ pub struct State {
     add: add_instance::Wizard,
     remove: Option<RemoveAsk>,
     rename: Option<pages::instances::Rename>,
+    parallel: Option<pages::instances::Parallel>,
     pending: Option<Pending>,
     proc_ui: crate::pages::processes::ProcUi,
     /// Plugins whose technical status is expanded.
@@ -182,6 +188,7 @@ impl State {
                 add: add_instance::Wizard::default(),
                 remove: None,
                 rename: None,
+                parallel: None,
                 pending: None,
                 proc_ui: crate::pages::processes::ProcUi::default(),
                 plugin_open: Default::default(),
@@ -214,6 +221,7 @@ impl State {
             add: add_instance::Wizard::default(),
             remove: None,
             rename: None,
+            parallel: None,
             pending: None,
             proc_ui: crate::pages::processes::ProcUi::default(),
             plugin_open: Default::default(),
@@ -256,6 +264,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             state.pending = None;
             state.remove = None;
             state.rename = None;
+            state.parallel = None;
             if page == Page::AddInstance {
                 state.add = add_instance::Wizard::default();
             }
@@ -312,6 +321,79 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.toast(fl!(loader(), "cli-open-error", what = error), true);
             }
             Task::none()
+        }
+        Message::ParallelAsk(id) => {
+            if state.parallel.as_ref().is_some_and(|edit| edit.busy) {
+                return Task::none();
+            }
+            if let Some(inst) = state.data.instances.iter().find(|i| i.id == id) {
+                state.parallel = Some(pages::instances::Parallel {
+                    id,
+                    value: inst.max_parallel.map(|n| n.to_string()).unwrap_or_default(),
+                    busy: false,
+                    error: None,
+                });
+            }
+            Task::none()
+        }
+        Message::ParallelInput(value) => {
+            if let Some(edit) = state.parallel.as_mut().filter(|e| !e.busy) {
+                edit.value = value;
+                edit.error = None;
+            }
+            Task::none()
+        }
+        Message::ParallelCancel => {
+            if state.parallel.as_ref().is_none_or(|e| !e.busy) {
+                state.parallel = None;
+            }
+            Task::none()
+        }
+        Message::ParallelSave => {
+            let Some(edit) = state.parallel.as_mut().filter(|e| !e.busy) else {
+                return Task::none();
+            };
+            let limit = match pages::instances::parse_parallel(&edit.value) {
+                Ok(limit) => limit,
+                Err(()) => {
+                    edit.error = Some(fl!(loader(), "parallel-invalid"));
+                    return Task::none();
+                }
+            };
+            let Some(paths) = state.paths.clone() else {
+                return Task::none();
+            };
+            edit.busy = true;
+            edit.error = None;
+            let id = edit.id.clone();
+            Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        agentdeck_core::registry::set_max_parallel(&paths, &id, limit, false)
+                            .map(|_| ())
+                            .map_err(|e| format!("{e:#}"))
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r)
+                },
+                Message::ParallelDone,
+            )
+        }
+        Message::ParallelDone(result) => {
+            match result {
+                Ok(()) => state.parallel = None,
+                Err(error) => {
+                    if let Some(edit) = state.parallel.as_mut() {
+                        edit.busy = false;
+                        edit.error = Some(error);
+                    }
+                }
+            }
+            match state.paths.clone() {
+                Some(paths) => load_data(paths),
+                None => Task::none(),
+            }
         }
         Message::RenameAsk(id) => {
             if let Some(inst) = state.data.instances.iter().find(|i| i.id == id) {
@@ -574,6 +656,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             Task::none()
         }
         // Keys act on the open modal only; its messages decide what happens.
+        Message::Escape if state.parallel.is_some() => update(state, Message::ParallelCancel),
         Message::Escape if state.rename.is_some() => update(state, Message::RenameCancel),
         Message::Escape => match modal(state).map(|m| m.on_cancel) {
             Some(msg) => update(state, msg),
@@ -863,7 +946,11 @@ fn header(state: &State) -> Element<'_, Message> {
 pub fn view(state: &State) -> Element<'_, Message> {
     let look = st::look();
     let content: Element<'_, Message> = match state.page {
-        Page::Instances => pages::instances::view_with_rename(&state.data, state.rename.as_ref()),
+        Page::Instances => pages::instances::view_with_edits(
+            &state.data,
+            state.rename.as_ref(),
+            state.parallel.as_ref(),
+        ),
         Page::AddInstance => add_instance::view(&state.add),
         Page::Drift => drift::view(&state.drift).map(Message::Drift),
         Page::Plugins => pages::plugins::view(&state.data, &state.plugin_open),

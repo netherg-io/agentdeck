@@ -200,3 +200,7 @@ rename-save = Сохранить
 
 instances-cli = CLI
 cli-open-error = Не удалось открыть CLI: { $what }
+
+parallel-label = Параллельные задачи
+parallel-unlimited = Без ограничений
+parallel-invalid = Введите целое число от 1 до 4294967295 или оставьте поле пустым для снятия ограничения.

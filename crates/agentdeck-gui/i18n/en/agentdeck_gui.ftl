@@ -195,3 +195,7 @@ rename-save = Save
 
 instances-cli = CLI
 cli-open-error = Could not open CLI: { $what }
+
+parallel-label = Parallel tasks
+parallel-unlimited = Unlimited
+parallel-invalid = Enter a whole number from 1 to 4294967295, or leave blank for unlimited.

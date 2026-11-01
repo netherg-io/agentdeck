@@ -31,8 +31,7 @@ export function validatePlan(plan) {
   if (!isObj(plan)) fail('plan must be an object');
   onlyKeys(plan, ['title', 'concurrency', 'steps'], 'plan');
   if (typeof plan.title !== 'string' || !plan.title.trim()) fail('plan.title must be a non-empty string');
-  const concurrency = plan.concurrency ?? 2;
-  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 20) fail('plan.concurrency must be an integer 1..20');
+  // Old plans may carry concurrency; the router now owns admission limits.
   if (!Array.isArray(plan.steps) || !plan.steps.length) fail('plan.steps must be a non-empty array');
   const ids = new Set();
   const steps = plan.steps.map((s, i) => {
@@ -62,7 +61,7 @@ export function validatePlan(plan) {
     mark.set(id, 'done');
   };
   steps.forEach(s => visit(s.id));
-  return { title: plan.title, concurrency, steps };
+  return { title: plan.title, steps };
 }
 
 export function newState(plan, parentThreadId) {
@@ -74,7 +73,6 @@ export function newState(plan, parentThreadId) {
 
 const stepOf = (state, id) => state.plan.steps.find(s => s.id === id) ?? fail(`unknown step ${id}`);
 const progOf = (state, id) => state.progress.find(p => p.id === id);
-const busy = state => state.progress.filter(p => p.state === 'prepared' || p.state === 'running').length;
 
 function blockedIds(state) {
   const blocked = new Set(state.progress.filter(p => p.state === 'blocked').map(p => p.id));
@@ -92,9 +90,8 @@ const depsDone = (state, id) => stepOf(state, id).needs.every(n => progOf(state,
 
 export function next(state) {
   const blocked = blockedIds(state);
-  const free = Math.max(0, state.plan.concurrency - busy(state));
   const ready = state.stopped ? [] : state.progress
-    .filter(p => p.state === 'pending' && !blocked.has(p.id) && depsDone(state, p.id)).slice(0, free).map(p => p.id);
+    .filter(p => p.state === 'pending' && !blocked.has(p.id) && depsDone(state, p.id)).map(p => p.id);
   const by = s => state.progress.filter(p => p.state === s);
   return {
     runId: state.runId, title: state.plan.title, stopped: state.stopped,
@@ -135,7 +132,6 @@ export function prepare(state, id, source, route = runRouter) {
     notice: 'Saved payload reused; routing was not run. After a confirmed pre-dispatch denial, release with --not-dispatched, check success, then prepare again. Never change this payload or replay an unknown launch.' };
   if (p.state !== 'pending') fail(`step ${id} is ${p.state}, not pending`);
   if (!depsDone(state, id)) fail(`step ${id} has unfinished or unsuccessful dependencies`);
-  if (busy(state) >= state.plan.concurrency) fail('no free concurrency slot');
   let task = buildTask(state, id);
   if (task.length > MAX_TASK) fail(`step ${id}: brief plus dependency results exceeds T3's ${MAX_TASK}-character limit; use a revised plan with smaller inputs`);
   const diag = routeDiagnostics(route(task, source));

@@ -1035,6 +1035,33 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
                 return Ok(());
             }
         }
+        if allowed_now {
+            let provider = target
+                .and_then(|t| t.get("providerInstanceId"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let cfg = crate::policy::router_config()?;
+            if let Some(limit) = cfg.instance_limits.get(provider)
+                && let Err(error) = crate::admission::reserve(
+                    &home,
+                    &state_dir()?,
+                    provider,
+                    *limit,
+                    str_field(&args, "task").unwrap_or_default(),
+                )
+            {
+                let reason = format!("model-route: {error}. Retry after a running task finishes.");
+                ctx.deny(
+                    instance.as_deref(),
+                    Some(&tool_name),
+                    &args_obj,
+                    Some(&route),
+                    "deny:capacity",
+                    &reason,
+                );
+                return Ok(());
+            }
+        }
         let reason_text = validation
             .get("reason")
             .and_then(Value::as_str)

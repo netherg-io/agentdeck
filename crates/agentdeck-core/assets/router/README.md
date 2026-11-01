@@ -230,3 +230,18 @@ alone was ignored (agents used native subagents and never ran the router), so ea
   Verify live dispatch separately. agy loads hooks per session.
   Decisions include candidate ranking and quota gates: `~/.local/state/model-route/decisions.jsonl`; touch `~/.local/state/model-route/debug`
   to also log raw hook input to `hook-input.jsonl` (contains task text).
+
+## Instance capacity
+
+Agentdeck's `[[instance]].max_parallel` (positive integer, absent = unlimited)
+becomes `instanceLimits` in exported router JSON. The router reads the live
+registry, counts all active T3 threads and subagents by exact provider instance
+across coordinators and models, and excludes full instances. Queued and waiting
+runs also occupy slots; completed/idle threads do not. Shared quota accounts do
+not combine instance capacities. Unknown T3 load blocks limited instances.
+
+The launch hook repeats the capacity check inside a shared SQLite transaction
+and reserves the slot until T3 projects the launch. A failed dispatch reservation
+expires after 120 seconds. The user-choice model override does not bypass this
+capacity gate. Workflow plans enforce dependencies, with no coordinator-wide cap;
+old `concurrency` keys are accepted and ignored.

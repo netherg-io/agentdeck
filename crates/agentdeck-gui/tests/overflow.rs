@@ -73,6 +73,7 @@ fn data() -> Data {
                 display_name: LONG_NAME.into(),
                 harness: "claude".into(),
                 enabled: false,
+                max_parallel: Some(u32::MAX),
                 t3: Some(T3Info {
                     status: Some("ready".into()),
                     threads: Some(1234),
@@ -84,6 +85,7 @@ fn data() -> Data {
                 display_name: "Codex second".into(),
                 harness: "codex".into(),
                 enabled: true,
+                max_parallel: None,
                 t3: None,
                 quotas: vec![quotas("Codex", "stale"), quotas(LONG_NAME, "error")],
             },

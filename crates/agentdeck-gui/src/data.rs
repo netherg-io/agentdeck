@@ -53,6 +53,7 @@ pub struct InstanceRow {
     pub display_name: String,
     pub harness: String,
     pub enabled: bool,
+    pub max_parallel: Option<u32>,
     pub t3: Option<T3Info>,
     pub quotas: Vec<UsageQuotas>,
 }
@@ -166,6 +167,7 @@ pub fn load(paths: &Paths) -> Data {
             display_name: inst.display_name.clone(),
             harness: inst.harness.as_str().to_string(),
             enabled: inst.enabled,
+            max_parallel: inst.max_parallel,
             t3: t3_rows.get(&inst.id).map(|(status, threads)| T3Info {
                 status: status.clone(),
                 threads: *threads,
