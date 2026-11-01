@@ -1657,7 +1657,9 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     }
     out.insert(
         "reason".into(),
-        Value::from(if best.is_none() {
+        Value::from(if best.is_none() && !current_cfg.instance_limits.is_empty() {
+            "no adequate model with enough quota and an available instance slot"
+        } else if best.is_none() {
             "no adequate model with enough quota"
         } else {
             "highest estimated quality with enough quota, after shared-quota and paid-credit penalties and cheap-model bonus"
