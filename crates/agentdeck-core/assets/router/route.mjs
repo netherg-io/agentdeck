@@ -318,26 +318,51 @@ if (!cached) {
   const keyFile = path.join(home, '.config/model-route', keyName);
   const jevKey = process.env[keyEnv] || (fs.existsSync(keyFile) ? fs.readFileSync(keyFile, 'utf8').trim() : '');
   if (!jevKey) { console.error(`decision key not found: set ${keyEnv} or write ${keyFile}`); process.exit(1); }
-  // Vercel AI Gateway has no decisions endpoint: ask the same questions as one JSON chat completion.
-  const system = 'You answer routing questions for an AI agent router. Reply with one JSON object and nothing else. '
-    + 'For every key of `questions` return {"score": n, "confidence": c, "probabilities": {"0": p0, "1": p1, "2": p2, "3": p3}}: '
-    + "n is the index (0-3) of the best-matching entry in that question's `criteria`, c in [0,1] is your confidence, "
-    + "and the probabilities over the four criteria sum to 1. Follow each question's `instructions`; `state` is the context.";
-  const body = vercel
-    ? { model: request.model, messages: [{ role: 'system', content: system }, { role: 'user', content: JSON.stringify({ state: request.state, questions: request.questions }) }], response_format: { type: 'json_object' }, temperature: 0 }
-    : request;
-  const res = await fetch(vercel ? 'https://ai-gateway.vercel.sh/v1/chat/completions' : 'https://openrouter.ai/api/alpha/decisions', {
+  const post = (url, body) => fetch(url, {
     method: 'POST', signal: AbortSignal.timeout(30_000),
     headers: { Authorization: `Bearer ${jevKey}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  if (!res.ok) { console.error(`Jev HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`); process.exit(1); }
-  const out = await res.json();
-  if (vercel) {
-    try { answers = JSON.parse(String(out.choices?.[0]?.message?.content ?? '').trim().replace(/^```(?:json)?|```$/g, '').trim()); }
-    catch (e) { console.error(`gateway answer is not JSON: ${e.message}`); process.exit(1); }
-    cost = {};
-  } else ({ answers, usage: cost = {} } = out);
+  const fail = async res => { console.error(`Jev HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`); process.exit(1); };
+  if (!vercel) {
+    const res = await post('https://openrouter.ai/api/alpha/decisions', request);
+    if (!res.ok) await fail(res);
+    ({ answers, usage: cost = {} } = await res.json());
+  } else {
+    // Vercel's OpenAI-shaped /decisions takes decision models only; a language model
+    // answers the same questions as one JSON chat completion instead.
+    const res = await post('https://ai-gateway.vercel.sh/v1/decisions', {
+      model: request.model, input: JSON.stringify({ state: request.state }),
+      questions: Object.entries(request.questions).map(([name, q]) => ({
+        type: 'score', name, instructions: q.instructions,
+        levels: q.criteria.map((c, i) => ({ label: String(i), description: c })),
+      })),
+    });
+    const text = await res.text();
+    if (res.ok) {
+      const out = JSON.parse(text);
+      answers = {};
+      for (const a of out.answers ?? []) if (a?.type === 'score' && a.name) answers[a.name] = {
+        score: a.score, confidence: a.confidence,
+        ...(Array.isArray(a.probabilities) && { probabilities: Object.fromEntries(a.probabilities.map(p => [String(p.value), p.probability])) }),
+      };
+      const c = Number(out.provider_metadata?.gateway?.cost);
+      cost = Number.isFinite(c) ? { cost: c } : {};
+    } else if (!text.includes('is a language model')) {
+      console.error(`Jev HTTP ${res.status}: ${text.slice(0, 300)}`); process.exit(1);
+    } else {
+      const system = 'You answer routing questions for an AI agent router. Reply with one JSON object and nothing else. '
+        + 'For every key of `questions` return {"score": n, "confidence": c, "probabilities": {"0": p0, "1": p1, "2": p2, "3": p3}}: '
+        + "n is the index (0-3) of the best-matching entry in that question's `criteria`, c in [0,1] is your confidence, "
+        + "and the probabilities over the four criteria sum to 1. Follow each question's `instructions`; `state` is the context.";
+      const chat = await post('https://ai-gateway.vercel.sh/v1/chat/completions', { model: request.model, messages: [{ role: 'system', content: system }, { role: 'user', content: JSON.stringify({ state: request.state, questions: request.questions }) }], response_format: { type: 'json_object' }, temperature: 0 });
+      if (!chat.ok) await fail(chat);
+      const out = await chat.json();
+      try { answers = JSON.parse(String(out.choices?.[0]?.message?.content ?? '').trim().replace(/^```(?:json)?|```$/g, '').trim()); }
+      catch (e) { console.error(`gateway answer is not JSON: ${e.message}`); process.exit(1); }
+      cost = {};
+    }
+  }
   if (!complete(answers)) { console.error('Jev returned incomplete or out-of-range routing answers'); process.exit(1); }
   try {
     fs.mkdirSync(cacheDir, { recursive: true, mode: 0o700 });

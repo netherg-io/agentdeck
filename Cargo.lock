@@ -161,6 +161,7 @@ name = "agentdeck-gui"
 version = "0.1.6"
 dependencies = [
  "agentdeck-core",
+ "agentdeck-router",
  "agentdeck-usage",
  "anyhow",
  "dirs",
@@ -168,10 +169,14 @@ dependencies = [
  "i18n-embed-fl",
  "iced 0.14.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "iced_test",
+ "raw-window-handle",
  "rust-embed",
  "serde_json",
  "tokio",
  "unic-langid",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]
@@ -187,6 +192,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tokio",
 ]
 
 [[package]]

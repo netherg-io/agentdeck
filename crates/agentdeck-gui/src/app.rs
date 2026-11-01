@@ -56,6 +56,8 @@ impl Page {
 #[derive(Debug, Clone)]
 pub enum Message {
     Tick,
+    /// A second launch asked this instance to show itself (its activation token).
+    Raise(String),
     Loaded(Data),
     SelectPage(Page),
     Add(AddMsg),
@@ -86,7 +88,10 @@ pub enum Message {
     ProcConfirm,
     ProcCancel,
     ProcForce(bool),
-    ProcDone { result: String, error: bool },
+    ProcDone {
+        result: String,
+        error: bool,
+    },
     ProcToggle(u32, u64),
     ProcFilter(String),
     PluginDetail(String),
@@ -751,6 +756,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             Some(msg) => update(state, msg),
             None => Task::none(),
         },
+        Message::Raise(token) => crate::single::raise(token),
         Message::ThemeMode(mode) => {
             state.dark = mode != iced::theme::Mode::Light;
             Task::none()
@@ -883,6 +889,7 @@ pub fn subscription(state: &State) -> Subscription<Message> {
             _ => None,
         }),
         iced::system::theme_changes().map(Message::ThemeMode),
+        crate::single::subscription().map(Message::Raise),
     ];
     if state.toasts.iter().any(|t| !t.error) {
         subs.push(iced::time::every(Duration::from_millis(500)).map(|_| Message::ToastTick));

@@ -229,6 +229,7 @@ usage-instance = Инстанс
 usage-instance-none = Не привязан
 usage-empty = Нет источников квот.
 usage-widget-scope = Скрытые провайдеры пропадают только с панели COSMIC; опрос и роутинг их по-прежнему используют.
+usage-order-title = Порядок на панели
 usage-sources-count = { $count ->
         [one] { $count } источник
         [few] { $count } источника
@@ -266,3 +267,6 @@ settings-decision-model-vercel = Id модели в шлюзе, например
 settings-model-required = Для Vercel AI Gateway нужна модель решений
 settings-key = Ключ API { $provider }
 pool-show-legacy = Устаревшие ({ $count })
+settings-test = Проверить
+settings-testing = Проверка…
+settings-test-ok = { $model } работает: объём { $size }, сложность { $difficulty }, { $ms } мс{ $cost }

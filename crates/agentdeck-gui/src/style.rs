@@ -590,6 +590,7 @@ pub enum Icon {
     Search,
     ChevronRight,
     ChevronDown,
+    ChevronUp,
     X,
     Square,
     RefreshCw,
@@ -638,6 +639,7 @@ impl Icon {
             Icon::Search => r#"<path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/>"#,
             Icon::ChevronRight => r#"<path d="m9 18 6-6-6-6"/>"#,
             Icon::ChevronDown => r#"<path d="m6 9 6 6 6-6"/>"#,
+            Icon::ChevronUp => r#"<path d="m18 15-6-6-6 6"/>"#,
             Icon::X => r#"<path d="M18 6 6 18"/><path d="m6 6 12 12"/>"#,
             Icon::Square => r#"<rect width="18" height="18" x="3" y="3" rx="2"/>"#,
             Icon::RefreshCw => {

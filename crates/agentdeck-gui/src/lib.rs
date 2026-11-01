@@ -9,12 +9,17 @@ pub mod data;
 pub mod i18n;
 pub mod overlay;
 pub mod pages;
+mod single;
 pub mod style;
 
 pub use app::{Message, Page, State};
 
-/// Open the GUI. Without a display the backend returns an error (no panic).
+/// Open the GUI, or raise the one already running. Without a display the
+/// backend returns an error (no panic).
 pub fn run() -> iced::Result {
+    if let single::Claim::Handed = single::claim() {
+        return Ok(());
+    }
     iced::application(State::new, app::update, app::view)
         .title(app::title)
         .theme(app::theme)

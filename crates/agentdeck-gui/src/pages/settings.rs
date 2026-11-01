@@ -29,6 +29,9 @@ pub struct State {
     pub refresh: String,
     pub stale: String,
     pub busy: bool,
+    pub testing: bool,
+    /// Last provider check: (text, is error), shown under the form.
+    pub test: Option<(String, bool)>,
     /// Last outcome (text, is error); the shell turns it into a toast.
     pub result: Option<(String, bool)>,
 }
@@ -42,6 +45,8 @@ pub enum Msg {
     Refresh(String),
     Stale(String),
     SaveRouter,
+    Test,
+    Tested(Result<String, String>),
     SavePoll,
     Done(Result<(), String>),
 }
@@ -154,6 +159,55 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
         }
         Msg::Provider(p) => {
             state.provider = p;
+            state.test = None;
+            Task::none()
+        }
+        Msg::Test => {
+            let provider = state.provider;
+            let model = Some(state.decision_model.trim().to_string())
+                .filter(|m| !m.is_empty())
+                .or_else(|| {
+                    (provider == Provider::OpenRouter)
+                        .then(|| settings::DEFAULT_DECISION_MODEL.to_string())
+                });
+            let Some(model) = model else {
+                state.test = Some((fl!(loader(), "settings-model-required"), true));
+                return Task::none();
+            };
+            // An unsaved key in the field is what the user wants to check.
+            let key = Some(state.key.trim().to_string()).filter(|k| !k.is_empty());
+            state.testing = true;
+            state.test = None;
+            Task::perform(
+                async move {
+                    let started = std::time::Instant::now();
+                    let wire = (provider == Provider::Vercel).then_some(settings::PROVIDER_VERCEL);
+                    agentdeck_router::route::probe_decision(wire, &model, key.as_deref())
+                        .await
+                        .map(|(size, difficulty, cost)| {
+                            let ms = started.elapsed().as_millis().to_string();
+                            let cost = cost.map(|c| format!(", ${c:.6}")).unwrap_or_default();
+                            fl!(
+                                loader(),
+                                "settings-test-ok",
+                                model = model,
+                                size = format!("{size:.2}"),
+                                difficulty = format!("{difficulty:.2}"),
+                                ms = ms,
+                                cost = cost
+                            )
+                        })
+                        .map_err(|e| format!("{e:#}"))
+                },
+                Msg::Tested,
+            )
+        }
+        Msg::Tested(result) => {
+            state.testing = false;
+            state.test = Some(match result {
+                Ok(text) => (text, false),
+                Err(e) => (e, true),
+            });
             Task::none()
         }
         Msg::DecisionModel(v) => {
@@ -250,6 +304,16 @@ fn save_row(state: &State, msg: Msg) -> Element<'_, Msg> {
     .into()
 }
 
+/// The last check's outcome, filling the space left of the buttons.
+fn test_line(state: &State) -> Element<'_, Msg> {
+    let line: Element<'_, Msg> = match &state.test {
+        Some((text, false)) => st::pill(text.clone(), st::Tone::Ok),
+        Some((text, true)) => st::body(text.as_str()).into(),
+        None => iced::widget::Space::new().into(),
+    };
+    iced::widget::container(line).width(Length::Fill).into()
+}
+
 pub fn router_view(state: &State) -> Element<'_, Msg> {
     let size = st::look().body;
     let key_set = match state.provider {
@@ -307,7 +371,22 @@ pub fn router_view(state: &State) -> Element<'_, Msg> {
                 .into(),
             Some(key_hint),
         ),
-        save_row(state, Msg::SaveRouter),
+        row![
+            test_line(state),
+            st::btn(
+                st::Btn::Quiet,
+                if state.testing {
+                    fl!(loader(), "settings-testing")
+                } else {
+                    fl!(loader(), "settings-test")
+                }
+            )
+            .on_press_maybe((!state.testing && !state.busy).then_some(Msg::Test)),
+            st::btn(st::Btn::Primary, fl!(loader(), "settings-save"))
+                .on_press_maybe((!state.busy).then_some(Msg::SaveRouter)),
+        ]
+        .spacing(st::SPACE_S)
+        .align_y(Alignment::Center),
     ]
     .spacing(st::SPACE_M);
     column![]
