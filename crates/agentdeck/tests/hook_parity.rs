@@ -393,12 +393,12 @@ fn instance_capacity_blocks_launch_override_and_recommends_another_instance() {
     let t3 = fx.dir.join(".t3/userdata/statev2.sqlite");
     sql(&t3, "CREATE TABLE orchestration_v2_projection_subagents (
         subagent_id TEXT, provider_instance_id TEXT, payload_json TEXT, started_at TEXT,
-        origin TEXT, status TEXT, provider_thread_id TEXT, run_id TEXT);
+        origin TEXT, status TEXT, provider_thread_id TEXT, run_id TEXT, child_thread_id TEXT);
         CREATE TABLE orchestration_v2_projection_provider_threads (
         provider_thread_id TEXT, provider_instance_id TEXT, provider_session_id TEXT, status TEXT);
         CREATE TABLE orchestration_v2_projection_provider_sessions (provider_session_id TEXT, model TEXT, status TEXT);
         CREATE TABLE orchestration_v2_projection_provider_turns (provider_thread_id TEXT, run_attempt_id TEXT, status TEXT);
-        CREATE TABLE orchestration_v2_projection_runs (run_id TEXT, provider_instance_id TEXT, provider_thread_id TEXT, payload_json TEXT, status TEXT);
+        CREATE TABLE orchestration_v2_projection_runs (run_id TEXT, provider_instance_id TEXT, provider_thread_id TEXT, payload_json TEXT, status TEXT, thread_id TEXT);
         CREATE TABLE orchestration_v2_projection_run_attempts (attempt_id TEXT, run_id TEXT);");
     let input = |task: &str| {
         delegate_input(
@@ -457,7 +457,7 @@ fn instance_capacity_blocks_launch_override_and_recommends_another_instance() {
     // An ordinary queued branch occupies the same instance slot, without a subagent.
     sql(
         &t3,
-        "INSERT INTO orchestration_v2_projection_runs VALUES ('branch', 'codex', NULL, '{\"modelSelection\":{\"model\":\"gpt-6-astra\"}}', 'queued')",
+        "INSERT INTO orchestration_v2_projection_runs VALUES ('branch', 'codex', NULL, '{\"modelSelection\":{\"model\":\"gpt-6-astra\"}}', 'queued', 'branch')",
     );
     assert_eq!(verdict(input("With ordinary branch"))["decision"], "deny");
     std::fs::remove_file(&t3).unwrap();

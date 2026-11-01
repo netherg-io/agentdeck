@@ -50,21 +50,44 @@ fn refresh(tx: &Transaction<'_>, home: &Path, time: f64) -> anyhow::Result<Agent
     let file = home.join(".t3/userdata/statev2.sqlite");
     let t3 = Connection::open_with_flags(&file, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     t3.busy_timeout(std::time::Duration::from_secs(1))?;
+    let load = read_active_agents(&file);
+    anyhow::ensure!(
+        load.known,
+        "live T3 agent metadata unavailable; cannot check instance limit"
+    );
+    let live_ids = serde_json::to_string(&load.agents.iter().map(|a| &a.id).collect::<Vec<_>>())?;
     let mut stmt = t3.prepare(
-        "SELECT subagent_id, provider_instance_id,
-        json_extract(payload_json, '$.prompt') FROM orchestration_v2_projection_subagents
-        WHERE (julianday(started_at) - 2440587.5) * 86400 >= ?1
-        ORDER BY started_at, subagent_id",
+        "SELECT n.subagent_id, n.provider_instance_id, json_extract(n.payload_json, '$.prompt'),
+        CASE WHEN n.status IN ('completed', 'failed', 'cancelled', 'interrupted')
+          OR n.provider_thread_id IN (SELECT value FROM json_each(?2))
+          OR EXISTS (SELECT 1 FROM orchestration_v2_projection_runs r
+            WHERE r.thread_id = n.child_thread_id AND (r.run_id IN (SELECT value FROM json_each(?2))
+              OR r.provider_thread_id IN (SELECT value FROM json_each(?2))))
+        THEN 1 ELSE 0 END
+        FROM orchestration_v2_projection_subagents n
+        WHERE (julianday(n.started_at) - 2440587.5) * 86400 >= ?1
+        ORDER BY n.started_at, n.subagent_id",
     )?;
-    let launches = stmt.query_map([time - HANDOFF_SECS], |r| {
+    let launches = stmt.query_map(params![time - HANDOFF_SECS, live_ids], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, Option<String>>(1)?,
             r.get::<_, Option<String>>(2)?,
+            r.get::<_, bool>(3)?,
         ))
     })?;
     for launch in launches {
-        let (id, provider, prompt) = launch?;
+        let (id, provider, prompt, projected) = launch?;
+        // A subagent record can precede its run. Keep its claim until the
+        // load snapshot counts that exact child, or the child has finished.
+        let pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pending WHERE provider = ?1 AND instr(?2, task) > 0)",
+            params![provider, prompt],
+            |r| r.get(0),
+        )?;
+        if pending && !projected {
+            continue;
+        }
         let fresh = tx.execute(
             "INSERT OR IGNORE INTO seen VALUES (?1, ?2)",
             params![id, time],
@@ -79,13 +102,6 @@ fn refresh(tx: &Transaction<'_>, home: &Path, time: f64) -> anyhow::Result<Agent
             )?;
         }
     }
-    // Read after reconciliation so a newly visible launch cannot disappear
-    // from reservations before it is included in the live count.
-    let load = read_active_agents(&file);
-    anyhow::ensure!(
-        load.known,
-        "live T3 agent metadata unavailable; cannot check instance limit"
-    );
     Ok(load)
 }
 
@@ -159,12 +175,12 @@ mod tests {
             let fx = Self(dir);
             fx.t3().execute_batch("CREATE TABLE orchestration_v2_projection_subagents (
                 subagent_id TEXT PRIMARY KEY, provider_instance_id TEXT, payload_json TEXT, started_at TEXT,
-                origin TEXT, status TEXT, provider_thread_id TEXT, run_id TEXT);
+                origin TEXT, status TEXT, provider_thread_id TEXT, run_id TEXT, child_thread_id TEXT);
                 CREATE TABLE orchestration_v2_projection_provider_threads (
                 provider_thread_id TEXT, provider_instance_id TEXT, provider_session_id TEXT, status TEXT);
                 CREATE TABLE orchestration_v2_projection_provider_sessions (provider_session_id TEXT, model TEXT, status TEXT);
                 CREATE TABLE orchestration_v2_projection_provider_turns (provider_thread_id TEXT, run_attempt_id TEXT, status TEXT);
-                CREATE TABLE orchestration_v2_projection_runs (run_id TEXT, provider_instance_id TEXT, provider_thread_id TEXT, payload_json TEXT, status TEXT);
+                CREATE TABLE orchestration_v2_projection_runs (run_id TEXT, provider_instance_id TEXT, provider_thread_id TEXT, payload_json TEXT, status TEXT, thread_id TEXT);
                 CREATE TABLE orchestration_v2_projection_run_attempts (attempt_id TEXT, run_id TEXT);").unwrap();
             fx
         }
@@ -176,12 +192,12 @@ mod tests {
             let payload = serde_json::json!({"prompt": format!("Act as implementation agent.\n\n{task}"), "modelSelection": {"model": "different-model"}}).to_string();
             db.execute(
                 "INSERT INTO orchestration_v2_projection_subagents
-                VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'app', ?4, NULL, ?1)",
+                VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'app', ?4, NULL, ?1, ?1)",
                 params![id, provider, payload, status],
             )
             .unwrap();
             db.execute(
-                "INSERT INTO orchestration_v2_projection_runs VALUES (?1, ?2, NULL, ?3, ?4)",
+                "INSERT INTO orchestration_v2_projection_runs VALUES (?1, ?2, NULL, ?3, ?4, ?1)",
                 params![id, provider, payload, status],
             )
             .unwrap();
@@ -258,6 +274,32 @@ mod tests {
     }
 
     #[test]
+    fn reservation_stays_until_its_run_is_projected() {
+        let fx = Fixture::new();
+        reserve(&fx.0, &fx.0, "codex", 1, "task").unwrap();
+        fx.launch("child", "codex", "task", "queued");
+        fx.t3()
+            .execute("DELETE FROM orchestration_v2_projection_runs", [])
+            .unwrap();
+        let (_, pending) = snapshot(&fx.0, &fx.0).unwrap();
+        assert_eq!(pending.get("codex"), Some(&1));
+        assert!(reserve(&fx.0, &fx.0, "codex", 1, "racing task").is_err());
+        fx.t3().execute_batch("INSERT INTO orchestration_v2_projection_runs VALUES ('child', 'codex', NULL, '{}', 'queued', 'child')").unwrap();
+        let (load, pending) = snapshot(&fx.0, &fx.0).unwrap();
+        assert!(!pending.contains_key("codex"));
+        assert_eq!(load.agents.len(), 1);
+        fx.t3()
+            .execute(
+                "UPDATE orchestration_v2_projection_runs SET status = 'running'",
+                [],
+            )
+            .unwrap();
+        let (load, _) = snapshot(&fx.0, &fx.0).unwrap();
+        assert_eq!(load.agents.len(), 1);
+        assert!(reserve(&fx.0, &fx.0, "codex", 1, "before first turn").is_err());
+    }
+
+    #[test]
     fn unreadable_t3_fails_closed() {
         let fx = Fixture::new();
         fx.t3()
@@ -273,7 +315,7 @@ mod tests {
         db.execute_batch("INSERT INTO orchestration_v2_projection_provider_sessions VALUES ('s', 'gpt-6.1-sol', 'ready');
             INSERT INTO orchestration_v2_projection_provider_threads VALUES ('parent', 'codex', 's', 'active');
             INSERT INTO orchestration_v2_projection_provider_turns VALUES ('parent', NULL, 'running');
-            INSERT INTO orchestration_v2_projection_runs VALUES ('r', 'codex', 'parent', '{}', 'running');").unwrap();
+            INSERT INTO orchestration_v2_projection_runs VALUES ('r', 'codex', 'parent', '{}', 'running', 'root');").unwrap();
         let (load, pending) = snapshot(&fx.0, &fx.0).unwrap();
         assert_eq!(load.agents.len(), 1);
         assert!(reason(&load, 0, "codex", 1).is_some());
@@ -281,11 +323,16 @@ mod tests {
         assert!(reserve(&fx.0, &fx.0, "codex", 1, "child").is_err());
         db.execute_batch("INSERT INTO orchestration_v2_projection_provider_threads VALUES ('child', 'codex', 's', 'active');
             INSERT INTO orchestration_v2_projection_provider_turns VALUES ('child', NULL, 'running');
-            INSERT INTO orchestration_v2_projection_subagents VALUES ('n', 'codex', '{\"model\":\"gpt-6-astra\"}', NULL, 'provider_native', 'running', 'child', 'r');").unwrap();
+            INSERT INTO orchestration_v2_projection_subagents VALUES ('n', 'codex', '{\"model\":\"gpt-6-astra\"}', NULL, 'provider_native', 'running', 'child', 'r', NULL);").unwrap();
         let (load, _) = snapshot(&fx.0, &fx.0).unwrap();
         assert_eq!(load.agents.len(), 2);
         assert_eq!(load.agents.iter().filter(|a| a.id == "child").count(), 1);
         db.execute("UPDATE orchestration_v2_projection_provider_turns SET status = 'completed' WHERE provider_thread_id = 'parent'", []).unwrap();
+        db.execute(
+            "UPDATE orchestration_v2_projection_runs SET status = 'completed'",
+            [],
+        )
+        .unwrap();
         let (load, _) = snapshot(&fx.0, &fx.0).unwrap();
         assert_eq!(load.agents.len(), 1);
         assert!(reason(&load, 0, "codex", 2).is_none());
