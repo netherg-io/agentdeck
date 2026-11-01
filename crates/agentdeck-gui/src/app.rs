@@ -12,7 +12,7 @@ use crate::overlay::{self, Modal, Toast};
 use crate::pages::add_instance::{self, AddMsg};
 use crate::pages::drift::{self, Ctx as DriftCtx};
 use crate::pages::plugins::Pending;
-use crate::pages::{self, harnesses, pool, shared, usage};
+use crate::pages::{self, harnesses, pool, settings, shared, usage};
 use crate::style as st;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -23,7 +23,10 @@ pub enum Page {
     Drift,
     UsageSources,
     UsageWidget,
+    UsagePoll,
     Limits,
+    RouterSettings,
+    Modules,
     Processes,
     Pool,
     Shared,
@@ -39,6 +42,9 @@ impl Page {
             Self::UsageSources => fl!(loader(), "nav-usage-sources"),
             Self::UsageWidget => fl!(loader(), "nav-usage-widget"),
             Self::Limits => fl!(loader(), "nav-limits"),
+            Self::UsagePoll => fl!(loader(), "nav-usage-poll"),
+            Self::RouterSettings => fl!(loader(), "nav-router-settings"),
+            Self::Modules => fl!(loader(), "nav-modules"),
             Self::Processes => fl!(loader(), "nav-processes"),
             Self::Pool => fl!(loader(), "nav-pool"),
             Self::Shared => fl!(loader(), "nav-shared"),
@@ -93,6 +99,7 @@ pub enum Message {
     Shared(pages::shared::Msg),
     Harnesses(pages::harnesses::Msg),
     Usage(usage::Msg),
+    Settings(settings::Msg),
     AutoApply(bool),
     AutoApplyDone(Result<(), String>),
 }
@@ -156,6 +163,7 @@ pub struct State {
     shared: shared::State,
     harnesses: harnesses::State,
     usage: usage::State,
+    settings: settings::State,
     toasts: Vec<Toast>,
     next_toast: u64,
     dark: bool,
@@ -204,6 +212,7 @@ impl State {
                 shared: shared::State::default(),
                 harnesses: harnesses::State::default(),
                 usage: usage::State::default(),
+                settings: settings::State::default(),
                 toasts: Vec::new(),
                 next_toast: 0,
                 dark: true,
@@ -238,6 +247,7 @@ impl State {
             shared: shared::State::default(),
             harnesses: harnesses::State::default(),
             usage: usage::State::default(),
+            settings: settings::State::default(),
             toasts: Vec::new(),
             next_toast: 0,
             dark: true,
@@ -291,6 +301,9 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 (Page::Harnesses, _) => Task::perform(harnesses::load(), Message::Harnesses),
                 (Page::UsageSources | Page::UsageWidget, Some(paths)) => {
                     Task::perform(async move { usage::load(&paths) }, Message::Usage)
+                }
+                (Page::UsagePoll | Page::RouterSettings, Some(paths)) => {
+                    Task::perform(async move { settings::load(&paths) }, Message::Settings)
                 }
                 _ => Task::none(),
             }
@@ -346,6 +359,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     busy: false,
                     error: None,
                 });
+                return iced::widget::operation::focus(pages::instances::PARALLEL_INPUT);
             }
             Task::none()
         }
@@ -416,6 +430,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                     busy: false,
                     error: None,
                 });
+                return iced::widget::operation::focus(pages::instances::RENAME_INPUT);
             }
             Task::none()
         }
@@ -662,6 +677,18 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             task
         }
+        Message::Settings(msg) => {
+            let task = match state.paths.clone() {
+                Some(paths) => {
+                    settings::update(&mut state.settings, paths, msg).map(Message::Settings)
+                }
+                None => Task::none(),
+            };
+            if let Some((text, error)) = state.settings.result.take() {
+                state.toast(text, error);
+            }
+            task
+        }
         Message::AutoApply(on) => match state.paths.clone() {
             Some(paths) => Task::perform(
                 async move {
@@ -872,7 +899,11 @@ fn modal(state: &State) -> Option<Modal<'_, Message>> {
         Page::Pool => pool::modal(&state.pool).map(|m| m.map(Message::Pool)),
         Page::Shared => shared::modal(&state.shared).map(|m| m.map(Message::Shared)),
         Page::Harnesses => harnesses::modal(&state.harnesses).map(|m| m.map(Message::Harnesses)),
-        Page::AddInstance | Page::Limits => None,
+        Page::AddInstance
+        | Page::Limits
+        | Page::UsagePoll
+        | Page::RouterSettings
+        | Page::Modules => None,
     }
 }
 
@@ -951,6 +982,7 @@ fn sidebar(state: &State) -> Element<'_, Message> {
             &[
                 (Page::UsageSources, st::Icon::Activity),
                 (Page::UsageWidget, st::Icon::Square),
+                (Page::UsagePoll, st::Icon::RefreshCw),
             ],
         ),
         module(
@@ -958,29 +990,41 @@ fn sidebar(state: &State) -> Element<'_, Message> {
             agentdeck_core::plugins::PLUGIN_ROUTER,
             &[
                 (Page::Pool, st::Icon::Layers),
-                (Page::Limits, st::Icon::Users),
+                (Page::Limits, st::Icon::Gauge),
+                (Page::RouterSettings, st::Icon::Split),
             ],
         ),
         module(
             fl!(loader(), "nav-group-agents"),
             agentdeck_core::plugins::PLUGIN_AGENT_PROCESS,
-            &[(Page::Processes, st::Icon::Activity)],
+            &[(Page::Processes, st::Icon::Terminal)],
         ),
         group(
             fl!(loader(), "nav-group-system"),
             &[
                 (Page::Shared, st::Icon::Share),
                 (Page::Harnesses, st::Icon::Wrench),
+                (Page::Modules, st::Icon::Plug),
             ],
         ),
     ]
-    .spacing(look.gap.max(12.0) + 6.0);
-    container(col)
-        .width(look.sidebar_width)
-        .height(Length::Fill)
-        .padding([look.page_pad, 10.0])
-        .style(st::sidebar_style)
-        .into()
+    .spacing(look.gap.max(12.0) + 2.0);
+    // Scrolls when the window is shorter than the full module list.
+    container(
+        scrollable(col)
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::new()
+                    .width(4)
+                    .scroller_width(4)
+                    .spacing(4),
+            ))
+            .height(Length::Fill),
+    )
+    .width(look.sidebar_width)
+    .height(Length::Fill)
+    .padding([look.page_pad, 10.0])
+    .style(st::sidebar_style)
+    .into()
 }
 
 fn page_header<'a>(title: String, action: Option<Element<'a, Message>>) -> Element<'a, Message> {
@@ -1034,6 +1078,9 @@ fn header(state: &State) -> Element<'_, Message> {
         ),
         Page::UsageWidget => (t("usage-widget-title"), None),
         Page::Limits => (t("limits-title"), None),
+        Page::UsagePoll => (t("usage-poll-title"), None),
+        Page::RouterSettings => (t("router-settings-title"), None),
+        Page::Modules => (t("modules-title"), None),
         Page::Pool => (
             t("pool-title"),
             Some(pool::header_actions(&state.pool).map(Message::Pool)),
@@ -1054,31 +1101,14 @@ pub fn view(state: &State) -> Element<'_, Message> {
         Page::Instances => pages::instances::view_with_rename(&state.data, state.rename.as_ref()),
         Page::AddInstance => add_instance::view(&state.add),
         Page::Drift => drift::view(&state.drift).map(Message::Drift),
-        Page::UsageSources => with_status(
-            state,
-            usage::sources_view(&state.usage, &state.data).map(Message::Usage),
-            agentdeck_core::plugins::PLUGIN_AI_USAGE,
-        ),
-        Page::UsageWidget => with_status(
-            state,
-            usage::widget_view(&state.usage).map(Message::Usage),
-            agentdeck_core::plugins::PLUGIN_AI_USAGE,
-        ),
-        Page::Limits => with_status(
-            state,
-            pages::instances::limits_view(&state.data, state.parallel.as_ref()),
-            agentdeck_core::plugins::PLUGIN_ROUTER,
-        ),
-        Page::Processes => with_status(
-            state,
-            pages::processes::view(&state.data, &state.proc_ui),
-            agentdeck_core::plugins::PLUGIN_AGENT_PROCESS,
-        ),
-        Page::Pool => with_status(
-            state,
-            pool::view(&state.pool).map(Message::Pool),
-            agentdeck_core::plugins::PLUGIN_ROUTER,
-        ),
+        Page::UsageSources => usage::sources_view(&state.usage, &state.data).map(Message::Usage),
+        Page::UsageWidget => usage::widget_view(&state.usage).map(Message::Usage),
+        Page::UsagePoll => settings::poll_view(&state.settings).map(Message::Settings),
+        Page::Limits => pages::instances::limits_view(&state.data, state.parallel.as_ref()),
+        Page::RouterSettings => settings::router_view(&state.settings).map(Message::Settings),
+        Page::Modules => pages::plugins::view(&state.data, &state.plugin_open),
+        Page::Processes => pages::processes::view(&state.data, &state.proc_ui),
+        Page::Pool => pool::view(&state.pool).map(Message::Pool),
         Page::Shared => shared::view(&state.shared).map(Message::Shared),
         Page::Harnesses => harnesses::view(&state.harnesses).map(Message::Harnesses),
     };
@@ -1107,20 +1137,6 @@ pub fn view(state: &State) -> Element<'_, Message> {
         overlay::toasts(&state.toasts, Message::ToastClose),
         modal(state),
     )
-}
-
-/// A module page ends with the module's own state, so a page never hides that its module is off.
-fn with_status<'a>(
-    state: &'a State,
-    page: Element<'a, Message>,
-    plugin: &'static str,
-) -> Element<'a, Message> {
-    column![
-        page,
-        pages::plugins::status_card(&state.data, plugin, &state.plugin_open)
-    ]
-    .spacing(st::look().gap.max(st::SPACE_S))
-    .into()
 }
 
 /// Palette following the system dark/light preference.

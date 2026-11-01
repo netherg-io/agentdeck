@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use agentdeck_core::{Paths, PoolEntry, Registry, pool};
 use i18n_embed_fl::fl;
-use iced::widget::{Space, column, container, pick_list, row, text_input, toggler};
+use iced::widget::{Space, column, container, pick_list, row, text_input, toggler, tooltip};
 use iced::{Alignment, Element, Length, Task};
 
 use crate::i18n::loader;
@@ -37,7 +37,9 @@ pub struct Loaded {
     pub entries: Vec<PoolEntry>,
     pub instances: Vec<String>,
     pub names: BTreeMap<String, String>,
-    pub saved: Vec<PoolEntry>,
+    /// Saved entries the catalog does not provide (custom model or options):
+    /// only these can be deleted; catalog models are just switched off.
+    pub custom: Vec<PoolEntry>,
     pub error: Option<String>,
 }
 
@@ -122,7 +124,17 @@ pub fn load(ctx: &Ctx) -> Msg {
                     .iter()
                     .map(|i| (i.id.clone(), i.display_name.clone()))
                     .collect(),
-                saved: reg.pool,
+                custom: reg
+                    .pool
+                    .iter()
+                    .filter(|e| {
+                        !e.options.is_empty()
+                            || !pool::cached_models(ctx.t3_root.as_deref(), &e.instance)
+                                .unwrap_or_default()
+                                .contains(&e.model)
+                    })
+                    .cloned()
+                    .collect(),
                 error,
             }
         }
@@ -479,7 +491,7 @@ pub fn header_actions(state: &State) -> Element<'_, Msg> {
     .into()
 }
 
-const TOGGLE_W: f32 = 48.0;
+const TOGGLE_W: f32 = 64.0;
 const REMOVE_W: f32 = 28.0;
 
 pub fn view(state: &State) -> Element<'_, Msg> {
@@ -590,13 +602,15 @@ pub fn view(state: &State) -> Element<'_, Msg> {
                         .on_toggle_maybe((!state.busy).then_some(move |_| Msg::AskToggle(i))),
                 )
                 .width(TOGGLE_W),
-                if state.data.saved.iter().any(|saved| saved.key_eq(e)) {
-                    Element::from(
+                if state.data.custom.iter().any(|c| c.key_eq(e)) {
+                    Element::from(tooltip(
                         st::icon_btn(st::Icon::Trash)
                             .on_press_maybe((!state.busy).then_some(Msg::AskRemove(i))),
-                    )
+                        st::body(fl!(loader(), "pool-remove-tip")),
+                        tooltip::Position::Left,
+                    ))
                 } else {
-                    Element::from(Space::new().width(REMOVE_W))
+                    Element::from(Space::new().width(REMOVE_W).height(REMOVE_W))
                 },
             ]
             .spacing(st::SPACE_M)

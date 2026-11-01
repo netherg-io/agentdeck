@@ -634,7 +634,7 @@ fn drift_fix_then_reenable_offer_and_snapshots() {
     agentdeck_gui::i18n::set_language("en");
 }
 
-/// Module switches: a module page with its status card, enable preview + cancel, EN/RU snapshots.
+/// Module switches: the Modules page with every status card, enable preview + cancel, EN/RU snapshots.
 ///
 /// HOME and XDG_CONFIG_HOME point at a temp dir so the status/probe reads are
 /// deterministic (launcher missing, unit not installed) and read-only.
@@ -665,15 +665,19 @@ fn module_switch_preview_cancel_and_snapshots() {
     std::fs::create_dir_all(SNAPSHOTS).unwrap();
     let home = fakehome;
 
-    // A module page ends with its status card; snapshot EN + RU.
+    // System → Modules lists every module's status card; snapshot EN + RU.
     agentdeck_gui::i18n::set_language("en");
     let mut state = app::State::for_tests(paths.clone(), data.clone());
-    let mut ui = iced_test::simulator(app::view(&state));
-    ui.click("Limits").expect("limits nav button");
-    for message in ui.into_messages() {
-        let _ = app::update(&mut state, message);
+    let _ = app::update(
+        &mut state,
+        app::Message::SelectPage(agentdeck_gui::Page::Modules),
+    );
+    {
+        let mut ui = iced_test::simulator(app::view(&state));
+        for name in ["ai-usage", "router", "agent-process"] {
+            ui.find(name).expect("module status card");
+        }
     }
-    assert!(matches!(state.page(), agentdeck_gui::Page::Limits));
     let _ = app::update(&mut state, app::Message::PluginDetail("router".into()));
     for (lang, stem) in [("en", "modules_en"), ("ru", "modules_ru")] {
         agentdeck_gui::i18n::set_language(lang);
@@ -699,7 +703,7 @@ fn module_switch_preview_cancel_and_snapshots() {
             .expect("golden written");
         let bytes = std::fs::metadata(&golden).expect("golden png").len();
         assert!(bytes > 1_024, "golden {} looks empty", golden.display());
-        assert!(bytes < 100 * 1024, "golden {} too big", golden.display());
+        assert!(bytes < 160 * 1024, "golden {} too big", golden.display());
     }
 
     // Enable flow: the preview lists changes, Cancel drops it without writes.
@@ -952,7 +956,7 @@ fn parallel_limit_edit_validate_persist_reload_and_clear() {
         app::Message::SelectPage(agentdeck_gui::Page::Limits),
     );
     let mut ui = iced_test::simulator(app::view(&state));
-    ui.click("Parallel tasks: Unlimited").unwrap();
+    ui.click("Unlimited").unwrap();
     for message in ui.into_messages() {
         let _ = app::update(&mut state, message);
     }
@@ -987,18 +991,14 @@ fn parallel_limit_edit_validate_persist_reload_and_clear() {
             .max_parallel,
         Some(3)
     );
-    iced_test::simulator(app::view(&state))
-        .find("Parallel tasks: 3")
-        .unwrap();
+    iced_test::simulator(app::view(&state)).find("3").unwrap();
     assert_eq!(data::load(&paths).instances[0].max_parallel, Some(3));
 
     // Cancel keeps the stored value; a failed write keeps the editor usable.
     let _ = app::update(&mut state, app::Message::ParallelAsk("claude-main".into()));
     let _ = app::update(&mut state, app::Message::ParallelInput("9".into()));
     let _ = app::update(&mut state, app::Message::Escape);
-    iced_test::simulator(app::view(&state))
-        .find("Parallel tasks: 3")
-        .unwrap();
+    iced_test::simulator(app::view(&state)).find("3").unwrap();
     let _ = app::update(&mut state, app::Message::ParallelAsk("claude-main".into()));
     let task = app::update(
         &mut state,
@@ -1039,7 +1039,7 @@ fn parallel_limit_edit_validate_persist_reload_and_clear() {
         None
     );
     iced_test::simulator(app::view(&state))
-        .find("Parallel tasks: Unlimited")
+        .find("Unlimited")
         .unwrap();
 }
 

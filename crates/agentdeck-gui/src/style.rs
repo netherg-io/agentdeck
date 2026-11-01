@@ -593,6 +593,9 @@ pub enum Icon {
     X,
     Square,
     RefreshCw,
+    Gauge,
+    Split,
+    Terminal,
     Download,
     ArrowLeft,
     CircleCheck,
@@ -623,6 +626,11 @@ impl Icon {
             Icon::Activity => {
                 r#"<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>"#
             }
+            Icon::Gauge => r#"<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>"#,
+            Icon::Split => {
+                r#"<path d="M16 3h5v5"/><path d="M8 3H3v5"/><path d="M12 22v-8.3a4 4 0 0 0-1.172-2.872L3 3"/><path d="m15 9 6-6"/>"#
+            }
+            Icon::Terminal => r#"<path d="M12 19h8"/><path d="m4 17 6-6-6-6"/>"#,
             Icon::Plus => r#"<path d="M5 12h14"/><path d="M12 5v14"/>"#,
             Icon::Trash => {
                 r#"<path d="M10 11v6"/><path d="M14 11v6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>"#

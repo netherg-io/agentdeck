@@ -7,5 +7,6 @@ pub mod instances;
 pub mod plugins;
 pub mod pool;
 pub mod processes;
+pub mod settings;
 pub mod shared;
 pub mod usage;

@@ -77,15 +77,30 @@ systemctl --user enable --now agentdeck-daemon.service   # owner's call
 
 The same binary serves the iced GUI (English and Russian): instances with
 quotas, the add wizard with login and the drift view (with the sync auto-apply
-switch). Each module is a sidebar group with its on/off switch, its pages and
-its technical status: Quotas (sources, panel widget visibility), Router (pool,
-parallel limits) and Agents (processes). The usage daemon re-reads quota
-sources every cycle, so GUI edits apply without a restart. The GUI shares the registry with the CLI under `flock` and
+switch). Each module is a sidebar group with its on/off switch and its pages:
+Quotas (sources with API keys, panel widget visibility, polling interval),
+Router (pool, parallel limits, decision model and OpenRouter key) and Agents
+(processes). System → Modules shows each module's technical status. The usage
+daemon re-reads quota sources, polling settings and new keys from `usage.env`
+every cycle, so GUI edits apply without a restart. The GUI shares the registry with the CLI under `flock` and
 works while the daemon is stopped. The Pool page lists every cached model per
 registered instance, with search, an instance filter and sorting. New catalog
 entries start disabled; only explicitly enabled entries are routing candidates.
 T3 favorites are not used. Instance names can be edited without changing their
 IDs or T3 thread history. The router reads the current registry directly.
+Saved pool entries the catalog does not provide (custom models or options) can
+be deleted; catalog models are switched off instead.
+
+Module settings live in `instances.toml`; absent keys use the defaults:
+
+```toml
+[router]
+decision_model = "~typesafe/jev-latest"   # OpenRouter model that picks targets
+
+[usage_poll]
+refresh_seconds = 120   # minimum 15
+stale_seconds = 900     # cached quota data older than this is stale
+```
 
 **Parallel tasks** on each instance sets its router limit; a blank value means
 unlimited. The limit covers active T3 threads and subagents across every

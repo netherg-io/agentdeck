@@ -48,6 +48,8 @@ pub struct Form {
     /// Path or env-var name, depending on the kind (see [`source_field`]).
     pub source: String,
     pub instance: Option<String>,
+    /// Key-based kinds: the key itself, written to `usage.env`, never to the registry.
+    pub key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +85,7 @@ pub enum Msg {
     Display(String),
     Source(String),
     Instance(String),
+    Key(String),
     AskAdd,
     AskRemove(String),
     Confirm,
@@ -118,10 +121,46 @@ fn source_field(kind: UsageKind) -> (&'static str, bool) {
     match kind {
         UsageKind::Claude => ("usage-config-dir", true),
         UsageKind::Codex => ("usage-codex-home", true),
-        UsageKind::Deepseek | UsageKind::Openrouter => ("usage-api-key-env", true),
+        UsageKind::Deepseek | UsageKind::Openrouter => ("usage-api-key-env", false),
         UsageKind::Antigravity => ("usage-token-file", false),
         UsageKind::OpencodeGo => ("usage-db-file", false),
     }
+}
+
+fn is_key_kind(kind: UsageKind) -> bool {
+    matches!(kind, UsageKind::Deepseek | UsageKind::Openrouter)
+}
+
+/// Env var holding a key-based source's key when the user names none.
+fn default_key_env(kind: UsageKind, id: &str) -> String {
+    format!("AGENTDECK_{}_{}", kind.as_str(), id.trim())
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Sets `var=key` in `usage.env` (0600), replacing an earlier line for `var`.
+fn write_secret(paths: &Paths, var: &str, key: &str) -> anyhow::Result<()> {
+    let path = agentdeck_usage::daemon::agentdeck_secrets_file(&paths.config_dir);
+    let old = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => anyhow::bail!("{}: {e}", path.display()),
+    };
+    let mut out: String = old
+        .lines()
+        .filter(|l| l.split_once('=').is_none_or(|(k, _)| k.trim() != var))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    out.push_str(&format!("{var}={key}\n"));
+    agentdeck_usage::util::atomic_write_mode(&path, out.as_bytes(), Some(0o600))
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
 }
 
 fn entry_of(form: &Form) -> anyhow::Result<UsageEntry> {
@@ -148,6 +187,9 @@ fn entry_of(form: &Form) -> anyhow::Result<UsageEntry> {
         UsageKind::Antigravity => &mut entry.token_file,
         UsageKind::OpencodeGo => &mut entry.db_file,
     } = source;
+    if is_key_kind(kind) && entry.api_key_env.is_none() {
+        entry.api_key_env = Some(default_key_env(kind, &form.id));
+    }
     Ok(entry)
 }
 
@@ -203,9 +245,21 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
             // Picking the current instance again clears the binding.
             f.instance = (f.instance.as_deref() != Some(v.as_str())).then(|| v.clone());
         }),
+        Msg::Key(v) => form(state, &|f| f.key.clone_from(&v)),
         Msg::AskAdd => {
             if let Some(form) = state.form.clone() {
                 ask(state, &paths, entry_of(&form).map(Op::Add));
+                if let Some((var, _)) = secret(state)
+                    && let Some(p) = state.pending.as_mut()
+                {
+                    let file = agentdeck_usage::daemon::agentdeck_secrets_file(&paths.config_dir);
+                    p.lines.push(fl!(
+                        loader(),
+                        "usage-key-write",
+                        var = var,
+                        path = file.display().to_string()
+                    ));
+                }
             }
             Task::none()
         }
@@ -213,8 +267,10 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
             ask(state, &paths, Ok(Op::Remove(id)));
             Task::none()
         }
-        Msg::Confirm => match state.pending.take().and_then(|p| p.op) {
+        Msg::Confirm => match state.pending.as_ref().and_then(|p| p.op.clone()) {
             Some(op) => {
+                let secret = secret(state);
+                state.pending = None;
                 state.busy = true;
                 if matches!(op, Op::Add(_)) {
                     state.form = None;
@@ -222,6 +278,9 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
+                            if let Some((var, key)) = &secret {
+                                write_secret(&paths, var, key).map_err(|e| format!("{e:#}"))?;
+                            }
                             changes(&paths, &op, false)
                                 .map(|_| ())
                                 .map_err(|e| format!("{e:#}"))
@@ -262,6 +321,15 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
     }
 }
 
+/// The pending add's key env var and the typed key, when one was entered.
+fn secret(state: &State) -> Option<(String, String)> {
+    let key = state.form.as_ref()?.key.trim().to_string();
+    match state.pending.as_ref()?.op.as_ref()? {
+        Op::Add(e) if !key.is_empty() => e.api_key_env.clone().map(|var| (var, key)),
+        _ => None,
+    }
+}
+
 fn add_form(form: &Form, instances: &[String]) -> crate::overlay::Modal<'static, Msg> {
     let size = st::look().body;
     let field = |label: String, input: Element<'static, Msg>| -> Element<'static, Msg> {
@@ -296,10 +364,29 @@ fn add_form(form: &Form, instances: &[String]) -> crate::overlay::Modal<'static,
             fl!(loader(), "usage-display"),
             input("", &form.display, Msg::Display),
         ));
-        body.push(field(label, input("", &form.source, Msg::Source)));
-        if kind == UsageKind::Deepseek || kind == UsageKind::Openrouter {
-            body.push(st::muted(fl!(loader(), "usage-api-key-hint")).into());
+        if is_key_kind(kind) {
+            body.push(field(
+                fl!(loader(), "usage-api-key"),
+                text_input(&fl!(loader(), "usage-api-key-placeholder"), &form.key)
+                    .secure(true)
+                    .on_input(Msg::Key)
+                    .size(size)
+                    .into(),
+            ));
         }
+        let placeholder = if is_key_kind(kind) {
+            default_key_env(
+                kind,
+                if form.id.trim().is_empty() {
+                    "main"
+                } else {
+                    &form.id
+                },
+            )
+        } else {
+            String::new()
+        };
+        body.push(field(label, input(&placeholder, &form.source, Msg::Source)));
         if matches!(kind, UsageKind::Claude | UsageKind::Codex) && !instances.is_empty() {
             body.push(field(
                 fl!(loader(), "usage-instance"),
@@ -482,5 +569,32 @@ mod tests {
         assert!(entry_of(&form).unwrap().db_file.is_none());
         form.kind = None;
         assert!(entry_of(&form).is_err());
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    #[test]
+    fn default_env_name_and_secret_replacement() {
+        assert_eq!(
+            default_key_env(UsageKind::Openrouter, "or-main"),
+            "AGENTDECK_OPENROUTER_OR_MAIN"
+        );
+        let dir = std::env::temp_dir().join(format!("agentdeck-secret-{}", std::process::id()));
+        let paths = Paths::new(dir.clone(), dir.join("state"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("usage.env"), "# keys\nA=1\nB=2\n").unwrap();
+        write_secret(&paths, "A", "new").unwrap();
+        let text = std::fs::read_to_string(dir.join("usage.env")).unwrap();
+        assert_eq!(text, "# keys\nB=2\nA=new\n");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.join("usage.env"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
