@@ -338,7 +338,10 @@ fn every_page_fits_at_min_size_with_long_names() {
                     source("openrouter-main", UsageKind::Openrouter, None),
                 ],
                 instances: vec![LONG_ID.into()],
-                hidden: ["openrouter".to_string()].into(),
+                prefs: agentdeck_usage::visibility::Prefs {
+                    hidden: ["openrouter".to_string()].into(),
+                    ..Default::default()
+                },
                 error: None,
             })),
         );

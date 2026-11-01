@@ -37,7 +37,7 @@ impl std::fmt::Display for Kind {
 pub struct Loaded {
     pub sources: Vec<UsageEntry>,
     pub instances: Vec<String>,
-    pub hidden: BTreeSet<String>,
+    pub prefs: agentdeck_usage::visibility::Prefs,
     pub error: Option<String>,
 }
 
@@ -94,6 +94,8 @@ pub enum Msg {
     Done(Result<(), String>),
     /// Provider, shown.
     Show(String, bool),
+    /// Account id, up: one step in the panel order.
+    Move(String, bool),
 }
 
 pub fn load(paths: &Paths) -> Msg {
@@ -106,7 +108,7 @@ pub fn load(paths: &Paths) -> Msg {
         Err(e) => out.error = Some(format!("{e:#}")),
     }
     match agentdeck_usage::visibility::load(&visibility_path(paths)) {
-        Ok(hidden) => out.hidden = hidden,
+        Ok(prefs) => out.prefs = prefs,
         Err(e) => out.error = Some(e),
     }
     Msg::Loaded(out)
@@ -312,19 +314,52 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
             Task::done(load(&paths))
         }
         Msg::Show(provider, shown) => {
-            let mut hidden = state.data.hidden.clone();
+            let mut prefs = state.data.prefs.clone();
             if shown {
-                hidden.remove(&provider);
+                prefs.hidden.remove(&provider);
             } else {
-                hidden.insert(provider);
+                prefs.hidden.insert(provider);
             }
-            match agentdeck_usage::visibility::save(&visibility_path(&paths), &hidden) {
-                Ok(()) => state.data.hidden = hidden,
-                Err(e) => state.result = Some((e, true)),
+            save_prefs(state, &paths, prefs);
+            Task::none()
+        }
+        Msg::Move(id, up) => {
+            let mut order: Vec<String> = panel_order(&state.data)
+                .into_iter()
+                .map(|u| u.id.clone())
+                .collect();
+            if let Some(i) = order.iter().position(|o| *o == id) {
+                let j = if up {
+                    i.checked_sub(1)
+                } else {
+                    Some(i + 1).filter(|j| *j < order.len())
+                };
+                if let Some(j) = j {
+                    order.swap(i, j);
+                    let prefs = agentdeck_usage::visibility::Prefs {
+                        order,
+                        ..state.data.prefs.clone()
+                    };
+                    save_prefs(state, &paths, prefs);
+                }
             }
             Task::none()
         }
     }
+}
+
+fn save_prefs(state: &mut State, paths: &Paths, prefs: agentdeck_usage::visibility::Prefs) {
+    match agentdeck_usage::visibility::save(&visibility_path(paths), &prefs) {
+        Ok(()) => state.data.prefs = prefs,
+        Err(e) => state.result = Some((e, true)),
+    }
+}
+
+/// Sources in the order the panel applet shows them.
+fn panel_order(data: &Loaded) -> Vec<&UsageEntry> {
+    let mut v: Vec<_> = data.sources.iter().collect();
+    v.sort_by_key(|u| data.prefs.rank(&u.id));
+    v
 }
 
 /// The pending add's key env var and the typed key, when one was entered.
@@ -515,7 +550,7 @@ pub fn widget_view(state: &State) -> Element<'_, Msg> {
         .sources
         .iter()
         .map(|u| u.kind.as_str())
-        .chain(state.data.hidden.iter().map(String::as_str))
+        .chain(state.data.prefs.hidden.iter().map(String::as_str))
         .collect();
     let mut col =
         column![st::muted(fl!(loader(), "usage-widget-scope"))].spacing(look.gap.max(st::SPACE_S));
@@ -547,7 +582,7 @@ pub fn widget_view(state: &State) -> Element<'_, Msg> {
                     "usage-sources-count",
                     count = count
                 ))),
-                toggler(!state.data.hidden.contains(p))
+                toggler(!state.data.prefs.hidden.contains(p))
                     .size(16)
                     .on_toggle(move |on| Msg::Show(provider.clone(), on)),
             ]
@@ -555,7 +590,40 @@ pub fn widget_view(state: &State) -> Element<'_, Msg> {
             .align_y(Alignment::Center),
         );
     }
-    col.push(st::card(list)).into()
+    col = col.push(st::card(list));
+    let sources = panel_order(&state.data);
+    let mut order = column![].spacing(look.row_gap);
+    for (i, u) in sources.iter().enumerate() {
+        if i > 0 {
+            order = order.push(st::hairline());
+        }
+        let hidden = state.data.prefs.hidden.contains(u.kind.as_str());
+        let name = st::fit(
+            u.display.as_str(),
+            if hidden {
+                st::Role::Muted
+            } else {
+                st::Role::Body
+            },
+            st::Cut::End,
+        );
+        order = order.push(
+            row![
+                container(name).width(Length::Fill),
+                container(st::pill(u.kind.as_str(), st::Tone::Accent)).width(KIND_W),
+                st::icon_btn(st::Icon::ChevronUp)
+                    .on_press_maybe((i > 0).then(|| Msg::Move(u.id.clone(), true))),
+                st::icon_btn(st::Icon::ChevronDown).on_press_maybe(
+                    (i + 1 < sources.len()).then(|| Msg::Move(u.id.clone(), false))
+                ),
+            ]
+            .spacing(st::SPACE_S)
+            .align_y(Alignment::Center),
+        );
+    }
+    col.push(st::heading(fl!(loader(), "usage-order-title")))
+        .push(st::card(order))
+        .into()
 }
 
 #[cfg(test)]

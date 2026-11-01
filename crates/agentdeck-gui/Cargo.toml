@@ -10,6 +10,7 @@ rust-version = "1.93"
 [dependencies]
 agentdeck-core = { path = "../agentdeck-core" }
 agentdeck-usage = { path = "../agentdeck-usage" }
+agentdeck-router = { path = "../agentdeck-router" }
 anyhow = "1.0"
 dirs = "6.0"
 iced = { version = "0.14", features = ["tokio", "svg"] }
@@ -17,7 +18,12 @@ i18n-embed = { version = "0.16", features = ["fluent-system", "desktop-requester
 i18n-embed-fl = "0.10"
 rust-embed = "8"
 serde_json = "1.0"
-tokio = { version = "1.47", features = ["rt"] }
+tokio = { version = "1.47", features = ["rt", "net"] }
+# Raising the running window on a second launch (xdg-activation); all already in winit's tree.
+raw-window-handle = "0.6"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 unic-langid = "0.9"
 
 [dev-dependencies]

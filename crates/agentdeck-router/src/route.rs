@@ -942,8 +942,76 @@ fn decision_key(env: &str, file: &str) -> anyhow::Result<String> {
         })
 }
 
-/// The same questions as OpenRouter's decisions API, asked as one JSON
-/// chat completion (Vercel AI Gateway has no decisions endpoint).
+/// OpenRouter's question map as Vercel's OpenAI-shaped `/v1/decisions` body:
+/// an ordered question list whose criteria become score levels 0-3.
+fn decisions_body(request: &Value) -> Value {
+    let questions: Vec<Value> = request
+        .get("questions")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(name, q)| {
+            let levels: Vec<Value> = q
+                .get("criteria")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(|(i, c)| serde_json::json!({"label": i.to_string(), "description": c}))
+                .collect();
+            serde_json::json!({"type": "score", "name": name, "instructions": q.get("instructions"), "levels": levels})
+        })
+        .collect();
+    serde_json::json!({
+        "model": request.get("model"),
+        "input": serde_json::json!({"state": request.get("state")}).to_string(),
+        "questions": questions,
+    })
+}
+
+/// Vercel's answer list back to OpenRouter's `{name: {score, confidence, probabilities}}`;
+/// refusals are dropped, so the completeness check rejects them.
+fn decisions_answers(response: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for a in response
+        .get("answers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(name) = a.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if a.get("type").and_then(Value::as_str) != Some("score") {
+            continue;
+        }
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "score".into(),
+            a.get("score").cloned().unwrap_or(Value::Null),
+        );
+        if let Some(c) = a.get("confidence") {
+            entry.insert("confidence".into(), c.clone());
+        }
+        if let Some(ps) = a.get("probabilities").and_then(Value::as_array) {
+            let probs: serde_json::Map<String, Value> = ps
+                .iter()
+                .filter_map(|p| {
+                    Some((
+                        p.get("value")?.as_i64()?.to_string(),
+                        p.get("probability")?.clone(),
+                    ))
+                })
+                .collect();
+            entry.insert("probabilities".into(), Value::Object(probs));
+        }
+        out.insert(name.to_string(), Value::Object(entry));
+    }
+    Value::Object(out)
+}
+
+/// The same questions asked as one JSON chat completion, for a Vercel
+/// language model (the gateway's decisions endpoint takes decision models only).
 fn gateway_body(request: &Value) -> Value {
     let system = "You answer routing questions for an AI agent router. Reply with one JSON object and nothing else. \
 For every key of `questions` return {\"score\": n, \"confidence\": c, \"probabilities\": {\"0\": p0, \"1\": p1, \"2\": p2, \"3\": p3}}: \
@@ -1004,6 +1072,7 @@ async fn jev_fetch(
     provider: Option<&str>,
     request: &Value,
     request_body: &str,
+    key: Option<&str>,
 ) -> anyhow::Result<(Value, Option<f64>)> {
     if let Ok(mock) = std::env::var("AGENTDECK_ROUTE_MOCK_JEV") {
         let text = std::fs::read_to_string(mock)?;
@@ -1016,17 +1085,39 @@ async fn jev_fetch(
         ));
     }
     if provider == Some(agentdeck_core::settings::PROVIDER_VERCEL) {
-        let key = decision_key("AI_GATEWAY_API_KEY", "vercel.key")?;
+        let key = match key {
+            Some(k) => k.to_string(),
+            None => decision_key("AI_GATEWAY_API_KEY", "vercel.key")?,
+        };
+        match post_json(
+            "https://ai-gateway.vercel.sh/v1/decisions",
+            &key,
+            decisions_body(request).to_string(),
+        )
+        .await
+        {
+            Ok(v) => {
+                let cost = v
+                    .pointer("/provider_metadata/gateway/cost")
+                    .and_then(|c| c.as_f64().or_else(|| c.as_str()?.parse().ok()));
+                return Ok((decisions_answers(&v), cost));
+            }
+            Err(e) if e.to_string().contains("is a language model") => {}
+            Err(e) => return Err(e),
+        }
         let v = post_json(
             "https://ai-gateway.vercel.sh/v1/chat/completions",
             &key,
             gateway_body(request).to_string(),
         )
         .await?;
-        // shortcut: the gateway's cost is not read, so Jev cost reports as unknown.
+        // shortcut: the chat completion's cost is not read, so Jev cost reports as unknown.
         return Ok((gateway_answers(&v)?, None));
     }
-    let key = decision_key("JEV_OPENROUTER_API_KEY", "openrouter.key")?;
+    let key = match key {
+        Some(k) => k.to_string(),
+        None => decision_key("JEV_OPENROUTER_API_KEY", "openrouter.key")?,
+    };
     let v = post_json(
         "https://openrouter.ai/api/alpha/decisions",
         &key,
@@ -1039,6 +1130,37 @@ async fn jev_fetch(
             .and_then(|u| u.get("cost"))
             .and_then(Value::as_f64),
     ))
+}
+
+/// One live decision on a fixed small task, bypassing the cache: checks that
+/// the provider, model and key work. `key` overrides the stored key.
+/// Returns (size score, difficulty score, cost in USD when reported).
+pub async fn probe_decision(
+    provider: Option<&str>,
+    model: &str,
+    key: Option<&str>,
+) -> anyhow::Result<(f64, f64, Option<f64>)> {
+    let request = serde_json::json!({
+        "model": model,
+        "state": {"task": "Rename one local variable in a 20-line Python script.", "models": {}},
+        "questions": {
+            "size": {"type": "score", "instructions": "How much work will the actual delegated task take?", "criteria": SIZES},
+            "difficulty": {"type": "score", "instructions": "How difficult is the actual task?", "criteria": DIFFICULTY},
+        },
+    });
+    let body = stringify_like_node(&request);
+    let (answers, cost) = jev_fetch(provider, &request, &body, key).await?;
+    let score = |k: &str| {
+        answers
+            .get(k)
+            .filter(|a| valid_answer(a, false))
+            .and_then(|a| a.get("score"))
+            .and_then(Value::as_f64)
+            .ok_or_else(|| {
+                anyhow::anyhow!("the model answered, but {k} is missing or out of range: {answers}")
+            })
+    };
+    Ok((score("size")?, score("difficulty")?, cost))
 }
 
 // --- CLI ---------------------------------------------------------------------
@@ -1417,10 +1539,14 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     let (answers, cost) = match cached {
         Some(a) => (a, Some(0.0)),
         None => {
-            let (answers, cost) =
-                jev_fetch(cfg.decision_provider.as_deref(), &request_value, &body_json)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let (answers, cost) = jev_fetch(
+                cfg.decision_provider.as_deref(),
+                &request_value,
+                &body_json,
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             if !complete(&answers) {
                 return Err(anyhow::anyhow!(
                     "Jev returned incomplete or out-of-range routing answers"
@@ -1882,5 +2008,44 @@ mod gateway_tests {
         let a = gateway_answers(&resp).unwrap();
         assert!(valid_answer(&a["size"], false));
         assert!(gateway_answers(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn decisions_round_trip_shapes() {
+        let req = serde_json::json!({"model": "perplexity/pplx-decider-v1.2", "state": {"task": "t"},
+            "questions": {"size": {"type": "score", "instructions": "i", "criteria": SIZES}}});
+        let body = decisions_body(&req);
+        assert_eq!(body["questions"][0]["name"], "size");
+        assert_eq!(body["questions"][0]["levels"][3]["label"], "3");
+        assert!(body["input"].as_str().unwrap().contains("\"task\":\"t\""));
+        let resp = serde_json::json!({"answers": [
+            {"type": "score", "name": "size", "score": 0.12, "confidence": 0.92, "probabilities": [
+                {"value": 0, "probability": 0.88}, {"value": 1, "probability": 0.11},
+                {"value": 2, "probability": 0.005}, {"value": 3, "probability": 0.005}]},
+            {"type": "refusal", "name": "difficulty"}]});
+        let a = decisions_answers(&resp);
+        assert!(valid_answer(&a["size"], true));
+        assert!(a.get("difficulty").is_none());
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    #[tokio::test]
+    async fn probe_reads_mock_answers() {
+        let dir = std::env::temp_dir().join(format!("agentdeck-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mock = dir.join("jev.json");
+        std::fs::write(
+            &mock,
+            r#"{"answers":{"size":{"score":0,"confidence":0.9},"difficulty":{"score":0,"confidence":0.8}},"usage":{"cost":0.001}}"#,
+        )
+        .unwrap();
+        // SAFETY: test-only env override read by jev_fetch.
+        unsafe { std::env::set_var("AGENTDECK_ROUTE_MOCK_JEV", &mock) };
+        let r = super::probe_decision(None, "m", Some("k")).await;
+        unsafe { std::env::remove_var("AGENTDECK_ROUTE_MOCK_JEV") };
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(r.unwrap(), (0.0, 0.0, Some(0.001)));
     }
 }

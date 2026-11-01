@@ -224,6 +224,7 @@ usage-instance = Instance
 usage-instance-none = Not bound
 usage-empty = No quota sources.
 usage-widget-scope = Hidden providers leave the COSMIC panel only; polling and routing still use them.
+usage-order-title = Panel order
 usage-sources-count = { $count ->
         [one] { $count } source
        *[other] { $count } sources
@@ -259,3 +260,6 @@ settings-decision-model-vercel = Gateway model id, e.g. openai/gpt-5-mini. Requi
 settings-model-required = Vercel AI Gateway needs a decision model
 settings-key = { $provider } API key
 pool-show-legacy = Legacy ({ $count })
+settings-test = Check
+settings-testing = Checking…
+settings-test-ok = { $model } works: size { $size }, difficulty { $difficulty }, { $ms } ms{ $cost }

@@ -307,7 +307,7 @@ fn run_gui() -> anyhow::Result<()> {
 async fn async_main(paths: &Paths, cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Pool { cmd } => cmd_pool::run(paths, cmd)?,
-        Cmd::Router { cmd } => cmd_router::run(paths, cmd)?,
+        Cmd::Router { cmd } => cmd_router::run(paths, cmd).await?,
         Cmd::Route { args } => {
             std::process::exit(agentdeck_router::route::run(args).await);
         }

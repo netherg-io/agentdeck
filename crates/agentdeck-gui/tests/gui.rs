@@ -1068,12 +1068,15 @@ fn quota_module_hides_providers_and_adds_and_removes_sources() {
     // The applet reads this file beside instances.toml.
     let visibility = paths.config_dir.join("ai-usage-visibility.json");
     run(&mut state, Msg::Show("codex".into(), false));
-    let hidden = agentdeck_usage::visibility::load(&visibility).unwrap();
+    let hidden = agentdeck_usage::visibility::load(&visibility)
+        .unwrap()
+        .hidden;
     assert!(hidden.contains("codex"), "{hidden:?}");
     run(&mut state, Msg::Show("codex".into(), true));
     assert!(
         agentdeck_usage::visibility::load(&visibility)
             .unwrap()
+            .hidden
             .is_empty()
     );
 

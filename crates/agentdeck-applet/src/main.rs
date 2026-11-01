@@ -3,7 +3,7 @@ use cosmic::iced::platform_specific::shell::wayland::commands::popup::destroy_po
 use cosmic::iced::{Alignment, Length, Rectangle, Subscription, window};
 use cosmic::{Element, Task, app, widget};
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::HashSet,
     path::PathBuf,
     sync::LazyLock,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -11,6 +11,7 @@ use std::{
 
 // Reuse the backend's schema so provider changes remain compatible with both desktops.
 use agentdeck_usage::model::{self, AccountState, AppState, QuotaWindow};
+use agentdeck_usage::visibility::Prefs;
 
 static AUTOSIZE: LazyLock<widget::Id> = LazyLock::new(widget::Id::unique);
 
@@ -178,14 +179,13 @@ fn provider_icon(provider: &str) -> widget::icon::Handle {
     widget::icon::from_svg_bytes(bytes).symbolic(true)
 }
 
-fn visible_accounts<'a>(
-    accounts: &'a [AccountState],
-    hidden: &BTreeSet<String>,
-) -> Vec<&'a AccountState> {
-    accounts
+fn visible_accounts<'a>(accounts: &'a [AccountState], prefs: &Prefs) -> Vec<&'a AccountState> {
+    let mut shown: Vec<_> = accounts
         .iter()
-        .filter(|a| !hidden.contains(&a.provider))
-        .collect()
+        .filter(|a| !prefs.hidden.contains(&a.provider))
+        .collect();
+    shown.sort_by_key(|a| prefs.rank(&a.id));
+    shown
 }
 
 fn new_state_path() -> PathBuf {
@@ -245,7 +245,7 @@ struct App {
     state: Result<AppState, String>,
     popup: Option<window::Id>,
     revealed: HashSet<String>,
-    hidden: BTreeSet<String>,
+    prefs: Prefs,
     prefs_error: Option<String>,
 }
 
@@ -261,8 +261,8 @@ impl App {
     /// The agentdeck GUI edits the file; a malformed one keeps the last good set.
     fn reload_visibility(&mut self) {
         match agentdeck_usage::visibility::load(&agentdeck_usage::visibility::path()) {
-            Ok(hidden) => {
-                self.hidden = hidden;
+            Ok(prefs) => {
+                self.prefs = prefs;
                 self.prefs_error = None;
             }
             Err(error) => self.prefs_error = Some(format!("Настройки видимости: {error}")),
@@ -287,7 +287,7 @@ impl cosmic::Application for App {
             state: read_state(),
             popup: None,
             revealed: HashSet::new(),
-            hidden: BTreeSet::new(),
+            prefs: Prefs::default(),
             prefs_error: None,
         };
         app.reload_visibility();
@@ -347,7 +347,7 @@ impl cosmic::Application for App {
         let mut row = widget::row(vec![]).spacing(12).align_y(Alignment::Center);
         if let Ok(state) = &self.state {
             let mut shown = 0;
-            for account in visible_accounts(&state.accounts, &self.hidden) {
+            for account in visible_accounts(&state.accounts, &self.prefs) {
                 shown += 1;
                 row = row.push(
                     widget::row(vec![])
@@ -393,7 +393,7 @@ impl cosmic::Application for App {
                 content = content.push(widget::text("Нет настроенных аккаунтов"))
             }
             Ok(state) => {
-                let visible = visible_accounts(&state.accounts, &self.hidden);
+                let visible = visible_accounts(&state.accounts, &self.prefs);
                 for (index, account) in visible.iter().enumerate() {
                     if index > 0 {
                         content = content.push(widget::divider::horizontal::default());
@@ -553,12 +553,17 @@ mod tests {
             test_account("b", "claude"),
             test_account("c", "codex"),
         ];
-        let mut hidden = BTreeSet::new();
-        hidden.insert("codex".to_owned());
-        let visible = visible_accounts(&accounts, &hidden);
+        let mut prefs = Prefs {
+            order: vec!["c".into()],
+            ..Prefs::default()
+        };
+        let ids = |v: Vec<&AccountState>| v.iter().map(|a| a.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(visible_accounts(&accounts, &prefs)), ["c", "a", "b"]);
+        prefs.hidden.insert("codex".to_owned());
+        let visible = visible_accounts(&accounts, &prefs);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].provider, "claude");
-        hidden.insert("claude".to_owned());
-        assert!(visible_accounts(&accounts, &hidden).is_empty());
+        prefs.hidden.insert("claude".to_owned());
+        assert!(visible_accounts(&accounts, &prefs).is_empty());
     }
 }
