@@ -814,7 +814,10 @@ mod generated_config_tests {
         let first = registry_config(&paths).unwrap();
         agentdeck_core::pool::set_pool_enabled(&paths, "a", "m", &Default::default(), false, false)
             .unwrap();
+        agentdeck_core::registry::set_max_parallel(&paths, "a", Some(3), false).unwrap();
         let latest = registry_config(&paths).unwrap();
+        assert!(first.instance_limits.is_empty());
+        assert_eq!(latest.instance_limits["a"], 3);
         assert_eq!(first.pool[0]["enabled"], true);
         assert_eq!(latest.pool[0]["enabled"], false);
         assert_ne!(latest.version, first.version);
@@ -825,7 +828,31 @@ mod generated_config_tests {
         )
         .unwrap();
         assert_eq!(stale.pool[0]["enabled"], true);
+        assert!(stale.instance_limits.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_instance_limits_fail_closed() {
+        for limit in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(4294967296u64),
+            Value::Null,
+            serde_json::json!("2"),
+        ] {
+            let cfg =
+                serde_json::json!({"pool": [], "accounts": {}, "instanceLimits": {"codex": limit}});
+            assert!(parse_router_config(cfg, "test").is_err());
+        }
+        assert!(
+            parse_router_config(
+                serde_json::json!({"pool": [], "accounts": {}, "instanceLimits": []}),
+                "test"
+            )
+            .is_err()
+        );
     }
 
     /// The real shape: a shared opencode instance with a prefix account.
@@ -839,6 +866,7 @@ id = "opencode"
 harness = "opencode"
 display_name = "opencode"
 home = "~/.local/share/opencode"
+max_parallel = 4
 [[pool]]
 instance = "opencode"
 model = "opencode-go/m"
@@ -862,6 +890,7 @@ display = "Go"
         std::fs::write(&file, value.to_string()).unwrap();
         let config = load_router_json(file.to_str().unwrap()).unwrap();
         assert_eq!(config.meta.len(), 2);
+        assert_eq!(config.instance_limits["opencode"], 4);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
