@@ -5,11 +5,12 @@
 //! One line per assessment; repeats for the same task are revisions, newest
 //! last. Only metadata is stored: no task text, summaries or evidence text.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-pub const USAGE: &str = "usage: agentdeck route outcomes record --task ID --provider P --model M --category C --verdict V --evidence E [--source coordinator]\n  agentdeck route outcomes list [--task ID] [--limit N]\n\n  category: implementation|research|review|design|test|general\n  verdict: ok|partial|fail|blocked|missing|unavailable (blocked/missing/unavailable are not failures)\n  evidence: direct|spot-check|test-output|child-report\n  source is always recorded as \"coordinator\"; decider metadata is reserved (null) for future use.\n  repeats for one task append a new revision; concurrent appends are safe; corrupt lines are skipped on read.";
+pub const USAGE: &str = "usage: agentdeck route outcomes record --task ID --provider P --model M --category C --verdict V --evidence E [--source coordinator]\n  agentdeck route outcomes list [--task ID] [--limit N]\n\n  category: implementation|research|review|design|test|general\n  verdict: ok|partial|fail|blocked|missing|unavailable (blocked/missing/unavailable are not failures)\n  evidence: direct|spot-check|test-output|child-report\n  source is always recorded as \"coordinator\"; decider metadata is reserved (null) for future use.\n  repeats for one task append a new revision; appends are file-locked; corrupt lines fail reads (a torn final line is skipped), never deleted.";
 
 const CATEGORIES: &[&str] = &[
     "implementation",
@@ -29,7 +30,7 @@ const VERDICTS: &[&str] = &[
 ];
 const EVIDENCE: &[&str] = &["direct", "spot-check", "test-output", "child-report"];
 
-const MAX_TASK: usize = 128;
+const MAX_TASK: usize = 256;
 const MAX_PROVIDER: usize = 64;
 const MAX_MODEL: usize = 128;
 const MAX_LIST: usize = 1000;
@@ -91,7 +92,10 @@ fn ensure_parent(base: &Path) -> Result<PathBuf, OutcomeError> {
         .mode(0o700)
         .create(&dir)
         .map_err(|e| OutcomeError::fail(e.to_string()))?;
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    // A private dir that is not 0700 (pre-existing or raced) must fail loudly,
+    // never silently hold outcome data in a group/world-readable directory.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| OutcomeError::fail(format!("cannot secure {}: {e}", dir.display())))?;
     Ok(outcomes_path(base))
 }
 
@@ -193,7 +197,8 @@ fn parse_record(argv: &[String]) -> Result<Record, OutcomeError> {
         evidence: evidence.ok_or_else(|| OutcomeError::usage(USAGE))?,
     };
     // T3 IDs are untrusted input: strict charset + length bounds.
-    check_id(&r.task, "task", MAX_TASK, &[':', '_', '.', '-'])?;
+    // '%' covers percent-encoded T3 task IDs (e.g. command%3Amcp%3A...).
+    check_id(&r.task, "task", MAX_TASK, &[':', '_', '.', '-', '%'])?;
     check_id(&r.provider, "provider", MAX_PROVIDER, &['_', '.', '-'])?;
     check_id(
         &r.model,
@@ -211,6 +216,22 @@ fn record_cli(argv: &[String]) -> Result<serde_json::Value, OutcomeError> {
     let r = parse_record(argv)?;
     let path = append_to(&state_base(), &r, now_secs())?;
     Ok(serde_json::json!({"recorded": true, "file": path.display().to_string()}))
+}
+
+// flock(2) advisory lock on an open file; released on close. libc is already a
+// dependency, so no new crate for one syscall. Retries on EINTR.
+fn lock_file(f: &std::fs::File, op: libc::c_int, what: &str) -> Result<(), OutcomeError> {
+    loop {
+        // shortcut: non-blocking attempts are never used; a stuck lock just waits.
+        let rc = unsafe { libc::flock(f.as_raw_fd(), op) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(OutcomeError::fail(format!("cannot {what} outcomes file: {e}")));
+        }
+    }
 }
 
 fn append_to(
@@ -232,30 +253,90 @@ fn append_to(
     });
     let mut text = serde_json::to_string(&line).map_err(|e| OutcomeError::fail(e.to_string()))?;
     text.push('\n');
-    // O_APPEND single write: concurrent recorders interleave only whole lines.
+    // Exclusive flock serializes concurrent recorders across processes, so one
+    // write_all lands as whole lines; fsync under the same lock gives each
+    // record command durability. Lock releases on close, even on error paths.
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
         .open(&path)
         .map_err(|e| OutcomeError::fail(e.to_string()))?;
-    f.write_all(text.as_bytes())
-        .map_err(|e| OutcomeError::fail(e.to_string()))?;
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    lock_file(&f, libc::LOCK_EX, "lock")?;
+    let r = f
+        .write_all(text.as_bytes())
+        .map_err(|e| OutcomeError::fail(e.to_string()))
+        .and_then(|()| {
+            f.sync_all()
+                .map_err(|e| OutcomeError::fail(format!("cannot persist {}: {e}", path.display())))
+        })
+        .and_then(|()| {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+                OutcomeError::fail(format!("cannot secure {}: {e}", path.display()))
+            })
+        });
+    drop(f); // releases LOCK_EX
+    r?;
     Ok(path)
 }
 
-fn read_all(base: &Path) -> Vec<serde_json::Value> {
+fn valid_record(v: &serde_json::Value) -> bool {
+    v.get("task_id").and_then(|t| t.as_str()).is_some_and(|t| !t.is_empty())
+        && v.get("verdict").and_then(|t| t.as_str()).is_some_and(|t| VERDICTS.contains(&t))
+}
+
+fn read_all(base: &Path) -> Result<Vec<serde_json::Value>, OutcomeError> {
     let path = outcomes_path(base);
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|v| {
-            v.get("task_id").and_then(|t| t.as_str()).is_some_and(|t| !t.is_empty())
-                && v.get("verdict").and_then(|t| t.as_str()).is_some_and(|t| VERDICTS.contains(&t))
-        })
-        .collect()
+    let mut f = match std::fs::File::open(&path) {
+        // A store that was never recorded to reads as empty.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => {
+            return Err(OutcomeError::fail(format!(
+                "cannot read {}: {e}",
+                path.display()
+            )));
+        }
+        Ok(f) => f,
+    };
+    // Shared lock waits out any concurrent append, so the tail we read is whole.
+    lock_file(&f, libc::LOCK_SH, "lock")?;
+    let mut text = String::new();
+    let r = f
+        .read_to_string(&mut text)
+        .map_err(|e| OutcomeError::fail(format!("cannot read {}: {e}", path.display())));
+    drop(f); // releases LOCK_SH
+    r?;
+    // Our writer always ends lines with '\n'; a final line without one is the
+    // torn tail of a crashed append and is skipped. Anything else invalid is
+    // corruption: fail loudly and leave the file untouched, never treat as empty.
+    let complete = text.is_empty() || text.ends_with('\n');
+    let mut lines: Vec<(usize, &str)> = text.lines().enumerate().map(|(i, l)| (i + 1, l)).collect();
+    let torn = if complete { None } else { lines.pop() };
+    let mut items = Vec::new();
+    for (n, l) in lines {
+        if l.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(l).map_err(|e| {
+            OutcomeError::fail(format!("{}:{n}: invalid JSON ({e}); file left unchanged", path.display()))
+        })?;
+        if !valid_record(&v) {
+            return Err(OutcomeError::fail(format!(
+                "{}:{n}: not an outcome record; file left unchanged",
+                path.display()
+            )));
+        }
+        items.push(v);
+    }
+    if let Some((_, t)) = torn
+        && !t.trim().is_empty()
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(t)
+        && valid_record(&v)
+    {
+        // shortcut: a torn tail that still parses as a record is kept, not dropped.
+        items.push(v);
+    }
+    Ok(items)
 }
 
 fn list_cli(argv: &[String]) -> Result<serde_json::Value, OutcomeError> {
@@ -286,7 +367,7 @@ fn list_cli(argv: &[String]) -> Result<serde_json::Value, OutcomeError> {
         }
         i += 1;
     }
-    let mut items = read_all(&state_base());
+    let mut items = read_all(&state_base())?;
     if let Some(t) = task {
         items.retain(|v| v.get("task_id").and_then(|x| x.as_str()) == Some(t.as_str()));
     }
@@ -336,25 +417,80 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_and_skips_partial_lines() {
+    fn accepts_percent_encoded_t3_task_ids() {
+        // Literal observed T3 delegated-task ID (127 chars): must be accepted.
+        let id = "node:delegated-task:command%3Amcp%3Ad4694301-3125-4b66-8d54-2b3158afcf5a%3Adelegate-task%3A500f3994-4df3-4306-a536-05d9bc83f263";
+        assert_eq!(id.len(), 127);
+        let a = ["--task", id, "--provider", "p", "--model", "m", "--category", "test", "--verdict", "ok", "--evidence", "direct"].map(String::from);
+        assert!(parse_record(&a).is_ok());
+        // Bounds still hold: 256 ok, 257 rejected; traversal still rejected.
+        let max = "t".repeat(256);
+        let over = "t".repeat(257);
+        for (task, ok) in [(max.as_str(), true), (over.as_str(), false), ("a/b", false), ("a%b%3A", true)] {
+            let a = ["--task", task, "--provider", "p", "--model", "m", "--category", "test", "--verdict", "ok", "--evidence", "direct"].map(String::from);
+            assert_eq!(parse_record(&a).is_ok(), ok, "{task}");
+        }
+    }
+
+    #[test]
+    fn roundtrip_keeps_revisions() {
         let base = tmp_base("roundtrip");
         append_to(&base, &rec("task-1"), 1).unwrap();
         append_to(&base, &rec("task-1"), 2).unwrap(); // revision
-        // partial/corrupt lines must not break reads
-        {
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(outcomes_path(&base))
-                .unwrap();
-            f.write_all(b"{\"task_id\": broken\n\n").unwrap();
-        }
-        let items = read_all(&base);
+        let items = read_all(&base).unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[1]["t"], 2);
         assert_eq!(items[0]["source"], "coordinator");
         assert!(items[0].get("decider").is_some());
         // no free-text payload stored
         assert!(items[0].get("summary").is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn corrupt_lines_fail_and_data_survives() {
+        let base = tmp_base("corrupt");
+        append_to(&base, &rec("task-1"), 1).unwrap();
+        let before = std::fs::read(outcomes_path(&base)).unwrap();
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(outcomes_path(&base))
+                .unwrap();
+            f.write_all(b"{\"task_id\": broken\n").unwrap();
+        }
+        let err = read_all(&base).unwrap_err();
+        assert!(err.message.contains(":2:"), "{}", err.message);
+        // Failed reads never delete or modify existing data.
+        assert_eq!(std::fs::read(outcomes_path(&base)).unwrap()[..before.len()], before[..]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn torn_final_line_is_skipped() {
+        let base = tmp_base("torn");
+        append_to(&base, &rec("task-1"), 1).unwrap();
+        // Torn tail of a crashed append: no trailing newline, must not break reads.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(outcomes_path(&base))
+                .unwrap();
+            f.write_all(b"{\"task_id\": tor").unwrap();
+        }
+        let items = read_all(&base).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["task_id"], "task-1");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn missing_store_is_empty_but_unreadable_is_an_error() {
+        let base = tmp_base("missing");
+        assert!(read_all(&base).unwrap().is_empty());
+        // outcomes.jsonl path blocked by a directory: read must fail, not read empty.
+        std::fs::create_dir_all(outcomes_path(&base)).unwrap();
+        assert!(read_all(&base).is_err());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -381,7 +517,7 @@ mod tests {
                 });
             }
         });
-        let items = read_all(&base);
+        let items = read_all(&base).unwrap();
         assert_eq!(items.len(), 16);
         let _ = std::fs::remove_dir_all(&base);
     }
