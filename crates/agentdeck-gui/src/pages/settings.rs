@@ -554,27 +554,54 @@ fn entry_row(entry: &eval_history::Entry) -> Element<'_, Msg> {
         "fail" => st::Tone::Danger,
         _ => st::Tone::Neutral,
     };
-    let self_line = match entry.self_judged {
-        Some(true) => fl!(loader(), "settings-eval-self"),
-        _ => fl!(loader(), "settings-eval-self-unknown"),
-    };
-    let cost = match entry.cost {
-        Some(c) => fl!(loader(), "settings-eval-cost", cost = format!("{c:.6}")),
-        None => fl!(loader(), "settings-eval-cost-unknown"),
-    };
-    let evidence = if entry.source == eval_history::Source::Decider {
-        fl!(
+    let age = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|now| now.as_secs().checked_sub(entry.t))
+        .filter(|_| entry.t != 0)
+        .map(|seconds| {
+            if seconds < 3600 {
+                fl!(
+                    loader(),
+                    "settings-eval-minutes-ago",
+                    count = (seconds / 60).to_string()
+                )
+            } else if seconds < 86400 {
+                fl!(
+                    loader(),
+                    "settings-eval-hours-ago",
+                    count = (seconds / 3600).to_string()
+                )
+            } else {
+                fl!(
+                    loader(),
+                    "settings-eval-days-ago",
+                    count = (seconds / 86400).to_string()
+                )
+            }
+        });
+    let mut detail = format!("{} · {}", entry.task_id, entry.category);
+    if let Some(age) = age {
+        detail.push_str(&format!(" · {age}"));
+    }
+    if entry.source == eval_history::Source::Decider {
+        let self_line = match entry.self_judged {
+            Some(true) => fl!(loader(), "settings-eval-self"),
+            _ => fl!(loader(), "settings-eval-self-unknown"),
+        };
+        let cost = match entry.cost {
+            Some(c) => fl!(loader(), "settings-eval-cost", cost = format!("{c:.6}")),
+            None => fl!(loader(), "settings-eval-cost-unknown"),
+        };
+        let evidence = fl!(
             loader(),
             "settings-eval-evidence-ids",
             count = entry.evidence_count.to_string()
-        )
+        );
+        detail.push_str(&format!(" · {evidence} · {self_line} · {cost}"));
     } else {
-        entry.evidence.clone()
-    };
-    let mut detail = format!(
-        "{} · {} · t={} · {evidence} · {self_line} · {cost}",
-        entry.task_id, entry.category, entry.t,
-    );
+        detail.push_str(&format!(" · {}", entry.evidence));
+    }
     if let Some(judge) = &entry.judge {
         detail.push_str(&format!(
             " · {}",

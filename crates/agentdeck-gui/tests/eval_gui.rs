@@ -23,7 +23,7 @@ fn state_with(history: History) -> settings_page::State {
 fn entries() -> Vec<Entry> {
     vec![
         Entry {
-            t: 7,
+            t: 0,
             source: Source::Coordinator,
             task_id: "task-1".into(),
             provider: Some("p".into()),
@@ -37,7 +37,7 @@ fn entries() -> Vec<Entry> {
             judge: None,
         },
         Entry {
-            t: 8,
+            t: 0,
             source: Source::Decider,
             task_id: "task-2".into(),
             provider: None,
@@ -93,13 +93,13 @@ fn loaded_rows_show_metadata_in_both_languages() {
     for (lang, coord_detail, dec_detail) in [
         (
             "en",
-            "task-1 · test · t=7 · direct · self-check unknown · cost unreported",
-            "task-2 · review · t=8 · 2 evidence ids · self-check · cost $0.001000 · judge openrouter/judge",
+            "task-1 · test · direct",
+            "task-2 · review · 2 evidence ids · self-check · cost $0.001000 · judge openrouter/judge",
         ),
         (
             "ru",
-            "task-1 · test · t=7 · direct · самопроверка неизвестна · цена не указана",
-            "task-2 · review · t=8 · 2 id свидетельств · самопроверка · цена $0.001000 · судья openrouter/judge",
+            "task-1 · test · direct",
+            "task-2 · review · 2 id свидетельств · самопроверка · цена $0.001000 · судья openrouter/judge",
         ),
     ] {
         agentdeck_gui::i18n::set_language(lang);

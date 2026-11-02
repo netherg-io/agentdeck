@@ -285,3 +285,7 @@ settings-eval-cost = cost ${ $cost }
 settings-eval-cost-unknown = cost unreported
 settings-eval-evidence-ids = { $count } evidence ids
 settings-eval-judge = judge { $who }
+
+settings-eval-minutes-ago = { $count } min ago
+settings-eval-hours-ago = { $count } h ago
+settings-eval-days-ago = { $count } d ago
