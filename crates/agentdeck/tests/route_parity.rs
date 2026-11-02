@@ -214,12 +214,20 @@ fn check_case(
     if nout == rout {
         return;
     }
+    if args.contains(&"--check") {
+        let actual = std::str::from_utf8(&rout).unwrap();
+        let line = "user rules (source: default): no-review: gemini-.*argon; denied: (none)\n";
+        assert!(actual.contains(line), "{name}: missing default rules");
+        assert_eq!(actual.replacen(line, "", 1).as_bytes(), nout, "{name}: non-additive output differs");
+        return;
+    }
     // Additive-only allowance: the Rust router emits per-candidate
     // `quotaEstimate` provenance (estimates, never ranking). Strip it from
     // both sides, require everything else to match, then validate the new
     // field's shape on the Rust side.
     let strip = |bytes: &[u8]| -> Option<serde_json::Value> {
         let mut v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        v.as_object_mut()?.remove("userRules");
         let ranking = v.get_mut("ranking")?.as_array_mut()?;
         for entry in ranking.iter_mut() {
             entry.as_object_mut()?.remove("quotaEstimate");
@@ -228,8 +236,11 @@ fn check_case(
     };
     match (strip(&nout), strip(&rout)) {
         (Some(n), Some(r)) => {
-            assert_eq!(n, r, "{name}: non-quotaEstimate output differs");
+            assert_eq!(n, r, "{name}: non-additive output differs");
             let rust_v: serde_json::Value = serde_json::from_slice(&rout).unwrap();
+            assert_eq!(rust_v["userRules"], serde_json::json!({
+                "source": "default", "noReviewModels": ["gemini-.*argon"], "denyModels": []
+            }), "{name}: unexpected default user rules");
             let entries = rust_v["ranking"].as_array().unwrap();
             assert!(!entries.is_empty(), "{name}: empty ranking");
             for entry in entries {
