@@ -195,7 +195,8 @@ assert.equal(pick([{ ...sonnet55, quality: 1 }, { ...haiku, quality: 0.667 }], 0
 assert.equal(rankCandidates([model('codex', { burn: 3 })], 1, null, weights)[0].cheapModelBonus, 0);
 // Eligibility uses the raw fit, never a rounded one.
 assert.equal(rankCandidates([model('codex', { fit: MIN_FIT - 0.0004 })], 1, null, weights)[0].eligible, false);
-assert.equal(rankCandidates([model('codex', { profiled: false })], 1, null, weights)[0].eligible, false);
+assert.equal(rankCandidates([model('codex', { profiled: false })], 1, null, weights)[0].eligible, true);
+assert.equal(rankCandidates([model('codex', { profiled: false, fit: 0.1 })], 1, null, weights)[0].eligible, false);
 
 // Jev answers must be bounded and coherent before they may make anything eligible.
 const answer = (score, probabilities = { 0: 0, 1: 0.1, 2: 0.6, 3: 0.3 }, confidence = 0.8) => ({ score, confidence, probabilities });

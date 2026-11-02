@@ -146,7 +146,7 @@ export function rankCandidates(candidates, difficulty, source, weights) {
     const paidCreditPenalty = own === 'openrouter' ? weights.paidCreditPenalty * scale : 0;
     // Rewards models that are cheap per task (burn < 1), never remaining quota; unknown burn earns nothing.
     const cheapModelBonus = weights.cheapModelBonus * Math.max(0, 1 - (c.burn ?? 1)) * scale;
-    return { ...c, account: own ?? null, sharedQuota, sharedQuotaPenalty, paidCreditPenalty, cheapModelBonus, eligible: Boolean(c.allowed && c.profiled !== false && !c.reasoningError && !c.policyBan && c.fit >= MIN_FIT),
+    return { ...c, account: own ?? null, sharedQuota, sharedQuotaPenalty, paidCreditPenalty, cheapModelBonus, eligible: Boolean(c.allowed && !c.reasoningError && !c.policyBan && c.fit >= MIN_FIT),
       score: c.quality - sharedQuotaPenalty - paidCreditPenalty + cheapModelBonus,
     };
   }).sort((a, b) => Number(b.eligible) - Number(a.eligible) || b.score - a.score
@@ -169,7 +169,6 @@ export function validateTarget(ranking, requested) {
   const deny = reason => ({ allowed: false, reason });
   if (r?.policyBan) return { allowed: false, reason: r.policyBan };
   if (!r) return deny('not an exact active favorite');
-  if (r.profiled === false) return deny('favorite has no capability profile');
   if (r.reasoningError) return deny(r.reasoningError);
   if (!r.allowed) return deny('not enough current quota for this task size');
   if (!(r.fit >= MIN_FIT)) return deny(`fit ${r.fit.toFixed(3)} below ${MIN_FIT}`);

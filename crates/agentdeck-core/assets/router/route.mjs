@@ -272,7 +272,7 @@ if (argv[0] === '--check') {
       + (q.weekly ? `\n    weekly % per size 0..3: ${q.weekly.map(c => +c.toFixed(2)).join(' / ')} (${q.basis})` : '')
       + `\n    allowed sizes: ${[0, 1, 2, 3].filter(s => q.allowed(s)).join(',') || 'none'}`);
   }
-  process.exit(unprofiled.length ? 1 : 0);
+  process.exit(0);
 }
 
 const hintOf = model => [roster.briefHint, familyOf(model ?? '')?.briefHint].filter(Boolean).join('\n\n');
@@ -392,7 +392,7 @@ const ranking = rankCandidates(favorites.map(f => {
   return { provider: f.provider, model: f.model, profiled: Boolean(f.profile), burn: familyOf(f.model)?.burn,
     target, ...(reasoningError && { reasoningError }),
     ...(familyOf(f.model)?.noReview && { noReview: true, ...(REVIEW_TASK.test(task) && { policyBan: NO_REVIEW_BAN }) }),
-    fit: f.profile ? a.probabilities['2'] + a.probabilities['3'] : 0,
+    fit: a.probabilities['2'] + a.probabilities['3'],
     quality: a.score / (CAPABILITY.length - 1), confidence: a.confidence,
     // spendToZero families never lose a cost tie-break.
     allowed: f.quota.allowed(size), taskCost: familyOf(f.model)?.spendToZero ? 0 : f.quota.cost(size),

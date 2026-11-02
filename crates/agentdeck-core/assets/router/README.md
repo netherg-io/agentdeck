@@ -27,7 +27,9 @@ Selection policy:
   quota. Models without a roster family are judged on the same scale against the honest
   `unprofiled; capability unknown` criterion: an adequate Jev score still makes them eligible, a low one
   gates them out. They are flagged `profiled: false` (and listed in `unprofiled`), carry no `burn`, and
-  their quota reserves the highest profiled burn, so an unknown cost can only deny, never sneak in.
+  their quota uses the highest profiled burn when quota data exists. If the account has no quota data,
+  the existing policy allows it and marks quota unknown; no cost is claimed as measured. The judgment
+  is an unverified prediction based on the model ID and task, not evidence of actual performance.
   Raw values determine eligibility; output rounding cannot admit a candidate below 0.7. Jev scores,
   confidence and all four probabilities must be in range, with probabilities summing to 1 within 0.02.
   These are model judgments, not calibrated success probabilities. `quality` is the independent
