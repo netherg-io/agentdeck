@@ -526,12 +526,15 @@ fn drift_snapshot_groups_actions_preview_apply() {
         "theme imported, no Import left"
     );
 
-    // T3 group: sync Apply for the managed instance, Import for the missing one.
+    // T3 group: envelope mismatches (enabled/config) are out of Drift scope
+    // (explicit `t3 sync`); only the importable instance stays, with Import.
     let t3 = drift_group(&snap, "t3");
     assert!(
         t3.items
             .iter()
-            .any(|i| i.actions.iter().any(|a| a.kind == drift::Kind::Apply))
+            .all(|i| i.actions.iter().all(|a| a.kind != drift::Kind::Apply)),
+        "no envelope Apply rows: {:?}",
+        t3.items.iter().map(|i| &i.key).collect::<Vec<_>>()
     );
     assert!(
         t3.items

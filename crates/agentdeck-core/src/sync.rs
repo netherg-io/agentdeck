@@ -2,12 +2,17 @@
 //! item, and auto-apply only the additive ones (behind the `[sync]`
 //! `auto_apply` flag, OFF by default).
 //!
+//! Drift is the divergence of settings, instructions, MCP and skills between
+//! providers (Claude/Codex homes). T3 provider-instance envelopes
+//! (enabled/config) are explicit T3 management (`t3 sync`), never Drift:
+//! they are excluded here so they show no badge and send no notification.
+//!
 //! Classification (value-free summaries only, so logs/notifications leak
 //! nothing):
 //! - ADDITIVE: a missing symlink, a settings key missing on a secondary, a
 //!   new main-home entry needing a shadow link. Safe to create.
 //! - DECISION: changed values, wrong link targets, real entries where a link
-//!   belongs, deletions/extras, private links, T3 differences. Needs the
+//!   belongs, deletions/extras, private links. Needs the
 //!   owner; never written by [`apply_additive`], even with auto-apply on.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,7 +22,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::changes::Change;
-use crate::{Paths, Registry, claude, codex, t3};
+use crate::{Paths, Registry, claude, codex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -28,7 +33,7 @@ pub enum ItemKind {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SyncItem {
-    /// Registry instance id (`t3:<id>` for T3 envelope drift).
+    /// Registry instance id.
     pub instance: String,
     pub harness: String,
     pub kind: ItemKind,
@@ -95,10 +100,12 @@ pub fn set_auto_apply(paths: &Paths, on: bool, dry_run: bool) -> anyhow::Result<
     }])
 }
 
-/// Gather drift for every registry instance (Claude + Codex) plus T3 envelope
-/// drift. `home` is the real `$HOME` in production, a temp dir in tests;
-/// `t3_root` is `None` when T3 is unavailable (skipped, not an error).
+/// Gather drift for every registry instance (Claude + Codex). `home` is the
+/// real `$HOME` in production, a temp dir in tests; `t3_root` is accepted and
+/// ignored: T3 provider-instance envelopes are explicit T3 management
+/// (`t3 sync`), never Drift, so they contribute no badge or notification.
 pub fn gather(paths: &Paths, home: &Path, t3_root: Option<&Path>) -> anyhow::Result<Vec<SyncItem>> {
+    let _ = t3_root;
     let reg = Registry::load(paths)?;
     let mut out = Vec::new();
     let primary = home.join(".claude");
@@ -120,25 +127,6 @@ pub fn gather(paths: &Paths, home: &Path, t3_root: Option<&Path>) -> anyhow::Res
             }
             // Managed later (M7); background sync only watches Claude/Codex.
             crate::Harness::Opencode | crate::Harness::Agy => {}
-        }
-    }
-    if let Some(root) = t3_root {
-        // A T3 dir without settings.json is "not installed here", not drift.
-        if t3::settings_file(root).exists() {
-            for e in t3::sync_t3(paths, root, true)? {
-                if e.action != "unchanged" {
-                    out.push(SyncItem::new(
-                        &format!("t3:{}", e.id),
-                        "t3",
-                        ItemKind::Decision,
-                        format!(
-                            "provider instance {} needs {action}",
-                            e.id,
-                            action = e.action
-                        ),
-                    ));
-                }
-            }
         }
     }
     out.sort_by(|a, b| (&a.instance, &a.detail).cmp(&(&b.instance, &b.detail)));
@@ -268,7 +256,7 @@ pub fn apply_additive(
     home: &Path,
     t3_root: Option<&Path>,
 ) -> anyhow::Result<Vec<Change>> {
-    let _ = t3_root; // T3 drift is always a decision; never auto-applied.
+    let _ = t3_root; // T3 envelopes are out of Drift scope (see `gather`).
     let reg = Registry::load(paths)?;
     let primary = home.join(".claude");
     let primary_json = home.join(".claude.json");
@@ -579,30 +567,47 @@ mod tests {
     }
 
     #[test]
-    fn t3_drift_is_decision() {
+    fn t3_envelope_mismatch_is_not_drift() {
+        // T3 provider-instance envelopes (enabled/config) are explicit T3
+        // management (`t3 sync`), not Drift: neither missing instances, nor
+        // an enabled-flag-only mismatch, may surface as sync items (and so
+        // never as a Drift badge or background notification).
         let fx = fixture();
         let t3_root = fx.dir.join("t3");
         fs::create_dir_all(t3_root.join("userdata")).unwrap();
-        fs::write(
-            t3_root.join("userdata/settings.json"),
-            "{\"providerInstances\":{}}",
-        )
-        .unwrap();
-        let items = gather(&fx.paths, &fx.home, Some(&t3_root)).unwrap();
-        // Both t3-enabled instances are absent from providerInstances, so
-        // sync wants to create them -> decisions (never auto-applied).
+        let settings = t3_root.join("userdata/settings.json");
+        // Managed instances absent: T3 sync would create them.
+        fs::write(&settings, "{\"providerInstances\":{}}").unwrap();
+        let entries = crate::t3::sync_t3(&fx.paths, &t3_root, true).unwrap();
         assert!(
-            items
+            entries.iter().any(|e| e.action != "unchanged"),
+            "{entries:?}"
+        );
+        let items = gather(&fx.paths, &fx.home, Some(&t3_root)).unwrap();
+        assert!(items.iter().all(|i| i.harness != "t3"), "{items:?}");
+        // Enabled-flag-only mismatch (the reported antigravity case).
+        crate::t3::sync_t3(&fx.paths, &t3_root, false).unwrap();
+        let raw = fs::read_to_string(&settings).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        v["providerInstances"]["cl-second"]["enabled"] = serde_json::Value::Bool(false);
+        fs::write(&settings, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        let entries = crate::t3::sync_t3(&fx.paths, &t3_root, true).unwrap();
+        assert!(
+            entries.iter().any(|e| e.action == "updated"),
+            "{entries:?}"
+        );
+        let items = gather(&fx.paths, &fx.home, Some(&t3_root)).unwrap();
+        assert!(items.iter().all(|i| i.harness != "t3"), "{items:?}");
+        assert!(
+            decision_instances(&items)
                 .iter()
-                .any(|i| i.harness == "t3" && i.kind == ItemKind::Decision),
+                .all(|id| !id.starts_with("t3:")),
             "{items:?}"
         );
-        let before = fs::read(t3_root.join("userdata/settings.json")).unwrap();
+        // Explicit T3 sync still sees (and writes) the mismatch.
+        let before = fs::read(&settings).unwrap();
         apply_additive(&fx.paths, &fx.home, Some(&t3_root)).unwrap();
-        assert_eq!(
-            fs::read(t3_root.join("userdata/settings.json")).unwrap(),
-            before
-        );
+        assert_eq!(fs::read(&settings).unwrap(), before);
     }
 
     #[test]

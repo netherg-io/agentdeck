@@ -1,8 +1,8 @@
 //! Drift page: per-instance-group drift with Apply / Import / Fix / Re-enable.
 //!
 //! Reads are read-only; every mutating action first shows a preview built
-//! from the [`agentdeck_core::Change`] list (or the redacted T3 plan) and
-//! only runs after an explicit confirm. Long work runs off the UI thread
+//! from the [`agentdeck_core::Change`] list (or the import candidate list)
+//! and only runs after an explicit confirm. Long work runs off the UI thread
 //! via `Task::perform`; the page refreshes after any action and on the tick.
 
 use std::path::{Path, PathBuf};
@@ -34,7 +34,7 @@ pub enum Kind {
 pub struct Action {
     pub kind: Kind,
     /// Item key encoding the target (`settings:<k>`, `mcpserver:<s>`,
-    /// `fix:<path>`, `t3:<id>`, `t3import`, …).
+    /// `fix:<path>`, `t3import`, …).
     pub key: String,
     /// Per-server Import action; the button label resolves in `view` so
     /// snapshots stay language-independent.
@@ -310,6 +310,9 @@ fn codex_group(inst: &agentdeck_core::Instance, ctx: &Ctx, main: &Path) -> Group
     }
 }
 
+/// T3 importables only: provider-instance envelopes (enabled/config) are
+/// explicit T3 management (`t3 sync`, the Add-instance page), never Drift,
+/// so an enabled-flag mismatch shows no row, badge or notification here.
 fn t3_group(paths: &Paths, t3_root: Option<&Path>) -> Group {
     let mut items = Vec::new();
     let Some(root) = t3_root else {
@@ -325,33 +328,6 @@ fn t3_group(paths: &Paths, t3_root: Option<&Path>) -> Group {
             items,
         };
     };
-    match t3::sync_t3(paths, root, true) {
-        Err(e) => items.push(Item {
-            key: "error".into(),
-            text: format!("sync failed: {e:#}"),
-            ..Item::default()
-        }),
-        Ok(entries) => {
-            for e in &entries {
-                if e.action == "unchanged" {
-                    continue;
-                }
-                // Compact single-line redacted JSON: the full envelope would
-                // bury the page; the CLI shows the pretty form.
-                let mut after = serde_json::to_string(&t3::redact(&e.after)).unwrap_or_default();
-                if after.len() > 300 {
-                    after.truncate(300);
-                    after.push('…');
-                }
-                items.push(Item {
-                    key: format!("t3:{}", e.id),
-                    text: format!("{}: {} {}", e.id, e.action, after),
-                    actions: vec![apply_button()],
-                    ..Item::default()
-                });
-            }
-        }
-    }
     match t3::t3_status(paths, root) {
         Err(e) => items.push(Item {
             key: "status-error".into(),
@@ -540,32 +516,6 @@ pub fn preview(ctx: &Ctx, group: &str, key: &str, kind: Kind) -> Result<Pending,
                 kind,
                 preview,
                 confirm_path: Some(path.to_string()),
-            })
-        }
-        ("t3", Kind::Apply, _) => {
-            let root = ctx
-                .t3_root
-                .clone()
-                .ok_or_else(|| "T3 unavailable".to_string())?;
-            let entries = t3::sync_t3(&ctx.paths, &root, true).map_err(|e| format!("{e:#}"))?;
-            let preview = entries
-                .iter()
-                .filter(|e| e.action != "unchanged")
-                .map(|e| {
-                    format!(
-                        "{}: {}\n{}",
-                        e.id,
-                        e.action,
-                        serde_json::to_string_pretty(&t3::redact(&e.after)).unwrap_or_default()
-                    )
-                })
-                .collect();
-            Ok(Pending {
-                group: group.into(),
-                key: key.into(),
-                kind,
-                preview,
-                confirm_path: None,
             })
         }
         ("t3", Kind::Import, _) => {
