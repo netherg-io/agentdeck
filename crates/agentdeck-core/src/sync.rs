@@ -592,10 +592,7 @@ mod tests {
         v["providerInstances"]["cl-second"]["enabled"] = serde_json::Value::Bool(false);
         fs::write(&settings, serde_json::to_string_pretty(&v).unwrap()).unwrap();
         let entries = crate::t3::sync_t3(&fx.paths, &t3_root, true).unwrap();
-        assert!(
-            entries.iter().any(|e| e.action == "updated"),
-            "{entries:?}"
-        );
+        assert!(entries.iter().any(|e| e.action == "updated"), "{entries:?}");
         let items = gather(&fx.paths, &fx.home, Some(&t3_root)).unwrap();
         assert!(items.iter().all(|i| i.harness != "t3"), "{items:?}");
         assert!(

@@ -1036,10 +1036,12 @@ mod tests {
         let (paths, _g) = test_paths("rules");
         Registry::update(&paths, |r| r.add(spec("a"))).unwrap();
         let reg = Registry::load(&paths).unwrap();
-        assert_eq!(router_json_value(&reg).unwrap()["userRules"]["source"], "default");
+        assert_eq!(
+            router_json_value(&reg).unwrap()["userRules"]["source"],
+            "default"
+        );
         // Explicit write (even of the defaults) marks the source as user.
-        crate::settings::write_user_rules(&paths, &crate::settings::UserRules::default())
-            .unwrap();
+        crate::settings::write_user_rules(&paths, &crate::settings::UserRules::default()).unwrap();
         let reg = Registry::load(&paths).unwrap();
         let v = router_json_value(&reg).unwrap();
         assert_eq!(v["userRules"]["source"], "user");
@@ -1047,7 +1049,10 @@ mod tests {
         // Invalid rules fail generation closed, never a silently unguarded file.
         Registry::update(&paths, |r| {
             use toml::Value;
-            let router = r.extra.entry("router".to_string()).or_insert(Value::Table(Default::default()));
+            let router = r
+                .extra
+                .entry("router".to_string())
+                .or_insert(Value::Table(Default::default()));
             let t = router.as_table_mut().unwrap();
             let mut rules = toml::map::Map::new();
             rules.insert("no_review_models".into(), Value::String("oops".into()));

@@ -1027,11 +1027,8 @@ mod user_rules_tests {
             );
         }
         // Absent stays compatible: today's behavior byte-identical.
-        let cfg = parse_router_config(
-            serde_json::json!({"pool": [], "accounts": {}}),
-            "test",
-        )
-        .unwrap();
+        let cfg =
+            parse_router_config(serde_json::json!({"pool": [], "accounts": {}}), "test").unwrap();
         assert_eq!(cfg.user_rules, UserRules::default());
     }
 
