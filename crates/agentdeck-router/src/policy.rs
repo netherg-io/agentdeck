@@ -4,6 +4,8 @@ use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
 
+use agentdeck_core::settings::UserRules;
+
 pub const MIN_FIT: f64 = 0.7;
 pub const TARGET_MARGIN: f64 = 0.02;
 pub type CostsOf<'a> = dyn Fn(&str, Option<&str>) -> ([f64; 4], f64) + 'a;
@@ -145,6 +147,9 @@ pub struct RouterConfig {
     pub decision_model: Option<String>,
     /// `"vercel"` sends the judgment through Vercel AI Gateway; else OpenRouter.
     pub decision_provider: Option<String>,
+    /// Persistent user model restrictions; defaults preserve the Argon
+    /// audit/review ban exactly when the generated JSON predates them.
+    pub user_rules: UserRules,
     pub account: HashMap<String, String>,
     pub usage_id: HashMap<String, String>,
     /// Insertion-ordered, like `Object.entries` on the JSON object.
@@ -311,6 +316,8 @@ fn parse_router_config(data: Value, source: &str) -> anyhow::Result<RouterConfig
             .get("decisionProvider")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        user_rules: UserRules::from_json(data.get("userRules"))
+            .map_err(|e| fail(format!("bad userRules: {e}")))?,
         account,
         usage_id,
         meta,
@@ -932,6 +939,109 @@ display = "Go"
         let config = load_router_json(file.to_str().unwrap()).unwrap();
         assert_eq!(config.meta.len(), 2);
         assert_eq!(config.instance_limits["opencode"], 4);
+        // Generated defaults survive the round trip with their source.
+        assert_eq!(
+            config.user_rules,
+            agentdeck_core::settings::UserRules::default()
+        );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod user_rules_tests {
+    use super::*;
+
+    fn ranked_with_ban(ban: Option<&str>) -> Vec<Ranked> {
+        let candidate = Candidate {
+            provider: "a".into(),
+            model: "gemini-argon-x".into(),
+            profiled: true,
+            burn: Some(1.0),
+            target: serde_json::json!({"providerInstanceId": "a", "model": "gemini-argon-x"}),
+            reasoning_error: None,
+            no_review: true,
+            policy_ban: ban.map(str::to_string),
+            fit: 0.9,
+            quality: 0.8,
+            confidence: 0.9,
+            allowed: true,
+            task_cost: Some(1.0),
+            quota_note: String::new(),
+            active_agents: 0,
+            quota_provenance: QuotaProvenance {
+                basis: "unknown",
+                detail: String::new(),
+                sample_sessions: None,
+                stale_minutes: None,
+                load_unknown: true,
+                windows: vec![],
+                balances: vec![],
+            },
+        };
+        vec![Ranked {
+            account: None,
+            shared_quota: false,
+            shared_quota_penalty: 0.0,
+            paid_credit_penalty: 0.0,
+            cheap_model_bonus: 0.0,
+            eligible: ban.is_none(),
+            score: 0.8,
+            candidate,
+        }]
+    }
+
+    #[test]
+    fn default_matches_embedded_roster_ban() {
+        let roster_bans: Vec<String> = families()
+            .into_iter()
+            .filter(|(_, f)| f.no_review)
+            .map(|(pat, _)| pat)
+            .collect();
+        assert_eq!(
+            UserRules::default().no_review_models,
+            roster_bans,
+            "default user rules must preserve the embedded ban exactly"
+        );
+        let rules = UserRules::default();
+        assert!(rules.is_no_review("gemini-foo-argon"));
+        assert!(!rules.is_no_review("gemini-2.5-pro"));
+    }
+
+    #[test]
+    fn invalid_user_rules_fail_closed() {
+        for v in [
+            serde_json::json!({"noReviewModels": "x"}),
+            serde_json::json!({"denyModels": [42]}),
+            serde_json::json!({"noReviewModels": ["(["]}),
+            serde_json::json!({"source": "someone"}),
+            serde_json::json!("x"),
+        ] {
+            assert!(UserRules::from_json(Some(&v)).is_err());
+            assert!(
+                parse_router_config(
+                    serde_json::json!({"pool": [], "accounts": {}, "userRules": v}),
+                    "test"
+                )
+                .is_err()
+            );
+        }
+        // Absent stays compatible: today's behavior byte-identical.
+        let cfg = parse_router_config(
+            serde_json::json!({"pool": [], "accounts": {}}),
+            "test",
+        )
+        .unwrap();
+        assert_eq!(cfg.user_rules, UserRules::default());
+    }
+
+    #[test]
+    fn deny_wins_in_validation() {
+        let denied = ranked_with_ban(Some("denied by user rule"));
+        let v = validate_target(&denied, "a", "gemini-argon-x");
+        assert!(!v.allowed);
+        assert_eq!(v.reason, "denied by user rule");
+        let clean = ranked_with_ban(None);
+        assert!(validate_target(&clean, "a", "gemini-argon-x").allowed);
     }
 }

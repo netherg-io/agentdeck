@@ -264,6 +264,12 @@ pub fn router_json_value(reg: &Registry) -> anyhow::Result<Value> {
     if let Some(model) = settings.decision_model {
         root.insert("decisionModel".into(), Value::String(model));
     }
+    // Visible to the GUI and route output; invalid rules fail closed here so
+    // a bad edit never ships a router.json that silently drops the ban.
+    // Excluded from `content_version` on purpose: rules change eligibility,
+    // not the Jev questions, so no cache bust is needed.
+    let rules = crate::settings::UserRules::from_registry(reg)?;
+    root.insert("userRules".into(), rules.to_json());
     Ok(Value::Object(root))
 }
 
@@ -1011,6 +1017,10 @@ mod tests {
         assert!(v["version"].is_number());
         assert_eq!(v["pool"].as_array().unwrap().len(), 2);
         assert_eq!(v["pool"][0]["providerInstanceId"], "codex");
+        // Defaults are explicit so the GUI can show the active ban + source.
+        assert_eq!(v["userRules"]["source"], "default");
+        assert_eq!(v["userRules"]["noReviewModels"][0], "gemini-.*argon");
+        assert!(v["userRules"]["denyModels"].as_array().unwrap().is_empty());
         let acc = &v["accounts"];
         assert_eq!(acc["codex"]["usageId"], "codex-main");
         assert_eq!(acc["codex"]["instances"][0], "codex");
@@ -1019,6 +1029,34 @@ mod tests {
         // Refresh is idempotent.
         let reg = Registry::load(&paths).unwrap();
         assert!(plan_router_files(&paths, &reg).unwrap().is_empty());
+    }
+
+    #[test]
+    fn user_rules_flow_into_generated_json() {
+        let (paths, _g) = test_paths("rules");
+        Registry::update(&paths, |r| r.add(spec("a"))).unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        assert_eq!(router_json_value(&reg).unwrap()["userRules"]["source"], "default");
+        // Explicit write (even of the defaults) marks the source as user.
+        crate::settings::write_user_rules(&paths, &crate::settings::UserRules::default())
+            .unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        let v = router_json_value(&reg).unwrap();
+        assert_eq!(v["userRules"]["source"], "user");
+        assert_eq!(v["userRules"]["noReviewModels"][0], "gemini-.*argon");
+        // Invalid rules fail generation closed, never a silently unguarded file.
+        Registry::update(&paths, |r| {
+            use toml::Value;
+            let router = r.extra.entry("router".to_string()).or_insert(Value::Table(Default::default()));
+            let t = router.as_table_mut().unwrap();
+            let mut rules = toml::map::Map::new();
+            rules.insert("no_review_models".into(), Value::String("oops".into()));
+            t.insert("rules".into(), Value::Table(rules));
+            Ok(())
+        })
+        .unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        assert!(router_json_value(&reg).is_err());
     }
 
     #[test]

@@ -1432,17 +1432,38 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                 .as_deref()
                 .unwrap_or("unknown (use --source to preserve orchestrator quota)")
         );
+        // Source is visible so the GUI/operator can tell a default ban from
+        // an explicit user override.
+        println!(
+            "user rules (source: {}): no-review: {}; denied: {}",
+            cfg.user_rules.source.as_str(),
+            if cfg.user_rules.no_review_models.is_empty() {
+                "(none)".to_string()
+            } else {
+                cfg.user_rules.no_review_models.join(", ")
+            },
+            if cfg.user_rules.deny_models.is_empty() {
+                "(none)".to_string()
+            } else {
+                cfg.user_rules.deny_models.join(", ")
+            }
+        );
         if !load.known {
             println!("live T3 agent metadata unavailable");
         }
         for (provider, model, profile) in &favorites {
             let q = quota(&cfg, &measured, &usage, &load, provider, model, now);
             print!(
-                "{}  {provider}/{model}\n    left: {}",
+                "{}{}  {provider}/{model}\n    left: {}",
                 if profile.is_some() {
                     "ok"
                 } else {
                     "UNPROFILED"
+                },
+                if cfg.user_rules.is_denied(model) {
+                    " DENIED by user rule"
+                } else {
+                    ""
                 },
                 q.note
             );
@@ -1750,7 +1771,13 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                 ),
             };
         let fam = family_of(model);
-        let mut policy_ban = if fam.as_ref().is_some_and(|f| f.no_review) && is_review_task(&task) {
+        // User rules (defaults preserve the embedded Argon ban): deny wins,
+        // then the audit/review ban, then the instance capacity ban.
+        let user_rules = &current_cfg.user_rules;
+        let no_review = user_rules.is_no_review(model);
+        let mut policy_ban = if user_rules.is_denied(model) {
+            Some("denied by user rule".to_string())
+        } else if no_review && is_review_task(&task) {
             Some(NO_REVIEW_BAN.to_string())
         } else {
             None
@@ -1790,7 +1817,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
             burn: fam.as_ref().map(|f| f.burn),
             target,
             reasoning_error,
-            no_review: fam.as_ref().is_some_and(|f| f.no_review),
+            no_review,
             policy_ban,
             fit,
             quality: a.get("score").and_then(Value::as_f64).unwrap_or(0.0)
@@ -1997,10 +2024,10 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         out.insert("requestedTarget".into(), req_target);
         out.insert(
             "requestedNoReview".into(),
-            Value::from(family_of(&req.model).is_some_and(|f| f.no_review)),
+            Value::from(current_cfg.user_rules.is_no_review(&req.model)),
         );
         let validation =
-            if family_of(&req.model).is_some_and(|f| f.no_review) && is_review_task(&task) {
+            if current_cfg.user_rules.is_no_review(&req.model) && is_review_task(&task) {
                 serde_json::json!({"allowed": false, "reason": NO_REVIEW_BAN})
             } else {
                 let v = validate_target(&ranking, &req.provider, &req.model);
@@ -2015,6 +2042,8 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
             .cloned()
             .unwrap_or(Value::Null),
     );
+    // Explicit rules + source for the GUI and for route-output readers.
+    out.insert("userRules".into(), current_cfg.user_rules.to_json());
     out.insert(
         "blocked".into(),
         Value::Array(blocked.iter().cloned().map(Value::String).collect()),
@@ -2133,6 +2162,7 @@ mod quota_estimate_tests {
             usage_state_path: None,
             decision_model: None,
             decision_provider: None,
+            user_rules: agentdeck_core::settings::UserRules::default(),
             account: [("codex".to_string(), "codex".to_string())]
                 .into_iter()
                 .collect(),
