@@ -887,14 +887,37 @@ pub(crate) fn write_state(file: &Path, state: &State, fresh: bool) -> Result<(),
     if fresh && file.exists() {
         return Err(WfError::fail(format!("{} already exists", file.display())));
     }
+    // Every production caller holds the exclusive state lock, so no other
+    // live writer can own a sibling tmp: drop stale `<state>.json.*.tmp`
+    // files left by crashed writes (including our own pid name, which is
+    // recreated below), then open with truncate in case one reappeared.
+    if let Some(dir) = file.parent()
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        let prefix = format!(
+            "{}.",
+            file.file_name().and_then(|n| n.to_str()).unwrap_or("")
+        );
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&prefix) && name.ends_with(".tmp") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
     let tmp = file.with_extension(format!("json.{}.tmp", std::process::id()));
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(true)
         .mode(0o600)
         .open(&tmp)
+        .map_err(|e| WfError::fail(e.to_string()))?;
+    // mode() only applies on creation; a surviving stale tmp keeps its mode.
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
         .map_err(|e| WfError::fail(e.to_string()))?;
     let result = (|| {
         let text = serde_json::to_string_pretty(state).map_err(|e| WfError::fail(e.to_string()))?;
@@ -1131,6 +1154,39 @@ async fn run_inner(argv: &[String]) -> Result<Value, WfError> {
             .map(|(out, _)| out)
         }
         _ => Err(WfError::usage(USAGE)),
+    }
+}
+
+#[cfg(test)]
+mod state_write_tests {
+    use super::*;
+
+    #[test]
+    fn stale_tmp_siblings_do_not_break_write_and_are_removed() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("agentdeck-state-tmp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("11111111-2222-3333-4444-555555555555.json");
+        // Stale tmps from crashed writes: a foreign pid and our own pid name.
+        std::fs::write(file.with_extension("json.999999.tmp"), b"stale").unwrap();
+        std::fs::write(
+            file.with_extension(format!("json.{}.tmp", std::process::id())),
+            b"stale",
+        )
+        .unwrap();
+        let plan = serde_json::json!({"title": "t", "steps": [{"id": "a", "task": "do"}]});
+        let state = new_state(&plan, "thread").unwrap();
+        write_state(&file, &state, false).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
+        let back: State = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(back.run_id, state.run_id);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 

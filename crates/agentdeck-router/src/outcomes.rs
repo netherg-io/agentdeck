@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 
 use crate::policy::valid_answer;
 
-pub const USAGE: &str = "usage: agentdeck route outcomes record --task ID --provider P --model M --category C --verdict V --evidence E [--source coordinator]\n  agentdeck route outcomes record-decider --task ID --category C --model M [--provider P] < evaluation.json\n  agentdeck route outcomes list [--task ID] [--limit N]\n  agentdeck route outcomes evaluate < evaluation.json\n\n  category: implementation|research|review|design|test|general\n  verdict: ok|partial|fail|blocked|missing|unavailable (blocked/missing/unavailable are not failures)\n  evidence: direct|spot-check|test-output|child-report\n  source is always recorded as \"coordinator\"; decider assessments use record-decider and are recorded as \"decider\".\n  repeats for one task append a new revision; appends are file-locked; corrupt lines fail reads (a torn final line is skipped), never deleted.\n\nevaluate reads one JSON object on stdin (max 16 KiB):\n  {\"task\": \"what was asked, 1-2000 chars\", \"evidence\": [{\"id\": \"e1\", \"text\": \"...1-4000 chars...\"} 1-8 items],\n   \"performer\": {\"provider\": \"P\", \"model\": \"M\"}?}\n  It sends that content to the configured decision provider/model (explicit opt-in; standard keys)\n  and prints {verdict: pass|partial|fail|insufficient, confidence, evidenceConsidered, judge{provider,model},\n  selfJudged: true|null (null means unknown), judgeCostUsd: number|null (null means unreported)}.\n  Nothing is written anywhere: raw task and evidence text are never persisted. To persist an\n  assessment, run `outcomes record` separately with validated metadata only.\n\nrecord-decider reads the JSON object printed by `outcomes evaluate` on stdin (max 16 KiB)\n  and appends validated decider metadata only: no task text, evidence text, summaries or\n  secrets are read or stored. Judge identity, selfJudged and cost come from that result\n  (never from flags); unknown stays null. Needs no network and never affects ranking.";
+pub const USAGE: &str = "usage: agentdeck route outcomes record --task ID --provider P --model M --category C --verdict V --evidence E [--source coordinator]\n  agentdeck route outcomes record-decider --task ID --category C --model M [--provider P] < evaluation.json\n  agentdeck route outcomes list [--task ID] [--limit N]\n  agentdeck route outcomes evaluate < evaluation.json\n\n  category: implementation|research|review|design|test|general\n  verdict: ok|partial|fail|blocked|missing|unavailable (blocked/missing/unavailable are not failures)\n  evidence: direct|spot-check|test-output|child-report\n  source is always recorded as \"coordinator\"; decider assessments use record-decider and are recorded as \"decider\".\n  repeats for one task append a new revision; appends are file-locked; corrupt lines fail reads, never deleted.
+  A torn final line from a crashed append is skipped by reads and quarantined to a private
+  `<journal>.torn-<secs>` sibling by the next append, which then succeeds.\n\nevaluate reads one JSON object on stdin (max 16 KiB):\n  {\"task\": \"what was asked, 1-2000 chars\", \"evidence\": [{\"id\": \"e1\", \"text\": \"...1-4000 chars...\"} 1-8 items],\n   \"performer\": {\"provider\": \"P\", \"model\": \"M\"}?}\n  It sends that content to the configured decision provider/model (explicit opt-in; standard keys)\n  and prints {verdict: pass|partial|fail|insufficient, confidence, evidenceConsidered, judge{provider,model},\n  selfJudged: true|null (null means unknown), judgeCostUsd: number|null (null means unreported)}.\n  Nothing is written anywhere: raw task and evidence text are never persisted. To persist an\n  assessment, run `outcomes record` separately with validated metadata only.\n\nrecord-decider reads the JSON object printed by `outcomes evaluate` on stdin (max 16 KiB)\n  and appends validated decider metadata only: no task text, evidence text, summaries or\n  secrets are read or stored. Judge identity, selfJudged and cost come from that result\n  (never from flags); unknown stays null. Needs no network and never affects ranking.";
 
 const CATEGORIES: &[&str] = &[
     "implementation",
@@ -283,9 +285,32 @@ fn append_line(base: &Path, line: &serde_json::Value) -> Result<PathBuf, Outcome
         f.read_exact(&mut last)
             .map_err(|e| OutcomeError::fail(e.to_string()))?;
         if last[0] != b'\n' {
-            return Err(OutcomeError::fail(
-                "outcomes file has an incomplete final record; file left unchanged",
-            ));
+            // Torn tail of a crashed append, still under the exclusive lock
+            // that serializes writers: quarantine the partial bytes in a
+            // private sibling, truncate back to the last whole line, fsync,
+            // then fall through to the normal append below.
+            f.seek(SeekFrom::Start(0))
+                .map_err(|e| OutcomeError::fail(e.to_string()))?;
+            let mut all = Vec::new();
+            f.read_to_end(&mut all)
+                .map_err(|e| OutcomeError::fail(e.to_string()))?;
+            let cut = all.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+            let sib = path.with_extension(format!("jsonl.torn-{}", now_secs()));
+            let mut q = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&sib)
+                .map_err(|e| OutcomeError::fail(format!("cannot quarantine torn tail: {e}")))?;
+            q.write_all(&all[cut..])
+                .and_then(|()| q.sync_all())
+                .map_err(|e| OutcomeError::fail(format!("cannot quarantine torn tail: {e}")))?;
+            drop(q);
+            f.set_len(cut as u64)
+                .map_err(|e| OutcomeError::fail(e.to_string()))?;
+            f.sync_all().map_err(|e| {
+                OutcomeError::fail(format!("cannot persist {}: {e}", path.display()))
+            })?;
         }
     }
     let r = f
@@ -1033,12 +1058,39 @@ mod tests {
     }
 
     #[test]
-    fn append_refuses_incomplete_tail_without_changing_it() {
+    fn torn_tail_is_quarantined_and_append_succeeds() {
+        use std::os::unix::fs::MetadataExt;
         let base = tmp_base("append-torn");
         let path = ensure_parent(&base).unwrap();
-        std::fs::write(&path, b"{\"partial\":").unwrap();
-        assert!(append_to(&base, &rec("task-1"), 1).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"{\"partial\":");
+        append_to(&base, &rec("task-1"), 1).unwrap();
+        // Torn tail of a crashed append: no trailing newline.
+        {
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"{\"partial\":")
+                .unwrap();
+        }
+        append_to(&base, &rec("task-2"), 2).unwrap();
+        // Journal holds whole lines only; both records read back.
+        let items = read_all(&base).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1]["task_id"], "task-2");
+        // Quarantine sibling holds exactly the torn bytes, mode 0600.
+        let sibs: Vec<PathBuf> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("outcomes.jsonl.torn-"))
+            })
+            .collect();
+        assert_eq!(sibs.len(), 1);
+        assert_eq!(std::fs::read(&sibs[0]).unwrap(), b"{\"partial\":");
+        assert_eq!(std::fs::metadata(&sibs[0]).unwrap().mode() & 0o777, 0o600);
         let _ = std::fs::remove_dir_all(&base);
     }
 
