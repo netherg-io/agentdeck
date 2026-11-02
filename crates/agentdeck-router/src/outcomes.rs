@@ -473,9 +473,7 @@ pub(crate) fn parse_decider_eval(text: &str) -> Result<DeciderEval, OutcomeError
     }
     let mut evidence = Vec::with_capacity(ids.len());
     for id in ids {
-        let id = id
-            .as_str()
-            .ok_or_else(|| OutcomeError::usage(USAGE))?;
+        let id = id.as_str().ok_or_else(|| OutcomeError::usage(USAGE))?;
         check_id(id, "evidence id", MAX_EVAL_ID, &[':', '_', '.', '-'])?;
         evidence.push(id.to_string());
     }
@@ -520,9 +518,7 @@ pub(crate) fn parse_decider_eval(text: &str) -> Result<DeciderEval, OutcomeError
             let n = c
                 .as_f64()
                 .filter(|n| n.is_finite() && *n >= 0.0)
-                .ok_or_else(|| {
-                    OutcomeError::usage("judgeCostUsd must be a number >= 0 or null")
-                })?;
+                .ok_or_else(|| OutcomeError::usage("judgeCostUsd must be a number >= 0 or null"))?;
             Some(n)
         }
     };
@@ -670,7 +666,9 @@ fn record_decider_cli(argv: &[String]) -> Result<serde_json::Value, OutcomeError
         &eval,
         now_secs(),
     )?;
-    Ok(serde_json::json!({"recorded": true, "source": "decider", "file": path.display().to_string()}))
+    Ok(
+        serde_json::json!({"recorded": true, "source": "decider", "file": path.display().to_string()}),
+    )
 }
 
 // --- Explicit on-demand outcome evaluation (no persistence) ------------------
@@ -1126,8 +1124,16 @@ mod tests {
         let base = tmp_base("decider-distinct");
         append_to(&base, &rec("task-1"), 1).unwrap();
         let eval = parse_decider_eval(&good_eval()).unwrap();
-        record_decider_to(&base, "task-1", "implementation", Some("testprov"), "test-model", &eval, 2)
-            .unwrap();
+        record_decider_to(
+            &base,
+            "task-1",
+            "implementation",
+            Some("testprov"),
+            "test-model",
+            &eval,
+            2,
+        )
+        .unwrap();
         let items = read_all(&base).unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["source"], "coordinator");
@@ -1177,17 +1183,94 @@ mod tests {
     fn decider_rejects_bad_results_without_writing() {
         let judge = serde_json::json!({"provider": "openrouter", "model": "t/judge"});
         let bad = [
-            decider_eval("great", serde_json::json!(0.5), &["a"], judge.clone(), serde_json::Value::Null, serde_json::Value::Null),
-            decider_eval("pass", serde_json::json!(2.0), &["a"], judge.clone(), serde_json::Value::Null, serde_json::Value::Null),
-            decider_eval("pass", serde_json::json!("high"), &["a"], judge.clone(), serde_json::Value::Null, serde_json::Value::Null),
-            decider_eval("pass", serde_json::json!(0.5), &[], judge.clone(), serde_json::Value::Null, serde_json::Value::Null),
-            decider_eval("pass", serde_json::json!(0.5), &["a/b"], judge.clone(), serde_json::Value::Null, serde_json::Value::Null),
-            decider_eval("pass", serde_json::json!(0.5), &["a", "a"], judge.clone(), serde_json::Value::Null, serde_json::Value::Null),
-            decider_eval("pass", serde_json::json!(0.5), &["a"], serde_json::json!({"provider": "p"}), serde_json::Value::Null, serde_json::Value::Null),
-            decider_eval("pass", serde_json::json!(0.5), &["a"], judge.clone(), serde_json::json!(false), serde_json::Value::Null),
-            decider_eval("pass", serde_json::json!(0.5), &["a"], judge.clone(), serde_json::json!("no"), serde_json::Value::Null),
-            decider_eval("pass", serde_json::json!(0.5), &["a"], judge.clone(), serde_json::Value::Null, serde_json::json!(-0.1)),
-            decider_eval("pass", serde_json::json!(0.5), &["a"], judge.clone(), serde_json::Value::Null, serde_json::json!("cheap")),
+            decider_eval(
+                "great",
+                serde_json::json!(0.5),
+                &["a"],
+                judge.clone(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ),
+            decider_eval(
+                "pass",
+                serde_json::json!(2.0),
+                &["a"],
+                judge.clone(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ),
+            decider_eval(
+                "pass",
+                serde_json::json!("high"),
+                &["a"],
+                judge.clone(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ),
+            decider_eval(
+                "pass",
+                serde_json::json!(0.5),
+                &[],
+                judge.clone(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ),
+            decider_eval(
+                "pass",
+                serde_json::json!(0.5),
+                &["a/b"],
+                judge.clone(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ),
+            decider_eval(
+                "pass",
+                serde_json::json!(0.5),
+                &["a", "a"],
+                judge.clone(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ),
+            decider_eval(
+                "pass",
+                serde_json::json!(0.5),
+                &["a"],
+                serde_json::json!({"provider": "p"}),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ),
+            decider_eval(
+                "pass",
+                serde_json::json!(0.5),
+                &["a"],
+                judge.clone(),
+                serde_json::json!(false),
+                serde_json::Value::Null,
+            ),
+            decider_eval(
+                "pass",
+                serde_json::json!(0.5),
+                &["a"],
+                judge.clone(),
+                serde_json::json!("no"),
+                serde_json::Value::Null,
+            ),
+            decider_eval(
+                "pass",
+                serde_json::json!(0.5),
+                &["a"],
+                judge.clone(),
+                serde_json::Value::Null,
+                serde_json::json!(-0.1),
+            ),
+            decider_eval(
+                "pass",
+                serde_json::json!(0.5),
+                &["a"],
+                judge.clone(),
+                serde_json::Value::Null,
+                serde_json::json!("cheap"),
+            ),
             "not json".to_string(),
         ];
         for (n, text) in bad.iter().enumerate() {
@@ -1203,12 +1286,8 @@ mod tests {
         assert!(!outcomes_path(&base).exists());
         // Bad task/category/performer flags also fail without writing.
         let eval = parse_decider_eval(&good_eval()).unwrap();
-        assert!(
-            record_decider_to(&base, "../evil", "test", Some("p"), "m", &eval, 1).is_err()
-        );
-        assert!(
-            record_decider_to(&base, "t", "nope", Some("p"), "m", &eval, 1).is_err()
-        );
+        assert!(record_decider_to(&base, "../evil", "test", Some("p"), "m", &eval, 1).is_err());
+        assert!(record_decider_to(&base, "t", "nope", Some("p"), "m", &eval, 1).is_err());
         assert!(!outcomes_path(&base).exists());
         let _ = std::fs::remove_dir_all(&base);
     }

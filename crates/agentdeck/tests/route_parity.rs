@@ -218,7 +218,11 @@ fn check_case(
         let actual = std::str::from_utf8(&rout).unwrap();
         let line = "user rules (source: default): no-review: gemini-.*argon; denied: (none)\n";
         assert!(actual.contains(line), "{name}: missing default rules");
-        assert_eq!(actual.replacen(line, "", 1).as_bytes(), nout, "{name}: non-additive output differs");
+        assert_eq!(
+            actual.replacen(line, "", 1).as_bytes(),
+            nout,
+            "{name}: non-additive output differs"
+        );
         return;
     }
     // Additive-only allowance: the Rust router emits per-candidate
@@ -234,33 +238,33 @@ fn check_case(
         }
         Some(v)
     };
-    match (strip(&nout), strip(&rout)) {
-        (Some(n), Some(r)) => {
-            assert_eq!(n, r, "{name}: non-additive output differs");
-            let rust_v: serde_json::Value = serde_json::from_slice(&rout).unwrap();
-            assert_eq!(rust_v["userRules"], serde_json::json!({
+    if let (Some(n), Some(r)) = (strip(&nout), strip(&rout)) {
+        assert_eq!(n, r, "{name}: non-additive output differs");
+        let rust_v: serde_json::Value = serde_json::from_slice(&rout).unwrap();
+        assert_eq!(
+            rust_v["userRules"],
+            serde_json::json!({
                 "source": "default", "noReviewModels": ["gemini-.*argon"], "denyModels": []
-            }), "{name}: unexpected default user rules");
-            let entries = rust_v["ranking"].as_array().unwrap();
-            assert!(!entries.is_empty(), "{name}: empty ranking");
-            for entry in entries {
-                let q = &entry["quotaEstimate"];
-                assert!(
-                    ["measured", "estimate", "unknown"]
-                        .contains(&q["basis"].as_str().unwrap_or("")),
-                    "{name}: bad quotaEstimate basis: {q}"
-                );
-                assert!(q["detail"].is_string(), "{name}: bad detail: {q}");
-                assert!(
-                    q["loadUnknown"].is_boolean(),
-                    "{name}: bad loadUnknown: {q}"
-                );
-                assert!(q["windows"].is_array(), "{name}: bad windows: {q}");
-                assert!(q["balancesUsd"].is_array(), "{name}: bad balancesUsd: {q}");
-            }
-            return;
+            }),
+            "{name}: unexpected default user rules"
+        );
+        let entries = rust_v["ranking"].as_array().unwrap();
+        assert!(!entries.is_empty(), "{name}: empty ranking");
+        for entry in entries {
+            let q = &entry["quotaEstimate"];
+            assert!(
+                ["measured", "estimate", "unknown"].contains(&q["basis"].as_str().unwrap_or("")),
+                "{name}: bad quotaEstimate basis: {q}"
+            );
+            assert!(q["detail"].is_string(), "{name}: bad detail: {q}");
+            assert!(
+                q["loadUnknown"].is_boolean(),
+                "{name}: bad loadUnknown: {q}"
+            );
+            assert!(q["windows"].is_array(), "{name}: bad windows: {q}");
+            assert!(q["balancesUsd"].is_array(), "{name}: bad balancesUsd: {q}");
         }
-        _ => {}
+        return;
     }
     if nout != rout {
         let dir = std::env::temp_dir().join(format!("route-parity-{name}"));

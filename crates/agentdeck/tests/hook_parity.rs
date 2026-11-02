@@ -360,10 +360,7 @@ fn check_case(name: &str, fx: &Fixture, harness: &str, input: &serde_json::Value
         let mut r = rust_records.to_vec();
         for records in [&mut n, &mut r] {
             for rec in records.iter_mut() {
-                if let Some(ranking) = rec
-                    .get_mut("ranking")
-                    .and_then(|v| v.as_array_mut())
-                {
+                if let Some(ranking) = rec.get_mut("ranking").and_then(|v| v.as_array_mut()) {
                     for entry in ranking.iter_mut() {
                         if let Some(obj) = entry.as_object_mut() {
                             obj.remove("quotaEstimate");
@@ -388,10 +385,7 @@ fn check_case(name: &str, fx: &Fixture, harness: &str, input: &serde_json::Value
                         "{name}: bad loadUnknown: {q}"
                     );
                     assert!(q["windows"].is_array(), "{name}: bad windows: {q}");
-                    assert!(
-                        q["balancesUsd"].is_array(),
-                        "{name}: bad balancesUsd: {q}"
-                    );
+                    assert!(q["balancesUsd"].is_array(), "{name}: bad balancesUsd: {q}");
                 }
             }
         }
