@@ -1295,7 +1295,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         Some("hook") => return Ok(crate::hook::run(&argv[1..])),
         Some("claude-shell") => return Ok(crate::shell::run(&argv[1..])),
         Some("t3-mcp-call") => return Ok(crate::mcp_call::run(&argv[1..]).await),
-        Some("workflow") => return Ok(crate::workflow::run(&argv[1..])),
+        Some("workflow") => return Ok(crate::workflow::run(&argv[1..]).await),
         Some("outcomes") => return Ok(crate::outcomes::run(&argv[1..]).await),
         _ => {}
     }

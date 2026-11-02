@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const USAGE: &str = "usage: workflow.mjs init PLAN.json --thread ID | next|stop|resume STATE.json --thread ID\n  | prepare STATE.json STEP --thread ID --source INSTANCE | record STATE.json STEP --thread ID < T3_RESPONSE.json\n  | release STATE.json STEP --thread ID --not-dispatched";
+pub const USAGE: &str = "usage: workflow.mjs init PLAN.json --thread ID | next|stop|resume STATE.json --thread ID\n  | prepare STATE.json STEP --thread ID --source INSTANCE | record STATE.json STEP --thread ID < T3_RESPONSE.json\n  | release STATE.json STEP --thread ID --not-dispatched | eval STATE.json STEP --thread ID [--sample N] [--force]\n\neval is explicit opt-in observational grading of one settled completed step via the configured\ndecision provider (the brief and summary are sent there; only metadata is stored as a child\nreport). record never evaluates, so default workflow use is unchanged. Direct delegate_task\ncalls outside a routed workflow are not covered.";
 const ROLES: &[&str] = &[
     "implementation",
     "research",
@@ -45,13 +45,13 @@ pub struct WfError {
 }
 
 impl WfError {
-    fn usage(message: impl Into<String>) -> Self {
+    pub(crate) fn usage(message: impl Into<String>) -> Self {
         Self {
             usage: true,
             message: message.into(),
         }
     }
-    fn fail(message: impl Into<String>) -> Self {
+    pub(crate) fn fail(message: impl Into<String>) -> Self {
         Self {
             usage: false,
             message: message.into(),
@@ -110,6 +110,28 @@ pub struct Progress {
     pub summary: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempt: Option<u32>,
+    /// Observational evaluation marker; absent means never evaluated. Additive
+    /// and optional, so older states load unchanged and `record` output that
+    /// never mentions it stays byte-identical to the .mjs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval: Option<EvalStatus>,
+}
+
+/// Outcome of one explicit `workflow eval`: observational only, never a
+/// routing input. `truncated`/`verdict` are metadata; raw brief/summary text
+/// is never stored here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvalStatus {
+    /// evaluated|already-recorded(not persisted)|skipped|failed|unknown.
+    pub status: String,
+    #[serde(rename = "taskId")]
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,6 +343,7 @@ pub fn new_state(plan: &Value, parent_thread_id: &str) -> Result<State, WfError>
                 route: None,
                 summary: None,
                 attempt: None,
+                eval: None,
             })
             .collect(),
         plan: base,
@@ -899,11 +922,13 @@ struct Cli {
     thread: Option<String>,
     source: Option<String>,
     not_dispatched: bool,
+    sample: Option<u64>,
+    force: bool,
 }
 
 /// CLI entry. Returns the process exit code (0, 1, or 2 on usage errors).
-pub fn run(argv: &[String]) -> i32 {
-    match run_inner(argv) {
+pub async fn run(argv: &[String]) -> i32 {
+    match run_inner(argv).await {
         Ok(value) => {
             println!(
                 "{}",
@@ -918,12 +943,27 @@ pub fn run(argv: &[String]) -> i32 {
     }
 }
 
-fn parse_cli(argv: &[String]) -> Result<(Cli, String, Option<String>, Option<String>), WfError> {
+fn parse_cli(
+    argv: &[String],
+) -> Result<(Cli, String, Option<String>, Option<String>), WfError> {
     let mut thread = None;
     let mut source = None;
     let mut not_dispatched = false;
+    let mut sample = None;
+    let mut force = false;
     let mut rest = Vec::new();
     let mut i = 0;
+    let parse_sample = |raw: &str| {
+        raw.parse::<u64>()
+            .ok()
+            .filter(|n| (1..=crate::workflow_eval::MAX_SAMPLE).contains(n))
+            .ok_or_else(|| {
+                WfError::usage(format!(
+                    "sample must be 1-{}",
+                    crate::workflow_eval::MAX_SAMPLE
+                ))
+            })
+    };
     while i < argv.len() {
         match argv[i].as_str() {
             "--thread" => {
@@ -936,6 +976,15 @@ fn parse_cli(argv: &[String]) -> Result<(Cli, String, Option<String>, Option<Str
                 source = argv.get(i).cloned();
             }
             s if s.starts_with("--source=") => source = Some(s[9..].to_string()),
+            "--sample" => {
+                i += 1;
+                let raw = argv.get(i).cloned().unwrap_or_default();
+                sample = Some(parse_sample(&raw)?);
+            }
+            s if s.starts_with("--sample=") => {
+                sample = Some(parse_sample(&s[9..])?);
+            }
+            "--force" => force = true,
             "--not-dispatched" => not_dispatched = true,
             s if s.starts_with("--") => return Err(WfError::usage(USAGE)),
             s => rest.push(s.to_string()),
@@ -953,6 +1002,8 @@ fn parse_cli(argv: &[String]) -> Result<(Cli, String, Option<String>, Option<Str
             thread,
             source,
             not_dispatched,
+            sample,
+            force,
         },
         cmd,
         file,
@@ -960,7 +1011,7 @@ fn parse_cli(argv: &[String]) -> Result<(Cli, String, Option<String>, Option<Str
     ))
 }
 
-fn run_inner(argv: &[String]) -> Result<Value, WfError> {
+async fn run_inner(argv: &[String]) -> Result<Value, WfError> {
     let (cli, cmd, file, step) = parse_cli(argv)?;
     let thread = cli.thread.clone().unwrap_or_default();
     if thread.is_empty() || file.as_deref().unwrap_or("").is_empty() {
@@ -1029,6 +1080,21 @@ fn run_inner(argv: &[String]) -> Result<Value, WfError> {
                 serde_json::from_str(&input).map_err(|e| WfError::fail(e.to_string()))?;
             let out = record(&mut state, &step, &response)?;
             if out.get("unchanged").is_none() {
+                write_state(&path, &state, false)?;
+            }
+            Ok(out)
+        }
+        "eval" => {
+            // Explicit opt-in only: record never reaches here, so default
+            // workflow use never bills the judge or sends task text anywhere.
+            let step = step.ok_or_else(|| WfError::usage(USAGE))?;
+            let opts = crate::workflow_eval::EvalOptions {
+                sample: cli.sample.unwrap_or(1),
+                force: cli.force,
+            };
+            let (out, changed) =
+                crate::workflow_eval::eval_step(&mut state, &step, &opts).await?;
+            if changed {
                 write_state(&path, &state, false)?;
             }
             Ok(out)

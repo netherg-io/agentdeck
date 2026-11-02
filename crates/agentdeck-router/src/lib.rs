@@ -12,6 +12,7 @@ pub mod reasoning;
 pub mod route;
 pub mod shell;
 pub mod workflow;
+pub mod workflow_eval;
 
 use serde_json::Value;
 

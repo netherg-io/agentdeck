@@ -31,9 +31,9 @@ const MAX_MODEL: usize = 128;
 const MAX_LIST: usize = 1000;
 
 #[derive(Debug)]
-struct OutcomeError {
-    usage: bool,
-    message: String,
+pub(crate) struct OutcomeError {
+    pub(crate) usage: bool,
+    pub(crate) message: String,
 }
 
 impl OutcomeError {
@@ -101,7 +101,7 @@ fn ensure_parent(base: &Path) -> Result<PathBuf, OutcomeError> {
     Ok(outcomes_path(base))
 }
 
-fn state_base() -> PathBuf {
+pub(crate) fn state_base() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -426,17 +426,17 @@ fn list_cli(argv: &[String]) -> Result<serde_json::Value, OutcomeError> {
 const MAX_DEC_EVIDENCE: usize = 8;
 
 #[derive(Debug, Clone)]
-struct DeciderEval {
-    verdict: String,
-    confidence: f64,
-    evidence: Vec<String>,
-    judge_provider: String,
-    judge_model: String,
-    self_judged: bool,
-    cost: Option<f64>,
+pub(crate) struct DeciderEval {
+    pub(crate) verdict: String,
+    pub(crate) confidence: f64,
+    pub(crate) evidence: Vec<String>,
+    pub(crate) judge_provider: String,
+    pub(crate) judge_model: String,
+    pub(crate) self_judged: bool,
+    pub(crate) cost: Option<f64>,
 }
 
-fn parse_decider_eval(text: &str) -> Result<DeciderEval, OutcomeError> {
+pub(crate) fn parse_decider_eval(text: &str) -> Result<DeciderEval, OutcomeError> {
     if text.len() > MAX_EVAL_STDIN {
         return Err(OutcomeError::usage(format!(
             "evaluation result must fit in {MAX_EVAL_STDIN} bytes"
@@ -534,15 +534,14 @@ fn parse_decider_eval(text: &str) -> Result<DeciderEval, OutcomeError> {
     })
 }
 
-fn record_decider_to(
-    base: &Path,
+fn decider_line(
     task: &str,
     category: &str,
     provider: Option<&str>,
     model: &str,
     eval: &DeciderEval,
     now: u64,
-) -> Result<PathBuf, OutcomeError> {
+) -> Result<serde_json::Value, OutcomeError> {
     // T3 IDs are untrusted input: strict charset + length bounds, as in record.
     check_id(task, "task", MAX_TASK, &[':', '_', '.', '-', '%'])?;
     check_enum(category, "category", CATEGORIES)?;
@@ -551,7 +550,7 @@ fn record_decider_to(
     }
     check_id(model, "model", MAX_MODEL, &['_', '.', '-', '/', ':', '+'])?;
     // Metadata only: IDs and counts, never task/evidence text or summaries.
-    let line = serde_json::json!({
+    Ok(serde_json::json!({
         "t": now,
         "source": "decider",
         "task_id": task,
@@ -567,8 +566,63 @@ fn record_decider_to(
             "self_judged": if eval.self_judged { serde_json::Value::Bool(true) } else { serde_json::Value::Null },
             "judge_cost_usd": eval.cost.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
         },
-    });
+    }))
+}
+
+fn record_decider_to(
+    base: &Path,
+    task: &str,
+    category: &str,
+    provider: Option<&str>,
+    model: &str,
+    eval: &DeciderEval,
+    now: u64,
+) -> Result<PathBuf, OutcomeError> {
+    let line = decider_line(task, category, provider, model, eval, now)?;
     append_line(base, &line)
+}
+
+/// Workflow-triggered decider record: the same validated metadata, attributed
+/// as a child report (the only evidence is the delegated agent's own summary,
+/// not independent proof) and joined to the workflow run/step. No task text,
+/// evidence text or summaries are stored. Additive fields only, so existing
+/// readers accept these lines.
+/// Workflow join keys for [`record_workflow_decider_to`]: our own run/step
+/// identifiers, length-bound like every other stored id, never raw text.
+pub(crate) struct WorkflowDecider<'a> {
+    pub task: &'a str,
+    pub category: &'a str,
+    pub provider: Option<&'a str>,
+    pub model: &'a str,
+    pub eval: &'a DeciderEval,
+    pub now: u64,
+    pub run_id: &'a str,
+    pub step: &'a str,
+}
+
+pub(crate) fn record_workflow_decider_to(
+    base: &Path,
+    w: &WorkflowDecider<'_>,
+) -> Result<PathBuf, OutcomeError> {
+    // Our own run/step identifiers: still length-bound, never raw text.
+    if w.run_id.is_empty() || w.run_id.len() > MAX_TASK || w.step.is_empty() || w.step.len() > 64 {
+        return Err(OutcomeError::usage("run/step must be 1-256/1-64 chars"));
+    }
+    let mut line = decider_line(w.task, w.category, w.provider, w.model, w.eval, w.now)?;
+    line["basis"] = serde_json::Value::from("child-report");
+    line["run_id"] = serde_json::Value::from(w.run_id);
+    line["step"] = serde_json::Value::from(w.step);
+    append_line(base, &line)
+}
+
+/// True when a decider line already exists for this T3 task. A corrupt or
+/// unreadable store errors (fail closed) so the caller never bills a judge
+/// it cannot de-duplicate against.
+pub(crate) fn has_decider_for(base: &Path, task_id: &str) -> Result<bool, OutcomeError> {
+    Ok(read_all(base)?.iter().any(|v| {
+        v.get("source").and_then(|s| s.as_str()) == Some("decider")
+            && v.get("task_id").and_then(|t| t.as_str()) == Some(task_id)
+    }))
 }
 
 fn record_decider_cli(argv: &[String]) -> Result<serde_json::Value, OutcomeError> {
@@ -622,10 +676,10 @@ fn record_decider_cli(argv: &[String]) -> Result<serde_json::Value, OutcomeError
 // and evidence text only travel to the explicitly invoked judge.
 
 const MAX_EVAL_STDIN: usize = 16384;
-const MAX_EVAL_TASK: usize = 2000;
+pub(crate) const MAX_EVAL_TASK: usize = 2000;
 const MAX_EVAL_EVIDENCE: usize = 8;
 const MAX_EVAL_ID: usize = 64;
-const MAX_EVAL_TEXT: usize = 4000;
+pub(crate) const MAX_EVAL_TEXT: usize = 4000;
 
 const OUTCOME_VERDICTS: [&str; 4] = ["fail", "partial", "pass", "insufficient"];
 
@@ -787,7 +841,7 @@ async fn evaluate_cli() -> Result<serde_json::Value, OutcomeError> {
     evaluate_json(&buf).await
 }
 
-async fn evaluate_json(text: &str) -> Result<serde_json::Value, OutcomeError> {
+pub(crate) async fn evaluate_json(text: &str) -> Result<serde_json::Value, OutcomeError> {
     let input = parse_eval_input(text)?;
     let state = serde_json::json!({
         "task": input.task,
