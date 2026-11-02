@@ -46,6 +46,14 @@ Selection policy:
   Dollar costs and non-Codex quota costs are estimates. Measured zero is floored at 0.1 percentage point,
   because coarse logs do not prove free work. Unknown quota is allowed and flagged.
   `allowed` alone only checks quota, not suitability.
+- `quotaEstimate` (per ranking entry, additive): structured quota provenance —
+  `basis` (`measured` from Codex session logs / `estimate` from plan table × burn /
+  `unknown` when no quota data), `detail` source string, `sampleSessions` (measured only),
+  `staleMinutes` (null when unreported), `loadUnknown`, applicable `windows`
+  (percent units: key, label, post-reserve `remainingPercent`, `resetsInHours`) and
+  `balancesUsd`. Estimates only: never used for ranking, gating or validation; missing
+  data is null/empty, never zero-filled. The legacy `quota` note, `taskCost` and ranking
+  are unchanged.
   Failed/stale refreshes retain the last known windows and balances as budget ceilings.
   Only an account with no retained quota is unknown; expired resets never imply replenishment.
 - Weekly reserve (`routing.weeklyReservePercent`) is **0** (user rule 2026-10-17): the task only has to fit the

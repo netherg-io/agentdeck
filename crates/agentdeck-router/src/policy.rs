@@ -579,6 +579,34 @@ pub fn budget_cost_full(
 }
 
 #[derive(Clone, Debug)]
+pub struct QuotaWindowEstimate {
+    pub key: String,
+    pub label: Option<String>,
+    pub remaining_percent: f64,
+    pub resets_in_hours: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct QuotaProvenance {
+    /// "measured" (Codex session logs), "estimate" (plan table × burn), or
+    /// "unknown" (no usable quota data). Informational only: never used for
+    /// ranking, gating or validation.
+    pub basis: &'static str,
+    /// Human provenance: the estimate source string, or the unknown reason.
+    pub detail: String,
+    /// Measured session count; set only when basis is "measured".
+    pub sample_sessions: Option<usize>,
+    /// Rounded minutes since the quota snapshot; None when not reported.
+    pub stale_minutes: Option<i64>,
+    /// True when live agent metadata was unavailable (reserve may be low).
+    pub load_unknown: bool,
+    /// Applicable post-reserve windows (percent units); empty when none apply.
+    pub windows: Vec<QuotaWindowEstimate>,
+    /// Applicable post-reserve balances in USD.
+    pub balances: Vec<f64>,
+}
+
+#[derive(Clone, Debug)]
 pub struct Candidate {
     pub provider: String,
     pub model: String,
@@ -595,6 +623,7 @@ pub struct Candidate {
     pub task_cost: Option<f64>,
     pub quota_note: String,
     pub active_agents: usize,
+    pub quota_provenance: QuotaProvenance,
 }
 
 #[derive(Clone, Debug)]

@@ -211,6 +211,46 @@ fn check_case(
         "{name}: exit codes differ (node {nc}, rust {rc}): {}",
         String::from_utf8_lossy(&rerr)
     );
+    if nout == rout {
+        return;
+    }
+    // Additive-only allowance: the Rust router emits per-candidate
+    // `quotaEstimate` provenance (estimates, never ranking). Strip it from
+    // both sides, require everything else to match, then validate the new
+    // field's shape on the Rust side.
+    let strip = |bytes: &[u8]| -> Option<serde_json::Value> {
+        let mut v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        let ranking = v.get_mut("ranking")?.as_array_mut()?;
+        for entry in ranking.iter_mut() {
+            entry.as_object_mut()?.remove("quotaEstimate");
+        }
+        Some(v)
+    };
+    match (strip(&nout), strip(&rout)) {
+        (Some(n), Some(r)) => {
+            assert_eq!(n, r, "{name}: non-quotaEstimate output differs");
+            let rust_v: serde_json::Value = serde_json::from_slice(&rout).unwrap();
+            let entries = rust_v["ranking"].as_array().unwrap();
+            assert!(!entries.is_empty(), "{name}: empty ranking");
+            for entry in entries {
+                let q = &entry["quotaEstimate"];
+                assert!(
+                    ["measured", "estimate", "unknown"]
+                        .contains(&q["basis"].as_str().unwrap_or("")),
+                    "{name}: bad quotaEstimate basis: {q}"
+                );
+                assert!(q["detail"].is_string(), "{name}: bad detail: {q}");
+                assert!(
+                    q["loadUnknown"].is_boolean(),
+                    "{name}: bad loadUnknown: {q}"
+                );
+                assert!(q["windows"].is_array(), "{name}: bad windows: {q}");
+                assert!(q["balancesUsd"].is_array(), "{name}: bad balancesUsd: {q}");
+            }
+            return;
+        }
+        _ => {}
+    }
     if nout != rout {
         let dir = std::env::temp_dir().join(format!("route-parity-{name}"));
         let _ = std::fs::remove_dir_all(&dir);

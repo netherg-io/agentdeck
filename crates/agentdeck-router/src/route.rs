@@ -5,10 +5,11 @@ use sha2::{Digest, Sha256};
 
 use crate::load::{AgentLoad, read_active_agents};
 use crate::policy::{
-    Candidate, MIN_FIT, NO_REVIEW_BAN, QuotaWindow, Ranked, RouterConfig, UsageAccount,
-    UsageSnapshot, budget_allowed, budget_cost_full, enabled_favorites, family_of, hint_of,
-    is_review_task, load_router_json, max_burn, owns_usage, quota_windows, rank_candidates,
-    reserve_active_quota, router_config, routing_weights, valid_answer, validate_target,
+    Candidate, MIN_FIT, NO_REVIEW_BAN, QuotaProvenance, QuotaWindow, QuotaWindowEstimate, Ranked,
+    RouterConfig, UsageAccount, UsageSnapshot, budget_allowed, budget_cost_full, enabled_favorites,
+    family_of, hint_of, is_review_task, load_router_json, max_burn, owns_usage, quota_windows,
+    rank_candidates, reserve_active_quota, router_config, routing_weights, valid_answer,
+    validate_target,
 };
 use crate::reasoning::{read_catalog, reasoning_target, save_catalog};
 use crate::{home_dir, js_num, parse_time_ms, round2, round3, runtime_dir, state_home};
@@ -589,21 +590,42 @@ fn compute_codex_costs(env: &Env) -> Measured {
 struct QuotaResult {
     weekly: Option<[f64; 4]>,
     basis: Option<String>,
+    estimate_basis: &'static str,
+    estimate_detail: String,
+    sample_sessions: Option<usize>,
+    stale_minutes: Option<i64>,
+    load_unknown: bool,
+    estimate_windows: Vec<QuotaWindowEstimate>,
+    estimate_balances: Vec<f64>,
     allowed: [bool; 4],
     cost: Option<[f64; 4]>,
     note: String,
     active_agents: usize,
 }
 
-fn unknown_quota(err: &str) -> QuotaResult {
+fn unknown_quota(err: &str, load_unknown: bool, stale_minutes: Option<i64>) -> QuotaResult {
     QuotaResult {
         weekly: None,
         basis: None,
+        estimate_basis: "unknown",
+        estimate_detail: err.to_string(),
+        sample_sessions: None,
+        stale_minutes,
+        load_unknown,
+        estimate_windows: vec![],
+        estimate_balances: vec![],
         allowed: [true; 4],
         cost: None,
         note: format!("quota unknown ({err})"),
         active_agents: 0,
     }
+}
+
+/// Rounded minutes since the quota snapshot; None when never reported.
+fn stale_minutes(updated_at: f64, now: f64) -> Option<i64> {
+    updated_at
+        .is_finite()
+        .then(|| ((now - updated_at) / 60.0).round() as i64)
 }
 
 fn model_costs(
@@ -612,7 +634,7 @@ fn model_costs(
     acc: &UsageAccountFull,
     provider: &str,
     model: &str,
-) -> ([f64; 4], f64, String) {
+) -> ([f64; 4], f64, String, Option<usize>) {
     let normalized = if ["opus", "sonnet", "haiku", "fable"].contains(&model) {
         format!("claude-{model}")
     } else {
@@ -660,18 +682,24 @@ fn model_costs(
             w
         })
         .unwrap_or([2.0, 8.0, 25.0, 60.0]);
-    let (weekly, basis) = match (m, plan_cost) {
-        (Some((n, pct)), _) => (*pct, format!("measured over {n} sessions on {}", acc.plan)),
+    let (weekly, basis, sample) = match (m, plan_cost) {
+        (Some((n, pct)), _) => (
+            *pct,
+            format!("measured over {n} sessions on {}", acc.plan),
+            Some(*n),
+        ),
         (None, Some(c)) => (
             c.map(|x| x * burn),
             format!("{} estimate × burn {burn}", acc.plan),
+            None,
         ),
         (None, None) => (
             star.map(|x| x * burn),
             format!("unknown plan \"{}\", conservative estimate", acc.plan),
+            None,
         ),
     };
-    (weekly, burn, basis)
+    (weekly, burn, basis, sample)
 }
 
 fn quota(
@@ -695,7 +723,7 @@ fn quota(
         )
     });
     let Some(acc) = found else {
-        return unknown_quota("no ai-usage account");
+        return unknown_quota("no ai-usage account", !load.known, None);
     };
     let mut acc = acc.clone();
     let plan_key = if acc.provider == "codex" {
@@ -716,13 +744,17 @@ fn quota(
         }
     }
     if acc.windows.is_empty() && acc.balances.is_empty() {
-        return unknown_quota(&acc.error.clone().unwrap_or_else(|| {
-            acc.status
-                .clone()
-                .unwrap_or_else(|| "no ai-usage account".into())
-        }));
+        return unknown_quota(
+            &acc.error.clone().unwrap_or_else(|| {
+                acc.status
+                    .clone()
+                    .unwrap_or_else(|| "no ai-usage account".into())
+            }),
+            !load.known,
+            stale_minutes(acc.updated_at, now),
+        );
     }
-    let (weekly, burn, basis) = model_costs(cfg, measured, &acc, provider, model);
+    let (weekly, burn, basis, sample) = model_costs(cfg, measured, &acc, provider, model);
     let (_, _, _, reserve_default) = routing_weights();
     let reserve_percent = if family_of(model).is_some_and(|f| f.spend_to_zero) {
         0.0
@@ -739,7 +771,7 @@ fn quota(
         },
         &load.agents,
         &|p, m| {
-            let (w, b, _) = model_costs(cfg, measured, &acc, p, m.unwrap_or(""));
+            let (w, b, _, _) = model_costs(cfg, measured, &acc, p, m.unwrap_or(""));
             (w, b)
         },
     );
@@ -820,13 +852,58 @@ fn quota(
         basis: if windows.is_empty() {
             None
         } else {
-            Some(basis)
+            Some(basis.clone())
         },
+        estimate_basis: if sample.is_some() {
+            "measured"
+        } else {
+            "estimate"
+        },
+        estimate_detail: basis,
+        sample_sessions: sample,
+        stale_minutes: stale_minutes(acc.updated_at, now),
+        load_unknown: !load.known,
+        estimate_windows: windows
+            .iter()
+            .map(|w| QuotaWindowEstimate {
+                key: w.key.clone(),
+                label: w.label.clone(),
+                remaining_percent: w.remaining_percent,
+                resets_in_hours: w.resets_at.filter(|r| r.is_finite()).map(|r| {
+                    // Same display granularity as the `quota` note (0.1h).
+                    (0.0_f64.max(r - now) / 360.0).round() / 10.0
+                }),
+            })
+            .collect(),
+        estimate_balances: reserved.balances.clone(),
         allowed,
         cost,
         note,
         active_agents: reserved.active_agents,
     }
+}
+
+/// Structured quota provenance for one ranking entry. Additive only: the
+/// legacy `quota` note, `taskCost` and all ranking/gating stay unchanged.
+/// Windows carry percents, balances USD; anything unavailable is null/empty,
+/// never zero-filled.
+fn quota_estimate_json(c: &Candidate) -> Value {
+    let p = &c.quota_provenance;
+    serde_json::json!({
+        "basis": p.basis,
+        "detail": p.detail,
+        "sampleSessions": p.sample_sessions.map(|n| Value::from(n as u64)).unwrap_or(Value::Null),
+        "staleMinutes": p.stale_minutes.map(Value::from).unwrap_or(Value::Null),
+        "loadUnknown": p.load_unknown,
+        "windows": p.windows.iter().map(|w| serde_json::json!({
+            "key": w.key,
+            "label": w.label.clone().map(Value::from).unwrap_or(Value::Null),
+            "unit": "percent",
+            "remainingPercent": js_num(round2(w.remaining_percent)),
+            "resetsInHours": w.resets_in_hours.map(js_num).unwrap_or(Value::Null),
+        })).collect::<Vec<_>>(),
+        "balancesUsd": p.balances.iter().map(|b| js_num(round2(*b))).collect::<Vec<_>>(),
+    })
 }
 
 // --- source detection --------------------------------------------------------
@@ -1727,6 +1804,15 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
             },
             quota_note: q.note,
             active_agents: q.active_agents,
+            quota_provenance: QuotaProvenance {
+                basis: q.estimate_basis,
+                detail: q.estimate_detail.clone(),
+                sample_sessions: q.sample_sessions,
+                stale_minutes: q.stale_minutes,
+                load_unknown: q.load_unknown,
+                windows: q.estimate_windows.clone(),
+                balances: q.estimate_balances.clone(),
+            },
         });
     }
     let (shared_w, paid_w, cheap_w, _) = routing_weights();
@@ -1794,6 +1880,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                 .unwrap_or(Value::Null),
         );
         m.insert("quota".into(), Value::from(c.quota_note.clone()));
+        m.insert("quotaEstimate".into(), quota_estimate_json(c));
         m.insert("activeAgents".into(), Value::from(c.active_agents as u64));
         if let Some(limit) = current_cfg.instance_limits.get(&c.provider) {
             m.insert("maxParallel".into(), Value::from(*limit));
@@ -2027,6 +2114,211 @@ mod gateway_tests {
         let a = decisions_answers(&resp);
         assert!(valid_answer(&a["size"], true));
         assert!(a.get("difficulty").is_none());
+    }
+}
+
+#[cfg(test)]
+mod quota_estimate_tests {
+    use super::*;
+    use crate::policy::RouterConfig;
+
+    const NOW: f64 = 1_760_000_000.0;
+
+    fn test_cfg() -> RouterConfig {
+        RouterConfig {
+            file: String::new(),
+            version: Value::Null,
+            pool: vec![],
+            instance_limits: std::collections::HashMap::new(),
+            usage_state_path: None,
+            decision_model: None,
+            decision_provider: None,
+            account: [("codex".to_string(), "codex".to_string())]
+                .into_iter()
+                .collect(),
+            usage_id: std::collections::HashMap::new(),
+            meta: vec![],
+        }
+    }
+
+    fn load_known() -> AgentLoad {
+        AgentLoad {
+            known: true,
+            agents: vec![],
+            note: None,
+        }
+    }
+
+    fn codex_acc(plan: &str, updated_secs_ago: f64) -> UsageAccountFull {
+        UsageAccountFull {
+            provider: "codex".into(),
+            id: Some("codex-main".into()),
+            plan: plan.into(),
+            status: Some("ok".into()),
+            error: None,
+            updated_at: NOW - updated_secs_ago,
+            windows: vec![QuotaWindow {
+                key: "weekly".into(),
+                label: Some("Week".into()),
+                scope: None,
+                remaining_percent: 80.0,
+                duration_mins: 10080.0,
+                resets_at: Some(NOW + 3.0 * 86400.0),
+                cost_factor: None,
+                pending: 0.0,
+            }],
+            balances: vec![],
+        }
+    }
+
+    fn measured_for(key: &str, n: usize) -> Measured {
+        let mut m = Measured::default();
+        m.costs.insert(key.into(), (n, [0.4, 1.6, 5.0, 12.0]));
+        m
+    }
+
+    #[test]
+    fn measured_basis_reports_sample_count() {
+        let cfg = test_cfg();
+        // "Pro 5x" maps via codexPlanTypes to raw plan "prolite".
+        let m = measured_for("prolite|gpt-6.1-sol", 12);
+        let acc = codex_acc("Pro 5x", 60.0);
+        let (weekly, _burn, basis, sample) = model_costs(&cfg, &m, &acc, "codex", "gpt-6.1-sol");
+        assert_eq!(weekly, [0.4, 1.6, 5.0, 12.0]);
+        assert_eq!(sample, Some(12));
+        assert!(basis.contains("measured over 12 sessions"), "{basis}");
+        let q = quota(&cfg, &m, &[acc], &load_known(), "codex", "gpt-6.1-sol", NOW);
+        assert_eq!(q.estimate_basis, "measured");
+        assert_eq!(q.sample_sessions, Some(12));
+        assert_eq!(q.stale_minutes, Some(1));
+        assert!(!q.load_unknown);
+        assert_eq!(q.estimate_windows.len(), 1);
+        assert_eq!(q.estimate_windows[0].key, "weekly");
+    }
+
+    #[test]
+    fn plan_fallback_is_estimate_without_sample() {
+        let cfg = test_cfg();
+        let m = Measured::default(); // no session data at all
+        let acc = codex_acc("Pro 5x", 60.0);
+        let (_w, _b, basis, sample) = model_costs(&cfg, &m, &acc, "codex", "gpt-6.1-sol");
+        assert_eq!(sample, None);
+        assert!(basis.contains("estimate"), "{basis}");
+        let q = quota(&cfg, &m, &[acc], &load_known(), "codex", "gpt-6.1-sol", NOW);
+        assert_eq!(q.estimate_basis, "estimate");
+        assert_eq!(q.sample_sessions, None);
+        // Ranking inputs are untouched: gated by quota, cost present.
+        assert!(q.cost.is_some());
+    }
+
+    #[test]
+    fn unknown_plan_is_conservative_estimate() {
+        let cfg = test_cfg();
+        let m = Measured::default();
+        let acc = codex_acc("NoSuchPlan", 60.0);
+        let (_w, _b, basis, sample) = model_costs(&cfg, &m, &acc, "codex", "gpt-6.1-sol");
+        assert_eq!(sample, None);
+        assert!(basis.contains("conservative estimate"), "{basis}");
+    }
+
+    #[test]
+    fn unknown_quota_reports_unknown_basis() {
+        let cfg = test_cfg();
+        let m = Measured::default();
+        let load = AgentLoad {
+            known: false,
+            agents: vec![],
+            note: Some("metadata unavailable".into()),
+        };
+        let q = quota(&cfg, &m, &[], &load, "codex", "gpt-6.1-sol", NOW);
+        assert_eq!(q.estimate_basis, "unknown");
+        assert_eq!(q.estimate_detail, "no ai-usage account");
+        assert_eq!(q.sample_sessions, None);
+        assert_eq!(q.stale_minutes, None);
+        assert!(q.load_unknown);
+        assert!(q.estimate_windows.is_empty());
+        assert!(q.estimate_balances.is_empty());
+        assert_eq!(q.allowed, [true; 4]);
+        assert!(q.note.contains("quota unknown"));
+    }
+
+    #[test]
+    fn estimate_json_shapes_windows_and_nulls() {
+        let cfg = test_cfg();
+        let m = Measured::default();
+        let acc = codex_acc("Pro 5x", 45.0 * 60.0);
+        let q = quota(&cfg, &m, &[acc], &load_known(), "codex", "gpt-6.1-sol", NOW);
+        let provenance = QuotaProvenance {
+            basis: q.estimate_basis,
+            detail: q.estimate_detail.clone(),
+            sample_sessions: q.sample_sessions,
+            stale_minutes: q.stale_minutes,
+            load_unknown: q.load_unknown,
+            windows: q.estimate_windows.clone(),
+            balances: q.estimate_balances.clone(),
+        };
+        let c = Candidate {
+            provider: "codex".into(),
+            model: "gpt-6.1-sol".into(),
+            profiled: true,
+            burn: Some(1.0),
+            target: Value::Null,
+            reasoning_error: None,
+            no_review: false,
+            policy_ban: None,
+            fit: 0.9,
+            quality: 0.8,
+            confidence: 0.9,
+            allowed: true,
+            task_cost: None,
+            quota_note: q.note.clone(),
+            active_agents: 0,
+            quota_provenance: provenance,
+        };
+        let v = quota_estimate_json(&c);
+        assert_eq!(v["basis"], "estimate");
+        assert!(v["detail"].as_str().unwrap().contains("estimate"));
+        assert!(v["sampleSessions"].is_null());
+        assert_eq!(v["staleMinutes"], 45);
+        assert_eq!(v["loadUnknown"], false);
+        assert_eq!(v["windows"][0]["unit"], "percent");
+        assert_eq!(v["windows"][0]["remainingPercent"], 80);
+        assert_eq!(v["windows"][0]["resetsInHours"], 72);
+        assert!(v["balancesUsd"].as_array().unwrap().is_empty());
+
+        let u = unknown_quota("no ai-usage account", true, None);
+        let uc = Candidate {
+            provider: "codex".into(),
+            model: "gpt-6.1-sol".into(),
+            profiled: false,
+            burn: None,
+            target: Value::Null,
+            reasoning_error: None,
+            no_review: false,
+            policy_ban: None,
+            fit: 0.0,
+            quality: 0.0,
+            confidence: 0.0,
+            allowed: true,
+            task_cost: None,
+            quota_note: u.note.clone(),
+            active_agents: 0,
+            quota_provenance: QuotaProvenance {
+                basis: u.estimate_basis,
+                detail: u.estimate_detail.clone(),
+                sample_sessions: u.sample_sessions,
+                stale_minutes: u.stale_minutes,
+                load_unknown: u.load_unknown,
+                windows: u.estimate_windows.clone(),
+                balances: u.estimate_balances.clone(),
+            },
+        };
+        let uv = quota_estimate_json(&uc);
+        assert_eq!(uv["basis"], "unknown");
+        assert!(uv["sampleSessions"].is_null());
+        assert!(uv["staleMinutes"].is_null());
+        assert_eq!(uv["loadUnknown"], true);
+        assert!(uv["windows"].as_array().unwrap().is_empty());
     }
 }
 
