@@ -7,7 +7,7 @@
 
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const USAGE: &str = "usage: agentdeck route outcomes record --task ID --provider P --model M --category C --verdict V --evidence E [--source coordinator]\n  agentdeck route outcomes list [--task ID] [--limit N]\n\n  category: implementation|research|review|design|test|general\n  verdict: ok|partial|fail|blocked|missing|unavailable (blocked/missing/unavailable are not failures)\n  evidence: direct|spot-check|test-output|child-report\n  source is always recorded as \"coordinator\"; decider metadata is reserved (null) for future use.\n  repeats for one task append a new revision; concurrent appends are safe; corrupt lines are skipped on read.";
 
@@ -80,11 +80,11 @@ fn run_inner(argv: &[String]) -> Result<serde_json::Value, OutcomeError> {
     }
 }
 
-fn outcomes_path(base: &PathBuf) -> PathBuf {
+fn outcomes_path(base: &Path) -> PathBuf {
     base.join("model-route/outcomes.jsonl")
 }
 
-fn ensure_parent(base: &PathBuf) -> Result<PathBuf, OutcomeError> {
+fn ensure_parent(base: &Path) -> Result<PathBuf, OutcomeError> {
     let dir = base.join("model-route");
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -214,7 +214,7 @@ fn record_cli(argv: &[String]) -> Result<serde_json::Value, OutcomeError> {
 }
 
 fn append_to(
-    base: &PathBuf,
+    base: &Path,
     r: &Record,
     now: u64,
 ) -> Result<PathBuf, OutcomeError> {
@@ -245,7 +245,7 @@ fn append_to(
     Ok(path)
 }
 
-fn read_all(base: &PathBuf) -> Vec<serde_json::Value> {
+fn read_all(base: &Path) -> Vec<serde_json::Value> {
     let path = outcomes_path(base);
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     text.lines()
