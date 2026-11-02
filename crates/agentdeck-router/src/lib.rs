@@ -6,6 +6,7 @@ pub mod admission;
 pub mod hook;
 pub mod load;
 pub mod mcp_call;
+pub mod outcomes;
 pub mod policy;
 pub mod reasoning;
 pub mod route;

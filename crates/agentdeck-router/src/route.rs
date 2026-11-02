@@ -32,7 +32,7 @@ const CAPABILITY: [&str; 4] = [
     "Specific relevant strengths should produce a substantially better result on THIS task. A merely stronger model with no practical advantage does not qualify.",
 ];
 
-const USAGE: &str = "usage: agentdeck route [--source <provider instance>] [--validate-target <provider instance> <model>] \"<task brief>\" | - (brief on stdin) | --check | --catalog (orchestrator_capabilities structuredContent on stdin) | hook --harness <name> | claude-shell [args...] | t3-mcp-call TOOL FILE | workflow CMD ...";
+const USAGE: &str = "usage: agentdeck route [--source <provider instance>] [--validate-target <provider instance> <model>] \"<task brief>\" | - (brief on stdin) | --check | --catalog (orchestrator_capabilities structuredContent on stdin) | hook --harness <name> | claude-shell [args...] | t3-mcp-call TOOL FILE | workflow CMD ... | outcomes record|list ...";
 
 pub struct Env {
     pub home: std::path::PathBuf,
@@ -1186,6 +1186,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         Some("claude-shell") => return Ok(crate::shell::run(&argv[1..])),
         Some("t3-mcp-call") => return Ok(crate::mcp_call::run(&argv[1..]).await),
         Some("workflow") => return Ok(crate::workflow::run(&argv[1..])),
+        Some("outcomes") => return Ok(crate::outcomes::run(&argv[1..])),
         _ => {}
     }
     let env = Env::from_env()?;
