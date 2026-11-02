@@ -2,6 +2,7 @@
 
 pub mod add_instance;
 pub mod drift;
+pub mod eval_history;
 pub mod harnesses;
 pub mod instances;
 pub mod plugins;

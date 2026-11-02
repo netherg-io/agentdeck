@@ -6,10 +6,11 @@ use std::path::PathBuf;
 use agentdeck_core::settings::{self, Settings, UserRuleSource, UserRules};
 use agentdeck_core::{Paths, Registry};
 use i18n_embed_fl::fl;
-use iced::widget::{column, pick_list, row, text_input};
+use iced::widget::{Space, column, pick_list, row, text_input};
 use iced::{Alignment, Element, Length, Task};
 
 use crate::i18n::loader;
+use crate::pages::eval_history::{self, History};
 use crate::style as st;
 
 #[derive(Debug, Clone, Default)]
@@ -19,6 +20,8 @@ pub struct Loaded {
     /// Whether a key is available, per provider (OpenRouter, Vercel).
     pub key_set: (bool, bool),
     pub error: Option<String>,
+    /// Read-only assessment metadata; refreshed on page open and on demand.
+    pub history: History,
 }
 
 #[derive(Default)]
@@ -58,6 +61,9 @@ pub enum Msg {
     Tested(Result<String, String>),
     SavePoll,
     Done(Result<(), String>),
+    /// Re-read the assessment file after the page stayed open.
+    RefreshHistory,
+    HistoryLoaded(History),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -118,6 +124,7 @@ pub fn load(paths: &Paths) -> Msg {
                 rules,
                 key_set,
                 error,
+                history: eval_history::load(),
             }
         }
         Err(e) => Loaded {
@@ -125,6 +132,7 @@ pub fn load(paths: &Paths) -> Msg {
             rules: UserRules::default(),
             key_set,
             error: Some(format!("{e:#}")),
+            history: eval_history::load(),
         },
     })
 }
@@ -361,6 +369,13 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
             });
             Task::done(load(&paths))
         }
+        Msg::RefreshHistory => {
+            Task::perform(async move { eval_history::load() }, Msg::HistoryLoaded)
+        }
+        Msg::HistoryLoaded(history) => {
+            state.loaded.history = history;
+            Task::none()
+        }
     }
 }
 
@@ -479,6 +494,7 @@ pub fn router_view(state: &State) -> Element<'_, Msg> {
         .push(error_card(state))
         .push(st::card(form))
         .push(rules_card(state))
+        .push(history_card(state))
         .spacing(st::SPACE_S)
         .into()
 }
@@ -518,6 +534,109 @@ fn rules_card(state: &State) -> Element<'_, Msg> {
     ]
     .spacing(st::SPACE_M);
     st::card(form)
+}
+
+/// Fluent wraps placeables in bidi isolates; strip them so exact-text
+/// matching (headless tests, assistive readers of the plain string) works.
+fn plain(s: String) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '\u{2068}' | '\u{2069}'))
+        .collect()
+}
+
+/// One assessment row: source and verdict pills plus the model; the muted line
+/// carries task id, category, timestamp, evidence count/kind, self-check and
+/// cost. Verdicts are shown, never scored or compared.
+fn entry_row(entry: &eval_history::Entry) -> Element<'_, Msg> {
+    let tone = match entry.verdict.as_str() {
+        "ok" | "pass" => st::Tone::Ok,
+        "partial" => st::Tone::Warn,
+        "fail" => st::Tone::Danger,
+        _ => st::Tone::Neutral,
+    };
+    let self_line = match entry.self_judged {
+        Some(true) => fl!(loader(), "settings-eval-self"),
+        _ => fl!(loader(), "settings-eval-self-unknown"),
+    };
+    let cost = match entry.cost {
+        Some(c) => fl!(loader(), "settings-eval-cost", cost = format!("{c:.6}")),
+        None => fl!(loader(), "settings-eval-cost-unknown"),
+    };
+    let evidence = if entry.source == eval_history::Source::Decider {
+        fl!(
+            loader(),
+            "settings-eval-evidence-ids",
+            count = entry.evidence_count.to_string()
+        )
+    } else {
+        entry.evidence.clone()
+    };
+    let mut detail = format!(
+        "{} · {} · t={} · {evidence} · {self_line} · {cost}",
+        entry.task_id, entry.category, entry.t,
+    );
+    if let Some(judge) = &entry.judge {
+        detail.push_str(&format!(
+            " · {}",
+            fl!(loader(), "settings-eval-judge", who = judge.clone())
+        ));
+    }
+    column![
+        row![
+            st::pill(entry.source.as_str(), st::Tone::Neutral),
+            st::pill(entry.verdict.as_str(), tone),
+            st::mono(entry.model.clone()),
+        ]
+        .spacing(st::SPACE_S)
+        .align_y(Alignment::Center),
+        st::mono_muted(plain(detail)),
+    ]
+    .spacing(2.0)
+    .into()
+}
+
+/// Read-only assessment history: observations only, routing does not use them.
+fn history_card(state: &State) -> Element<'_, Msg> {
+    let mut col = column![
+        row![
+            st::caption(fl!(loader(), "settings-eval-title")),
+            Space::new().width(Length::Fill),
+            st::btn(st::Btn::Quiet, fl!(loader(), "settings-eval-refresh"))
+                .on_press(Msg::RefreshHistory),
+        ]
+        .align_y(Alignment::Center),
+        st::muted(fl!(loader(), "settings-eval-note")),
+    ]
+    .spacing(st::SPACE_S);
+    match &state.loaded.history {
+        History::Missing => {
+            col = col.push(st::muted(fl!(loader(), "settings-eval-missing")));
+        }
+        History::Empty => {
+            col = col.push(st::muted(fl!(loader(), "settings-eval-empty")));
+        }
+        History::Unreadable(what) => {
+            col = col.push(st::body(plain(fl!(
+                loader(),
+                "settings-eval-unreadable",
+                what = what.clone()
+            ))));
+        }
+        History::Corrupt { line, what } => {
+            col = col.push(st::body(plain(fl!(
+                loader(),
+                "settings-eval-corrupt",
+                line = line.to_string(),
+                what = what.clone()
+            ))));
+        }
+        History::Loaded(entries) => {
+            for entry in entries.iter().rev().take(eval_history::MAX_SHOWN) {
+                col = col.push(entry_row(entry));
+            }
+        }
+    }
+    st::card(col)
 }
 
 pub fn poll_view(state: &State) -> Element<'_, Msg> {
