@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use agentdeck_core::settings::{self, Settings};
+use agentdeck_core::settings::{self, Settings, UserRuleSource, UserRules};
 use agentdeck_core::{Paths, Registry};
 use i18n_embed_fl::fl;
 use iced::widget::{column, pick_list, row, text_input};
@@ -15,6 +15,7 @@ use crate::style as st;
 #[derive(Debug, Clone, Default)]
 pub struct Loaded {
     pub settings: Option<Settings>,
+    pub rules: UserRules,
     /// Whether a key is available, per provider (OpenRouter, Vercel).
     pub key_set: (bool, bool),
     pub error: Option<String>,
@@ -28,6 +29,11 @@ pub struct State {
     pub key: String,
     pub refresh: String,
     pub stale: String,
+    /// Comma-separated rule patterns; saving stores them explicitly.
+    pub no_review: String,
+    pub deny: String,
+    /// True once the registry holds explicit `[router.rules]` keys.
+    pub rules_user: bool,
     pub busy: bool,
     pub testing: bool,
     /// Last provider check: (text, is error), shown under the form.
@@ -44,7 +50,10 @@ pub enum Msg {
     Key(String),
     Refresh(String),
     Stale(String),
+    NoReview(String),
+    Deny(String),
     SaveRouter,
+    SaveRules,
     Test,
     Tested(Result<String, String>),
     SavePoll,
@@ -97,13 +106,23 @@ impl Provider {
 pub fn load(paths: &Paths) -> Msg {
     let key_set = (Provider::OpenRouter.key_set(), Provider::Vercel.key_set());
     Msg::Loaded(match Registry::load(paths) {
-        Ok(reg) => Loaded {
-            settings: Some(settings::read(&reg)),
-            key_set,
-            error: None,
-        },
+        Ok(reg) => {
+            // A broken `[router.rules]` table keeps its error visible instead
+            // of silently falling back; the fields still edit from defaults.
+            let (rules, error) = match UserRules::from_registry(&reg) {
+                Ok(rules) => (rules, None),
+                Err(e) => (UserRules::default(), Some(format!("{e:#}"))),
+            };
+            Loaded {
+                settings: Some(settings::read(&reg)),
+                rules,
+                key_set,
+                error,
+            }
+        }
         Err(e) => Loaded {
             settings: None,
+            rules: UserRules::default(),
             key_set,
             error: Some(format!("{e:#}")),
         },
@@ -121,6 +140,17 @@ fn seconds(raw: &str) -> Result<Option<u64>, String> {
         .filter(|n| *n > 0)
         .map(Some)
         .ok_or_else(|| fl!(loader(), "settings-seconds-invalid"))
+}
+
+/// One rule pattern per comma; blanks drop out so clearing a field
+/// stores an empty list (which disables that ban) instead of failing.
+// shortcut: patterns containing a comma need a config-file edit, upgrade to one-field-per-pattern UI then.
+fn patterns(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn save(paths: Paths, f: impl FnOnce(&mut Settings) + Send + 'static) -> Task<Msg> {
@@ -154,6 +184,9 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
                 state.refresh = s.refresh_seconds.map(|n| n.to_string()).unwrap_or_default();
                 state.stale = s.stale_seconds.map(|n| n.to_string()).unwrap_or_default();
             }
+            state.no_review = loaded.rules.no_review_models.join(", ");
+            state.deny = loaded.rules.deny_models.join(", ");
+            state.rules_user = loaded.rules.source == UserRuleSource::User;
             state.loaded = loaded;
             Task::none()
         }
@@ -226,6 +259,14 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
             state.stale = v;
             Task::none()
         }
+        Msg::NoReview(v) => {
+            state.no_review = v;
+            Task::none()
+        }
+        Msg::Deny(v) => {
+            state.deny = v;
+            Task::none()
+        }
         Msg::SaveRouter => {
             let model = Some(state.decision_model.trim().to_string()).filter(|m| !m.is_empty());
             let provider = state.provider;
@@ -252,6 +293,31 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
                     (provider == Provider::Vercel).then(|| settings::PROVIDER_VERCEL.to_string());
                 s.decision_model = model;
             })
+        }
+        Msg::SaveRules => {
+            // Validate first so a bad pattern blocks the write and keeps
+            // the user's text; only the two rule keys are stored.
+            let rules = UserRules {
+                no_review_models: patterns(&state.no_review),
+                deny_models: patterns(&state.deny),
+                source: UserRuleSource::User,
+            };
+            if let Err(e) = rules.validate() {
+                state.result = Some((format!("{e:#}"), true));
+                return Task::none();
+            }
+            state.busy = true;
+            Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        settings::write_user_rules(&paths, &rules).map_err(|e| format!("{e:#}"))
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r)
+                },
+                Msg::Done,
+            )
         }
         Msg::SavePoll => {
             let (refresh, stale) = match (seconds(&state.refresh), seconds(&state.stale)) {
@@ -392,8 +458,46 @@ pub fn router_view(state: &State) -> Element<'_, Msg> {
     column![]
         .push(error_card(state))
         .push(st::card(form))
+        .push(rules_card(state))
         .spacing(st::SPACE_S)
         .into()
+}
+
+fn rules_card(state: &State) -> Element<'_, Msg> {
+    let size = st::look().body;
+    let source = if state.rules_user {
+        fl!(loader(), "settings-rules-source-user")
+    } else {
+        fl!(loader(), "settings-rules-source-default")
+    };
+    let form = column![
+        st::caption(format!("{} · {source}", fl!(loader(), "settings-rules"))),
+        field(
+            fl!(loader(), "settings-no-review"),
+            text_input(
+                &fl!(loader(), "settings-rules-placeholder"),
+                &state.no_review
+            )
+            .on_input(Msg::NoReview)
+            .on_submit(Msg::SaveRules)
+            .size(size)
+            .into(),
+            Some(fl!(loader(), "settings-no-review-hint")),
+        ),
+        field(
+            fl!(loader(), "settings-deny"),
+            text_input(&fl!(loader(), "settings-rules-placeholder"), &state.deny)
+                .on_input(Msg::Deny)
+                .on_submit(Msg::SaveRules)
+                .size(size)
+                .into(),
+            Some(fl!(loader(), "settings-deny-hint")),
+        ),
+        st::muted(fl!(loader(), "settings-rules-note")),
+        save_row(state, Msg::SaveRules),
+    ]
+    .spacing(st::SPACE_M);
+    st::card(form)
 }
 
 pub fn poll_view(state: &State) -> Element<'_, Msg> {
@@ -436,7 +540,8 @@ pub fn poll_view(state: &State) -> Element<'_, Msg> {
 
 #[cfg(test)]
 mod tests {
-    use super::seconds;
+    use super::{patterns, seconds};
+    use agentdeck_core::settings::{UserRuleSource, UserRules};
 
     #[test]
     fn blank_is_default_and_only_positive_numbers_pass() {
@@ -445,5 +550,28 @@ mod tests {
         for bad in ["0", "-5", "1.5", "abc"] {
             assert!(seconds(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn commas_split_and_blanks_drop_for_an_explicit_empty_list() {
+        assert_eq!(patterns(""), Vec::<String>::new());
+        assert_eq!(patterns(" , "), Vec::<String>::new());
+        assert_eq!(patterns("a, b ,,c "), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn parsed_fields_validate_like_stored_rules() {
+        let rules = UserRules {
+            no_review_models: patterns("gemini-.*argon"),
+            deny_models: patterns(""),
+            source: UserRuleSource::User,
+        };
+        assert!(rules.validate().is_ok());
+        let bad = UserRules {
+            no_review_models: patterns("(["),
+            deny_models: Vec::new(),
+            source: UserRuleSource::User,
+        };
+        assert!(bad.validate().is_err());
     }
 }
