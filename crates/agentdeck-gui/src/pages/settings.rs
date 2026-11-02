@@ -142,15 +142,35 @@ fn seconds(raw: &str) -> Result<Option<u64>, String> {
         .ok_or_else(|| fl!(loader(), "settings-seconds-invalid"))
 }
 
-/// One rule pattern per comma; blanks drop out so clearing a field
-/// stores an empty list (which disables that ban) instead of failing.
-// shortcut: patterns containing a comma need a config-file edit, upgrade to one-field-per-pattern UI then.
+/// Commas and backslashes are escaped so every stored regex round-trips.
 fn patterns(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .collect()
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if matches!(chars.peek(), Some('\\' | ',')) => part.push(chars.next().unwrap()),
+            ',' => {
+                if !part.trim().is_empty() {
+                    parts.push(part.trim().to_owned());
+                }
+                part.clear();
+            }
+            _ => part.push(c),
+        }
+    }
+    if !part.trim().is_empty() {
+        parts.push(part.trim().to_owned());
+    }
+    parts
+}
+
+fn format_patterns(patterns: &[String]) -> String {
+    patterns
+        .iter()
+        .map(|p| p.replace('\\', "\\\\").replace(',', "\\,"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn save(paths: Paths, f: impl FnOnce(&mut Settings) + Send + 'static) -> Task<Msg> {
@@ -184,8 +204,8 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
                 state.refresh = s.refresh_seconds.map(|n| n.to_string()).unwrap_or_default();
                 state.stale = s.stale_seconds.map(|n| n.to_string()).unwrap_or_default();
             }
-            state.no_review = loaded.rules.no_review_models.join(", ");
-            state.deny = loaded.rules.deny_models.join(", ");
+            state.no_review = format_patterns(&loaded.rules.no_review_models);
+            state.deny = format_patterns(&loaded.rules.deny_models);
             state.rules_user = loaded.rules.source == UserRuleSource::User;
             state.loaded = loaded;
             Task::none()
@@ -540,7 +560,7 @@ pub fn poll_view(state: &State) -> Element<'_, Msg> {
 
 #[cfg(test)]
 mod tests {
-    use super::{patterns, seconds};
+    use super::{format_patterns, patterns, seconds};
     use agentdeck_core::settings::{UserRuleSource, UserRules};
 
     #[test]
@@ -557,6 +577,8 @@ mod tests {
         assert_eq!(patterns(""), Vec::<String>::new());
         assert_eq!(patterns(" , "), Vec::<String>::new());
         assert_eq!(patterns("a, b ,,c "), vec!["a", "b", "c"]);
+        let original = vec![r"model-{1,3}\d".to_string(), r"x\,y".to_string()];
+        assert_eq!(patterns(&format_patterns(&original)), original);
     }
 
     #[test]
