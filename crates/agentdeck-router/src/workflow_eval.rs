@@ -34,6 +34,193 @@ pub const MAX_SAMPLE: u64 = 1024;
 pub struct EvalOptions {
     pub sample: u64,
     pub force: bool,
+    /// Daily judge-request budget; `None` keeps the old unbudgeted behaviour.
+    /// `--force` never bypasses it, and auto-spawned evals share it.
+    pub budget: Option<Budget>,
+}
+
+/// Daily spending guard for judge requests, enforced inside the eval path
+/// before the durable claim and before contacting the judge. Manual evals
+/// count too. Unknown request cost counts as `assume_usd_per_eval`.
+#[derive(Debug, Clone)]
+pub struct Budget {
+    pub max_per_day: u64,
+    pub max_usd_per_day: Option<f64>,
+    pub assume_usd_per_eval: Option<f64>,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            max_per_day: 20,
+            max_usd_per_day: None,
+            assume_usd_per_eval: None,
+        }
+    }
+}
+
+/// Current UTC day as YYYY-MM-DD (civil-date math, no new dependency).
+fn utc_day() -> String {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86400) as i64)
+        .unwrap_or(0);
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{:02}-{:02}", if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn budget_path(base: &std::path::Path) -> std::path::PathBuf {
+    base.join("model-route/workflow-eval-budget")
+        .join(format!("{}.json", utc_day()))
+}
+
+fn lock_blocking(file: &std::fs::File) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(());
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Err("cannot lock evaluation budget; not dispatched".to_string());
+        }
+    }
+}
+
+/// Open today's ledger under an exclusive cross-process lock (blocking: the
+/// critical section is one small read-modify-write). Corrupt ledgers fail
+/// closed like corrupt claims, so a budget is never silently exceeded.
+fn budget_open(base: &std::path::Path) -> Result<(std::fs::File, u64, f64), String> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    let path = budget_path(base);
+    if let Some(dir) = path.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|_| "cannot open evaluation budget".to_string())?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| "cannot open evaluation budget".to_string())?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|_| "cannot open evaluation budget".to_string())?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|_| "cannot open evaluation budget".to_string())?;
+    if !file
+        .metadata()
+        .map_err(|_| "cannot open evaluation budget".to_string())?
+        .is_file()
+        || unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_SET) } < 0
+    {
+        return Err("cannot open evaluation budget".to_string());
+    }
+    lock_blocking(&file)?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|_| "evaluation budget is unreadable; not dispatched".to_string())?;
+    if text.trim().is_empty() {
+        return Ok((file, 0, 0.0));
+    }
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|_| "evaluation budget is unreadable; not dispatched".to_string())?;
+    let count = v
+        .get("count")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "evaluation budget is unreadable; not dispatched".to_string())?;
+    let usd = v
+        .get("usd")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .ok_or_else(|| "evaluation budget is unreadable; not dispatched".to_string())?;
+    Ok((file, count, usd))
+}
+
+fn budget_store(file: &mut std::fs::File, count: u64, usd: f64) -> Result<(), String> {
+    use std::io::{Seek, Write};
+    let fail = |_| "cannot persist evaluation budget".to_string();
+    file.set_len(0).map_err(fail)?;
+    file.rewind().map_err(fail)?;
+    file.write_all(
+        serde_json::to_string(&serde_json::json!({"count": count, "usd": usd}))
+            .expect("budget serializes")
+            .as_bytes(),
+    )
+    .map_err(fail)?;
+    file.sync_all().map_err(fail)?;
+    Ok(())
+}
+
+/// Reserve one judge request. Returns the assumed USD charged, settled later
+/// against the reported cost. Exhaustion is a terminal `skipped`/`budget`
+/// marker, never a judge call.
+fn budget_reserve(base: &std::path::Path, b: &Budget) -> Result<f64, String> {
+    let (mut file, count, usd) = budget_open(base)?;
+    let assume = b.assume_usd_per_eval.unwrap_or(0.0);
+    if count + 1 > b.max_per_day {
+        return Err("budget".to_string());
+    }
+    // Epsilon: 0.01 * 5 prints as 0.050000000000000004 and must still fit 0.05.
+    if let Some(max) = b.max_usd_per_day
+        && usd + assume > max + 1e-9
+    {
+        return Err("budget".to_string());
+    }
+    budget_store(&mut file, count + 1, usd + assume)?;
+    Ok(assume)
+}
+
+/// Settle the reserve against the reported cost. Best-effort and skipped when
+/// nothing changed: the judge already billed, so a ledger failure must not
+/// fail an otherwise recorded evaluation.
+fn budget_settle(base: &std::path::Path, delta: f64) {
+    if delta == 0.0 || !delta.is_finite() {
+        return;
+    }
+    if let Ok((mut file, count, usd)) = budget_open(base) {
+        let _ = budget_store(&mut file, count, (usd + delta).max(0.0));
+    }
+}
+
+/// Best-effort today's ledger for status display; unreadable means zeros.
+fn budget_read(base: &std::path::Path) -> (u64, f64) {
+    let path = budget_path(base);
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    if text.trim().is_empty() {
+        return (0, 0.0);
+    }
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| {
+            Some((
+                v.get("count")?.as_u64()?,
+                v.get("usd")?
+                    .as_f64()
+                    .filter(|n| n.is_finite() && *n >= 0.0)?,
+            ))
+        })
+        .unwrap_or((0, 0.0))
+}
+
+/// `workflow eval-budget` output: today's count/USD against the limits.
+pub fn budget_report(base: &std::path::Path, b: &Budget) -> serde_json::Value {
+    let (count, usd) = budget_read(base);
+    serde_json::json!({"date": utc_day(), "count": count, "usd": usd,
+        "maxPerDay": b.max_per_day, "maxUsdPerDay": b.max_usd_per_day})
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +436,23 @@ where
         checkpoint(state)?;
         return Ok((response(id, &m), true));
     }
+    // Budget is enforced here, holding the per-task claim lock and its own
+    // ledger lock, before the durable unknown marker and the judge call.
+    let charged = match &opts.budget {
+        None => 0.0,
+        Some(b) => match budget_reserve(base, b) {
+            Ok(c) => c,
+            Err(reason) => {
+                return finish(
+                    state,
+                    id,
+                    &mut claim,
+                    &mut checkpoint,
+                    marker("skipped", &target.task_id, Some(reason), truncated),
+                );
+            }
+        },
+    };
     // Unknown is deliberate: a crash cannot tell us whether the provider billed.
     let pending = marker(
         "unknown",
@@ -312,6 +516,10 @@ where
         },
     ) {
         Ok(path) => {
+            // Unbudgeted evals (no limits configured) never touch the ledger.
+            if opts.budget.is_some() {
+                budget_settle(base, eval.cost.unwrap_or(charged) - charged);
+            }
             let mut m = marker("evaluated", &target.task_id, None, truncated);
             m.verdict = Some(eval.verdict.clone());
             let (mut out, changed) = finish(state, id, &mut claim, &mut checkpoint, m)?;
@@ -508,6 +716,7 @@ mod tests {
         EvalOptions {
             sample: 1,
             force: false,
+            budget: None,
         }
     }
     fn answer() -> serde_json::Value {
@@ -555,6 +764,9 @@ mod tests {
         }
     }
     fn worker(dir: &Path, mode: &str) -> Child {
+        worker_task(dir, mode, "process-task")
+    }
+    fn worker_task(dir: &Path, mode: &str, task: &str) -> Child {
         Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -563,6 +775,7 @@ mod tests {
             ])
             .env("EVAL_TEST_DIR", dir)
             .env("EVAL_TEST_MODE", mode)
+            .env("EVAL_TEST_TASK", task)
             .spawn()
             .unwrap()
     }
@@ -621,9 +834,20 @@ mod tests {
             return;
         }
         // A separately loaded workflow with the same T3 task must share the claim.
-        let mut s = settled("process-task");
+        // EVAL_TEST_TASK and budget.json let budget tests isolate tasks/limits
+        // per worker without touching the shared default modes above.
+        let task = std::env::var("EVAL_TEST_TASK").unwrap_or_else(|_| "process-task".into());
+        let mut s = settled(&task);
         let mut options = opts();
         options.force = mode == "concurrent-force";
+        if let Ok(text) = std::fs::read_to_string(dir.join("budget.json")) {
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            options.budget = Some(Budget {
+                max_per_day: v.get("maxPerDay").and_then(|n| n.as_u64()).unwrap_or(20),
+                max_usd_per_day: v.get("maxUsdPerDay").and_then(|n| n.as_f64()),
+                assume_usd_per_eval: v.get("assumeUsdPerEval").and_then(|n| n.as_f64()),
+            });
+        }
         let out = eval_step_with(
             &mut s,
             "a",
@@ -652,7 +876,11 @@ mod tests {
         .await
         .unwrap()
         .0;
-        std::fs::write(dir.join(format!("{mode}-result.json")), out.to_string()).unwrap();
+        std::fs::write(
+            dir.join(format!("{task}-{mode}-result.json")),
+            out.to_string(),
+        )
+        .unwrap();
     }
     #[test]
     fn cli_uses_durable_evaluation_and_default_record_stays_observational() {
@@ -671,9 +899,10 @@ mod tests {
             1,
             "retry billed an interrupted request twice"
         );
-        let out: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.0.join("retry-result.json")).unwrap())
-                .unwrap();
+        let out: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.0.join("process-task-retry-result.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(out["eval"]["status"], "unknown");
     }
     #[test]
@@ -693,6 +922,157 @@ mod tests {
         assert!(finish(&mut worker(&dir.0, "retry")).success());
         assert_eq!(calls(&dir.0), 1);
     }
+    fn budgeted(max_per_day: u64, max_usd: Option<f64>, assume: Option<f64>) -> EvalOptions {
+        EvalOptions {
+            sample: 1,
+            force: false,
+            budget: Some(Budget {
+                max_per_day,
+                max_usd_per_day: max_usd,
+                assume_usd_per_eval: assume,
+            }),
+        }
+    }
+    fn costed(cost: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"verdict":"pass", "confidence":0.8, "evidenceConsidered":["summary"],
+            "judge":{"provider":"mock", "model":"judge"}, "selfJudged":null, "judgeCostUsd":cost})
+    }
+    async fn budgeted_eval(
+        dir: &Path,
+        task: &str,
+        opts: &EvalOptions,
+        judge: impl FnOnce(
+            String,
+        )
+            -> std::future::Ready<Result<serde_json::Value, outcomes::OutcomeError>>,
+    ) -> serde_json::Value {
+        let mut s = settled(task);
+        eval_step_with(&mut s, "a", opts, dir, |s| snapshot(dir, s), judge)
+            .await
+            .unwrap()
+            .0
+    }
+
+    #[tokio::test]
+    async fn budget_exhausted_skips_without_judge_call() {
+        let dir = Temp::new("budget");
+        let out = budgeted_eval(&dir.0, "budget-a", &budgeted(1, None, None), |_| {
+            std::future::ready({
+                counted(&dir.0);
+                Ok(answer())
+            })
+        })
+        .await;
+        assert_eq!(out["eval"]["status"], "evaluated");
+        let out = budgeted_eval(&dir.0, "budget-b", &budgeted(1, None, None), |_| {
+            std::future::ready({
+                counted(&dir.0);
+                Ok(answer())
+            })
+        })
+        .await;
+        assert_eq!(out["eval"]["status"], "skipped");
+        assert_eq!(out["eval"]["reason"], "budget");
+        assert_eq!(calls(&dir.0), 1, "exhausted budget billed the judge");
+        assert_eq!(budget_read(&dir.0), (1, 0.0));
+        // The skip is terminal: replays and --force never bill either.
+        for task in ["budget-b", "budget-c"] {
+            let mut force = budgeted(1, None, None);
+            force.force = true;
+            let out = budgeted_eval(&dir.0, task, &force, |_| {
+                std::future::ready({
+                    counted(&dir.0);
+                    Ok(answer())
+                })
+            })
+            .await;
+            assert_eq!(out["eval"]["status"], "skipped");
+            assert_eq!(out["eval"]["reason"], "budget");
+        }
+        assert_eq!(calls(&dir.0), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_cost_counts_assume_against_usd_cap() {
+        let dir = Temp::new("budget-usd");
+        // answer() reports no cost, so each request charges the assume value.
+        let out = budgeted_eval(
+            &dir.0,
+            "usd-a",
+            &budgeted(100, Some(0.015), Some(0.01)),
+            |_| {
+                std::future::ready({
+                    counted(&dir.0);
+                    Ok(answer())
+                })
+            },
+        )
+        .await;
+        assert_eq!(out["eval"]["status"], "evaluated");
+        assert_eq!(budget_read(&dir.0), (1, 0.01));
+        let out = budgeted_eval(
+            &dir.0,
+            "usd-b",
+            &budgeted(100, Some(0.015), Some(0.01)),
+            |_| {
+                std::future::ready({
+                    counted(&dir.0);
+                    Ok(answer())
+                })
+            },
+        )
+        .await;
+        assert_eq!(out["eval"]["status"], "skipped");
+        assert_eq!(out["eval"]["reason"], "budget");
+        assert_eq!(calls(&dir.0), 1);
+    }
+
+    #[tokio::test]
+    async fn reported_cost_settles_against_assume() {
+        let dir = Temp::new("budget-settle");
+        let out = budgeted_eval(
+            &dir.0,
+            "settle-a",
+            &budgeted(100, Some(1.0), Some(0.01)),
+            |_| {
+                std::future::ready({
+                    counted(&dir.0);
+                    Ok(costed(serde_json::json!(0.002)))
+                })
+            },
+        )
+        .await;
+        assert_eq!(out["eval"]["status"], "evaluated");
+        let (count, usd) = budget_read(&dir.0);
+        assert_eq!(count, 1);
+        assert!((usd - 0.002).abs() < 1e-12, "ledger usd is {usd}");
+    }
+
+    #[test]
+    fn concurrent_processes_share_one_budget_slot() {
+        let dir = Temp::new("budget-race");
+        std::fs::write(dir.0.join("budget.json"), r#"{"maxPerDay":1}"#).unwrap();
+        let mut first = worker_task(&dir.0, "hold", "race-a");
+        wait_marker(&dir.0, "entered", &mut first);
+        // The first worker holds the only daily slot inside its fake judge;
+        // the second must skip on budget without ever calling the judge.
+        let mut second = worker_task(&dir.0, "race", "race-b");
+        let second_status = finish(&mut second);
+        std::fs::write(dir.0.join("release"), b"").unwrap();
+        assert!(finish(&mut first).success());
+        assert!(second_status.success());
+        assert_eq!(
+            calls(&dir.0),
+            1,
+            "budget allowed two concurrent judge requests"
+        );
+        let out: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.0.join("race-b-race-result.json")).unwrap())
+                .unwrap();
+        assert_eq!(out["eval"]["status"], "skipped");
+        assert_eq!(out["eval"]["reason"], "budget");
+    }
+
     #[tokio::test]
     async fn durable_checkpoint_precedes_judge_and_state_errors_fail_closed() {
         let dir = Temp::new("checkpoint");
@@ -848,6 +1228,7 @@ mod tests {
         let sampling = EvalOptions {
             sample: 16,
             force: false,
+            budget: None,
         };
         let out = eval_step_with(
             &mut s,

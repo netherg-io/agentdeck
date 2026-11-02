@@ -128,6 +128,96 @@ pub fn is_review_task(task: &str) -> bool {
     review_re().is_match(task)
 }
 
+/// Opt-in automatic evaluation of settled workflow tasks (`workflowEval` in
+/// the router JSON). Default off. `error` disables auto spawns with a reason
+/// but never fails config loading; manual `workflow eval` then uses default
+/// budget limits.
+#[derive(Clone, Debug)]
+pub struct WorkflowEvalConfig {
+    pub auto: bool,
+    pub sample: u64,
+    pub max_per_day: u64,
+    pub max_usd_per_day: Option<f64>,
+    pub assume_usd_per_eval: Option<f64>,
+    pub error: Option<String>,
+}
+
+impl Default for WorkflowEvalConfig {
+    fn default() -> Self {
+        Self {
+            auto: false,
+            sample: 1,
+            max_per_day: 20,
+            max_usd_per_day: None,
+            assume_usd_per_eval: None,
+            error: None,
+        }
+    }
+}
+
+fn parse_workflow_eval(data: &Value) -> WorkflowEvalConfig {
+    let bad = |why: &str| WorkflowEvalConfig {
+        error: Some(why.to_string()),
+        ..WorkflowEvalConfig::default()
+    };
+    let Some(v) = data.get("workflowEval") else {
+        return WorkflowEvalConfig::default();
+    };
+    let o = match v.as_object() {
+        Some(o) => o,
+        None => return bad("workflowEval must be an object"),
+    };
+    let auto = match o.get("auto") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return bad("workflowEval.auto must be a boolean"),
+    };
+    let sample = match o.get("sample") {
+        None => 1,
+        Some(n) => match n.as_u64() {
+            Some(n) if (1..=crate::workflow_eval::MAX_SAMPLE).contains(&n) => n,
+            _ => {
+                return bad("workflowEval.sample must be 1-1024");
+            }
+        },
+    };
+    let max_per_day = match o.get("maxPerDay") {
+        None => 20,
+        Some(n) => match n.as_u64() {
+            Some(n) if n >= 1 => n,
+            _ => return bad("workflowEval.maxPerDay must be a positive integer"),
+        },
+    };
+    let usd = |key: &str| -> Result<Option<f64>, String> {
+        match o.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(n) => match n.as_f64() {
+                Some(n) if n.is_finite() && n >= 0.0 => Ok(Some(n)),
+                _ => Err(format!("workflowEval.{key} must be a number >= 0 or null")),
+            },
+        }
+    };
+    let max_usd_per_day = match usd("maxUsdPerDay") {
+        Ok(v) => v,
+        Err(e) => return bad(&e),
+    };
+    let assume_usd_per_eval = match usd("assumeUsdPerEval") {
+        Ok(v) => v,
+        Err(e) => return bad(&e),
+    };
+    if max_usd_per_day.is_some() && assume_usd_per_eval.is_none() {
+        return bad("workflowEval.maxUsdPerDay needs assumeUsdPerEval");
+    }
+    WorkflowEvalConfig {
+        auto,
+        sample,
+        max_per_day,
+        max_usd_per_day,
+        assume_usd_per_eval,
+        error: None,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AccountMeta {
     pub usage_provider: String,
@@ -147,6 +237,8 @@ pub struct RouterConfig {
     pub decision_model: Option<String>,
     /// `"vercel"` sends the judgment through Vercel AI Gateway; else OpenRouter.
     pub decision_provider: Option<String>,
+    /// Opt-in automatic evaluation of settled workflow tasks; default off.
+    pub workflow_eval: WorkflowEvalConfig,
     /// Persistent user model restrictions; defaults preserve the Argon
     /// audit/review ban exactly when the generated JSON predates them.
     pub user_rules: UserRules,
@@ -316,6 +408,7 @@ fn parse_router_config(data: Value, source: &str) -> anyhow::Result<RouterConfig
             .get("decisionProvider")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        workflow_eval: parse_workflow_eval(&data),
         user_rules: UserRules::from_json(data.get("userRules"))
             .map_err(|e| fail(format!("bad userRules: {e}")))?,
         account,
@@ -947,6 +1040,57 @@ display = "Go"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn workflow_eval_parses_with_safe_defaults_and_rejects_bad_limits() {
+        let base = serde_json::json!({"pool": [], "accounts": {}});
+        let cfg = |we: serde_json::Value| {
+            let mut v = base.clone();
+            v["workflowEval"] = we;
+            parse_router_config(v, "test").unwrap().workflow_eval
+        };
+        let absent = parse_router_config(base.clone(), "test")
+            .unwrap()
+            .workflow_eval;
+        assert!(!absent.auto && absent.sample == 1 && absent.error.is_none());
+        let on = cfg(
+            serde_json::json!({"auto": true, "sample": 8, "maxPerDay": 5,
+            "maxUsdPerDay": 0.5, "assumeUsdPerEval": 0.01}),
+        );
+        assert!(on.auto && on.error.is_none());
+        assert_eq!((on.sample, on.max_per_day), (8, 5));
+        assert_eq!(
+            (on.max_usd_per_day, on.assume_usd_per_eval),
+            (Some(0.5), Some(0.01))
+        );
+        // Invalid configs disable auto with a reason instead of failing load.
+        for (we, part) in [
+            (serde_json::json!([]), "must be an object"),
+            (serde_json::json!({"auto": "yes"}), "auto must be a boolean"),
+            (serde_json::json!({"sample": 0}), "sample must be 1-1024"),
+            (serde_json::json!({"sample": 1025}), "sample must be 1-1024"),
+            (
+                serde_json::json!({"maxPerDay": 0}),
+                "maxPerDay must be a positive",
+            ),
+            (
+                serde_json::json!({"maxUsdPerDay": 1.0}),
+                "needs assumeUsdPerEval",
+            ),
+            (
+                serde_json::json!({"maxUsdPerDay": -1.0}),
+                "must be a number",
+            ),
+        ] {
+            let c = cfg(we);
+            assert!(!c.auto, "invalid config must not enable auto");
+            assert!(
+                c.error.as_deref().is_some_and(|e| e.contains(part)),
+                "{:?}",
+                c.error
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1087,6 +1231,7 @@ mod unknown_models_tests {
                 usage_state_path: None,
                 decision_model: None,
                 decision_provider: None,
+                workflow_eval: WorkflowEvalConfig::default(),
                 user_rules: UserRules::default(),
                 account: std::collections::HashMap::new(),
                 usage_id: std::collections::HashMap::new(),
