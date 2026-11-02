@@ -292,6 +292,8 @@ settings-eval-cost = цена ${ $cost }
 settings-eval-cost-unknown = цена не указана
 settings-eval-evidence-ids = { $count } id свидетельств
 settings-eval-judge = судья { $who }
+settings-eval-confidence = уверенность { $value }
+settings-eval-workflow = workflow { $run }/{ $step }
 
 settings-eval-minutes-ago = { $count } мин назад
 settings-eval-hours-ago = { $count } ч назад

@@ -544,9 +544,11 @@ fn plain(s: String) -> String {
         .collect()
 }
 
-/// One assessment row: source and verdict pills plus the model; the muted line
-/// carries task id, category, timestamp, evidence count/kind, self-check and
-/// cost. Verdicts are shown, never scored or compared.
+/// One assessment row: source and verdict pills (plus a verbatim `workflow`
+/// pill for workflow task evaluations) and the model; the muted line carries
+/// task id, category, timestamp, evidence count/kind, confidence, self-check,
+/// cost and, for workflow evaluations, the run/step join keys.
+/// Verdicts are shown, never scored or compared.
 fn entry_row(entry: &eval_history::Entry) -> Element<'_, Msg> {
     let tone = match entry.verdict.as_str() {
         "ok" | "pass" => st::Tone::Ok,
@@ -598,7 +600,18 @@ fn entry_row(entry: &eval_history::Entry) -> Element<'_, Msg> {
             "settings-eval-evidence-ids",
             count = entry.evidence_count.to_string()
         );
-        detail.push_str(&format!(" · {evidence} · {self_line} · {cost}"));
+        detail.push_str(&format!(" · {evidence}"));
+        if let Some(c) = entry.confidence {
+            detail.push_str(&format!(
+                " · {}",
+                fl!(
+                    loader(),
+                    "settings-eval-confidence",
+                    value = format!("{c:.2}")
+                )
+            ));
+        }
+        detail.push_str(&format!(" · {self_line} · {cost}"));
     } else {
         detail.push_str(&format!(" · {}", entry.evidence));
     }
@@ -608,14 +621,31 @@ fn entry_row(entry: &eval_history::Entry) -> Element<'_, Msg> {
             fl!(loader(), "settings-eval-judge", who = judge.clone())
         ));
     }
+    // Workflow task evaluations carry the run/step join keys; plain decider
+    // and coordinator rows never show this segment.
+    let workflow = entry.run_id.as_ref().zip(entry.step.as_ref());
+    if let Some((run, step)) = workflow {
+        detail.push_str(&format!(
+            " · {}",
+            fl!(
+                loader(),
+                "settings-eval-workflow",
+                run = run.clone(),
+                step = step.clone()
+            )
+        ));
+    }
+    let mut pills = row![
+        st::pill(entry.source.as_str(), st::Tone::Neutral),
+        st::pill(entry.verdict.as_str(), tone),
+        st::mono(entry.model.clone()),
+    ];
+    if workflow.is_some() {
+        // Verbatim like the source pills; never ranked.
+        pills = pills.push(st::pill("workflow", st::Tone::Accent));
+    }
     column![
-        row![
-            st::pill(entry.source.as_str(), st::Tone::Neutral),
-            st::pill(entry.verdict.as_str(), tone),
-            st::mono(entry.model.clone()),
-        ]
-        .spacing(st::SPACE_S)
-        .align_y(Alignment::Center),
+        pills.spacing(st::SPACE_S).align_y(Alignment::Center),
         st::mono_muted(plain(detail)),
     ]
     .spacing(2.0)

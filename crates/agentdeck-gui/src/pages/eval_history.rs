@@ -63,6 +63,13 @@ pub struct Entry {
     pub self_judged: Option<bool>,
     /// `None` means the judge did not report a cost.
     pub cost: Option<f64>,
+    /// Decider confidence (0-1) when the judge reported one.
+    pub confidence: Option<f64>,
+    /// Workflow join keys: present only when a decider record came from a
+    /// workflow task evaluation (`basis` "child-report"). Plain decider and
+    /// coordinator records leave both `None`.
+    pub run_id: Option<String>,
+    pub step: Option<String>,
     /// Decider judge as `provider/model`.
     pub judge: Option<String>,
 }
@@ -227,6 +234,9 @@ fn parse_line(line: &str) -> Result<Entry, String> {
                 evidence_count: 1,
                 self_judged: None,
                 cost: None,
+                confidence: None,
+                run_id: None,
+                step: None,
                 judge: None,
             })
         }
@@ -280,6 +290,20 @@ fn parse_line(line: &str) -> Result<Entry, String> {
                         .ok_or_else(|| "not an outcome record: bad cost".to_string())?,
                 ),
             };
+            // Additive workflow keys: only the exact child-report shape marks
+            // a workflow evaluation; anything else stays a plain decider row.
+            let (run_id, step) = match (
+                v.get("basis").and_then(|b| b.as_str()),
+                v.get("run_id").and_then(|r| r.as_str()),
+                v.get("step").and_then(|s| s.as_str()),
+            ) {
+                (Some("child-report"), Some(run), Some(step))
+                    if !run.is_empty() && !step.is_empty() =>
+                {
+                    (Some(run.to_string()), Some(step.to_string()))
+                }
+                _ => (None, None),
+            };
             Ok(Entry {
                 t,
                 source,
@@ -292,6 +316,9 @@ fn parse_line(line: &str) -> Result<Entry, String> {
                 evidence_count: ids.len(),
                 self_judged,
                 cost,
+                confidence: v.get("confidence").and_then(|c| c.as_f64()),
+                run_id,
+                step,
                 judge: Some(judge),
             })
         }
@@ -357,7 +384,31 @@ mod tests {
         assert_eq!(dec.source, Source::Decider);
         assert!(dec.provider.is_none());
         assert_eq!(dec.evidence_count, 2);
+        assert_eq!(dec.confidence, Some(0.8));
         assert_eq!(dec.judge.as_deref(), Some("openrouter/j/judge"));
+        assert!(dec.run_id.is_none());
+        assert!(dec.step.is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn workflow_decider_keeps_join_keys_plain_does_not() {
+        let base = tmp_base("workflow");
+        write(
+            &base,
+            "{\"t\":3,\"source\":\"decider\",\"task_id\":\"wf-task\",\"provider\":null,\"model\":\"perf/m\",\"category\":\"test\",\"verdict\":\"pass\",\"confidence\":0.9,\"evidence_ids\":[\"r\"],\"evidence_count\":1,\"decider\":{\"judge\":{\"provider\":\"openrouter\",\"model\":\"wf/judge\"},\"self_judged\":true,\"judge_cost_usd\":null},\"basis\":\"child-report\",\"run_id\":\"run-7\",\"step\":\"3\"}\n{\"t\":4,\"source\":\"decider\",\"task_id\":\"plain\",\"provider\":null,\"model\":\"perf/m\",\"category\":\"test\",\"verdict\":\"pass\",\"confidence\":0.5,\"evidence_ids\":[\"a\"],\"evidence_count\":1,\"decider\":{\"judge\":{\"provider\":\"p\",\"model\":\"m\"},\"self_judged\":null,\"judge_cost_usd\":null}}\n",
+        );
+        let History::Loaded(entries) = load_from_base(&base) else {
+            panic!("expected records")
+        };
+        assert_eq!(entries.len(), 2);
+        let wf = &entries[0];
+        assert_eq!(wf.run_id.as_deref(), Some("run-7"));
+        assert_eq!(wf.step.as_deref(), Some("3"));
+        assert_eq!(wf.confidence, Some(0.9));
+        let plain = &entries[1];
+        assert!(plain.run_id.is_none());
+        assert!(plain.step.is_none());
         let _ = std::fs::remove_dir_all(&base);
     }
 
