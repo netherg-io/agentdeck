@@ -1854,12 +1854,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     let blocked: Vec<String> = ranking
         .iter()
         .filter(|r| {
-            (!r.candidate.allowed
-                || (current_cfg
-                    .instance_limits
-                    .contains_key(&r.candidate.provider)
-                    && r.candidate.policy_ban.is_some()))
-                && r.candidate.fit >= MIN_FIT
+            (!r.candidate.allowed || r.candidate.policy_ban.is_some()) && r.candidate.fit >= MIN_FIT
         })
         .map(|r| format!("{}/{}", r.candidate.provider, r.candidate.model))
         .collect();
@@ -2026,13 +2021,14 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
             "requestedNoReview".into(),
             Value::from(current_cfg.user_rules.is_no_review(&req.model)),
         );
-        let validation =
-            if current_cfg.user_rules.is_no_review(&req.model) && is_review_task(&task) {
-                serde_json::json!({"allowed": false, "reason": NO_REVIEW_BAN})
-            } else {
-                let v = validate_target(&ranking, &req.provider, &req.model);
-                serde_json::json!({"allowed": v.allowed, "reason": v.reason})
-            };
+        let validation = if current_cfg.user_rules.is_denied(&req.model) {
+            serde_json::json!({"allowed": false, "reason": "denied by user rule"})
+        } else if current_cfg.user_rules.is_no_review(&req.model) && is_review_task(&task) {
+            serde_json::json!({"allowed": false, "reason": NO_REVIEW_BAN})
+        } else {
+            let v = validate_target(&ranking, &req.provider, &req.model);
+            serde_json::json!({"allowed": v.allowed, "reason": v.reason})
+        };
         out.insert("validation".into(), validation);
     }
     out.insert(

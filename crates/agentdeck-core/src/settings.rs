@@ -181,8 +181,9 @@ fn check_patterns(key: &str, patterns: &[String]) -> anyhow::Result<()> {
         }
         // Same case-insensitive matching as roster families; a bad pattern
         // fails closed here instead of silently matching nothing later.
-        regex::Regex::new(&format!("(?i){p}"))
-            .map_err(|e| anyhow::anyhow!("[router.rules] {key} pattern {p:?} is not a regex: {e}"))?;
+        regex::Regex::new(&format!("(?i){p}")).map_err(|e| {
+            anyhow::anyhow!("[router.rules] {key} pattern {p:?} is not a regex: {e}")
+        })?;
     }
     Ok(())
 }
@@ -195,9 +196,9 @@ impl UserRules {
     }
 
     fn matches_any(patterns: &[String], model: &str) -> bool {
-        patterns.iter().any(|p| {
-            regex::Regex::new(&format!("(?i){p}")).is_ok_and(|re| re.is_match(model))
-        })
+        patterns
+            .iter()
+            .any(|p| regex::Regex::new(&format!("(?i){p}")).is_ok_and(|re| re.is_match(model)))
     }
 
     /// True when the model must never take audits or reviews (unless the
@@ -206,7 +207,7 @@ impl UserRules {
         Self::matches_any(&self.no_review_models, model)
     }
 
-    /// True when the model is denied outright, regardless of quota or fit.
+    /// Denied for automatic routing regardless of quota or fit; a verified explicit user choice may override this rule.
     pub fn is_denied(&self, model: &str) -> bool {
         Self::matches_any(&self.deny_models, model)
     }
@@ -224,8 +225,7 @@ impl UserRules {
             return Ok(Self::default());
         };
         let defaults = Self::default();
-        let touched =
-            table.contains_key("no_review_models") || table.contains_key("deny_models");
+        let touched = table.contains_key("no_review_models") || table.contains_key("deny_models");
         let rules = Self {
             no_review_models: rule_list(table, "no_review_models")?
                 .unwrap_or(defaults.no_review_models),
@@ -264,7 +264,9 @@ impl UserRules {
                     })
                     .collect::<anyhow::Result<Vec<_>>>()
                     .map(Some),
-                Some(_) => Err(anyhow::anyhow!("userRules {key} must be an array of strings")),
+                Some(_) => Err(anyhow::anyhow!(
+                    "userRules {key} must be an array of strings"
+                )),
             }
         };
         let defaults = Self::default();
@@ -307,8 +309,9 @@ impl UserRules {
 pub fn write_user_rules(paths: &Paths, rules: &UserRules) -> anyhow::Result<()> {
     rules.validate()?;
     Registry::update(paths, |reg| {
-        let arr =
-            |items: &[String]| toml::Value::Array(items.iter().cloned().map(toml::Value::String).collect());
+        let arr = |items: &[String]| {
+            toml::Value::Array(items.iter().cloned().map(toml::Value::String).collect())
+        };
         let router = reg
             .extra
             .entry("router".to_string())
@@ -325,10 +328,7 @@ pub fn write_user_rules(paths: &Paths, rules: &UserRules) -> anyhow::Result<()> 
             *nested = toml::Value::Table(Default::default());
         }
         let t = nested.as_table_mut().expect("table");
-        t.insert(
-            "no_review_models".to_string(),
-            arr(&rules.no_review_models),
-        );
+        t.insert("no_review_models".to_string(), arr(&rules.no_review_models));
         t.insert("deny_models".to_string(), arr(&rules.deny_models));
         Ok(())
     })
@@ -418,7 +418,8 @@ mod tests {
             .insert("future_knob".into(), toml::Value::Integer(1));
         assert!(UserRules::from_registry(&reg).is_ok());
         // Explicit empty list disables the ban and survives.
-        let reg = Registry::from_toml("version = 1\n[router.rules]\nno_review_models = []\n").unwrap();
+        let reg =
+            Registry::from_toml("version = 1\n[router.rules]\nno_review_models = []\n").unwrap();
         let rules = UserRules::from_registry(&reg).unwrap();
         assert_eq!(rules.source, UserRuleSource::User);
         assert!(rules.no_review_models.is_empty());
@@ -438,9 +439,14 @@ mod tests {
             assert!(UserRules::from_registry(&reg).is_err(), "{text}");
         }
         // Too many patterns also fails.
-        let many = (0..40).map(|i| format!("\"m{i}\"")).collect::<Vec<_>>().join(", ");
-        let reg =
-            Registry::from_toml(&format!("version = 1\n[router.rules]\ndeny_models = [{many}]")).unwrap();
+        let many = (0..40)
+            .map(|i| format!("\"m{i}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let reg = Registry::from_toml(&format!(
+            "version = 1\n[router.rules]\ndeny_models = [{many}]"
+        ))
+        .unwrap();
         assert!(UserRules::from_registry(&reg).is_err());
     }
 
@@ -450,8 +456,12 @@ mod tests {
         let back = UserRules::from_json(Some(&rules.to_json())).unwrap();
         assert_eq!(back, rules);
         assert!(UserRules::from_json(None).unwrap().source == UserRuleSource::Default);
-        assert!(UserRules::from_json(Some(&serde_json::Value::Null)).unwrap().source
-            == UserRuleSource::Default);
+        assert!(
+            UserRules::from_json(Some(&serde_json::Value::Null))
+                .unwrap()
+                .source
+                == UserRuleSource::Default
+        );
         assert!(UserRules::from_json(Some(&serde_json::json!({"noReviewModels": [42]}))).is_err());
         assert!(UserRules::from_json(Some(&serde_json::json!("x"))).is_err());
     }
