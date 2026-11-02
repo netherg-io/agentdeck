@@ -2,8 +2,22 @@
 //! coordinator vs decider rows (EN/RU), and loading from the XDG state dir the
 //! router store uses. No window, no goldens, isolated temp dirs only.
 
-use agentdeck_gui::pages::eval_history::{Entry, History, Source};
+use agentdeck_gui::pages::eval_history::{self, Entry, History, Source};
 use agentdeck_gui::pages::settings as settings_page;
+
+const SNAPSHOTS: &str = "tests/snapshots";
+
+// Goldens depend on this machine's fonts and GPU rasterizer, so CI only checks that rendering works.
+fn assert_snapshot(snapshot: &iced_test::simulator::Snapshot, stem: &str) {
+    if std::env::var_os("CI").is_none() {
+        assert!(
+            snapshot
+                .matches_image(format!("{SNAPSHOTS}/{stem}.png"))
+                .expect("snapshot compare/write"),
+            "snapshot {stem} changed"
+        );
+    }
+}
 
 static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn lock() -> std::sync::MutexGuard<'static, ()> {
@@ -34,6 +48,9 @@ fn entries() -> Vec<Entry> {
             evidence_count: 1,
             self_judged: None,
             cost: None,
+            confidence: None,
+            run_id: None,
+            step: None,
             judge: None,
         },
         Entry {
@@ -48,6 +65,9 @@ fn entries() -> Vec<Entry> {
             evidence_count: 2,
             self_judged: Some(true),
             cost: Some(0.001),
+            confidence: Some(0.8),
+            run_id: None,
+            step: None,
             judge: Some("openrouter/judge".into()),
         },
     ]
@@ -94,12 +114,12 @@ fn loaded_rows_show_metadata_in_both_languages() {
         (
             "en",
             "task-1 · test · direct",
-            "task-2 · review · 2 evidence ids · self-check · cost $0.001000 · judge openrouter/judge",
+            "task-2 · review · 2 evidence ids · confidence 0.80 · self-check · cost $0.001000 · judge openrouter/judge",
         ),
         (
             "ru",
             "task-1 · test · direct",
-            "task-2 · review · 2 id свидетельств · самопроверка · цена $0.001000 · судья openrouter/judge",
+            "task-2 · review · 2 id свидетельств · уверенность 0.80 · самопроверка · цена $0.001000 · судья openrouter/judge",
         ),
     ] {
         agentdeck_gui::i18n::set_language(lang);
@@ -117,6 +137,8 @@ fn loaded_rows_show_metadata_in_both_languages() {
         ] {
             ui.find(needle).expect("row metadata");
         }
+        // No workflow evaluations here: nothing may carry the workflow mark.
+        assert!(ui.find("workflow").is_err(), "plain rows stay unmarked");
         ui.snapshot(&agentdeck_gui::style::theme(true))
             .expect("headless render");
     }
@@ -182,4 +204,69 @@ impl Drop for Temp<'_> {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(self.0);
     }
+}
+
+/// Workflow task evaluations (child-report decider records with run/step
+/// join keys) render their verdict, confidence, judge, self-check, unknown
+/// cost, task id and run/step, marked with a workflow pill that plain
+/// decider and coordinator rows never carry. EN/RU desktop-size goldens.
+#[test]
+fn workflow_records_show_run_step_and_pill() {
+    let _env = lock();
+    let dir = std::env::temp_dir().join(format!("agentdeck-eval-wf-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let base = dir.join("base");
+    std::fs::create_dir_all(base.join("model-route")).unwrap();
+    std::fs::write(
+        base.join("model-route/outcomes.jsonl"),
+        concat!(
+            "{\"t\":0,\"source\":\"coordinator\",\"task_id\":\"task-1\",\"provider\":\"p\",\"model\":\"perf/model\",\"category\":\"test\",\"verdict\":\"ok\",\"evidence\":\"direct\",\"decider\":null}\n",
+            "{\"t\":0,\"source\":\"decider\",\"task_id\":\"task-2\",\"provider\":null,\"model\":\"perf/other\",\"category\":\"review\",\"verdict\":\"pass\",\"confidence\":0.8,\"evidence_ids\":[\"a\",\"b\"],\"decider\":{\"judge\":{\"provider\":\"openrouter\",\"model\":\"judge\"},\"self_judged\":null,\"judge_cost_usd\":0.001}}\n",
+            "{\"t\":0,\"source\":\"decider\",\"task_id\":\"wf-task\",\"provider\":null,\"model\":\"perf/wf\",\"category\":\"test\",\"verdict\":\"pass\",\"confidence\":0.9,\"evidence_ids\":[\"r1\"],\"evidence_count\":1,\"decider\":{\"judge\":{\"provider\":\"openrouter\",\"model\":\"wf/judge\"},\"self_judged\":true,\"judge_cost_usd\":null},\"basis\":\"child-report\",\"run_id\":\"run-7\",\"step\":\"3\"}\n",
+        ),
+    )
+    .unwrap();
+    let _guard = Temp(&dir);
+    let History::Loaded(entries) = eval_history::load_from_base(&base) else {
+        panic!("fixture must load")
+    };
+    assert_eq!(entries.len(), 3);
+    let wf = &entries[2];
+    assert_eq!(wf.source, Source::Decider);
+    assert_eq!(wf.run_id.as_deref(), Some("run-7"));
+    assert_eq!(wf.step.as_deref(), Some("3"));
+    assert_eq!(wf.confidence, Some(0.9));
+    assert!(entries[1].run_id.is_none());
+
+    std::fs::create_dir_all(SNAPSHOTS).unwrap();
+    for (lang, wf_detail) in [
+        (
+            "en",
+            "wf-task · test · 1 evidence ids · confidence 0.90 · self-check · cost unreported · judge openrouter/wf/judge · workflow run-7/3",
+        ),
+        (
+            "ru",
+            "wf-task · test · 1 id свидетельств · уверенность 0.90 · самопроверка · цена не указана · судья openrouter/wf/judge · workflow run-7/3",
+        ),
+    ] {
+        agentdeck_gui::i18n::set_language(lang);
+        let state = state_with(History::Loaded(entries.clone()));
+        // Desktop-size render for the golden; the row assertions use the
+        // default simulator below.
+        let mut shot = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            (960.0, 760.0),
+            settings_page::router_view(&state),
+        );
+        let snapshot = shot
+            .snapshot(&agentdeck_gui::style::theme(true))
+            .expect("headless snapshot");
+        assert_snapshot(&snapshot, &format!("eval_{lang}"));
+        let mut ui = iced_test::simulator(settings_page::router_view(&state));
+        for needle in ["perf/wf", "pass", "workflow", wf_detail] {
+            ui.find(needle).expect("workflow row metadata");
+        }
+    }
+    agentdeck_gui::i18n::set_language("en");
+    let _ = std::fs::remove_dir_all(&dir);
 }
