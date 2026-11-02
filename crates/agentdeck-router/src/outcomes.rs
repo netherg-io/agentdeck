@@ -5,7 +5,7 @@
 //! One line per assessment; repeats for the same task are revisions, newest
 //! last. Only metadata is stored: no task text, summaries or evidence text.
 
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -20,14 +20,7 @@ const CATEGORIES: &[&str] = &[
     "test",
     "general",
 ];
-const VERDICTS: &[&str] = &[
-    "ok",
-    "partial",
-    "fail",
-    "blocked",
-    "missing",
-    "unavailable",
-];
+const VERDICTS: &[&str] = &["ok", "partial", "fail", "blocked", "missing", "unavailable"];
 const EVIDENCE: &[&str] = &["direct", "spot-check", "test-output", "child-report"];
 
 const MAX_TASK: usize = 256;
@@ -119,15 +112,15 @@ fn now_secs() -> u64 {
 
 fn check_id(value: &str, what: &str, max: usize, extra: &[char]) -> Result<(), OutcomeError> {
     if value.is_empty() || value.len() > max {
-        return Err(OutcomeError::usage(format!(
-            "{what} must be 1-{max} chars"
-        )));
+        return Err(OutcomeError::usage(format!("{what} must be 1-{max} chars")));
     }
     if !value
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || extra.contains(&c))
     {
-        return Err(OutcomeError::usage(format!("{what} has invalid characters")));
+        return Err(OutcomeError::usage(format!(
+            "{what} has invalid characters"
+        )));
     }
     Ok(())
 }
@@ -229,16 +222,14 @@ fn lock_file(f: &std::fs::File, op: libc::c_int, what: &str) -> Result<(), Outco
         }
         let e = std::io::Error::last_os_error();
         if e.kind() != std::io::ErrorKind::Interrupted {
-            return Err(OutcomeError::fail(format!("cannot {what} outcomes file: {e}")));
+            return Err(OutcomeError::fail(format!(
+                "cannot {what} outcomes file: {e}"
+            )));
         }
     }
 }
 
-fn append_to(
-    base: &Path,
-    r: &Record,
-    now: u64,
-) -> Result<PathBuf, OutcomeError> {
+fn append_to(base: &Path, r: &Record, now: u64) -> Result<PathBuf, OutcomeError> {
     let path = ensure_parent(base)?;
     let line = serde_json::json!({
         "t": now,
@@ -259,21 +250,35 @@ fn append_to(
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .read(true)
         .mode(0o600)
         .open(&path)
         .map_err(|e| OutcomeError::fail(e.to_string()))?;
     lock_file(&f, libc::LOCK_EX, "lock")?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| OutcomeError::fail(format!("cannot secure {}: {e}", path.display())))?;
+    if f.metadata()
+        .map_err(|e| OutcomeError::fail(e.to_string()))?
+        .len()
+        > 0
+    {
+        f.seek(SeekFrom::End(-1))
+            .map_err(|e| OutcomeError::fail(e.to_string()))?;
+        let mut last = [0];
+        f.read_exact(&mut last)
+            .map_err(|e| OutcomeError::fail(e.to_string()))?;
+        if last[0] != b'\n' {
+            return Err(OutcomeError::fail(
+                "outcomes file has an incomplete final record; file left unchanged",
+            ));
+        }
+    }
     let r = f
         .write_all(text.as_bytes())
         .map_err(|e| OutcomeError::fail(e.to_string()))
         .and_then(|()| {
             f.sync_all()
                 .map_err(|e| OutcomeError::fail(format!("cannot persist {}: {e}", path.display())))
-        })
-        .and_then(|()| {
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-                OutcomeError::fail(format!("cannot secure {}: {e}", path.display()))
-            })
         });
     drop(f); // releases LOCK_EX
     r?;
@@ -281,8 +286,12 @@ fn append_to(
 }
 
 fn valid_record(v: &serde_json::Value) -> bool {
-    v.get("task_id").and_then(|t| t.as_str()).is_some_and(|t| !t.is_empty())
-        && v.get("verdict").and_then(|t| t.as_str()).is_some_and(|t| VERDICTS.contains(&t))
+    v.get("task_id")
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| !t.is_empty())
+        && v.get("verdict")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| VERDICTS.contains(&t))
 }
 
 fn read_all(base: &Path) -> Result<Vec<serde_json::Value>, OutcomeError> {
@@ -318,7 +327,10 @@ fn read_all(base: &Path) -> Result<Vec<serde_json::Value>, OutcomeError> {
             continue;
         }
         let v: serde_json::Value = serde_json::from_str(l).map_err(|e| {
-            OutcomeError::fail(format!("{}:{n}: invalid JSON ({e}); file left unchanged", path.display()))
+            OutcomeError::fail(format!(
+                "{}:{n}: invalid JSON ({e}); file left unchanged",
+                path.display()
+            ))
         })?;
         if !valid_record(&v) {
             return Err(OutcomeError::fail(format!(
@@ -359,9 +371,7 @@ fn list_cli(argv: &[String]) -> Result<serde_json::Value, OutcomeError> {
                     .get(i)
                     .and_then(|s| s.parse::<usize>().ok())
                     .filter(|&n| n > 0 && n <= MAX_LIST)
-                    .ok_or_else(|| {
-                        OutcomeError::usage(format!("limit must be 1-{MAX_LIST}"))
-                    })?;
+                    .ok_or_else(|| OutcomeError::usage(format!("limit must be 1-{MAX_LIST}")))?;
             }
             _ => return Err(OutcomeError::usage(USAGE)),
         }
@@ -405,13 +415,103 @@ mod tests {
 
     #[test]
     fn rejects_bad_enums_and_ids() {
-        assert!(parse_record(&["--task", "t", "--provider", "p", "--model", "m", "--category", "nope", "--verdict", "ok", "--evidence", "direct"].map(String::from)).is_err());
-        assert!(parse_record(&["--task", "t", "--provider", "p", "--model", "m", "--category", "test", "--verdict", "great", "--evidence", "direct"].map(String::from)).is_err());
-        assert!(parse_record(&["--task", "../evil", "--provider", "p", "--model", "m", "--category", "test", "--verdict", "ok", "--evidence", "direct"].map(String::from)).is_err());
-        assert!(parse_record(&["--task", "", "--provider", "p", "--model", "m", "--category", "test", "--verdict", "ok", "--evidence", "direct"].map(String::from)).is_err());
+        assert!(
+            parse_record(
+                &[
+                    "--task",
+                    "t",
+                    "--provider",
+                    "p",
+                    "--model",
+                    "m",
+                    "--category",
+                    "nope",
+                    "--verdict",
+                    "ok",
+                    "--evidence",
+                    "direct"
+                ]
+                .map(String::from)
+            )
+            .is_err()
+        );
+        assert!(
+            parse_record(
+                &[
+                    "--task",
+                    "t",
+                    "--provider",
+                    "p",
+                    "--model",
+                    "m",
+                    "--category",
+                    "test",
+                    "--verdict",
+                    "great",
+                    "--evidence",
+                    "direct"
+                ]
+                .map(String::from)
+            )
+            .is_err()
+        );
+        assert!(
+            parse_record(
+                &[
+                    "--task",
+                    "../evil",
+                    "--provider",
+                    "p",
+                    "--model",
+                    "m",
+                    "--category",
+                    "test",
+                    "--verdict",
+                    "ok",
+                    "--evidence",
+                    "direct"
+                ]
+                .map(String::from)
+            )
+            .is_err()
+        );
+        assert!(
+            parse_record(
+                &[
+                    "--task",
+                    "",
+                    "--provider",
+                    "p",
+                    "--model",
+                    "m",
+                    "--category",
+                    "test",
+                    "--verdict",
+                    "ok",
+                    "--evidence",
+                    "direct"
+                ]
+                .map(String::from)
+            )
+            .is_err()
+        );
         // missing/blocked/unavailable are valid and distinct from fail
         for v in ["ok", "partial", "fail", "blocked", "missing", "unavailable"] {
-            let a = ["--task", "t", "--provider", "p", "--model", "m", "--category", "test", "--verdict", v, "--evidence", "direct"].map(String::from);
+            let a = [
+                "--task",
+                "t",
+                "--provider",
+                "p",
+                "--model",
+                "m",
+                "--category",
+                "test",
+                "--verdict",
+                v,
+                "--evidence",
+                "direct",
+            ]
+            .map(String::from);
             assert!(parse_record(&a).is_ok(), "{v}");
         }
     }
@@ -421,15 +521,58 @@ mod tests {
         // Literal observed T3 delegated-task ID (127 chars): must be accepted.
         let id = "node:delegated-task:command%3Amcp%3Ad4694301-3125-4b66-8d54-2b3158afcf5a%3Adelegate-task%3A500f3994-4df3-4306-a536-05d9bc83f263";
         assert_eq!(id.len(), 127);
-        let a = ["--task", id, "--provider", "p", "--model", "m", "--category", "test", "--verdict", "ok", "--evidence", "direct"].map(String::from);
+        let a = [
+            "--task",
+            id,
+            "--provider",
+            "p",
+            "--model",
+            "m",
+            "--category",
+            "test",
+            "--verdict",
+            "ok",
+            "--evidence",
+            "direct",
+        ]
+        .map(String::from);
         assert!(parse_record(&a).is_ok());
         // Bounds still hold: 256 ok, 257 rejected; traversal still rejected.
         let max = "t".repeat(256);
         let over = "t".repeat(257);
-        for (task, ok) in [(max.as_str(), true), (over.as_str(), false), ("a/b", false), ("a%b%3A", true)] {
-            let a = ["--task", task, "--provider", "p", "--model", "m", "--category", "test", "--verdict", "ok", "--evidence", "direct"].map(String::from);
+        for (task, ok) in [
+            (max.as_str(), true),
+            (over.as_str(), false),
+            ("a/b", false),
+            ("a%b%3A", true),
+        ] {
+            let a = [
+                "--task",
+                task,
+                "--provider",
+                "p",
+                "--model",
+                "m",
+                "--category",
+                "test",
+                "--verdict",
+                "ok",
+                "--evidence",
+                "direct",
+            ]
+            .map(String::from);
             assert_eq!(parse_record(&a).is_ok(), ok, "{task}");
         }
+    }
+
+    #[test]
+    fn append_refuses_incomplete_tail_without_changing_it() {
+        let base = tmp_base("append-torn");
+        let path = ensure_parent(&base).unwrap();
+        std::fs::write(&path, b"{\"partial\":").unwrap();
+        assert!(append_to(&base, &rec("task-1"), 1).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"partial\":");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -462,7 +605,10 @@ mod tests {
         let err = read_all(&base).unwrap_err();
         assert!(err.message.contains(":2:"), "{}", err.message);
         // Failed reads never delete or modify existing data.
-        assert_eq!(std::fs::read(outcomes_path(&base)).unwrap()[..before.len()], before[..]);
+        assert_eq!(
+            std::fs::read(outcomes_path(&base)).unwrap()[..before.len()],
+            before[..]
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
