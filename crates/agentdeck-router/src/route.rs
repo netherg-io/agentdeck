@@ -2193,6 +2193,7 @@ mod quota_estimate_tests {
             usage_state_path: None,
             decision_model: None,
             decision_provider: None,
+            workflow_eval: crate::policy::WorkflowEvalConfig::default(),
             user_rules: agentdeck_core::settings::UserRules::default(),
             account: [("codex".to_string(), "codex".to_string())]
                 .into_iter()

@@ -15,8 +15,11 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const USAGE: &str = "usage: workflow.mjs init PLAN.json --thread ID | next|stop|resume STATE.json --thread ID\n  | prepare STATE.json STEP --thread ID --source INSTANCE | record STATE.json STEP --thread ID < T3_RESPONSE.json\n  | release STATE.json STEP --thread ID --not-dispatched | eval STATE.json STEP --thread ID [--sample N] [--force]\n\neval is explicit opt-in observational grading of one settled completed step via the configured\ndecision provider (the brief and summary are sent there; only metadata is stored as a child\nreport). record never evaluates, so default workflow use is unchanged. Direct delegate_task\ncalls outside a routed workflow are not covered. --force also evaluates sampled-out steps
-and may incur a first or repeat charge.";
+pub const USAGE: &str = "usage: workflow.mjs init PLAN.json --thread ID | next|stop|resume STATE.json --thread ID\n  | prepare STATE.json STEP --thread ID --source INSTANCE | record STATE.json STEP --thread ID < T3_RESPONSE.json\n  | release STATE.json STEP --thread ID --not-dispatched | eval STATE.json STEP --thread ID [--sample N] [--force]\n  | eval-budget\n\neval is explicit opt-in observational grading of one settled completed step via the configured\ndecision provider (the brief and summary are sent there; only metadata is stored as a child\nreport). record never evaluates, so default workflow use is unchanged. Direct delegate_task\ncalls outside a routed workflow are not covered. --force also evaluates sampled-out steps
+and may incur a first or repeat charge. With workflowEval.auto in the router JSON, record
+spawns a detached eval after a settled success and reports autoEval started|skipped:<reason>,
+additive only when auto is on or the config is invalid. eval-budget prints today's judge
+request count/USD against the workflowEval limits. --force never bypasses the daily budget.";
 const ROLES: &[&str] = &[
     "implementation",
     "research",
@@ -982,6 +985,102 @@ struct Cli {
     force: bool,
 }
 
+/// Daily judge-request budget for `eval`, from the router JSON. Manual evals
+/// always count toward the ledger; a missing or invalid config enforces the
+/// safe defaults (invalid configs only disable auto spawns, never crash).
+fn eval_budget_limit() -> Option<crate::workflow_eval::Budget> {
+    match crate::policy::router_config() {
+        Ok(cfg) if cfg.workflow_eval.error.is_none() => Some(crate::workflow_eval::Budget {
+            max_per_day: cfg.workflow_eval.max_per_day,
+            max_usd_per_day: cfg.workflow_eval.max_usd_per_day,
+            assume_usd_per_eval: cfg.workflow_eval.assume_usd_per_eval,
+        }),
+        _ => Some(crate::workflow_eval::Budget::default()),
+    }
+}
+
+/// Detached auto-eval spawn decision: silent unless a settled success was
+/// just recorded while the feature is on and valid.
+enum AutoEval {
+    Silent,
+    Skipped(String),
+    Start,
+}
+
+fn auto_eval_plan(auto: bool, error: Option<&str>, settled: bool) -> AutoEval {
+    if !settled {
+        return AutoEval::Silent;
+    }
+    if let Some(e) = error {
+        return AutoEval::Skipped(e.to_string());
+    }
+    if !auto {
+        return AutoEval::Silent;
+    }
+    AutoEval::Start
+}
+
+fn maybe_auto_eval(state_file: &std::path::Path, step: &str, thread: &str) -> Option<String> {
+    let cfg = crate::policy::router_config().ok()?.workflow_eval;
+    match auto_eval_plan(cfg.auto, cfg.error.as_deref(), true) {
+        AutoEval::Silent => None,
+        AutoEval::Skipped(reason) => Some(format!("skipped:{reason}")),
+        AutoEval::Start => Some(auto_eval_spawn(state_file, step, thread, cfg.sample)),
+    }
+}
+
+/// Spawn this binary's eval command detached: new session, no stdin, private
+/// 0600 log next to the state. Never waits; any failure is a skip reason,
+/// never a record error.
+fn auto_eval_spawn(state_file: &std::path::Path, step: &str, thread: &str, sample: u64) -> String {
+    use std::os::unix::fs::OpenOptionsExt;
+    let log_path = state_file.with_extension(format!("eval-{step}.log"));
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&log_path)
+        .and_then(|f| {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            f.try_clone().map(|out| (out, f))
+        });
+    let Ok((out, err)) = log else {
+        return "skipped:cannot start evaluator".to_string();
+    };
+    let mut cmd = match std::env::current_exe() {
+        Ok(exe) => std::process::Command::new(exe),
+        Err(_) => return "skipped:cannot start evaluator".to_string(),
+    };
+    cmd.arg("route")
+        .arg("workflow")
+        .arg("eval")
+        .arg(state_file)
+        .arg(step)
+        .arg("--thread")
+        .arg(thread)
+        .arg("--sample")
+        .arg(sample.to_string());
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(out))
+        .stderr(std::process::Stdio::from(err));
+    {
+        use std::os::unix::process::CommandExt as _;
+        // Unsafe: runs after fork in the child; only calls async-signal-safe setsid.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    match cmd.spawn() {
+        Ok(_) => "started".to_string(),
+        Err(_) => "skipped:cannot start evaluator".to_string(),
+    }
+}
+
 /// CLI entry. Returns the process exit code (0, 1, or 2 on usage errors).
 pub async fn run(argv: &[String]) -> i32 {
     match run_inner(argv).await {
@@ -1067,6 +1166,13 @@ fn parse_cli(argv: &[String]) -> Result<(Cli, String, Option<String>, Option<Str
 
 async fn run_inner(argv: &[String]) -> Result<Value, WfError> {
     let (cli, cmd, file, step) = parse_cli(argv)?;
+    if cmd == "eval-budget" {
+        // Global daily counter, no state file needed.
+        return Ok(crate::workflow_eval::budget_report(
+            &crate::outcomes::state_base(),
+            &eval_budget_limit().unwrap_or_default(),
+        ));
+    }
     let thread = cli.thread.clone().unwrap_or_default();
     if thread.is_empty() || file.as_deref().unwrap_or("").is_empty() {
         return Err(WfError::usage(USAGE));
@@ -1133,9 +1239,20 @@ async fn run_inner(argv: &[String]) -> Result<Value, WfError> {
                 .map_err(|e| WfError::fail(e.to_string()))?;
             let response: Value =
                 serde_json::from_str(&input).map_err(|e| WfError::fail(e.to_string()))?;
-            let out = record(&mut state, &step, &response)?;
-            if out.get("unchanged").is_none() {
+            let mut out = record(&mut state, &step, &response)?;
+            let changed = out.get("unchanged").is_none();
+            if changed {
                 write_state(&path, &state, false)?;
+            }
+            if changed && out.get("state") == Some(&Value::from("completed")) {
+                // Release the state lock before spawning: the detached eval
+                // locks the same state file, and record never waits for it.
+                drop(_lock);
+                if let Some(auto) = maybe_auto_eval(&path, &step, &thread) {
+                    out.as_object_mut()
+                        .expect("record returns an object")
+                        .insert("autoEval".into(), Value::from(auto));
+                }
             }
             Ok(out)
         }
@@ -1146,6 +1263,7 @@ async fn run_inner(argv: &[String]) -> Result<Value, WfError> {
             let opts = crate::workflow_eval::EvalOptions {
                 sample: cli.sample.unwrap_or(1),
                 force: cli.force,
+                budget: eval_budget_limit(),
             };
             crate::workflow_eval::eval_step(&mut state, &step, &opts, |s| {
                 write_state(&path, s, false)
@@ -1187,6 +1305,33 @@ mod state_write_tests {
         let back: State = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert_eq!(back.run_id, state.run_id);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod auto_eval_tests {
+    use super::*;
+
+    #[test]
+    fn spawn_decision_stays_silent_unless_settled_and_opted_in() {
+        assert!(matches!(
+            auto_eval_plan(false, None, true),
+            AutoEval::Silent
+        ));
+        assert!(matches!(
+            auto_eval_plan(true, None, false),
+            AutoEval::Silent
+        ));
+        assert!(matches!(auto_eval_plan(true, None, true), AutoEval::Start));
+        match auto_eval_plan(true, Some("workflowEval.sample must be 1-1024"), true) {
+            AutoEval::Skipped(r) => assert!(r.contains("workflowEval.sample")),
+            _ => panic!("invalid config must skip with a reason"),
+        }
+        // Invalid config disables auto spawns even when auto was requested.
+        assert!(matches!(
+            auto_eval_plan(false, Some("bad"), true),
+            AutoEval::Skipped(_)
+        ));
     }
 }
 
