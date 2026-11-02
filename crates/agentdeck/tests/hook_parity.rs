@@ -344,18 +344,58 @@ fn check_case(name: &str, fx: &Fixture, harness: &str, input: &serde_json::Value
         String::from_utf8_lossy(&rout)
     );
     // One fixture dir, one record per run: the tail after the Node record is
-    // the Rust record and must match it.
+    // the Rust record and must match it, up to the additive-only
+    // `quotaEstimate` provenance per ranking entry (same allowance as
+    // route_parity.rs: strip it from both sides, require everything else
+    // to match, then validate the new field's shape on the Rust side).
     let all = decisions(&fx.dir);
     assert_eq!(
         node_records,
         &all[..node_records.len()],
         "{name}: node record not stable"
     );
-    assert_eq!(
-        node_records,
-        all[node_records.len()..],
-        "{name}: decisions.jsonl differs"
-    );
+    let rust_records = &all[node_records.len()..];
+    if node_records != rust_records {
+        let mut n = node_records.clone();
+        let mut r = rust_records.to_vec();
+        for records in [&mut n, &mut r] {
+            for rec in records.iter_mut() {
+                if let Some(ranking) = rec
+                    .get_mut("ranking")
+                    .and_then(|v| v.as_array_mut())
+                {
+                    for entry in ranking.iter_mut() {
+                        if let Some(obj) = entry.as_object_mut() {
+                            obj.remove("quotaEstimate");
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(n, r, "{name}: non-quotaEstimate decisions.jsonl differs");
+        for rec in rust_records {
+            if let Some(ranking) = rec.get("ranking").and_then(|v| v.as_array()) {
+                for entry in ranking {
+                    let q = &entry["quotaEstimate"];
+                    assert!(
+                        ["measured", "estimate", "unknown"]
+                            .contains(&q["basis"].as_str().unwrap_or("")),
+                        "{name}: bad quotaEstimate basis: {q}"
+                    );
+                    assert!(q["detail"].is_string(), "{name}: bad detail: {q}");
+                    assert!(
+                        q["loadUnknown"].is_boolean(),
+                        "{name}: bad loadUnknown: {q}"
+                    );
+                    assert!(q["windows"].is_array(), "{name}: bad windows: {q}");
+                    assert!(
+                        q["balancesUsd"].is_array(),
+                        "{name}: bad balancesUsd: {q}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn delegate_input(
