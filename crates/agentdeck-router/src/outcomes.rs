@@ -1,6 +1,6 @@
 //! Observational coordinator outcome store (no routing effect).
 //!
-//! `agentdeck route outcomes record|list`: append-only JSONL at
+//! `agentdeck route outcomes record|list|evaluate`: append-only JSONL at
 //! `XDG_STATE_HOME/model-route/outcomes.jsonl` (dir `0700`, file `0600`).
 //! One line per assessment; repeats for the same task are revisions, newest
 //! last. Only metadata is stored: no task text, summaries or evidence text.
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::policy::valid_answer;
 
-pub const USAGE: &str = "usage: agentdeck route outcomes record --task ID --provider P --model M --category C --verdict V --evidence E [--source coordinator]\n  agentdeck route outcomes list [--task ID] [--limit N]\n  agentdeck route outcomes evaluate < evaluation.json\n\n  category: implementation|research|review|design|test|general\n  verdict: ok|partial|fail|blocked|missing|unavailable (blocked/missing/unavailable are not failures)\n  evidence: direct|spot-check|test-output|child-report\n  source is always recorded as \"coordinator\"; decider metadata is reserved (null) for future use.\n  repeats for one task append a new revision; appends are file-locked; corrupt lines fail reads (a torn final line is skipped), never deleted.\n\nevaluate reads one JSON object on stdin (max 16 KiB):\n  {\"task\": \"what was asked, 1-2000 chars\", \"evidence\": [{\"id\": \"e1\", \"text\": \"...1-4000 chars...\"} 1-8 items],\n   \"performer\": {\"provider\": \"P\", \"model\": \"M\"}?}\n  It sends that content to the configured decision provider/model (explicit opt-in; standard keys)\n  and prints {verdict: pass|partial|fail|insufficient, confidence, evidenceRefs, judge{provider,model},\n  selfJudged: true|false|null when the performer is unknown, judgeCostUsd: number|null}.\n  Nothing is written anywhere: raw task and evidence text are never persisted. To persist an\n  assessment, run `outcomes record` separately with validated metadata only.";
+pub const USAGE: &str = "usage: agentdeck route outcomes record --task ID --provider P --model M --category C --verdict V --evidence E [--source coordinator]\n  agentdeck route outcomes list [--task ID] [--limit N]\n  agentdeck route outcomes evaluate < evaluation.json\n\n  category: implementation|research|review|design|test|general\n  verdict: ok|partial|fail|blocked|missing|unavailable (blocked/missing/unavailable are not failures)\n  evidence: direct|spot-check|test-output|child-report\n  source is always recorded as \"coordinator\"; decider metadata is reserved (null) for future use.\n  repeats for one task append a new revision; appends are file-locked; corrupt lines fail reads (a torn final line is skipped), never deleted.\n\nevaluate reads one JSON object on stdin (max 16 KiB):\n  {\"task\": \"what was asked, 1-2000 chars\", \"evidence\": [{\"id\": \"e1\", \"text\": \"...1-4000 chars...\"} 1-8 items],\n   \"performer\": {\"provider\": \"P\", \"model\": \"M\"}?}\n  It sends that content to the configured decision provider/model (explicit opt-in; standard keys)\n  and prints {verdict: pass|partial|fail|insufficient, confidence, evidenceConsidered, judge{provider,model},\n  selfJudged: true|null (null means unknown), judgeCostUsd: number|null (null means unreported)}.\n  Nothing is written anywhere: raw task and evidence text are never persisted. To persist an\n  assessment, run `outcomes record` separately with validated metadata only.";
 
 const CATEGORIES: &[&str] = &[
     "implementation",
@@ -496,7 +496,12 @@ fn parse_eval_input(text: &str) -> Result<EvalInput, OutcomeError> {
                 &['_', '.', '-', '/', ':', '+'],
             )?;
             if let Some(provider) = p.get("provider").and_then(|x| x.as_str()) {
-                check_id(provider, "performer provider", MAX_PROVIDER, &['_', '.', '-'])?;
+                check_id(
+                    provider,
+                    "performer provider",
+                    MAX_PROVIDER,
+                    &['_', '.', '-'],
+                )?;
             }
             Some(model.to_string())
         }
@@ -526,25 +531,26 @@ fn build_output(
         .ok_or_else(|| {
             OutcomeError::fail("judge returned no usable outcome answer; nothing was recorded")
         })?;
-    let score = (answer
-        .get("score")
-        .and_then(|s| s.as_f64())
-        .unwrap_or(f64::NAN)
-        .round() as i64)
-        .clamp(0, 3) as usize;
+    let raw_score = answer["score"].as_f64().unwrap();
+    // The last criterion is non-ordinal: averaging scores cannot identify it.
+    let score = if raw_score.fract() == 0.0 {
+        raw_score as usize
+    } else {
+        3
+    };
     let confidence = answer
         .get("confidence")
         .and_then(|c| c.as_f64())
         .unwrap_or(0.0);
-    // Exact model-string match only: fuzzy matches risk false self-judgment flags.
+    // Different provider IDs may be aliases for the same underlying model.
     let self_judged = match &input.performer_model {
-        None => serde_json::Value::Null,
-        Some(p) => serde_json::Value::from(p == model),
+        Some(p) if p.eq_ignore_ascii_case(model) => serde_json::Value::Bool(true),
+        _ => serde_json::Value::Null,
     };
     Ok(serde_json::json!({
         "verdict": OUTCOME_VERDICTS[score],
         "confidence": confidence,
-        "evidenceRefs": input.evidence.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+        "evidenceConsidered": input.evidence.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
         "judge": {"provider": provider, "model": model},
         "selfJudged": self_judged,
         "judgeCostUsd": cost.filter(|c| c.is_finite()).map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
@@ -554,7 +560,9 @@ fn build_output(
 
 async fn evaluate_cli() -> Result<serde_json::Value, OutcomeError> {
     let mut buf = String::new();
-    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+    std::io::stdin()
+        .take((MAX_EVAL_STDIN + 1) as u64)
+        .read_to_string(&mut buf)
         .map_err(|e| OutcomeError::fail(format!("cannot read stdin: {e}")))?;
     evaluate_json(&buf).await
 }
@@ -873,10 +881,12 @@ mod tests {
         // Oversize stdin and evidence text are usage errors, never sent anywhere.
         assert!(parse_eval_input(&"x".repeat(MAX_EVAL_STDIN + 1)).is_err());
         let big = "y".repeat(MAX_EVAL_TEXT + 1);
-        assert!(parse_eval_input(&format!(
-            r#"{{"task": "t", "evidence": [{{"id": "e1", "text": "{big}"}}]}}"#
-        ))
-        .is_err());
+        assert!(
+            parse_eval_input(&format!(
+                r#"{{"task": "t", "evidence": [{{"id": "e1", "text": "{big}"}}]}}"#
+            ))
+            .is_err()
+        );
         // Bad performer identity is rejected before any judge call.
         assert!(parse_eval_input(
             r#"{"task": "t", "evidence": [{"id": "e1", "text": "x"}], "performer": {"model": "a/b c"}}"#
@@ -888,32 +898,52 @@ mod tests {
     #[test]
     fn evaluate_maps_verdicts_and_never_echoes_raw_text() {
         let input = parse_eval_input(&eval_input("ship it", &["a", "b"])).unwrap();
-        for (score, verdict) in [(0.0, "fail"), (1.0, "partial"), (2.0, "pass"), (3.0, "insufficient")] {
+        for (score, verdict) in [
+            (0.0, "fail"),
+            (1.0, "partial"),
+            (2.0, "pass"),
+            (3.0, "insufficient"),
+        ] {
             let answers = serde_json::json!({"outcome": {"score": score, "confidence": 0.7}});
             let out = build_output(&input, &answers, Some(0.002), "openrouter", "j/judge").unwrap();
             assert_eq!(out["verdict"], verdict);
             assert_eq!(out["confidence"], 0.7);
-            assert_eq!(out["evidenceRefs"], serde_json::json!(["a", "b"]));
-            assert_eq!(out["judge"], serde_json::json!({"provider": "openrouter", "model": "j/judge"}));
+            assert_eq!(out["evidenceConsidered"], serde_json::json!(["a", "b"]));
+            assert_eq!(
+                out["judge"],
+                serde_json::json!({"provider": "openrouter", "model": "j/judge"})
+            );
             assert!(out["selfJudged"].is_null()); // performer unknown
             assert_eq!(out["judgeCostUsd"], 0.002);
             // No raw evidence text leaks into the structured result.
             assert!(!serde_json::to_string(&out).unwrap().contains("did a"));
         }
+        let ambiguous = serde_json::json!({"outcome": {"score": 1.5, "confidence": 0.7}});
+        assert_eq!(
+            build_output(&input, &ambiguous, None, "p", "m").unwrap()["verdict"],
+            "insufficient"
+        );
+        let ambiguous = serde_json::json!({"outcome": {"score": 2.9, "confidence": 0.7}});
+        assert_eq!(
+            build_output(&input, &ambiguous, None, "p", "m").unwrap()["verdict"],
+            "insufficient"
+        );
         // Unknown cost reports null, never a fabricated zero.
         let answers = serde_json::json!({"outcome": {"score": 2.0, "confidence": 0.9}});
         let out = build_output(&input, &answers, None, "openrouter", "j/judge").unwrap();
         assert!(out["judgeCostUsd"].is_null());
         // Invalid judge answers fail safely instead of guessing a verdict.
         assert!(build_output(&input, &serde_json::json!({}), None, "p", "m").is_err());
-        assert!(build_output(
-            &input,
-            &serde_json::json!({"outcome": {"score": 9.0, "confidence": 0.5}}),
-            None,
-            "p",
-            "m"
-        )
-        .is_err());
+        assert!(
+            build_output(
+                &input,
+                &serde_json::json!({"outcome": {"score": 9.0, "confidence": 0.5}}),
+                None,
+                "p",
+                "m"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -930,7 +960,7 @@ mod tests {
         let out = build_output(&same, &answers, None, "openrouter", "j/judge").unwrap();
         assert_eq!(out["selfJudged"], true);
         let out = build_output(&other, &answers, None, "openrouter", "j/judge").unwrap();
-        assert_eq!(out["selfJudged"], false);
+        assert!(out["selfJudged"].is_null());
     }
 
     #[tokio::test]
@@ -973,7 +1003,7 @@ mod tests {
         }
         let out = out.unwrap();
         assert_eq!(out["verdict"], "pass");
-        assert_eq!(out["evidenceRefs"], serde_json::json!(["a"]));
+        assert_eq!(out["evidenceConsidered"], serde_json::json!(["a"]));
         assert_eq!(
             out["judge"],
             serde_json::json!({"provider": "openrouter", "model": "t/judge"})
