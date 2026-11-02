@@ -535,3 +535,37 @@ pub fn repair_reasoning(
     out.insert("options".into(), fixed(corrected));
     Ok(Value::Object(out))
 }
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    fn catalog() -> Value {
+        serde_json::json!({"providers": [{
+            "providerInstanceId": "codex",
+            "driverKind": "codex",
+            "models": [
+                {"id": "some-new-model-9", "options": [
+                    {"id": "reasoningEffort", "type": "select", "options": [
+                        {"id": "low"}, {"id": "medium", "isDefault": true}, {"id": "high"}]}]},
+                {"id": "plain-model", "options": []},
+            ],
+        }]})
+    }
+
+    #[test]
+    fn absent_model_fails_closed() {
+        assert!(reasoning_target(&catalog(), "codex", "no-such-model", 1).is_err());
+    }
+
+    #[test]
+    fn catalog_listed_model_without_family_gets_target() {
+        // No roster family, but an exact catalog entry: routable, no invented profile.
+        let t = reasoning_target(&catalog(), "codex", "some-new-model-9", 1).unwrap();
+        assert_eq!(t["model"], "some-new-model-9");
+        assert_eq!(t["options"]["reasoningEffort"], "medium");
+        let bare = reasoning_target(&catalog(), "codex", "plain-model", 2).unwrap();
+        assert_eq!(bare["model"], "plain-model");
+        assert!(bare.get("options").is_none());
+    }
+}

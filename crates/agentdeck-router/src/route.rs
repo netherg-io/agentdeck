@@ -1523,7 +1523,10 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                 }
             );
         }
-        return Ok(if unprofiled.is_empty() { 0 } else { 1 });
+        // UNPROFILED is an informational flag (conservative max-burn quota,
+        // profiled:false in JSON): unknown-profile favorites route on their
+        // Jev judgment like any other, so --check reports and exits 0.
+        return Ok(0);
     }
 
     let mut task = if args.len() == 1 && args[0] == "-" {
@@ -1829,18 +1832,17 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                 .or(policy_ban);
         }
         let probs = a.get("probabilities");
-        let fit = if profile.is_some() {
-            probs
-                .and_then(|p| p.get("2"))
+        // Jev judges every favorite, including ones without a roster family,
+        // on the honest "unprofiled; capability unknown" criterion above; a
+        // low score still gates them out via MIN_FIT.
+        let fit = probs
+            .and_then(|p| p.get("2"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+            + probs
+                .and_then(|p| p.get("3"))
                 .and_then(Value::as_f64)
-                .unwrap_or(0.0)
-                + probs
-                    .and_then(|p| p.get("3"))
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0)
-        } else {
-            0.0
-        };
+                .unwrap_or(0.0);
         let q = quota(&cfg, &measured, &usage, &load, provider, model, now);
         let spend_zero = fam.as_ref().is_some_and(|f| f.spend_to_zero);
         candidates.push(Candidate {
@@ -2278,6 +2280,32 @@ mod quota_estimate_tests {
         let (_w, _b, basis, sample) = model_costs(&cfg, &m, &acc, "codex", "gpt-6.1-sol");
         assert_eq!(sample, None);
         assert!(basis.contains("conservative estimate"), "{basis}");
+    }
+
+    #[test]
+    fn unknown_model_quota_is_conservative() {
+        let cfg = test_cfg();
+        let m = Measured::default();
+        let acc = codex_acc("Pro 5x", 60.0);
+        // No roster family: quota reserves the highest profiled burn and says
+        // so, instead of faking a cheap observed cost.
+        let (_weekly, burn, basis, sample) =
+            model_costs(&cfg, &m, &acc, "codex", "some-new-model-9");
+        assert_eq!(burn, crate::policy::max_burn());
+        assert_eq!(sample, None);
+        assert!(basis.contains("estimate"), "{basis}");
+        assert!(basis.contains(&burn.to_string()), "{basis}");
+        let q = quota(
+            &cfg,
+            &m,
+            &[acc],
+            &load_known(),
+            "codex",
+            "some-new-model-9",
+            NOW,
+        );
+        assert_eq!(q.estimate_basis, "estimate");
+        assert!(q.cost.is_some(), "conservative cost still gates task sizes");
     }
 
     #[test]

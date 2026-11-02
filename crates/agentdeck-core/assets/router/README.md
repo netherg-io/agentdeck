@@ -13,7 +13,9 @@ same way: `claudeAgent`, `claude_second`, `claude_third` and `claude_fourth` mat
 - Every target's `briefHint` combines the shared delegated-agent policy with any family hint, in that order separated by a blank line. Append the entire string verbatim; hooks require it. The shared policy text lives only in `roster.json` (`briefHint`): no nesting, scope, verification, report format and the `BLOCKED:` contract.
 - `route.mjs --source claudeAgent "<task>"`: explicitly identify the orchestrator; otherwise detected from executable names in the process chain. Other sources: `codex`, `codex_second`, `antigravity`, `opencode`, `claudeAgent_openrouter`. Codex shadow homes identify separate accounts. Unknown source is reported and cannot receive shared-quota protection.
 - `route.mjs --source codex --validate-target PROVIDER MODEL -`: read the complete task from stdin and validate an already selected target. Output includes `validation.allowed` and its reason. A denied target exits 0; malformed input or router failure exits nonzero.
-- `route.mjs --check`: quota, per-size cost and allowed sizes per favorite; exit 1 if a favorite has no family profile.
+- `route.mjs --check`: quota, per-size cost and allowed sizes per favorite; favorites without a family
+  profile are flagged `UNPROFILED` (report-only, exit 0: they route on their Jev judgment with
+  conservative max-burn quota, no manual roster edit required).
 - Tests: `for t in *.test.mjs; do node "$t" || break; done`. All offline, with isolated quota/log/SQLite fixtures and mocked Jev; run `claude-shell-mcp.test.mjs` through `agent-process` (it opens sockets).
 
 Selection policy:
@@ -22,7 +24,11 @@ Selection policy:
 - Custom non-Claude models under T3's Claude harness are rejected when they advertise reasoning: the installed T3 compiler currently ignores their knobs. Use a harness that applies that model's option instead of silently accepting an ineffective setting.
 - Suitability is judged independently per model on four capability levels, from unable to specialized.
   `fit` is the combined probability of adequate/specialized levels; `eligible` requires `fit >= 0.7` and enough
-  quota. Raw values determine eligibility; output rounding cannot admit a candidate below 0.7. Jev scores,
+  quota. Models without a roster family are judged on the same scale against the honest
+  `unprofiled; capability unknown` criterion: an adequate Jev score still makes them eligible, a low one
+  gates them out. They are flagged `profiled: false` (and listed in `unprofiled`), carry no `burn`, and
+  their quota reserves the highest profiled burn, so an unknown cost can only deny, never sneak in.
+  Raw values determine eligibility; output rounding cannot admit a candidate below 0.7. Jev scores,
   confidence and all four probabilities must be in range, with probabilities summing to 1 within 0.02.
   These are model judgments, not calibrated success probabilities. `quality` is the independent
   capability score normalized to 0..1; its top level requires a substantial practical advantage for this
@@ -82,8 +88,9 @@ Selection policy:
 - `reason`, `sourceAccount`, `quality`, `score`, `activeAgents`, `activeLoad` and per-candidate penalties explain the decision.
   `jevConfidence` is the lowest size, difficulty and selected-model confidence. Below 0.4, output includes a
   warning and the top two eligible candidates with their quality and penalties.
-  Target validation requires an exact active, profiled favorite with quota and fit, either the winner or
-  within 0.02 of its score with no higher task cost. The tolerance never restores an expensive near-equal choice.
+  Target validation requires an exact active favorite with quota and fit, either the winner or
+  within 0.02 of its score with no higher task cost. A favorite absent from the saved T3 catalog fails
+  closed (no reasoning target), as does a model outside the active pool. The tolerance never restores an expensive near-equal choice.
   Valid Jev answers are cached for ten minutes by source, full task and judgment context; a trailing known
   `briefHint` is stripped before judging, so `prepare` (bare brief) and validation (brief + hint) share one entry. Target validation
   reuses them and refreshes quota/load, so a retry cannot alternate models just because Jev was asked again.

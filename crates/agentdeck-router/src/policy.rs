@@ -685,8 +685,12 @@ pub fn rank_candidates(
                 0.0
             };
             let cheap_model_bonus = cheap_w * (0.0_f64).max(1.0 - c.burn.unwrap_or(1.0)) * scale;
+            // Unknown-profile models are eligible on the same terms: the
+            // catalog gate already fails closed (a model absent from the
+            // saved T3 catalog gets a reasoning error), Jev judges them on
+            // the honest "unprofiled; capability unknown" criterion, and
+            // quota stays conservative (max burn) via model_costs.
             let eligible = c.allowed
-                && c.profiled
                 && c.reasoning_error.is_none()
                 && c.policy_ban.is_none()
                 && c.fit >= MIN_FIT;
@@ -777,9 +781,6 @@ pub fn validate_target(ranking: &[Ranked], provider: &str, model: &str) -> Valid
     };
     if let Some(ban) = &r.candidate.policy_ban {
         return deny(ban.clone());
-    }
-    if !r.candidate.profiled {
-        return deny("favorite has no capability profile".into());
     }
     if let Some(e) = &r.candidate.reasoning_error {
         return deny(e.clone());
@@ -1040,5 +1041,122 @@ mod user_rules_tests {
         assert_eq!(v.reason, "denied by user rule");
         let clean = ranked_with_ban(None);
         assert!(validate_target(&clean, "a", "gemini-argon-x").allowed);
+    }
+}
+
+#[cfg(test)]
+mod unknown_models_tests {
+    use super::*;
+
+    fn candidate(profiled: bool, fit: f64, allowed: bool) -> Candidate {
+        Candidate {
+            provider: "a".into(),
+            model: "some-new-model-9".into(),
+            profiled,
+            burn: if profiled { Some(1.0) } else { None },
+            target: serde_json::json!({"providerInstanceId": "a", "model": "some-new-model-9"}),
+            reasoning_error: None,
+            no_review: false,
+            policy_ban: None,
+            fit,
+            quality: 0.8,
+            confidence: 0.9,
+            allowed,
+            task_cost: Some(1.0),
+            quota_note: String::new(),
+            active_agents: 0,
+            quota_provenance: QuotaProvenance {
+                basis: "estimate",
+                detail: "Pro 5x estimate × burn 12".into(),
+                sample_sessions: None,
+                stale_minutes: None,
+                load_unknown: false,
+                windows: vec![],
+                balances: vec![],
+            },
+        }
+    }
+
+    fn rank_one(c: Candidate) -> Vec<Ranked> {
+        rank_candidates(
+            &RouterConfig {
+                file: String::new(),
+                version: Value::Null,
+                pool: vec![],
+                instance_limits: std::collections::HashMap::new(),
+                usage_state_path: None,
+                decision_model: None,
+                decision_provider: None,
+                user_rules: UserRules::default(),
+                account: std::collections::HashMap::new(),
+                usage_id: std::collections::HashMap::new(),
+                meta: vec![],
+            },
+            vec![c],
+            1,
+            None,
+            (0.05, 0.0, 0.15),
+        )
+    }
+
+    #[test]
+    fn no_profile_is_eligible_when_judged_adequate() {
+        let ranked = rank_one(candidate(false, 0.85, true));
+        assert!(
+            ranked[0].eligible,
+            "unprofiled but adequate must be routable"
+        );
+        assert!(!ranked[0].candidate.profiled);
+        assert!(ranked[0].candidate.burn.is_none());
+        let v = validate_target(&ranked, "a", "some-new-model-9");
+        assert!(v.allowed, "validation must not demand a roster profile");
+    }
+
+    #[test]
+    fn low_fit_unprofiled_stays_out() {
+        let ranked = rank_one(candidate(false, 0.5, true));
+        assert!(!ranked[0].eligible);
+        let v = validate_target(&ranked, "a", "some-new-model-9");
+        assert!(!v.allowed);
+        assert!(v.reason.contains("fit"), "{}", v.reason);
+    }
+
+    #[test]
+    fn quota_denied_unprofiled_stays_out() {
+        let ranked = rank_one(candidate(false, 0.9, false));
+        assert!(!ranked[0].eligible);
+        let v = validate_target(&ranked, "a", "some-new-model-9");
+        assert!(!v.allowed);
+        assert!(v.reason.contains("quota"), "{}", v.reason);
+    }
+
+    #[test]
+    fn regex_ban_denies_unprofiled() {
+        let mut c = candidate(false, 0.9, true);
+        c.policy_ban = Some(NO_REVIEW_BAN.into());
+        let ranked = rank_one(c);
+        assert!(!ranked[0].eligible);
+        let v = validate_target(&ranked, "a", "some-new-model-9");
+        assert!(!v.allowed);
+        assert_eq!(v.reason, NO_REVIEW_BAN);
+    }
+
+    #[test]
+    fn reasoning_error_blocks_unknown_catalog_model() {
+        let mut c = candidate(false, 0.9, true);
+        c.reasoning_error =
+            Some("refresh orchestrator_capabilities catalog: no model a/some-new-model-9".into());
+        let ranked = rank_one(c);
+        assert!(!ranked[0].eligible);
+        let v = validate_target(&ranked, "a", "some-new-model-9");
+        assert!(!v.allowed);
+    }
+
+    #[test]
+    fn unknown_target_fails_closed() {
+        let ranked = rank_one(candidate(false, 0.9, true));
+        let v = validate_target(&ranked, "a", "no-such-model");
+        assert!(!v.allowed);
+        assert_eq!(v.reason, "not an exact active favorite");
     }
 }
