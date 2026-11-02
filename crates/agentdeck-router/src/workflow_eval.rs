@@ -14,23 +14,15 @@
 //! verdict reflects the child's own report, not independent proof. Raw task
 //! text, evidence text and summaries are never stored.
 //!
-//! Cost control: explicit invocation only, deterministic 1-in-N sampling
-//! (`--sample N`), bounded inputs (over-long brief/summary are truncated and
-//! the truncation is reported, never silent), and idempotency before any
-//! network: a step whose T3 task already has a decider line is reported
-//! `already-recorded` without calling the judge again.
+//! Cost control: explicit invocation, deterministic sampling, bounded inputs,
+//! and a private per-task journal locked across processes. An `unknown` claim
+//! is fsynced before checkpointing the workflow and before contacting the judge.
+//! Process exit releases the lock, but leaves the claim terminal on retry.
+//! `--force` accepts a possible repeat bill; concurrent calls never bypass the
+//! lock. A completed outcome always prevents another request, even with force.
 //!
-//! Crash safety: the judge call is a billed side effect, so a result that was
-//! obtained but could not be recorded is reported `unknown` and never
-//! silently retried; a judge call that returned no usable result is reported
-//! `failed`. Both are terminal for that task id unless the coordinator passes
-//! `--force`, which explicitly accepts a possible double bill. Interrupted,
-//! blocked and failed steps are never sent to the judge and are never
-//! reported as model failures.
-//!
-//! Coverage: settled `completed` steps of routed-workflow runs only. Direct
-//! `delegate_task` calls outside a routed workflow are not covered by this
-//! trigger. Outcomes never influence routing rankings.
+//! Only settled completed workflow tasks are eligible. Judge failures preserve
+//! completion. Outcomes reflect child reports and never influence rankings.
 
 use crate::outcomes;
 use crate::workflow::{EvalStatus, State, WfError};
@@ -169,15 +161,37 @@ fn marker(status: &str, task_id: &str, reason: Option<String>, truncated: bool) 
     }
 }
 
-/// Run one observational evaluation. Returns the JSON body; the caller
-/// persists `state` when the marker changed. Never bills twice for one task:
-/// the outcomes store is checked before any judge call, and `failed`/`unknown`
-/// markers are terminal unless `force` explicitly accepts a possible re-bill.
+/// Evaluate under a durable per-task claim. The caller checkpoints the
+/// workflow before dispatch; journal replay also protects stale workflow copies.
 pub async fn eval_step(
     state: &mut State,
     id: &str,
     opts: &EvalOptions,
+    checkpoint: impl FnMut(&State) -> Result<(), WfError>,
 ) -> Result<(serde_json::Value, bool), WfError> {
+    eval_step_with(
+        state,
+        id,
+        opts,
+        &outcomes::state_base(),
+        checkpoint,
+        |input| async move { outcomes::evaluate_json(&input).await },
+    )
+    .await
+}
+
+async fn eval_step_with<F, Fut>(
+    state: &mut State,
+    id: &str,
+    opts: &EvalOptions,
+    base: &std::path::Path,
+    mut checkpoint: impl FnMut(&State) -> Result<(), WfError>,
+    judge: F,
+) -> Result<(serde_json::Value, bool), WfError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value, outcomes::OutcomeError>>,
+{
     if !state.plan.steps.iter().any(|s| s.id == id) {
         return Err(WfError::usage(format!("unknown step {id}")));
     }
@@ -191,42 +205,37 @@ pub async fn eval_step(
         }
     };
     let truncated = target.brief_truncated || target.summary_truncated;
-    // A stale marker from a previous task id on this step is ignored: the
-    // step was re-prepared and re-recorded, so it is a new billable unit.
-    if !opts.force
-        && let Some(m) = state.progress.iter().find(|p| p.id == id).and_then(|p| p.eval.clone())
-        && m.task_id == target.task_id
-        && matches!(
-            m.status.as_str(),
-            "evaluated" | "skipped" | "failed" | "unknown"
-        )
+    let Some(mut claim) = Claim::open(base, &target.task_id)? else {
+        return Ok((
+            serde_json::json!({"step":id, "taskId":target.task_id,
+            "eval":{"status":"in-flight", "reason":"another evaluation holds this task claim"}}),
+            false,
+        ));
+    };
+    // Check under the same task lock as dispatch. An unreadable store fails closed.
+    if outcomes::has_decider_for(base, &target.task_id)
+        .map_err(|_| WfError::fail("cannot read outcomes; evaluation was not dispatched"))?
     {
         return Ok((
-            serde_json::json!({"step": id, "taskId": target.task_id,
-                "eval": {"status": m.status, "reason": m.reason, "truncated": m.truncated, "verdict": m.verdict}}),
+            serde_json::json!({"step":id, "taskId":target.task_id,
+            "eval":{"status":"already-recorded"}}),
             false,
         ));
     }
-    let base = outcomes::state_base();
-    // Idempotency before any network: never double-bill or double-record.
-    // An unreadable store fails closed here, before any side effect.
-    match outcomes::has_decider_for(&base, &target.task_id) {
-        Ok(true) => {
-            return Ok((
-                serde_json::json!({"step": id, "taskId": target.task_id,
-                    "eval": {"status": "already-recorded",
-                        "reason": "a decider line already exists for this task; not billed again"}}),
-                false,
-            ));
-        }
-        Ok(false) => {}
-        Err(e) => {
-            return Err(if e.usage {
-                WfError::usage(e.message)
-            } else {
-                WfError::fail(e.message)
-            });
-        }
+    let previous = claim.last(&target.task_id)?.or_else(|| {
+        state
+            .progress
+            .iter()
+            .find(|p| p.id == id)
+            .and_then(|p| p.eval.clone())
+            .filter(|m| m.task_id == target.task_id)
+    });
+    if !opts.force
+        && let Some(m) = previous
+    {
+        set_marker(state, id, m.clone());
+        checkpoint(state)?;
+        return Ok((response(id, &m), false));
     }
     if !opts.force && !sampled(&target.task_id, opts.sample) {
         let m = marker(
@@ -235,56 +244,62 @@ pub async fn eval_step(
             Some(format!("sampled out (1-in-{})", opts.sample)),
             truncated,
         );
+        claim.save(&m)?;
         set_marker(state, id, m.clone());
-        return Ok((
-            serde_json::json!({"step": id, "taskId": target.task_id,
-                "eval": {"status": "skipped", "reason": m.reason, "truncated": truncated}}),
-            true,
-        ));
+        checkpoint(state)?;
+        return Ok((response(id, &m), true));
     }
+    // Unknown is deliberate: a crash cannot tell us whether the provider billed.
+    let pending = marker(
+        "unknown",
+        &target.task_id,
+        Some("judge request may have been sent; cost unknown; not retried".into()),
+        truncated,
+    );
+    claim.save(&pending)?;
+    set_marker(state, id, pending);
+    checkpoint(state)?;
     let input = serde_json::json!({
         "task": target.brief,
         "evidence": [{"id": "summary", "text": target.summary}],
         "performer": {"provider": target.provider, "model": target.model},
     });
-    let judged = match outcomes::evaluate_json(&input.to_string()).await {
+    let judged = match judge(input.to_string()).await {
         Ok(v) => v,
-        Err(e) => {
-            // No usable result: report failed, never invent a verdict. The
-            // call may or may not have billed, so this is terminal without
-            // --force rather than silently retried.
-            let mut m = marker("failed", &target.task_id, Some(short(&e.message, 200)), truncated);
-            m.verdict = None;
-            set_marker(state, id, m.clone());
-            return Ok((
-                serde_json::json!({"step": id, "taskId": target.task_id,
-                    "eval": {"status": "failed", "reason": m.reason, "truncated": truncated}}),
-                true,
-            ));
+        Err(_) => {
+            return finish(
+                state,
+                id,
+                &mut claim,
+                &mut checkpoint,
+                marker(
+                    "failed",
+                    &target.task_id,
+                    Some("judge failed; request cost unknown; not retried".into()),
+                    truncated,
+                ),
+            );
         }
     };
     let eval = match outcomes::parse_decider_eval(&judged.to_string()) {
         Ok(e) => e,
-        Err(e) => {
-            let m = marker(
-                "failed",
-                &target.task_id,
-                Some(short(&e.message, 200)),
-                truncated,
+        Err(_) => {
+            return finish(
+                state,
+                id,
+                &mut claim,
+                &mut checkpoint,
+                marker(
+                    "failed",
+                    &target.task_id,
+                    Some("judge returned invalid metadata; cost unknown; not retried".into()),
+                    truncated,
+                ),
             );
-            set_marker(state, id, m.clone());
-            return Ok((
-                serde_json::json!({"step": id, "taskId": target.task_id,
-                    "eval": {"status": "failed", "reason": m.reason, "truncated": truncated}}),
-                true,
-            ));
         }
     };
-    // Crash window: the judge already billed, the line is not yet stored. If
-    // this append fails, report unknown and never silently retry the billed
-    // side effect; --force is the only way back, with a possible double bill.
     match outcomes::record_workflow_decider_to(
-        &base,
+        base,
         &outcomes::WorkflowDecider {
             task: &target.task_id,
             category: &target.category,
@@ -299,32 +314,137 @@ pub async fn eval_step(
         Ok(path) => {
             let mut m = marker("evaluated", &target.task_id, None, truncated);
             m.verdict = Some(eval.verdict.clone());
-            set_marker(state, id, m);
-            Ok((
-                serde_json::json!({"step": id, "taskId": target.task_id,
-                    "eval": {"status": "evaluated", "verdict": eval.verdict,
-                        "confidence": eval.confidence,
-                        "truncated": truncated,
-                        "file": path.display().to_string()}}),
-                true,
-            ))
+            let (mut out, changed) = finish(state, id, &mut claim, &mut checkpoint, m)?;
+            out["eval"]["confidence"] = serde_json::json!(eval.confidence);
+            out["eval"]["file"] = serde_json::json!(path);
+            Ok((out, changed))
         }
-        Err(e) => {
-            let m = marker(
+        Err(_) => finish(
+            state,
+            id,
+            &mut claim,
+            &mut checkpoint,
+            marker(
                 "unknown",
                 &target.task_id,
-                Some(short(&e.message, 200)),
+                Some("outcome was not stored; request cost unknown; not retried".into()),
                 truncated,
-            );
-            set_marker(state, id, m.clone());
-            Ok((
-                serde_json::json!({"step": id, "taskId": target.task_id,
-                    "eval": {"status": "unknown",
-                        "reason": "the judge was billed but the record was not stored; not retried",
-                        "detail": m.reason, "truncated": truncated}}),
-                true,
-            ))
+            ),
+        ),
+    }
+}
+
+fn response(id: &str, m: &EvalStatus) -> serde_json::Value {
+    serde_json::json!({"step":id, "taskId":m.task_id, "eval":{
+        "status":m.status, "reason":m.reason, "truncated":m.truncated, "verdict":m.verdict}})
+}
+
+fn finish(
+    state: &mut State,
+    id: &str,
+    claim: &mut Claim,
+    checkpoint: &mut impl FnMut(&State) -> Result<(), WfError>,
+    m: EvalStatus,
+) -> Result<(serde_json::Value, bool), WfError> {
+    claim.save(&m)?;
+    set_marker(state, id, m.clone());
+    checkpoint(state)?;
+    Ok((response(id, &m), true))
+}
+
+/// Stable inode: never rename/unlink a locked claim or truncate past an unknown
+/// marker. A torn append fails closed instead of looking like a fresh task.
+struct Claim {
+    file: std::fs::File,
+    dir: std::path::PathBuf,
+}
+
+impl Claim {
+    fn open(base: &std::path::Path, task: &str) -> Result<Option<Self>, WfError> {
+        use sha2::{Digest, Sha256};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+        let dir = base.join("model-route/workflow-evals");
+        let fail = |_| WfError::fail("cannot open private evaluation claim; not dispatched");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .map_err(fail)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(fail)?;
+        let path = dir.join(format!("{:x}.jsonl", Sha256::digest(task.as_bytes())));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(fail)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(fail)?;
+        if !file.metadata().map_err(fail)?.is_file() {
+            return Err(WfError::fail("evaluation claim is not a regular file"));
         }
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Some(Self { file, dir }));
+            }
+            let error = std::io::Error::last_os_error();
+            match error.kind() {
+                std::io::ErrorKind::WouldBlock => return Ok(None),
+                std::io::ErrorKind::Interrupted => continue,
+                _ => return Err(fail(error)),
+            }
+        }
+    }
+
+    fn last(&mut self, task: &str) -> Result<Option<EvalStatus>, WfError> {
+        use std::io::Read;
+        let invalid = || WfError::fail("unreadable evaluation claim; not dispatched");
+        let mut text = String::new();
+        (&mut self.file)
+            .take(1_048_577)
+            .read_to_string(&mut text)
+            .map_err(|_| invalid())?;
+        if text.len() > 1_048_576 || !text.is_empty() && !text.ends_with('\n') {
+            return Err(invalid());
+        }
+        let mut last = None;
+        for line in text.lines() {
+            let m: EvalStatus = serde_json::from_str(line).map_err(|_| invalid())?;
+            if m.task_id != task
+                || !matches!(
+                    m.status.as_str(),
+                    "unknown" | "failed" | "skipped" | "evaluated"
+                )
+            {
+                return Err(invalid());
+            }
+            last = Some(m);
+        }
+        Ok(last)
+    }
+
+    fn save(&mut self, m: &EvalStatus) -> Result<(), WfError> {
+        use std::io::Write;
+        let fail =
+            |_| WfError::fail("cannot persist evaluation claim; request cost may be unknown");
+        let mut text = serde_json::to_vec(m).expect("evaluation metadata serializes");
+        text.push(b'\n');
+        self.file.write_all(&text).map_err(fail)?;
+        self.file.sync_all().map_err(fail)?;
+        // Persist new directory entries as well as contents, before any network.
+        for dir in [
+            self.dir.as_path(),
+            self.dir.parent().unwrap(),
+            self.dir.parent().unwrap().parent().unwrap(),
+        ] {
+            std::fs::File::open(dir)
+                .and_then(|f| f.sync_all())
+                .map_err(fail)?;
+        }
+        Ok(())
     }
 }
 
@@ -334,367 +454,597 @@ fn set_marker(state: &mut State, id: &str, m: EvalStatus) {
     }
 }
 
-fn short(s: &str, max: usize) -> String {
-    let t: String = s.chars().take(max).collect();
-    if s.chars().count() > max {
-        format!("{t}…")
-    } else {
-        t
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::workflow::{new_state, prepare, record};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn target() -> serde_json::Value {
-        serde_json::json!({"providerInstanceId": "opencode", "model": "opencode/spark"})
+    struct Temp(PathBuf);
+    impl Temp {
+        fn new(tag: &str) -> Self {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "agentdeck-eval-c2-{}-{tag}-{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
     }
-
-    fn plan(task: &str) -> serde_json::Value {
-        serde_json::json!({"title": "t", "steps": [{"id": "a", "task": task, "role": "implementation"}]})
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
     }
-
-    fn prepared(task_brief: &str) -> State {
-        let mut s = new_state(&plan(task_brief), "thread-1").unwrap();
-        let t = target();
+    fn settled(task: &str) -> State {
+        let mut s = new_state(
+            &serde_json::json!({"title":"t", "steps":[{"id":"a",
+            "task":"RAW-BRIEF", "role":"implementation"}]}),
+            "thread",
+        )
+        .unwrap();
         prepare(&mut s, "a", "opencode", |_, _| {
-            Ok(serde_json::json!({"target": t}))
+            Ok(serde_json::json!({"target":{
+            "providerInstanceId":"opencode", "model":"opencode/spark"}}))
         })
         .unwrap();
+        record(
+            &mut s,
+            "a",
+            &serde_json::json!({"taskId":task, "status":"completed",
+            "workState":"result_available", "hasPendingChildRuns":false,
+            "providerInstanceId":"opencode", "model":"opencode/spark",
+            "latestTerminalSummary":"RAW-SUMMARY"}),
+        )
+        .unwrap();
+        assert_eq!(s.progress[0].state, "completed");
         s
     }
-
-    fn launched(task: &str) -> serde_json::Value {
-        serde_json::json!({"taskId": task, "status": "running", "workState": "working",
-            "hasPendingChildRuns": false, "providerInstanceId": "opencode", "model": "opencode/spark"})
-    }
-
-    fn done(task: &str, summary: &str) -> serde_json::Value {
-        serde_json::json!({"taskId": task, "status": "completed", "workState": "result_available",
-            "hasPendingChildRuns": false, "providerInstanceId": "opencode",
-            "model": "opencode/spark", "latestTerminalSummary": summary})
-    }
-
-    fn settled(task: &str, summary: &str) -> State {
-        let mut s = prepared("do the thing");
-        record(&mut s, "a", &launched(task)).unwrap();
-        record(&mut s, "a", &done(task, summary)).unwrap();
-        assert_eq!(
-            s.progress.iter().find(|p| p.id == "a").unwrap().state,
-            "completed"
-        );
-        s
-    }
-
-    struct Env {
-        _guard: std::sync::MutexGuard<'static, ()>,
-        keys: Vec<(&'static str, Option<String>)>,
-    }
-
-    impl Env {
-        /// Isolated XDG_STATE_HOME plus mock judge files; restores the
-        /// process environment on drop. Serialized: env is process-global.
-        fn mock(tag: &str, jev_answers: serde_json::Value) -> (Self, std::path::PathBuf) {
-            // A failed sibling test must not wedge the rest: keep the guard.
-            let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let base = std::env::temp_dir().join(format!(
-                "agentdeck-wf-eval-{}-{}",
-                std::process::id(),
-                tag
-            ));
-            let _ = std::fs::remove_dir_all(&base);
-            std::fs::create_dir_all(&base).unwrap();
-            let mock = base.join("mock");
-            std::fs::create_dir_all(&mock).unwrap();
-            std::fs::write(
-                mock.join("router.json"),
-                r#"{"pool": [], "accounts": {}, "version": 1, "decisionModel": "t/judge"}"#,
-            )
-            .unwrap();
-            std::fs::write(
-                mock.join("jev.json"),
-                serde_json::json!({"answers": jev_answers, "usage": {"cost": 0.001}}).to_string(),
-            )
-            .unwrap();
-            let mut env = Self {
-                _guard: guard,
-                keys: Vec::new(),
-            };
-            for (k, v) in [
-                ("XDG_STATE_HOME", base.to_string_lossy().into_owned()),
-                (
-                    "MODEL_ROUTE_ROUTER_JSON",
-                    mock.join("router.json").to_string_lossy().into_owned(),
-                ),
-                (
-                    "AGENTDECK_ROUTE_MOCK_JEV",
-                    mock.join("jev.json").to_string_lossy().into_owned(),
-                ),
-            ] {
-                env.keys.push((k, std::env::var(k).ok()));
-                // SAFETY: held mutex serializes all env mutation in this binary.
-                unsafe { std::env::set_var(k, v) };
-            }
-            (env, base)
-        }
-
-        fn set(&mut self, k: &'static str, v: impl AsRef<std::ffi::OsStr>) {
-            if !self.keys.iter().any(|(ek, _)| *ek == k) {
-                self.keys.push((k, std::env::var(k).ok()));
-            }
-            // SAFETY: held mutex serializes all env mutation in this binary.
-            unsafe { std::env::set_var(k, v) };
-        }
-
-        fn remove(&mut self, k: &'static str) {
-            if !self.keys.iter().any(|(ek, _)| *ek == k) {
-                self.keys.push((k, std::env::var(k).ok()));
-            }
-            // SAFETY: held mutex serializes all env mutation in this binary.
-            unsafe { std::env::remove_var(k) };
-        }
-    }
-
-    impl Drop for Env {
-        fn drop(&mut self) {
-            for (k, prev) in self.keys.drain(..) {
-                // SAFETY: still under the mutex; restores pre-test values.
-                unsafe {
-                    match prev {
-                        Some(v) => std::env::set_var(k, v),
-                        None => std::env::remove_var(k),
-                    }
-                }
-            }
-        }
-    }
-
     fn opts() -> EvalOptions {
         EvalOptions {
             sample: 1,
             force: false,
         }
     }
-
-    fn pass_answers() -> serde_json::Value {
-        serde_json::json!({"outcome": {"score": 2, "confidence": 0.81}})
+    fn answer() -> serde_json::Value {
+        serde_json::json!({"verdict":"pass", "confidence":0.8, "evidenceConsidered":["summary"],
+            "judge":{"provider":"mock", "model":"judge"}, "selfJudged":null, "judgeCostUsd":null})
     }
-
-    #[test]
-    fn unsettled_steps_are_ineligible_without_touching_disk() {
-        let mut s = prepared("work");
-        // Running, blocked and failed are never sent to the judge and never
-        // reported as model failures: eligibility fails before any file read.
-        record(&mut s, "a", &launched("t-1")).unwrap();
-        assert!(eligible(&s, "a").is_err());
-        let mut b = prepared("work");
-        record(&mut b, "a", &done("t-2", "BLOCKED: no key")).unwrap();
-        assert_eq!(
-            b.progress.iter().find(|p| p.id == "a").unwrap().state,
-            "blocked"
-        );
-        assert!(eligible(&b, "a").is_err());
-        assert!(eligible(&s, "nope").is_err());
+    fn snapshot(dir: &Path, s: &State) -> Result<(), WfError> {
+        crate::workflow::write_state(&dir.join("state.json"), s, false)
     }
-
-    #[test]
-    fn truncation_is_explicit_and_bounded() {
-        let big_brief = "b".repeat(outcomes::MAX_EVAL_TASK + 10);
-        let big_summary = "s".repeat(outcomes::MAX_EVAL_TEXT + 10);
-        let s = settled_with(&big_brief, &big_summary);
-        let t = eligible(&s, "a").unwrap();
-        assert!(t.brief_truncated && t.summary_truncated);
-        assert_eq!(t.brief.chars().count(), outcomes::MAX_EVAL_TASK);
-        assert_eq!(t.summary.chars().count(), outcomes::MAX_EVAL_TEXT);
-        let s = settled("t-1", "short");
-        let t = eligible(&s, "a").unwrap();
-        assert!(!t.brief_truncated && !t.summary_truncated);
+    fn calls(dir: &Path) -> usize {
+        std::fs::read_to_string(dir.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .count()
     }
-
-    fn settled_with(brief: &str, summary: &str) -> State {
-        let mut s = prepared(brief);
-        record(&mut s, "a", &launched("t-9")).unwrap();
-        record(&mut s, "a", &done("t-9", summary)).unwrap();
-        s
+    fn counted(dir: &Path) {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("calls"))
+            .unwrap()
+            .write_all(b"request\n")
+            .unwrap();
     }
-
-    #[test]
-    fn sampling_is_deterministic() {
-        assert!(sampled("anything", 1));
-        assert!(sampled("anything", 0));
-        // 1-in-64 cannot pass every id; repeats always agree.
-        assert!(!(0..200).all(|i| sampled(&format!("task-{i}"), 64)));
-        for i in 0..50 {
-            let id = format!("task-{i}");
-            assert_eq!(sampled(&id, 7), sampled(&id, 7));
-        }
-    }
-
-    fn outcomes_text(base: &std::path::Path) -> String {
-        std::fs::read_to_string(base.join("model-route/outcomes.jsonl")).unwrap_or_default()
-    }
-
-    #[tokio::test]
-    async fn mock_judge_records_once_then_never_rebills() {
-        // Other lib tests also swap the mock env vars; retry against a fresh
-        // state dir when cross-talk makes the judge unreadable.
-        for attempt in 0..10 {
-            let (mut env, base) =
-                Env::mock(&format!("once-{attempt}"), pass_answers());
-            let mut s = settled("t-once", "did the thing well");
-            let (out, changed) = eval_step(&mut s, "a", &opts()).await.unwrap();
-            if out["eval"]["status"] != "evaluated" {
-                continue;
-            }
-            assert!(changed);
-            assert_eq!(out["eval"]["verdict"], "pass");
-            assert_eq!(s.progress.iter().find(|p| p.id == "a").unwrap().eval.as_ref().unwrap().status, "evaluated");
-            let text = outcomes_text(&base);
-            assert_eq!(text.lines().count(), 1);
-            // Join keys and attribution present; raw summary text never stored.
-            for needle in [
-                "\"basis\":\"child-report\"",
-                "\"source\":\"decider\"",
-                "\"verdict\":\"pass\"",
-                "t-once",
-            ] {
-                assert!(text.contains(needle), "{needle}");
-            }
-            assert!(!text.contains("did the thing well"));
-            // Repeat with the judge unreachable: the marker replays without
-            // any network, and nothing is billed or written again.
-            env.remove("AGENTDECK_ROUTE_MOCK_JEV");
-            let (out2, changed2) = eval_step(&mut s, "a", &opts()).await.unwrap();
-            assert_eq!(out2["eval"]["status"], "evaluated");
-            assert!(!changed2);
-            assert_eq!(outcomes_text(&base).lines().count(), 1);
-            // Without the marker, the store scan still stops a re-bill.
-            s.progress.iter_mut().find(|p| p.id == "a").unwrap().eval = None;
-            let (out3, changed3) = eval_step(&mut s, "a", &opts()).await.unwrap();
-            assert_eq!(out3["eval"]["status"], "already-recorded");
-            assert!(!changed3);
-            assert_eq!(outcomes_text(&base).lines().count(), 1);
-            return;
-        }
-        panic!("mock judge unreadable after retries (env cross-talk)");
-    }
-
-    #[tokio::test]
-    async fn failed_judge_is_terminal_until_force() {
-        for attempt in 0..10 {
-            let (mut env, base) =
-                Env::mock(&format!("fail-{attempt}"), serde_json::json!({}));
-            let mut s = settled("t-fail", "some work");
-            let (out, changed) = eval_step(&mut s, "a", &opts()).await.unwrap();
-            if out["eval"]["status"] != "failed" {
-                continue;
-            }
-            assert!(changed);
-            assert!(outcomes_text(&base).is_empty());
-            // A working judge still does not re-bill without --force.
-            env.set(
-                "AGENTDECK_ROUTE_MOCK_JEV",
-                base.join("mock/jev.json"),
+    fn wait_marker(dir: &Path, marker: &str, child: &mut Child) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while !dir.join(marker).exists() {
+            assert!(Instant::now() < until, "timeout waiting for {marker}");
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "worker exited before {marker}"
             );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    fn finish(child: &mut Child) -> std::process::ExitStatus {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(Instant::now() < until, "worker timeout");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    fn worker(dir: &Path, mode: &str) -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workflow_eval::tests::process_worker",
+                "--nocapture",
+            ])
+            .env("EVAL_TEST_DIR", dir)
+            .env("EVAL_TEST_MODE", mode)
+            .spawn()
+            .unwrap()
+    }
+    #[tokio::test]
+    async fn process_worker() {
+        let Some(dir) = std::env::var_os("EVAL_TEST_DIR").map(PathBuf::from) else {
+            return;
+        };
+        let mode = std::env::var("EVAL_TEST_MODE").unwrap();
+        if mode == "cli" {
+            // Only this isolated --exact child mutates its environment; no
+            // sibling tests or real provider/credential paths can be reached.
+            let mock = dir.join("mock.json");
+            let router = dir.join("router.json");
             std::fs::write(
-                base.join("mock/jev.json"),
-                serde_json::json!({"answers": pass_answers(), "usage": {}}).to_string(),
+                &mock,
+                serde_json::json!({"answers":{"outcome":{"score":2,"confidence":0.8}},"usage":{}})
+                    .to_string(),
             )
             .unwrap();
-            let (out2, _) = eval_step(&mut s, "a", &opts()).await.unwrap();
-            assert_eq!(out2["eval"]["status"], "failed");
-            assert!(outcomes_text(&base).is_empty());
-            // Explicit --force accepts a possible re-bill and recovers.
-            let (out3, _) = eval_step(
-                &mut s,
-                "a",
-                &EvalOptions {
-                    sample: 1,
-                    force: true,
-                },
+            std::fs::write(
+                &router,
+                r#"{"pool":[],"accounts":{},"version":1,"decisionModel":"t/judge"}"#,
             )
-            .await
             .unwrap();
-            assert_eq!(out3["eval"]["status"], "evaluated");
-            assert_eq!(outcomes_text(&base).lines().count(), 1);
-            return;
-        }
-        panic!("mock judge unreadable after retries (env cross-talk)");
-    }
-
-    #[tokio::test]
-    async fn billed_but_unrecorded_is_unknown_never_retried() {
-        for attempt in 0..10 {
-            let (mut env, base) =
-                Env::mock(&format!("crash-{attempt}"), pass_answers());
-            // Crash window: judge succeeds, but the store cannot accept the
-            // line (dangling symlink where outcomes.jsonl goes). Reads see an
-            // empty store; the append fails.
-            let dir = base.join("model-route");
-            std::fs::create_dir_all(&dir).unwrap();
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(base.join("no-such-dir/outcomes.jsonl"), dir.join("outcomes.jsonl")).unwrap();
-            let mut s = settled("t-crash", "finished work");
-            let (out, changed) = eval_step(&mut s, "a", &opts()).await.unwrap();
-            if out["eval"]["status"] != "unknown" {
-                continue;
+            unsafe {
+                std::env::set_var("XDG_STATE_HOME", &dir);
+                std::env::set_var("MODEL_ROUTE_ROUTER_JSON", &router);
+                std::env::set_var("AGENTDECK_ROUTE_MOCK_JEV", &mock);
             }
-            assert!(changed);
-            // The workflow completion itself survives the grading failure.
-            let p = s.progress.iter().find(|p| p.id == "a").unwrap();
-            assert_eq!(p.state, "completed");
-            assert_eq!(p.eval.as_ref().unwrap().status, "unknown");
-            // Never silently retry the uncertain side effect: with the judge
-            // gone, the status replays from the marker without network.
-            env.remove("AGENTDECK_ROUTE_MOCK_JEV");
-            let (out2, changed2) = eval_step(&mut s, "a", &opts()).await.unwrap();
-            assert_eq!(out2["eval"]["status"], "unknown");
-            assert!(!changed2);
+            let s = settled("cli-task");
+            assert!(s.progress[0].eval.is_none());
+            assert!(!dir.join("model-route").exists());
+            let runs = crate::workflow::workflows_dir();
+            std::fs::create_dir_all(&runs).unwrap();
+            let file = runs.join(format!("{}.json", s.run_id));
+            crate::workflow::write_state(&file, &s, true).unwrap();
+            let args = vec![
+                "eval".into(),
+                file.to_string_lossy().into_owned(),
+                "a".into(),
+                "--thread".into(),
+                "thread".into(),
+            ];
+            assert_eq!(crate::workflow::run(&args).await, 0);
+            let disk: State = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            assert_eq!(disk.progress[0].state, "completed");
+            assert_eq!(disk.progress[0].eval.as_ref().unwrap().status, "evaluated");
+            // Keep a mock configured even on regressions: absent files fail
+            // locally and can never fall through to a real network request.
+            std::fs::remove_file(mock).unwrap();
+            assert_eq!(crate::workflow::run(&args).await, 0);
+            let text = std::fs::read_to_string(dir.join("model-route/outcomes.jsonl")).unwrap();
+            assert_eq!(text.lines().count(), 1);
+            assert!(!text.contains("RAW-"));
             return;
         }
-        panic!("mock judge unreadable after retries (env cross-talk)");
+        // A separately loaded workflow with the same T3 task must share the claim.
+        let mut s = settled("process-task");
+        let mut options = opts();
+        options.force = mode == "concurrent-force";
+        let out = eval_step_with(
+            &mut s,
+            "a",
+            &options,
+            &dir,
+            |s| snapshot(&dir, s),
+            |input| {
+                assert!(input.contains("RAW-SUMMARY"));
+                async {
+                    counted(&dir);
+                    std::fs::write(dir.join("entered"), b"").unwrap();
+                    if mode == "crash" {
+                        std::process::exit(73);
+                    }
+                    if mode == "hold" {
+                        let until = Instant::now() + Duration::from_secs(10);
+                        while !dir.join("release").exists() {
+                            assert!(Instant::now() < until, "fake judge timeout");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    Ok(answer())
+                }
+            },
+        )
+        .await
+        .unwrap()
+        .0;
+        std::fs::write(dir.join(format!("{mode}-result.json")), out.to_string()).unwrap();
+    }
+    #[test]
+    fn cli_uses_durable_evaluation_and_default_record_stays_observational() {
+        let dir = Temp::new("cli");
+        assert!(finish(&mut worker(&dir.0, "cli")).success());
     }
 
-    #[tokio::test]
-    async fn sampled_out_skips_then_force_evaluates() {
-        for attempt in 0..10 {
-            let (env, base) =
-                Env::mock(&format!("sample-{attempt}"), pass_answers());
-            let _env = env;
-            // Find a task id this N samples out (deterministic per id).
-            let (tid, n) = (0..500)
-                .flat_map(|i| (2..=16u64).map(move |n| (format!("sampled-{i}"), n)))
-                .find(|(tid, n)| !sampled(tid, *n))
+    #[test]
+    fn interrupted_process_never_rebills_on_retry() {
+        let dir = Temp::new("crash");
+        let mut first = worker(&dir.0, "crash");
+        assert_eq!(finish(&mut first).code(), Some(73));
+        assert!(finish(&mut worker(&dir.0, "retry")).success());
+        assert_eq!(
+            calls(&dir.0),
+            1,
+            "retry billed an interrupted request twice"
+        );
+        let out: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.0.join("retry-result.json")).unwrap())
                 .unwrap();
-            let mut s = settled(&tid, "work done");
-            let sampling = EvalOptions {
-                sample: n,
-                force: false,
-            };
-            let (out, changed) = eval_step(&mut s, "a", &sampling).await.unwrap();
-            if out["eval"]["status"] != "skipped" {
-                continue;
+        assert_eq!(out["eval"]["status"], "unknown");
+    }
+    #[test]
+    fn simultaneous_processes_send_exactly_one_request() {
+        let dir = Temp::new("concurrent");
+        let mut first = worker(&dir.0, "hold");
+        wait_marker(&dir.0, "entered", &mut first);
+        let mut second = worker(&dir.0, "concurrent");
+        // Second must return while the first judge is still in flight.
+        let second_status = finish(&mut second);
+        let forced_status = finish(&mut worker(&dir.0, "concurrent-force"));
+        assert!(forced_status.success());
+        std::fs::write(dir.0.join("release"), b"").unwrap();
+        assert!(finish(&mut first).success());
+        assert!(second_status.success());
+        assert_eq!(calls(&dir.0), 1, "concurrent evaluators both billed");
+        assert!(finish(&mut worker(&dir.0, "retry")).success());
+        assert_eq!(calls(&dir.0), 1);
+    }
+    #[tokio::test]
+    async fn durable_checkpoint_precedes_judge_and_state_errors_fail_closed() {
+        let dir = Temp::new("checkpoint");
+        let mut s = settled("checkpoint-task");
+        let out = eval_step_with(
+            &mut s,
+            "a",
+            &opts(),
+            &dir.0,
+            |s| snapshot(&dir.0, s),
+            |_| async {
+                let disk: State =
+                    serde_json::from_slice(&std::fs::read(dir.0.join("state.json")).unwrap())
+                        .unwrap();
+                assert_eq!(disk.progress[0].eval.as_ref().unwrap().status, "unknown");
+                Ok(answer())
+            },
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(out["eval"]["status"], "evaluated");
+        let mut s = settled("write-error-task");
+        snapshot(&dir.0, &s).unwrap();
+        let blocked = dir
+            .0
+            .join("state.json")
+            .with_extension(format!("json.{}.tmp", std::process::id()));
+        std::fs::create_dir(&blocked).unwrap();
+        let out = eval_step_with(
+            &mut s,
+            "a",
+            &opts(),
+            &dir.0,
+            |s| snapshot(&dir.0, s),
+            |_| async {
+                panic!("judge called after failed workflow checkpoint");
+            },
+        )
+        .await;
+        assert!(out.is_err());
+        assert_eq!(s.progress[0].state, "completed");
+        let disk: State =
+            serde_json::from_slice(&std::fs::read(dir.0.join("state.json")).unwrap()).unwrap();
+        assert_eq!(
+            disk.progress[0].task_id.as_deref(),
+            Some("write-error-task")
+        );
+        assert_eq!(disk.progress[0].state, "completed");
+        std::fs::remove_dir(blocked).unwrap();
+        let out = eval_step_with(
+            &mut s,
+            "a",
+            &opts(),
+            &dir.0,
+            |s| snapshot(&dir.0, s),
+            |_| async { panic!("checkpoint failure retried") },
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(out["eval"]["status"], "unknown");
+    }
+    fn artifacts(dir: &Path) -> String {
+        let mut text = String::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                text.push_str(&artifacts(&path));
+            } else if path.extension().is_some_and(|e| e == "jsonl") {
+                text.push_str(&std::fs::read_to_string(path).unwrap());
             }
-            assert!(changed);
-            assert!(outcomes_text(&base).is_empty());
-            let (out2, _) = eval_step(
+        }
+        text
+    }
+
+    #[tokio::test]
+    async fn judge_failures_are_terminal_private_and_preserve_completion() {
+        let dir = Temp::new("failures");
+        for (task, invalid) in [("judge-error", false), ("invalid-answer", true)] {
+            let mut s = settled(task);
+            let out = eval_step_with(
                 &mut s,
                 "a",
-                &EvalOptions {
-                    sample: n,
-                    force: true,
+                &opts(),
+                &dir.0,
+                |s| snapshot(&dir.0, s),
+                |_| async {
+                    counted(&dir.0);
+                    if invalid {
+                        Ok(serde_json::json!({"verdict":"RAW-JUDGE-RESPONSE"}))
+                    } else {
+                        Err(outcomes::OutcomeError {
+                            usage: false,
+                            message: "RAW-JUDGE-ERROR RAW-SUMMARY".into(),
+                        })
+                    }
                 },
             )
             .await
-            .unwrap();
-            assert_eq!(out2["eval"]["status"], "evaluated");
-            assert_eq!(outcomes_text(&base).lines().count(), 1);
-            return;
+            .unwrap()
+            .0;
+            assert_eq!(out["eval"]["status"], "failed");
+            assert!(!out.to_string().contains("RAW-"));
+            assert_eq!(s.progress[0].state, "completed");
+            let disk: State =
+                serde_json::from_slice(&std::fs::read(dir.0.join("state.json")).unwrap()).unwrap();
+            assert_eq!(disk.progress[0].state, "completed");
+            let mut stale = settled(task);
+            let replay = eval_step_with(
+                &mut stale,
+                "a",
+                &opts(),
+                &dir.0,
+                |s| snapshot(&dir.0, s),
+                |_| async {
+                    panic!("failed judge retried");
+                },
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(replay["eval"]["status"], "failed");
         }
-        panic!("mock judge unreadable after retries (env cross-talk)");
+        assert_eq!(calls(&dir.0), 2);
+        assert!(!artifacts(&dir.0).contains("RAW-"));
+        // Force is the only way to accept another possibly billed request.
+        let mut force = opts();
+        force.force = true;
+        let mut s = settled("judge-error");
+        let out = eval_step_with(
+            &mut s,
+            "a",
+            &force,
+            &dir.0,
+            |s| snapshot(&dir.0, s),
+            |_| async { Ok(answer()) },
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(out["eval"]["status"], "evaluated");
+    }
+
+    #[tokio::test]
+    async fn sampling_replays_per_task_and_new_task_can_evaluate() {
+        let dir = Temp::new("sample");
+        let tid = (0..100)
+            .map(|n| format!("sample-{n}"))
+            .find(|t| !sampled(t, 16))
+            .unwrap();
+        let mut s = settled(&tid);
+        let sampling = EvalOptions {
+            sample: 16,
+            force: false,
+        };
+        let out = eval_step_with(
+            &mut s,
+            "a",
+            &sampling,
+            &dir.0,
+            |s| snapshot(&dir.0, s),
+            |_| async { panic!("sampled-out judge called") },
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(out["eval"]["status"], "skipped");
+        let mut stale = settled(&tid);
+        let out = eval_step_with(
+            &mut stale,
+            "a",
+            &opts(),
+            &dir.0,
+            |s| snapshot(&dir.0, s),
+            |_| async { panic!("changed sample retried task") },
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(out["eval"]["status"], "skipped");
+        let mut fresh = settled("new-task");
+        fresh.progress[0].eval = s.progress[0].eval.clone();
+        let out = eval_step_with(
+            &mut fresh,
+            "a",
+            &opts(),
+            &dir.0,
+            |s| snapshot(&dir.0, s),
+            |_| async {
+                counted(&dir.0);
+                Ok(answer())
+            },
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(out["eval"]["status"], "evaluated");
+        assert_eq!(calls(&dir.0), 1);
+        let text = artifacts(&dir.0);
+        assert!(text.contains("\"basis\":\"child-report\""));
+        assert!(text.contains("\"judge_cost_usd\":null"));
+        assert!(!text.contains("RAW-"));
+    }
+
+    #[tokio::test]
+    async fn append_failure_and_final_state_failure_never_rebill() {
+        let dir = Temp::new("store-error");
+        std::fs::create_dir_all(dir.0.join("model-route")).unwrap();
+        // Read sees no store; append cannot follow this dangling destination.
+        std::os::unix::fs::symlink(
+            dir.0.join("absent/outcomes"),
+            dir.0.join("model-route/outcomes.jsonl"),
+        )
+        .unwrap();
+        let mut s = settled("append-error");
+        let out = eval_step_with(
+            &mut s,
+            "a",
+            &opts(),
+            &dir.0,
+            |s| snapshot(&dir.0, s),
+            |_| async {
+                counted(&dir.0);
+                Ok(answer())
+            },
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(out["eval"]["status"], "unknown");
+        assert_eq!(s.progress[0].state, "completed");
+        std::fs::remove_file(dir.0.join("model-route/outcomes.jsonl")).unwrap();
+        let mut stale = settled("append-error");
+        let out = eval_step_with(
+            &mut stale,
+            "a",
+            &opts(),
+            &dir.0,
+            |s| snapshot(&dir.0, s),
+            |_| async { panic!("append failure retried") },
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(out["eval"]["status"], "unknown");
+        let mut s = settled("final-state-error");
+        let blocked = dir
+            .0
+            .join("state.json")
+            .with_extension(format!("json.{}.tmp", std::process::id()));
+        let out = eval_step_with(
+            &mut s,
+            "a",
+            &opts(),
+            &dir.0,
+            |s| snapshot(&dir.0, s),
+            |_| async {
+                counted(&dir.0);
+                std::fs::create_dir(&blocked).unwrap();
+                Ok(answer())
+            },
+        )
+        .await;
+        assert!(out.is_err());
+        let disk: State =
+            serde_json::from_slice(&std::fs::read(dir.0.join("state.json")).unwrap()).unwrap();
+        assert_eq!(disk.progress[0].state, "completed");
+        assert_eq!(disk.progress[0].eval.as_ref().unwrap().status, "unknown");
+        std::fs::remove_dir(blocked).unwrap();
+        let mut stale = settled("final-state-error");
+        let mut force = opts();
+        force.force = true;
+        let out = eval_step_with(
+            &mut stale,
+            "a",
+            &force,
+            &dir.0,
+            |s| snapshot(&dir.0, s),
+            |_| async { panic!("recorded outcome retried even with force") },
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(out["eval"]["status"], "already-recorded");
+        assert_eq!(calls(&dir.0), 2);
+    }
+
+    #[tokio::test]
+    async fn corrupt_claim_and_unreadable_store_fail_closed() {
+        let dir = Temp::new("corrupt");
+        let mut claim = Claim::open(&dir.0, "corrupt-task").unwrap().unwrap();
+        use std::io::Write;
+        claim.file.write_all(b"{torn").unwrap();
+        drop(claim);
+        let mut s = settled("corrupt-task");
+        assert!(
+            eval_step_with(
+                &mut s,
+                "a",
+                &opts(),
+                &dir.0,
+                |_| Ok(()),
+                |_| async { panic!("corrupt claim dispatched") }
+            )
+            .await
+            .is_err()
+        );
+        std::fs::create_dir(dir.0.join("model-route/outcomes.jsonl")).unwrap();
+        let mut s = settled("unreadable-store");
+        assert!(
+            eval_step_with(
+                &mut s,
+                "a",
+                &opts(),
+                &dir.0,
+                |_| Ok(()),
+                |_| async { panic!("unreadable store dispatched") }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(s.progress[0].state, "completed");
+    }
+
+    #[tokio::test]
+    async fn ineligible_steps_do_not_touch_disk_and_inputs_remain_bounded() {
+        let dir = Temp::new("ineligible");
+        let mut s = settled("task");
+        for status in ["running", "blocked", "failed", "interrupted"] {
+            s.progress[0].state = status.into();
+            let out = eval_step_with(
+                &mut s,
+                "a",
+                &opts(),
+                &dir.0,
+                |_| panic!("ineligible checkpoint"),
+                |_| async { panic!("ineligible judge") },
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(out["eval"]["status"], "ineligible");
+        }
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
+        s.progress[0].state = "completed".into();
+        s.progress[0].payload.as_mut().unwrap()["task"] =
+            serde_json::json!("é".repeat(outcomes::MAX_EVAL_TASK + 1));
+        s.progress[0].summary = Some(serde_json::json!("界".repeat(outcomes::MAX_EVAL_TEXT + 1)));
+        let target = eligible(&s, "a").unwrap();
+        assert!(target.brief_truncated && target.summary_truncated);
+        assert_eq!(target.brief.chars().count(), outcomes::MAX_EVAL_TASK);
+        assert_eq!(target.summary.chars().count(), outcomes::MAX_EVAL_TEXT);
     }
 }

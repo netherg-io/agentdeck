@@ -122,7 +122,7 @@ pub struct Progress {
 /// is never stored here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EvalStatus {
-    /// evaluated|already-recorded(not persisted)|skipped|failed|unknown.
+    /// evaluated|skipped|failed|unknown (unknown is checkpointed before dispatch).
     pub status: String,
     #[serde(rename = "taskId")]
     pub task_id: String,
@@ -882,25 +882,33 @@ fn state_path(file: &str) -> Result<PathBuf, WfError> {
     Ok(dir.join(base))
 }
 
-fn write_state(file: &Path, state: &State, fresh: bool) -> Result<(), WfError> {
+pub(crate) fn write_state(file: &Path, state: &State, fresh: bool) -> Result<(), WfError> {
     if fresh && file.exists() {
         return Err(WfError::fail(format!("{} already exists", file.display())));
     }
     let tmp = file.with_extension(format!("json.{}.tmp", std::process::id()));
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|e| WfError::fail(e.to_string()))?;
+    let result = (|| {
+        let text = serde_json::to_string_pretty(state).map_err(|e| WfError::fail(e.to_string()))?;
+        f.write_all((text + "\n").as_bytes())
             .map_err(|e| WfError::fail(e.to_string()))?;
-        use std::io::Write;
-        f.write_all((serde_json::to_string_pretty(state).unwrap_or_default() + "\n").as_bytes())
-            .map_err(|e| WfError::fail(e.to_string()))?;
+        f.sync_all().map_err(|e| WfError::fail(e.to_string()))?;
+        std::fs::rename(&tmp, file).map_err(|e| WfError::fail(e.to_string()))?;
+        std::fs::File::open(file.parent().unwrap())
+            .and_then(|d| d.sync_all())
+            .map_err(|e| WfError::fail(e.to_string()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, file).map_err(|e| WfError::fail(e.to_string()))?;
-    Ok(())
+    result
 }
 
 fn load_state(file: &str, thread: &str) -> Result<(PathBuf, State), WfError> {
@@ -943,9 +951,7 @@ pub async fn run(argv: &[String]) -> i32 {
     }
 }
 
-fn parse_cli(
-    argv: &[String],
-) -> Result<(Cli, String, Option<String>, Option<String>), WfError> {
+fn parse_cli(argv: &[String]) -> Result<(Cli, String, Option<String>, Option<String>), WfError> {
     let mut thread = None;
     let mut source = None;
     let mut not_dispatched = false;
@@ -1092,12 +1098,11 @@ async fn run_inner(argv: &[String]) -> Result<Value, WfError> {
                 sample: cli.sample.unwrap_or(1),
                 force: cli.force,
             };
-            let (out, changed) =
-                crate::workflow_eval::eval_step(&mut state, &step, &opts).await?;
-            if changed {
-                write_state(&path, &state, false)?;
-            }
-            Ok(out)
+            crate::workflow_eval::eval_step(&mut state, &step, &opts, |s| {
+                write_state(&path, s, false)
+            })
+            .await
+            .map(|(out, _)| out)
         }
         _ => Err(WfError::usage(USAGE)),
     }
