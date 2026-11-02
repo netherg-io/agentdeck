@@ -526,33 +526,9 @@ fn drift_snapshot_groups_actions_preview_apply() {
         "theme imported, no Import left"
     );
 
-    // T3 group: envelope mismatches (enabled/config) are out of Drift scope
-    // (explicit `t3 sync`); only the importable instance stays, with Import.
-    let t3 = drift_group(&snap, "t3");
     assert!(
-        t3.items
-            .iter()
-            .all(|i| i.actions.iter().all(|a| a.kind != drift::Kind::Apply)),
-        "no envelope Apply rows: {:?}",
-        t3.items.iter().map(|i| &i.key).collect::<Vec<_>>()
-    );
-    assert!(
-        t3.items
-            .iter()
-            .any(|i| i.actions.iter().any(|a| a.kind == drift::Kind::Import))
-    );
-    let pending = drift::preview(&ctx, "t3", "t3import", drift::Kind::Import).expect("preview");
-    assert!(
-        pending.preview.iter().any(|l| l.contains("codex-extra")),
-        "{pending:?}"
-    );
-    let notice = drift::apply(&ctx, &pending);
-    assert!(notice.contains("imported 1"), "{notice}");
-    assert!(
-        Registry::load(&ctx.paths)
-            .unwrap()
-            .get("codex-extra")
-            .is_some()
+        snap.groups.iter().all(|group| group.id != "t3"),
+        "provider inventory is outside the drift page"
     );
 }
 

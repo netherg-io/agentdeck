@@ -310,65 +310,6 @@ fn codex_group(inst: &agentdeck_core::Instance, ctx: &Ctx, main: &Path) -> Group
     }
 }
 
-/// T3 importables only: provider-instance envelopes (enabled/config) are
-/// explicit T3 management (`t3 sync`, the Add-instance page), never Drift,
-/// so an enabled-flag mismatch shows no row, badge or notification here.
-fn t3_group(paths: &Paths, t3_root: Option<&Path>) -> Group {
-    let mut items = Vec::new();
-    let Some(root) = t3_root else {
-        items.push(Item {
-            key: "error".into(),
-            text_key: Some(TextKey::T3Unavailable),
-            ..Item::default()
-        });
-        return Group {
-            id: "t3".into(),
-            title: None,
-            harness: "t3".into(),
-            items,
-        };
-    };
-    match t3::t3_status(paths, root) {
-        Err(e) => items.push(Item {
-            key: "status-error".into(),
-            text: format!("status failed: {e:#}"),
-            ..Item::default()
-        }),
-        Ok(rows) => {
-            // T3 also offers drivers agentdeck cannot import (cursor, grok, ...).
-            let importable = |r: &&t3::T3StatusRow| {
-                !r.in_registry && matches!(r.driver.as_str(), "claudeAgent" | "codex")
-            };
-            for r in rows.iter().filter(importable) {
-                items.push(Item {
-                    key: "t3import".into(),
-                    text: format!("{} (driver={})", r.id, r.driver),
-                    note: Some(Note::NotInRegistry),
-                    actions: vec![Action {
-                        kind: Kind::Import,
-                        key: "t3import".into(),
-                        server: None,
-                    }],
-                    ..Item::default()
-                });
-            }
-        }
-    }
-    if items.is_empty() {
-        items.push(Item {
-            key: "clean".into(),
-            text_key: Some(TextKey::NoDrift),
-            ..Item::default()
-        });
-    }
-    Group {
-        id: "t3".into(),
-        title: None,
-        harness: "t3".into(),
-        items,
-    }
-}
-
 /// Read-only snapshot behind the page. Never fails: gaps become text.
 pub fn snapshot(ctx: &Ctx) -> Snapshot {
     let reg = match Registry::load(&ctx.paths) {
@@ -392,7 +333,6 @@ pub fn snapshot(ctx: &Ctx) -> Snapshot {
             groups.push(codex_group(inst, ctx, &main));
         }
     }
-    groups.push(t3_group(&ctx.paths, ctx.t3_root.as_deref()));
     Snapshot {
         groups,
         error: None,
