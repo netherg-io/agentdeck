@@ -297,6 +297,9 @@ fn append_line(base: &Path, line: &serde_json::Value) -> Result<PathBuf, Outcome
         });
     drop(f); // releases LOCK_EX
     r?;
+    std::fs::File::open(path.parent().unwrap())
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| OutcomeError::fail(format!("cannot persist outcomes directory: {e}")))?;
     Ok(path)
 }
 

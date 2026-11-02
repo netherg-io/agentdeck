@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const USAGE: &str = "usage: workflow.mjs init PLAN.json --thread ID | next|stop|resume STATE.json --thread ID\n  | prepare STATE.json STEP --thread ID --source INSTANCE | record STATE.json STEP --thread ID < T3_RESPONSE.json\n  | release STATE.json STEP --thread ID --not-dispatched | eval STATE.json STEP --thread ID [--sample N] [--force]\n\neval is explicit opt-in observational grading of one settled completed step via the configured\ndecision provider (the brief and summary are sent there; only metadata is stored as a child\nreport). record never evaluates, so default workflow use is unchanged. Direct delegate_task\ncalls outside a routed workflow are not covered.";
+pub const USAGE: &str = "usage: workflow.mjs init PLAN.json --thread ID | next|stop|resume STATE.json --thread ID\n  | prepare STATE.json STEP --thread ID --source INSTANCE | record STATE.json STEP --thread ID < T3_RESPONSE.json\n  | release STATE.json STEP --thread ID --not-dispatched | eval STATE.json STEP --thread ID [--sample N] [--force]\n\neval is explicit opt-in observational grading of one settled completed step via the configured\ndecision provider (the brief and summary are sent there; only metadata is stored as a child\nreport). record never evaluates, so default workflow use is unchanged. Direct delegate_task\ncalls outside a routed workflow are not covered. --force also evaluates sampled-out steps
+and may incur a first or repeat charge.";
 const ROLES: &[&str] = &[
     "implementation",
     "research",
@@ -911,6 +912,30 @@ pub(crate) fn write_state(file: &Path, state: &State, fresh: bool) -> Result<(),
     result
 }
 
+// Lock a stable sidecar, since the state file itself is replaced on every write.
+fn lock_state(path: &Path) -> Result<std::fs::File, WfError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path.with_extension("lock"))
+        .map_err(|e| WfError::fail(format!("cannot open workflow lock: {e}")))?;
+    if !lock
+        .metadata()
+        .map_err(|e| WfError::fail(e.to_string()))?
+        .is_file()
+    {
+        return Err(WfError::fail("workflow lock is not a regular file"));
+    }
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(WfError::fail("workflow is busy; retry the command"));
+    }
+    Ok(lock)
+}
+
 fn load_state(file: &str, thread: &str) -> Result<(PathBuf, State), WfError> {
     let path = state_path(file)?;
     let text =
@@ -1045,6 +1070,7 @@ async fn run_inner(argv: &[String]) -> Result<Value, WfError> {
         }
         return Ok(Value::Object(result));
     }
+    let _lock = lock_state(&state_path(&file)?)?;
     let (path, mut state) = load_state(&file, &thread)?;
     match cmd.as_str() {
         "next" => Ok(next(&state)),
@@ -1105,5 +1131,22 @@ async fn run_inner(argv: &[String]) -> Result<Value, WfError> {
             .map(|(out, _)| out)
         }
         _ => Err(WfError::usage(USAGE)),
+    }
+}
+
+#[cfg(test)]
+mod state_lock_tests {
+    use super::*;
+
+    #[test]
+    fn state_lock_excludes_other_writers_and_releases_on_drop() {
+        let dir = std::env::temp_dir().join(format!("agentdeck-state-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let first = lock_state(&path).unwrap();
+        assert!(lock_state(&path).is_err());
+        drop(first);
+        assert!(lock_state(&path).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

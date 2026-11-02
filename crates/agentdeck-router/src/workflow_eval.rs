@@ -86,7 +86,7 @@ pub fn eligible(state: &State, id: &str) -> Result<EvalTarget, String> {
         .progress
         .iter()
         .find(|p| p.id == id)
-        .expect("progress mirrors plan");
+        .ok_or_else(|| format!("missing progress for step {id}"))?;
     if p.state != "completed" {
         return Err(format!(
             "step is {}, not a settled success; only completed steps are evaluated",
@@ -1016,6 +1016,13 @@ mod tests {
             .is_err()
         );
         assert_eq!(s.progress[0].state, "completed");
+    }
+
+    #[test]
+    fn missing_progress_is_reported() {
+        let mut s = settled("task");
+        s.progress.clear();
+        assert!(eligible(&s, "a").is_err());
     }
 
     #[tokio::test]
