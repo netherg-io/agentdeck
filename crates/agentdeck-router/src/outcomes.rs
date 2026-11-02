@@ -10,7 +10,9 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-pub const USAGE: &str = "usage: agentdeck route outcomes record --task ID --provider P --model M --category C --verdict V --evidence E [--source coordinator]\n  agentdeck route outcomes list [--task ID] [--limit N]\n\n  category: implementation|research|review|design|test|general\n  verdict: ok|partial|fail|blocked|missing|unavailable (blocked/missing/unavailable are not failures)\n  evidence: direct|spot-check|test-output|child-report\n  source is always recorded as \"coordinator\"; decider metadata is reserved (null) for future use.\n  repeats for one task append a new revision; appends are file-locked; corrupt lines fail reads (a torn final line is skipped), never deleted.";
+use crate::policy::valid_answer;
+
+pub const USAGE: &str = "usage: agentdeck route outcomes record --task ID --provider P --model M --category C --verdict V --evidence E [--source coordinator]\n  agentdeck route outcomes list [--task ID] [--limit N]\n  agentdeck route outcomes evaluate < evaluation.json\n\n  category: implementation|research|review|design|test|general\n  verdict: ok|partial|fail|blocked|missing|unavailable (blocked/missing/unavailable are not failures)\n  evidence: direct|spot-check|test-output|child-report\n  source is always recorded as \"coordinator\"; decider metadata is reserved (null) for future use.\n  repeats for one task append a new revision; appends are file-locked; corrupt lines fail reads (a torn final line is skipped), never deleted.\n\nevaluate reads one JSON object on stdin (max 16 KiB):\n  {\"task\": \"what was asked, 1-2000 chars\", \"evidence\": [{\"id\": \"e1\", \"text\": \"...1-4000 chars...\"} 1-8 items],\n   \"performer\": {\"provider\": \"P\", \"model\": \"M\"}?}\n  It sends that content to the configured decision provider/model (explicit opt-in; standard keys)\n  and prints {verdict: pass|partial|fail|insufficient, confidence, evidenceRefs, judge{provider,model},\n  selfJudged: true|false|null when the performer is unknown, judgeCostUsd: number|null}.\n  Nothing is written anywhere: raw task and evidence text are never persisted. To persist an\n  assessment, run `outcomes record` separately with validated metadata only.";
 
 const CATEGORIES: &[&str] = &[
     "implementation",
@@ -50,8 +52,8 @@ impl OutcomeError {
 }
 
 /// CLI entry. Returns the process exit code (0, 1, or 2 on usage errors).
-pub fn run(argv: &[String]) -> i32 {
-    match run_inner(argv) {
+pub async fn run(argv: &[String]) -> i32 {
+    match run_inner(argv).await {
         Ok(value) => {
             println!(
                 "{}",
@@ -66,10 +68,16 @@ pub fn run(argv: &[String]) -> i32 {
     }
 }
 
-fn run_inner(argv: &[String]) -> Result<serde_json::Value, OutcomeError> {
+async fn run_inner(argv: &[String]) -> Result<serde_json::Value, OutcomeError> {
     match argv.first().map(String::as_str) {
         Some("record") => record_cli(&argv[1..]),
         Some("list") => list_cli(&argv[1..]),
+        Some("evaluate") => {
+            if argv.len() != 1 {
+                return Err(OutcomeError::usage(USAGE));
+            }
+            evaluate_cli().await
+        }
         _ => Err(OutcomeError::usage(USAGE)),
     }
 }
@@ -388,6 +396,182 @@ fn list_cli(argv: &[String]) -> Result<serde_json::Value, OutcomeError> {
     Ok(serde_json::Value::Array(items))
 }
 
+// --- Explicit on-demand outcome evaluation (no persistence) ------------------
+// Reads task criteria + evidence on stdin, asks the configured decision
+// provider once, prints a grounded verdict. Never writes any file: raw task
+// and evidence text only travel to the explicitly invoked judge.
+
+const MAX_EVAL_STDIN: usize = 16384;
+const MAX_EVAL_TASK: usize = 2000;
+const MAX_EVAL_EVIDENCE: usize = 8;
+const MAX_EVAL_ID: usize = 64;
+const MAX_EVAL_TEXT: usize = 4000;
+
+const OUTCOME_VERDICTS: [&str; 4] = ["fail", "partial", "pass", "insufficient"];
+
+#[derive(Debug, Clone)]
+struct EvalEvidence {
+    id: String,
+    text: String,
+}
+
+#[derive(Debug, Clone)]
+struct EvalInput {
+    task: String,
+    evidence: Vec<EvalEvidence>,
+    performer_model: Option<String>,
+}
+
+fn outcome_questions() -> serde_json::Value {
+    serde_json::json!({"outcome": {
+        "type": "score",
+        "instructions": "Judge whether the completed work meets the task requirements, using ONLY the quoted evidence. Be conservative: when the evidence is missing, vague or unrelated to the task, choose the insufficient-evidence criterion. Do not assume success from the task text alone.",
+        "criteria": [
+            "Failed: the evidence shows the requirements are not met.",
+            "Partially met: some requirements are met but material gaps remain.",
+            "Passed: the evidence shows the requirements are met.",
+            "Insufficient evidence: the evidence does not let you judge.",
+        ],
+    }})
+}
+
+fn parse_eval_input(text: &str) -> Result<EvalInput, OutcomeError> {
+    if text.len() > MAX_EVAL_STDIN {
+        return Err(OutcomeError::usage(format!(
+            "evaluation input must fit in {MAX_EVAL_STDIN} bytes"
+        )));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(text).map_err(|_| OutcomeError::usage(USAGE))?;
+    let task = v
+        .get("task")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| OutcomeError::usage(USAGE))?;
+    if task.chars().count() == 0 || task.chars().count() > MAX_EVAL_TASK {
+        return Err(OutcomeError::usage(format!(
+            "task must be 1-{MAX_EVAL_TASK} chars"
+        )));
+    }
+    let items = v
+        .get("evidence")
+        .and_then(|e| e.as_array())
+        .ok_or_else(|| OutcomeError::usage(USAGE))?;
+    if items.is_empty() || items.len() > MAX_EVAL_EVIDENCE {
+        return Err(OutcomeError::usage(format!(
+            "evidence must hold 1-{MAX_EVAL_EVIDENCE} items"
+        )));
+    }
+    let mut evidence = Vec::with_capacity(items.len());
+    for e in items {
+        let id = e
+            .get("id")
+            .and_then(|i| i.as_str())
+            .ok_or_else(|| OutcomeError::usage(USAGE))?;
+        check_id(id, "evidence id", MAX_EVAL_ID, &[':', '_', '.', '-'])?;
+        let etext = e
+            .get("text")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| OutcomeError::usage(USAGE))?;
+        if etext.chars().count() == 0 || etext.chars().count() > MAX_EVAL_TEXT {
+            return Err(OutcomeError::usage(format!(
+                "evidence text must be 1-{MAX_EVAL_TEXT} chars"
+            )));
+        }
+        evidence.push(EvalEvidence {
+            id: id.to_string(),
+            text: etext.to_string(),
+        });
+    }
+    let performer_model = match v.get("performer") {
+        None => None,
+        Some(p) => {
+            let model = p
+                .get("model")
+                .and_then(|m| m.as_str())
+                .ok_or_else(|| OutcomeError::usage(USAGE))?;
+            check_id(
+                model,
+                "performer model",
+                MAX_MODEL,
+                &['_', '.', '-', '/', ':', '+'],
+            )?;
+            if let Some(provider) = p.get("provider").and_then(|x| x.as_str()) {
+                check_id(provider, "performer provider", MAX_PROVIDER, &['_', '.', '-'])?;
+            }
+            Some(model.to_string())
+        }
+    };
+    // Duplicate evidence ids would make references ambiguous.
+    let mut seen = std::collections::HashSet::new();
+    if !evidence.iter().all(|e| seen.insert(e.id.clone())) {
+        return Err(OutcomeError::usage("evidence ids must be unique"));
+    }
+    Ok(EvalInput {
+        task: task.to_string(),
+        evidence,
+        performer_model,
+    })
+}
+
+fn build_output(
+    input: &EvalInput,
+    answers: &serde_json::Value,
+    cost: Option<f64>,
+    provider: &str,
+    model: &str,
+) -> Result<serde_json::Value, OutcomeError> {
+    let answer = answers
+        .get("outcome")
+        .filter(|a| valid_answer(a, false))
+        .ok_or_else(|| {
+            OutcomeError::fail("judge returned no usable outcome answer; nothing was recorded")
+        })?;
+    let score = (answer
+        .get("score")
+        .and_then(|s| s.as_f64())
+        .unwrap_or(f64::NAN)
+        .round() as i64)
+        .clamp(0, 3) as usize;
+    let confidence = answer
+        .get("confidence")
+        .and_then(|c| c.as_f64())
+        .unwrap_or(0.0);
+    // Exact model-string match only: fuzzy matches risk false self-judgment flags.
+    let self_judged = match &input.performer_model {
+        None => serde_json::Value::Null,
+        Some(p) => serde_json::Value::from(p == model),
+    };
+    Ok(serde_json::json!({
+        "verdict": OUTCOME_VERDICTS[score],
+        "confidence": confidence,
+        "evidenceRefs": input.evidence.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+        "judge": {"provider": provider, "model": model},
+        "selfJudged": self_judged,
+        "judgeCostUsd": cost.filter(|c| c.is_finite()).map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+        "note": "explicit on-demand evaluation; input was sent to the configured decision provider; nothing was persisted",
+    }))
+}
+
+async fn evaluate_cli() -> Result<serde_json::Value, OutcomeError> {
+    let mut buf = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+        .map_err(|e| OutcomeError::fail(format!("cannot read stdin: {e}")))?;
+    evaluate_json(&buf).await
+}
+
+async fn evaluate_json(text: &str) -> Result<serde_json::Value, OutcomeError> {
+    let input = parse_eval_input(text)?;
+    let state = serde_json::json!({
+        "task": input.task,
+        "evidence": input.evidence.iter().map(|e| serde_json::json!({"id": e.id, "text": e.text})).collect::<Vec<_>>(),
+    });
+    let (answers, cost, provider, model) =
+        crate::route::judge_evaluation(state, outcome_questions())
+            .await
+            .map_err(|e| OutcomeError::fail(format!("judge unavailable: {e}")))?;
+    build_output(&input, &answers, cost, &provider, &model)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,5 +850,136 @@ mod tests {
         let items = read_all(&base).unwrap();
         assert_eq!(items.len(), 16);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn eval_input(task: &str, ids: &[&str]) -> String {
+        let ev: Vec<String> = ids
+            .iter()
+            .map(|id| format!(r#"{{"id": "{id}", "text": "did {id}"}}"#))
+            .collect();
+        format!(r#"{{"task": "{task}", "evidence": [{}]}}"#, ev.join(","))
+    }
+
+    #[test]
+    fn evaluate_rejects_bad_input() {
+        assert!(parse_eval_input("not json").is_err());
+        assert!(parse_eval_input(&eval_input("", &["e1"])).is_err());
+        assert!(parse_eval_input(&eval_input("t", &[])).is_err());
+        let many = ["e"; 9];
+        assert!(parse_eval_input(&eval_input("t", &many)).is_err());
+        assert!(parse_eval_input(&eval_input("t", &["a/b"])).is_err());
+        assert!(parse_eval_input(&eval_input("t", &["e1", "e1"])).is_err());
+        assert!(parse_eval_input(r#"{"task": "t"}"#).is_err());
+        // Oversize stdin and evidence text are usage errors, never sent anywhere.
+        assert!(parse_eval_input(&"x".repeat(MAX_EVAL_STDIN + 1)).is_err());
+        let big = "y".repeat(MAX_EVAL_TEXT + 1);
+        assert!(parse_eval_input(&format!(
+            r#"{{"task": "t", "evidence": [{{"id": "e1", "text": "{big}"}}]}}"#
+        ))
+        .is_err());
+        // Bad performer identity is rejected before any judge call.
+        assert!(parse_eval_input(
+            r#"{"task": "t", "evidence": [{"id": "e1", "text": "x"}], "performer": {"model": "a/b c"}}"#
+        )
+        .is_err());
+        assert!(parse_eval_input(&eval_input("do it", &["e1"])).is_ok());
+    }
+
+    #[test]
+    fn evaluate_maps_verdicts_and_never_echoes_raw_text() {
+        let input = parse_eval_input(&eval_input("ship it", &["a", "b"])).unwrap();
+        for (score, verdict) in [(0.0, "fail"), (1.0, "partial"), (2.0, "pass"), (3.0, "insufficient")] {
+            let answers = serde_json::json!({"outcome": {"score": score, "confidence": 0.7}});
+            let out = build_output(&input, &answers, Some(0.002), "openrouter", "j/judge").unwrap();
+            assert_eq!(out["verdict"], verdict);
+            assert_eq!(out["confidence"], 0.7);
+            assert_eq!(out["evidenceRefs"], serde_json::json!(["a", "b"]));
+            assert_eq!(out["judge"], serde_json::json!({"provider": "openrouter", "model": "j/judge"}));
+            assert!(out["selfJudged"].is_null()); // performer unknown
+            assert_eq!(out["judgeCostUsd"], 0.002);
+            // No raw evidence text leaks into the structured result.
+            assert!(!serde_json::to_string(&out).unwrap().contains("did a"));
+        }
+        // Unknown cost reports null, never a fabricated zero.
+        let answers = serde_json::json!({"outcome": {"score": 2.0, "confidence": 0.9}});
+        let out = build_output(&input, &answers, None, "openrouter", "j/judge").unwrap();
+        assert!(out["judgeCostUsd"].is_null());
+        // Invalid judge answers fail safely instead of guessing a verdict.
+        assert!(build_output(&input, &serde_json::json!({}), None, "p", "m").is_err());
+        assert!(build_output(
+            &input,
+            &serde_json::json!({"outcome": {"score": 9.0, "confidence": 0.5}}),
+            None,
+            "p",
+            "m"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn evaluate_flags_self_judgment_on_exact_model_match() {
+        let same = parse_eval_input(
+            r#"{"task": "t", "evidence": [{"id": "e1", "text": "x"}], "performer": {"model": "j/judge"}}"#,
+        )
+        .unwrap();
+        let other = parse_eval_input(
+            r#"{"task": "t", "evidence": [{"id": "e1", "text": "x"}], "performer": {"provider": "p", "model": "other/m"}}"#,
+        )
+        .unwrap();
+        let answers = serde_json::json!({"outcome": {"score": 2.0, "confidence": 0.6}});
+        let out = build_output(&same, &answers, None, "openrouter", "j/judge").unwrap();
+        assert_eq!(out["selfJudged"], true);
+        let out = build_output(&other, &answers, None, "openrouter", "j/judge").unwrap();
+        assert_eq!(out["selfJudged"], false);
+    }
+
+    #[tokio::test]
+    async fn evaluate_end_to_end_through_mock_judge() {
+        let dir = std::env::temp_dir().join(format!("agentdeck-eval-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("router.json"),
+            r#"{"pool": [], "accounts": {}, "version": 1, "decisionModel": "t/judge"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("jev.json"),
+            r#"{"answers": {"size": {"score": 0, "confidence": 0.9}, "difficulty": {"score": 0, "confidence": 0.8}, "outcome": {"score": 2, "confidence": 0.81}}, "usage": {"cost": 0.001}}"#,
+        )
+        .unwrap();
+        // SAFETY: test-only overrides read by judge_evaluation/jev_fetch; restored below.
+        // The mock file also carries routing answers so a concurrent probe test
+        // reading it still passes; retries cover us reading the probe's file.
+        unsafe {
+            std::env::set_var("MODEL_ROUTE_ROUTER_JSON", dir.join("router.json"));
+            std::env::set_var("AGENTDECK_ROUTE_MOCK_JEV", dir.join("jev.json"));
+        }
+        let mut out = Err("unset".to_string());
+        for _ in 0..10 {
+            match evaluate_json(&eval_input("ship it", &["a"])).await {
+                Ok(v) => {
+                    out = Ok(v);
+                    break;
+                }
+                Err(e) => out = Err(e.message.clone()),
+            }
+            unsafe {
+                std::env::set_var("AGENTDECK_ROUTE_MOCK_JEV", dir.join("jev.json"));
+            }
+        }
+        unsafe {
+            std::env::remove_var("MODEL_ROUTE_ROUTER_JSON");
+            std::env::remove_var("AGENTDECK_ROUTE_MOCK_JEV");
+        }
+        let out = out.unwrap();
+        assert_eq!(out["verdict"], "pass");
+        assert_eq!(out["evidenceRefs"], serde_json::json!(["a"]));
+        assert_eq!(
+            out["judge"],
+            serde_json::json!({"provider": "openrouter", "model": "t/judge"})
+        );
+        assert_eq!(out["judgeCostUsd"], 0.001);
+        assert!(!serde_json::to_string(&out).unwrap().contains("did a"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

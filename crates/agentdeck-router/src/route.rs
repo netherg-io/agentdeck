@@ -33,7 +33,7 @@ const CAPABILITY: [&str; 4] = [
     "Specific relevant strengths should produce a substantially better result on THIS task. A merely stronger model with no practical advantage does not qualify.",
 ];
 
-const USAGE: &str = "usage: agentdeck route [--source <provider instance>] [--validate-target <provider instance> <model>] \"<task brief>\" | - (brief on stdin) | --check | --catalog (orchestrator_capabilities structuredContent on stdin) | hook --harness <name> | claude-shell [args...] | t3-mcp-call TOOL FILE | workflow CMD ... | outcomes record|list ...";
+const USAGE: &str = "usage: agentdeck route [--source <provider instance>] [--validate-target <provider instance> <model>] \"<task brief>\" | - (brief on stdin) | --check | --catalog (orchestrator_capabilities structuredContent on stdin) | hook --harness <name> | claude-shell [args...] | t3-mcp-call TOOL FILE | workflow CMD ... | outcomes record|list|evaluate ...";
 
 pub struct Env {
     pub home: std::path::PathBuf,
@@ -1209,6 +1209,39 @@ async fn jev_fetch(
     ))
 }
 
+/// One live decision through the configured provider (explicit only).
+///
+/// Builds a one-question Jev decision over caller-supplied `state` (task +
+/// evidence, already size-checked) and returns the raw `answers`, the reported
+/// judge cost (`None` when the provider reports none), and the judge identity
+/// (`provider` label, `model`). Reuses the routing decision provider, model and
+/// keys; adds no model settings. Honours `AGENTDECK_ROUTE_MOCK_JEV` like routing.
+pub async fn judge_evaluation(
+    state: Value,
+    questions: Value,
+) -> anyhow::Result<(Value, Option<f64>, String, String)> {
+    let env = Env::from_env()?;
+    let cfg = load_router_config(&env)?;
+    let provider = cfg
+        .decision_provider
+        .clone()
+        .unwrap_or_else(|| agentdeck_core::settings::PROVIDER_OPENROUTER.to_string());
+    let model = cfg
+        .decision_model
+        .clone()
+        .unwrap_or_else(|| agentdeck_core::settings::DEFAULT_DECISION_MODEL.to_string());
+    if provider == agentdeck_core::settings::PROVIDER_VERCEL && cfg.decision_model.is_none() {
+        return Err(anyhow::anyhow!(
+            "decision provider vercel needs [router] decision_model"
+        ));
+    }
+    let request = serde_json::json!({"model": &model, "state": state, "questions": questions});
+    let body = stringify_like_node(&request);
+    let (answers, cost) =
+        jev_fetch(cfg.decision_provider.as_deref(), &request, &body, None).await?;
+    Ok((answers, cost, provider, model))
+}
+
 /// One live decision on a fixed small task, bypassing the cache: checks that
 /// the provider, model and key work. `key` overrides the stored key.
 /// Returns (size score, difficulty score, cost in USD when reported).
@@ -1263,7 +1296,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         Some("claude-shell") => return Ok(crate::shell::run(&argv[1..])),
         Some("t3-mcp-call") => return Ok(crate::mcp_call::run(&argv[1..]).await),
         Some("workflow") => return Ok(crate::workflow::run(&argv[1..])),
-        Some("outcomes") => return Ok(crate::outcomes::run(&argv[1..])),
+        Some("outcomes") => return Ok(crate::outcomes::run(&argv[1..]).await),
         _ => {}
     }
     let env = Env::from_env()?;
