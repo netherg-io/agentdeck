@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::policy::valid_answer;
 
-pub const USAGE: &str = "usage: agentdeck route outcomes record --task ID --provider P --model M --category C --verdict V --evidence E [--source coordinator]\n  agentdeck route outcomes list [--task ID] [--limit N]\n  agentdeck route outcomes evaluate < evaluation.json\n\n  category: implementation|research|review|design|test|general\n  verdict: ok|partial|fail|blocked|missing|unavailable (blocked/missing/unavailable are not failures)\n  evidence: direct|spot-check|test-output|child-report\n  source is always recorded as \"coordinator\"; decider metadata is reserved (null) for future use.\n  repeats for one task append a new revision; appends are file-locked; corrupt lines fail reads (a torn final line is skipped), never deleted.\n\nevaluate reads one JSON object on stdin (max 16 KiB):\n  {\"task\": \"what was asked, 1-2000 chars\", \"evidence\": [{\"id\": \"e1\", \"text\": \"...1-4000 chars...\"} 1-8 items],\n   \"performer\": {\"provider\": \"P\", \"model\": \"M\"}?}\n  It sends that content to the configured decision provider/model (explicit opt-in; standard keys)\n  and prints {verdict: pass|partial|fail|insufficient, confidence, evidenceConsidered, judge{provider,model},\n  selfJudged: true|null (null means unknown), judgeCostUsd: number|null (null means unreported)}.\n  Nothing is written anywhere: raw task and evidence text are never persisted. To persist an\n  assessment, run `outcomes record` separately with validated metadata only.";
+pub const USAGE: &str = "usage: agentdeck route outcomes record --task ID --provider P --model M --category C --verdict V --evidence E [--source coordinator]\n  agentdeck route outcomes record-decider --task ID --category C --model M [--provider P] < evaluation.json\n  agentdeck route outcomes list [--task ID] [--limit N]\n  agentdeck route outcomes evaluate < evaluation.json\n\n  category: implementation|research|review|design|test|general\n  verdict: ok|partial|fail|blocked|missing|unavailable (blocked/missing/unavailable are not failures)\n  evidence: direct|spot-check|test-output|child-report\n  source is always recorded as \"coordinator\"; decider assessments use record-decider and are recorded as \"decider\".\n  repeats for one task append a new revision; appends are file-locked; corrupt lines fail reads (a torn final line is skipped), never deleted.\n\nevaluate reads one JSON object on stdin (max 16 KiB):\n  {\"task\": \"what was asked, 1-2000 chars\", \"evidence\": [{\"id\": \"e1\", \"text\": \"...1-4000 chars...\"} 1-8 items],\n   \"performer\": {\"provider\": \"P\", \"model\": \"M\"}?}\n  It sends that content to the configured decision provider/model (explicit opt-in; standard keys)\n  and prints {verdict: pass|partial|fail|insufficient, confidence, evidenceConsidered, judge{provider,model},\n  selfJudged: true|null (null means unknown), judgeCostUsd: number|null (null means unreported)}.\n  Nothing is written anywhere: raw task and evidence text are never persisted. To persist an\n  assessment, run `outcomes record` separately with validated metadata only.\n\nrecord-decider reads the JSON object printed by `outcomes evaluate` on stdin (max 16 KiB)\n  and appends validated decider metadata only: no task text, evidence text, summaries or\n  secrets are read or stored. Judge identity, selfJudged and cost come from that result\n  (never from flags); unknown stays null. Needs no network and never affects ranking.";
 
 const CATEGORIES: &[&str] = &[
     "implementation",
@@ -71,6 +71,7 @@ pub async fn run(argv: &[String]) -> i32 {
 async fn run_inner(argv: &[String]) -> Result<serde_json::Value, OutcomeError> {
     match argv.first().map(String::as_str) {
         Some("record") => record_cli(&argv[1..]),
+        Some("record-decider") => record_decider_cli(&argv[1..]),
         Some("list") => list_cli(&argv[1..]),
         Some("evaluate") => {
             if argv.len() != 1 {
@@ -238,7 +239,6 @@ fn lock_file(f: &std::fs::File, op: libc::c_int, what: &str) -> Result<(), Outco
 }
 
 fn append_to(base: &Path, r: &Record, now: u64) -> Result<PathBuf, OutcomeError> {
-    let path = ensure_parent(base)?;
     let line = serde_json::json!({
         "t": now,
         "source": "coordinator",
@@ -250,6 +250,13 @@ fn append_to(base: &Path, r: &Record, now: u64) -> Result<PathBuf, OutcomeError>
         "evidence": r.evidence,
         "decider": null,
     });
+    append_line(base, &line)
+}
+
+// Single locked, permission-checked, torn-tail-guarded append shared by both
+// sources, so coordinator and decider records get identical durability.
+fn append_line(base: &Path, line: &serde_json::Value) -> Result<PathBuf, OutcomeError> {
+    let path = ensure_parent(base)?;
     let mut text = serde_json::to_string(&line).map_err(|e| OutcomeError::fail(e.to_string()))?;
     text.push('\n');
     // Exclusive flock serializes concurrent recorders across processes, so one
@@ -294,12 +301,26 @@ fn append_to(base: &Path, r: &Record, now: u64) -> Result<PathBuf, OutcomeError>
 }
 
 fn valid_record(v: &serde_json::Value) -> bool {
-    v.get("task_id")
-        .and_then(|t| t.as_str())
-        .is_some_and(|t| !t.is_empty())
-        && v.get("verdict")
+    let source_ok = v.get("source").and_then(|s| s.as_str()).is_some_and(|s| {
+        // Decider lines use their own verdict scale; missing source predates
+        // neither writer and is corruption, never silently coordinator data.
+        s == "coordinator" || s == "decider"
+    });
+    let verdict_ok = match v.get("source").and_then(|s| s.as_str()) {
+        Some("decider") => v
+            .get("verdict")
             .and_then(|t| t.as_str())
-            .is_some_and(|t| VERDICTS.contains(&t))
+            .is_some_and(|t| OUTCOME_VERDICTS.contains(&t)),
+        _ => v
+            .get("verdict")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| VERDICTS.contains(&t)),
+    };
+    source_ok
+        && v.get("task_id")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| !t.is_empty())
+        && verdict_ok
 }
 
 fn read_all(base: &Path) -> Result<Vec<serde_json::Value>, OutcomeError> {
@@ -394,6 +415,205 @@ fn list_cli(argv: &[String]) -> Result<serde_json::Value, OutcomeError> {
         items = items.split_off(items.len() - limit);
     }
     Ok(serde_json::Value::Array(items))
+}
+
+// --- Typed decider assessment persistence (no routing effect) ----------------
+// `record-decider` appends the validated metadata of an already obtained
+// `evaluate` result: judge identity, self-judgment, verdict, confidence,
+// reported-or-unknown cost and evidence IDs/count only. Raw task and evidence
+// text are never read or stored, and no network call is made here.
+
+const MAX_DEC_EVIDENCE: usize = 8;
+
+#[derive(Debug, Clone)]
+struct DeciderEval {
+    verdict: String,
+    confidence: f64,
+    evidence: Vec<String>,
+    judge_provider: String,
+    judge_model: String,
+    self_judged: bool,
+    cost: Option<f64>,
+}
+
+fn parse_decider_eval(text: &str) -> Result<DeciderEval, OutcomeError> {
+    if text.len() > MAX_EVAL_STDIN {
+        return Err(OutcomeError::usage(format!(
+            "evaluation result must fit in {MAX_EVAL_STDIN} bytes"
+        )));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(text).map_err(|_| OutcomeError::usage(USAGE))?;
+    let verdict = v
+        .get("verdict")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| OutcomeError::usage(USAGE))?;
+    if !OUTCOME_VERDICTS.contains(&verdict) {
+        return Err(OutcomeError::usage(format!(
+            "verdict must be one of {}",
+            OUTCOME_VERDICTS.join("|")
+        )));
+    }
+    let confidence = v
+        .get("confidence")
+        .and_then(|c| c.as_f64())
+        .filter(|c| (0.0..=1.0).contains(c))
+        .ok_or_else(|| OutcomeError::usage("confidence must be a number in 0-1"))?;
+    let ids = v
+        .get("evidenceConsidered")
+        .and_then(|e| e.as_array())
+        .ok_or_else(|| OutcomeError::usage(USAGE))?;
+    if ids.is_empty() || ids.len() > MAX_DEC_EVIDENCE {
+        return Err(OutcomeError::usage(format!(
+            "evidenceConsidered must hold 1-{MAX_DEC_EVIDENCE} ids"
+        )));
+    }
+    let mut evidence = Vec::with_capacity(ids.len());
+    for id in ids {
+        let id = id
+            .as_str()
+            .ok_or_else(|| OutcomeError::usage(USAGE))?;
+        check_id(id, "evidence id", MAX_EVAL_ID, &[':', '_', '.', '-'])?;
+        evidence.push(id.to_string());
+    }
+    let mut seen = std::collections::HashSet::new();
+    if !evidence.iter().all(|e| seen.insert(e.clone())) {
+        return Err(OutcomeError::usage("evidence ids must be unique"));
+    }
+    // The judge is the model that actually produced this result; flags must
+    // never override it, and an absent judge fails instead of guessing one.
+    let judge = v.get("judge").ok_or_else(|| OutcomeError::usage(USAGE))?;
+    let judge_provider = judge
+        .get("provider")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| OutcomeError::usage(USAGE))?;
+    check_id(
+        judge_provider,
+        "judge provider",
+        MAX_PROVIDER,
+        &['_', '.', '-'],
+    )?;
+    let judge_model = judge
+        .get("model")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| OutcomeError::usage(USAGE))?;
+    check_id(
+        judge_model,
+        "judge model",
+        MAX_MODEL,
+        &['_', '.', '-', '/', ':', '+'],
+    )?;
+    // Only true (self-evaluation) or null (unknown) persist; anything else
+    // would invent certainty about the performer/judge relation.
+    let self_judged = match v.get("selfJudged") {
+        Some(serde_json::Value::Bool(true)) => true,
+        Some(serde_json::Value::Null) | None => false,
+        _ => return Err(OutcomeError::usage("selfJudged must be true or null")),
+    };
+    // An unreported cost stays null; a reported one must be a sane number.
+    let cost = match v.get("judgeCostUsd") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(c) => {
+            let n = c
+                .as_f64()
+                .filter(|n| n.is_finite() && *n >= 0.0)
+                .ok_or_else(|| {
+                    OutcomeError::usage("judgeCostUsd must be a number >= 0 or null")
+                })?;
+            Some(n)
+        }
+    };
+    Ok(DeciderEval {
+        verdict: verdict.to_string(),
+        confidence,
+        evidence,
+        judge_provider: judge_provider.to_string(),
+        judge_model: judge_model.to_string(),
+        self_judged,
+        cost,
+    })
+}
+
+fn record_decider_to(
+    base: &Path,
+    task: &str,
+    category: &str,
+    provider: Option<&str>,
+    model: &str,
+    eval: &DeciderEval,
+    now: u64,
+) -> Result<PathBuf, OutcomeError> {
+    // T3 IDs are untrusted input: strict charset + length bounds, as in record.
+    check_id(task, "task", MAX_TASK, &[':', '_', '.', '-', '%'])?;
+    check_enum(category, "category", CATEGORIES)?;
+    if let Some(p) = provider {
+        check_id(p, "provider", MAX_PROVIDER, &['_', '.', '-'])?;
+    }
+    check_id(model, "model", MAX_MODEL, &['_', '.', '-', '/', ':', '+'])?;
+    // Metadata only: IDs and counts, never task/evidence text or summaries.
+    let line = serde_json::json!({
+        "t": now,
+        "source": "decider",
+        "task_id": task,
+        "provider": provider.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+        "model": model,
+        "category": category,
+        "verdict": eval.verdict,
+        "confidence": eval.confidence,
+        "evidence_ids": eval.evidence,
+        "evidence_count": eval.evidence.len(),
+        "decider": {
+            "judge": {"provider": eval.judge_provider, "model": eval.judge_model},
+            "self_judged": if eval.self_judged { serde_json::Value::Bool(true) } else { serde_json::Value::Null },
+            "judge_cost_usd": eval.cost.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+        },
+    });
+    append_line(base, &line)
+}
+
+fn record_decider_cli(argv: &[String]) -> Result<serde_json::Value, OutcomeError> {
+    let mut task = None;
+    let mut category = None;
+    let mut provider: Option<String> = None;
+    let mut model = None;
+    let mut i = 0;
+    while i < argv.len() {
+        let flag = argv[i].as_str();
+        let get = |i: &mut usize| -> Result<String, OutcomeError> {
+            *i += 1;
+            argv.get(*i)
+                .cloned()
+                .ok_or_else(|| OutcomeError::usage(USAGE))
+        };
+        match flag {
+            "--task" => task = Some(get(&mut i)?),
+            "--category" => category = Some(get(&mut i)?),
+            "--provider" => provider = Some(get(&mut i)?),
+            "--model" => model = Some(get(&mut i)?),
+            _ => return Err(OutcomeError::usage(USAGE)),
+        }
+        i += 1;
+    }
+    let (task, category, model) = match (task, category, model) {
+        (Some(t), Some(c), Some(m)) => (t, c, m),
+        _ => return Err(OutcomeError::usage(USAGE)),
+    };
+    let mut buf = String::new();
+    std::io::stdin()
+        .take((MAX_EVAL_STDIN + 1) as u64)
+        .read_to_string(&mut buf)
+        .map_err(|e| OutcomeError::fail(format!("cannot read stdin: {e}")))?;
+    let eval = parse_decider_eval(&buf)?;
+    let path = record_decider_to(
+        &state_base(),
+        &task,
+        &category,
+        provider.as_deref(),
+        &model,
+        &eval,
+        now_secs(),
+    )?;
+    Ok(serde_json::json!({"recorded": true, "source": "decider", "file": path.display().to_string()}))
 }
 
 // --- Explicit on-demand outcome evaluation (no persistence) ------------------
@@ -779,6 +999,181 @@ mod tests {
         assert!(items[0].get("decider").is_some());
         // no free-text payload stored
         assert!(items[0].get("summary").is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn decider_eval(
+        verdict: &str,
+        confidence: serde_json::Value,
+        evidence: &[&str],
+        judge: serde_json::Value,
+        self_judged: serde_json::Value,
+        cost: serde_json::Value,
+    ) -> String {
+        serde_json::json!({
+            "verdict": verdict,
+            "confidence": confidence,
+            "evidenceConsidered": evidence,
+            "judge": judge,
+            "selfJudged": self_judged,
+            "judgeCostUsd": cost,
+        })
+        .to_string()
+    }
+
+    fn good_eval() -> String {
+        decider_eval(
+            "pass",
+            serde_json::json!(0.81),
+            &["a", "b"],
+            serde_json::json!({"provider": "openrouter", "model": "t/judge"}),
+            serde_json::Value::Null,
+            serde_json::json!(0.001),
+        )
+    }
+
+    #[test]
+    fn decider_roundtrip_stores_metadata_only() {
+        let base = tmp_base("decider-roundtrip");
+        let eval = parse_decider_eval(&good_eval()).unwrap();
+        record_decider_to(&base, "task-9", "test", Some("p"), "perf/m", &eval, 7).unwrap();
+        let items = read_all(&base).unwrap();
+        assert_eq!(items.len(), 1);
+        let v = &items[0];
+        assert_eq!(v["source"], "decider");
+        assert_eq!(v["task_id"], "task-9");
+        assert_eq!(v["category"], "test");
+        assert_eq!(v["provider"], "p");
+        assert_eq!(v["model"], "perf/m");
+        assert_eq!(v["verdict"], "pass");
+        assert_eq!(v["confidence"], 0.81);
+        assert_eq!(v["evidence_ids"], serde_json::json!(["a", "b"]));
+        assert_eq!(v["evidence_count"], 2);
+        assert_eq!(
+            v["decider"]["judge"],
+            serde_json::json!({"provider": "openrouter", "model": "t/judge"})
+        );
+        assert!(v["decider"]["self_judged"].is_null());
+        assert_eq!(v["decider"]["judge_cost_usd"], 0.001);
+        // No raw text, summaries or secrets leak into the stored line.
+        let raw = std::fs::read_to_string(outcomes_path(&base)).unwrap();
+        assert!(!raw.contains("did a"));
+        for key in ["task\"", "summary", "secret", "text"] {
+            assert!(!raw.contains(&format!("\"{key}")), "{key}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn coordinator_and_decider_records_stay_distinct() {
+        let base = tmp_base("decider-distinct");
+        append_to(&base, &rec("task-1"), 1).unwrap();
+        let eval = parse_decider_eval(&good_eval()).unwrap();
+        record_decider_to(&base, "task-1", "implementation", Some("testprov"), "test-model", &eval, 2)
+            .unwrap();
+        let items = read_all(&base).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["source"], "coordinator");
+        assert!(items[0]["decider"].is_null());
+        assert_eq!(items[1]["source"], "decider");
+        assert_eq!(items[1]["verdict"], "pass"); // decider scale, incl. insufficient
+        let insufficient = decider_eval(
+            "insufficient",
+            serde_json::json!(0.2),
+            &["a"],
+            serde_json::json!({"provider": "openrouter", "model": "t/judge"}),
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        );
+        let eval = parse_decider_eval(&insufficient).unwrap();
+        record_decider_to(&base, "task-2", "test", None, "m", &eval, 3).unwrap();
+        let items = read_all(&base).unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[2]["verdict"], "insufficient");
+        assert!(items[2]["provider"].is_null()); // unknown performer stays null
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn decider_preserves_unknown_self_judgment_and_cost() {
+        let base = tmp_base("decider-unknown");
+        // Self-evaluation keeps true; unknown stays null, never false.
+        let same = decider_eval(
+            "pass",
+            serde_json::json!(0.6),
+            &["e1"],
+            serde_json::json!({"provider": "p", "model": "j/judge"}),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+        );
+        let eval = parse_decider_eval(&same).unwrap();
+        assert!(eval.self_judged);
+        assert!(eval.cost.is_none());
+        record_decider_to(&base, "t", "test", Some("p"), "j/judge", &eval, 1).unwrap();
+        let items = read_all(&base).unwrap();
+        assert_eq!(items[0]["decider"]["self_judged"], true);
+        assert!(items[0]["decider"]["judge_cost_usd"].is_null());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn decider_rejects_bad_results_without_writing() {
+        let judge = serde_json::json!({"provider": "openrouter", "model": "t/judge"});
+        let bad = [
+            decider_eval("great", serde_json::json!(0.5), &["a"], judge.clone(), serde_json::Value::Null, serde_json::Value::Null),
+            decider_eval("pass", serde_json::json!(2.0), &["a"], judge.clone(), serde_json::Value::Null, serde_json::Value::Null),
+            decider_eval("pass", serde_json::json!("high"), &["a"], judge.clone(), serde_json::Value::Null, serde_json::Value::Null),
+            decider_eval("pass", serde_json::json!(0.5), &[], judge.clone(), serde_json::Value::Null, serde_json::Value::Null),
+            decider_eval("pass", serde_json::json!(0.5), &["a/b"], judge.clone(), serde_json::Value::Null, serde_json::Value::Null),
+            decider_eval("pass", serde_json::json!(0.5), &["a", "a"], judge.clone(), serde_json::Value::Null, serde_json::Value::Null),
+            decider_eval("pass", serde_json::json!(0.5), &["a"], serde_json::json!({"provider": "p"}), serde_json::Value::Null, serde_json::Value::Null),
+            decider_eval("pass", serde_json::json!(0.5), &["a"], judge.clone(), serde_json::json!(false), serde_json::Value::Null),
+            decider_eval("pass", serde_json::json!(0.5), &["a"], judge.clone(), serde_json::json!("no"), serde_json::Value::Null),
+            decider_eval("pass", serde_json::json!(0.5), &["a"], judge.clone(), serde_json::Value::Null, serde_json::json!(-0.1)),
+            decider_eval("pass", serde_json::json!(0.5), &["a"], judge.clone(), serde_json::Value::Null, serde_json::json!("cheap")),
+            "not json".to_string(),
+        ];
+        for (n, text) in bad.iter().enumerate() {
+            assert!(parse_decider_eval(text).is_err(), "case {n}: {text}");
+        }
+        // Nothing reaches the file: validation happens before any append.
+        let base = tmp_base("decider-invalid");
+        for text in &bad {
+            if let Ok(eval) = parse_decider_eval(text) {
+                panic!("should not parse: {eval:?}");
+            }
+        }
+        assert!(!outcomes_path(&base).exists());
+        // Bad task/category/performer flags also fail without writing.
+        let eval = parse_decider_eval(&good_eval()).unwrap();
+        assert!(
+            record_decider_to(&base, "../evil", "test", Some("p"), "m", &eval, 1).is_err()
+        );
+        assert!(
+            record_decider_to(&base, "t", "nope", Some("p"), "m", &eval, 1).is_err()
+        );
+        assert!(!outcomes_path(&base).exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn decider_accepts_real_t3_ids() {
+        let id = "node:delegated-task:command%3Amcp%3Ad4694301-3125-4b66-8d54-2b3158afcf5a%3Adelegate-task%3A500f3994-4df3-4306-a536-05d9bc83f263";
+        let base = tmp_base("decider-t3ids");
+        let eval = parse_decider_eval(&good_eval()).unwrap();
+        record_decider_to(
+            &base,
+            id,
+            "implementation",
+            Some("opencode-go"),
+            "opencode-go/muse-spark-1.3-contributor",
+            &eval,
+            1,
+        )
+        .unwrap();
+        let items = read_all(&base).unwrap();
+        assert_eq!(items[0]["task_id"], id);
+        assert_eq!(items[0]["model"], "opencode-go/muse-spark-1.3-contributor");
         let _ = std::fs::remove_dir_all(&base);
     }
 
