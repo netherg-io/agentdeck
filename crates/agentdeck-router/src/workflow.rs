@@ -518,9 +518,19 @@ fn route_diagnostics(r: &Value) -> Value {
 /// Production router: this binary's `route --source <s> -` (like the .mjs
 /// exec of `route.mjs`), 55s timeout, 16MB cap.
 pub fn run_router(task: &str, source: &str) -> anyhow::Result<Value> {
+    run_router_excluding(task, source, &[])
+}
+
+/// `run_router` with `--exclude` for instances whose account hit a usage limit.
+pub fn run_router_excluding(task: &str, source: &str, exclude: &[String]) -> anyhow::Result<Value> {
     let exe = std::env::current_exe()?;
-    let mut child = std::process::Command::new(exe)
-        .args(["route", "--source", source, "-"])
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["route", "--source", source]);
+    for x in exclude {
+        cmd.args(["--exclude", x]);
+    }
+    let mut child = cmd
+        .arg("-")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

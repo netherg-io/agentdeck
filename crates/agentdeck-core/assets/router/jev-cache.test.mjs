@@ -83,8 +83,8 @@ try {
   assert.match(commonHint, /never spawn, delegate to or launch other agents/);
   assert.match(commonHint, /BLOCKED:/);
   assert.equal(out.briefHint, commonHint);
-  const opusTarget = { providerInstanceId: 'claudeAgent', model: 'claude-opus-5-5', options: { effort: 'low' } };
-  const solTarget = { providerInstanceId: 'codex', model: 'gpt-6.1-sol', options: { reasoningEffort: 'low' } };
+  const opusTarget = { providerInstanceId: 'claudeAgent', model: 'claude-opus-5-5', options: { effort: 'medium' } };
+  const solTarget = { providerInstanceId: 'codex', model: 'gpt-6.1-sol', options: { reasoningEffort: 'medium' } };
   assert.deepEqual(out.target, opusTarget);
   // A fresh Jev sample would now prefer Sol; validation reuses the cached answers instead of flipping.
   out = run(validate('claudeAgent/claude-opus-5-5'), prefersSol, false);

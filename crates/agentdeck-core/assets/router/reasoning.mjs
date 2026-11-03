@@ -62,12 +62,16 @@ export function reasoningTarget(catalog, provider, model, difficulty) {
   const target = { providerInstanceId: provider, model };
   const d = reasoningDescriptor(catalog, provider, model);
   if (!d) return target;
-  if (d.type === 'boolean') return { ...target, options: { [d.id]: difficulty > 0 } };
+  // Delegates never run on low or an implicit default: difficulty 0 medium, 1 high, 2-3 xhigh.
+  difficulty = Math.min(Math.max(difficulty, 0) + 1, 3);
+  if (d.type === 'boolean') return { ...target, options: { [d.id]: true } };
   const supported = d.options.map(o => o.id);
   const floor = LEVELS.indexOf(minEffort(model));
   if (floor > difficulty) difficulty = floor;
   // Special modes can enable orchestration; ordinary difficulty must never select them implicitly.
-  const value = LEVELS.slice(0, difficulty + 1).reverse().find(v => supported.includes(v))
+  // Highest supported level up to the wanted one but not below medium, else the next one above.
+  const value = LEVELS.slice(1, difficulty + 1).reverse().find(v => supported.includes(v))
+    ?? LEVELS.slice(difficulty + 1).find(v => supported.includes(v))
     ?? LEVELS.find(v => supported.includes(v))
     ?? d.options.find(o => o.id === d.currentValue || o.isDefault)?.id;
   if (value === undefined || ['ultracode', 'ultrathink'].includes(value))
@@ -94,6 +98,10 @@ export function validateReasoning(catalog, target) {
   const floor = minEffort(target.model);
   if (floor && RANK.includes(e.value) && RANK.indexOf(e.value) < RANK.indexOf(floor))
     return `target.options.${d.id} ${e.value} is below this model family's minimum ${floor}`;
+  if (d.type !== 'boolean' && d.options.some(o => LEVELS.slice(1).includes(o.id)) && RANK.includes(e.value)
+    && RANK.indexOf(e.value) < RANK.indexOf('medium'))
+    return `target.options.${d.id} ${e.value} is below the router minimum medium`;
+  if (d.type === 'boolean' && e.value !== true) return `target.options.${d.id} must be true`;
   return null;
 }
 

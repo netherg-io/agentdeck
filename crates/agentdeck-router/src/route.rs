@@ -33,7 +33,7 @@ const CAPABILITY: [&str; 4] = [
     "Specific relevant strengths should produce a substantially better result on THIS task. A merely stronger model with no practical advantage does not qualify.",
 ];
 
-const USAGE: &str = "usage: agentdeck route [--source <provider instance>] [--validate-target <provider instance> <model>] \"<task brief>\" | - (brief on stdin) | --check | --catalog (orchestrator_capabilities structuredContent on stdin) | hook --harness <name> | claude-shell [args...] | t3-mcp-call TOOL FILE | workflow CMD ... | outcomes record|list|evaluate ...";
+const USAGE: &str = "usage: agentdeck route [--source <provider instance>] [--validate-target <provider instance> <model>] [--exclude <provider instance>]... \"<task brief>\" | - (brief on stdin) | --check | --catalog (orchestrator_capabilities structuredContent on stdin) | hook --harness <name> | claude-shell [args...] | t3-mcp-call TOOL FILE | workflow CMD ... | dispatch TASK_FILE [flags] | outcomes record|list|evaluate ...";
 
 pub struct Env {
     pub home: std::path::PathBuf,
@@ -1296,6 +1296,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         Some("claude-shell") => return Ok(crate::shell::run(&argv[1..])),
         Some("t3-mcp-call") => return Ok(crate::mcp_call::run(&argv[1..]).await),
         Some("workflow") => return Ok(crate::workflow::run(&argv[1..]).await),
+        Some("dispatch") => return Ok(crate::dispatch::run(&argv[1..]).await),
         Some("outcomes") => return Ok(crate::outcomes::run(&argv[1..]).await),
         _ => {}
     }
@@ -1323,6 +1324,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     let mut args = argv.as_slice();
     let mut source: Option<String> = None;
     let mut requested: Option<ValidatedTarget> = None;
+    let mut exclude: Vec<String> = Vec::new();
     while args.first().is_some_and(|a| a.starts_with("--")) && args[0] != "--check" {
         let flag = args[0].clone();
         args = &args[1..];
@@ -1338,6 +1340,9 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                 model: args[1].clone(),
             });
             args = &args[2..];
+        } else if flag == "--exclude" && !args.is_empty() {
+            exclude.push(args[0].clone());
+            args = &args[1..];
         } else {
             eprintln!("{USAGE}");
             return Ok(2);
@@ -1830,6 +1835,20 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                     )
                 })
                 .or(policy_ban);
+        }
+        // An excluded instance just hit a usage limit; its whole account is out.
+        let account_of = |i: &str| {
+            current_cfg
+                .account
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| i.to_string())
+        };
+        if exclude
+            .iter()
+            .any(|x| account_of(x) == account_of(provider))
+        {
+            policy_ban = Some("excluded: account hit a usage limit".to_string());
         }
         let probs = a.get("probabilities");
         // Jev judges every favorite, including ones without a roster family,

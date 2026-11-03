@@ -114,7 +114,9 @@ function run() {
   if (!native && !delegate && !workflow) return emit(true);
 
   const chain = ancestors();
-  const server = cmd => cmd.some(a => a.endsWith('/apps/server/dist/bin.mjs'));
+  // Older T3 ran a Node server; current T3 is a native `t3 serve` binary.
+  const server = cmd => cmd.some(a => a.endsWith('/apps/server/dist/bin.mjs'))
+    || (/(^|\/)t3$/.test(cmd[0] ?? '') && cmd[1] === 'serve');
   const underServer = predicate => { const i = chain.findIndex(predicate); return i >= 0 && chain.slice(i).some(server); };
   const inT3 = {
     claude: () => chain.some(cmd => cmd.includes('--mcp-config') && cmd.some(a => a.includes('"t3-code"')))
@@ -124,7 +126,8 @@ function run() {
     opencode: () => input.inT3 === true,
     shell: () => input.inT3 === true,
   }[harness];
-  if (!inT3?.()) return emit(true);
+  // delegate_task exists only in T3, so it is always routed: a missed T3 detection must not skip routing.
+  if (!delegate && !inT3?.()) return emit(true);
 
   // Children told to delegate via routing gave up and did the work anyway; deny nesting outright instead.
   if (isDelegatedChild({ nativeId: harness === 'agy' ? input.conversationId : input.session_id, threadId: input.threadId })) {
@@ -173,6 +176,14 @@ function run() {
     || typeof args.target?.model !== 'string' || !args.target.model)) {
     const reason = 'model-route: delegate_task requires a task and an explicit exact providerInstanceId/model target.';
     record('deny:invalid-delegate', reason);
+    return emit(false, reason);
+  }
+  // Claude and agy reach the T3 shell bridge, so `route dispatch` replaces their direct delegate_task;
+  // routed workflow payloads and explicit user choices still validate.
+  if (delegate && ['claude', 'agy'].includes(harness) && !USER_CHOICE.test(args.task)
+    && !String(args.clientRequestId ?? '').startsWith('routed-workflow-')) {
+    const reason = 'model-route: the router delegates tasks itself. Write the complete task to a file and run `agentdeck route dispatch FILE --title TITLE [--isolation worktree] [--role ROLE]`: it picks the model, delegates and prints a dispatch ID; its watcher cancels and re-dispatches the child after a usage limit. When T3 reports the child ended, run `agentdeck route dispatch --status ID` (running means a replacement is already working). Do not call delegate_task directly.' + USER_CHOICE_HINT;
+    record('deny:use-dispatch', reason);
     return emit(false, reason);
   }
   const command = ['--source', instance];

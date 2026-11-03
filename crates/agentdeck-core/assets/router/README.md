@@ -13,6 +13,16 @@ same way: `claudeAgent`, `claude_second`, `claude_third` and `claude_fourth` mat
 - Every target's `briefHint` combines the shared delegated-agent policy with any family hint, in that order separated by a blank line. Append the entire string verbatim; hooks require it. The shared policy text lives only in `roster.json` (`briefHint`): no nesting, scope, verification, report format and the `BLOCKED:` contract.
 - `route.mjs --source claudeAgent "<task>"`: explicitly identify the orchestrator; otherwise detected from executable names in the process chain. Other sources: `codex`, `codex_second`, `antigravity`, `opencode`, `claudeAgent_openrouter`. Codex shadow homes identify separate accounts. Unknown source is reported and cannot receive shared-quota protection.
 - `route.mjs --source codex --validate-target PROVIDER MODEL -`: read the complete task from stdin and validate an already selected target. Output includes `validation.allowed` and its reason. A denied target exits 0; malformed input or router failure exits nonzero.
+- `agentdeck route dispatch FILE [--title T] [--role R] [--isolation shared|worktree] [--id ID] [--max-hours H]`
+  (Rust binary only): the router delegates. It routes the task, calls T3 `delegate_task` through the session bridge with
+  the winner and `briefHint`, saves `~/.local/state/model-route/dispatch/<id>.json` and returns. A detached watcher
+  (`--watch ID`, log beside the state file, at most `--max-hours`, default 24) polls `task_status`. When the child's
+  latest run failed on a usage limit (T3 `error` item with `failure.class = usage_limit`), it cancels the task, archives
+  the child thread (T3's auto-resume skips archived threads, so the replaced child never resumes) and re-routes with
+  `--exclude` for that account, at most 4 attempts. `--status ID` prints the state. Claude and agy must use it: their
+  direct `delegate_task` is denied (`deny:use-dispatch`) unless it is a routed workflow payload or `[route:user-choice]`.
+  Codex and OpenCode have no shell bridge and keep target validation.
+- `route.mjs --exclude INSTANCE`: ban every favorite on that instance's account for this call (repeatable).
 - `route.mjs --check`: quota, per-size cost and allowed sizes per favorite; favorites without a family
   profile are flagged `UNPROFILED` (report-only, exit 0: they route on their Jev judgment with
   conservative max-burn quota, no manual roster edit required).
@@ -196,15 +206,17 @@ alone was ignored (agents used native subagents and never ran the router), so ea
 
 | Harness | Event | Registered in | Redirect mechanism |
 |---|---|---|---|
-| Claude (both instances) | PreToolUse `Agent` / T3 `delegate_task` | `~/.claude*/settings.json` | native calls redirect to an exact T3 target; MCP calls validate the requested target |
+| Claude (both instances) | PreToolUse `Agent` / T3 `delegate_task` | `~/.claude*/settings.json` | native and direct MCP calls are denied toward `route dispatch`; workflow and user-choice MCP calls validate the requested target |
 | Claude ultracode | PreToolUse `Workflow` | both Claude settings above | deny local starts/resumes inside T3; route each child task through T3 delegation |
 | Codex | PreToolUse `spawn_agent` / `collaborationspawn_agent` / `Agent` / T3 `delegate_task` | `~/.codex/hooks.json`, trust hash in `~/.codex/config.toml` `[hooks.state]` | native calls redirect to an exact T3 target; MCP calls validate the requested target |
-| agy (T3 ACP) | PreToolUse `start_subagent` / `invoke_subagent` / T3 `delegate_task` | `$GEMINI_HOME/config/hooks.json` (symlink into `~/.gemini/config/plugins/model-route/`) | native calls redirect to an exact T3 target; MCP calls validate the requested target |
+| agy (T3 ACP) | PreToolUse `start_subagent` / `invoke_subagent` / T3 `delegate_task` | `$GEMINI_HOME/config/hooks.json` (symlink into `~/.gemini/config/plugins/model-route/`) | native and direct MCP calls are denied toward `route dispatch`; workflow and user-choice MCP calls validate the requested target |
 | OpenCode | `execute.before` on `subagent` / T3 `delegate_task` | `~/.config/opencode/plugin/model-route.ts` | throws `Tool.Error` on a denied or failed hook |
 | Shell bridge | explicit pre-dispatch check | `t3-mcp-call.mjs` | same MCP target validation; source from live scoped capabilities |
 
-- Only processes T3 launched are routed (Claude: `t3-code` in `--mcp-config`; Codex/agy: app-server/ACP under T3's
-  server; OpenCode: server from T3's AppImage). Outside T3 calls pass through. Router errors/timeouts deny and
+- Only processes T3 launched are routed (Claude: `t3-code` in `--mcp-config` or stream-json under T3's server;
+  Codex/agy: app-server/ACP under T3's server, either the Node `apps/server/dist/bin.mjs` or the native `t3 serve`;
+  OpenCode: server from T3's AppImage). Outside T3 native calls pass through. `delegate_task` exists only in T3, so it
+  is always routed: a missed T3 detection must not silently disable routing. Router errors/timeouts deny and
   are logged. Native subagent calls have no escape hatch: they are always routed and handed back to
   `delegate_task`; MCP calls always validate. User choice: when the user explicitly asks for a model, a
   `delegate_task` whose task starts with `[route:user-choice]` may use any model in the live catalog, even

@@ -331,7 +331,7 @@ try {
   assert.equal(out.validation, undefined);
   assert.equal(run(['--source', 'claudeAgent', brief], jev(level(2.9), level(2.4))).target.model, 'claude-opus-5-5');
   out = run(['--source', 'claudeAgent', '--validate-target', 'claudeAgent', 'claude-opus-5-5', brief], typo);
-  assert.deepEqual(out.requestedTarget, { providerInstanceId: 'claudeAgent', model: 'claude-opus-5-5', options: { effort: 'low' } });
+  assert.deepEqual(out.requestedTarget, { providerInstanceId: 'claudeAgent', model: 'claude-opus-5-5', options: { effort: 'medium' } });
   assert.equal(out.validation.allowed, false);
   assert.equal(out.target.model, 'claude-haiku-5-5');
   out = run(['--validate-target', 'claudeAgent', 'claude-haiku-5-5', '--source', 'claudeAgent', brief], typo);
@@ -371,12 +371,12 @@ try {
   fs.writeFileSync(path.join(routeDir, '.local/state/ai-usage/state.json'), JSON.stringify({ accounts: [] }));
   // Effort follows difficulty, independently of size, and uses the target harness's option id.
   for (const [provider, model, key, levels] of [
-    ['codex', 'gpt-6.1-sol', 'reasoningEffort', ['low', 'medium', 'high', 'xhigh']],
-    ['codex_second', 'gpt-6.1-sol', 'reasoningEffort', ['low', 'medium', 'high', 'xhigh']],
-    ['claudeAgent', 'claude-opus-5-5', 'effort', ['low', 'medium', 'high', 'xhigh']],
-    ['opencode', 'anthropic/claude-opus-5-5', 'variant', ['low', 'low', 'high', 'xhigh']],
-    ['claudeAgent', 'claude-opus-4-5', 'effort', ['low', 'medium', 'high', 'high']],
-    ['claudeAgent_openrouter', 'claude-opus-5-5', 'effort', ['low', 'medium', 'high', 'xhigh']],
+    ['codex', 'gpt-6.1-sol', 'reasoningEffort', ['medium', 'high', 'xhigh', 'xhigh']],
+    ['codex_second', 'gpt-6.1-sol', 'reasoningEffort', ['medium', 'high', 'xhigh', 'xhigh']],
+    ['claudeAgent', 'claude-opus-5-5', 'effort', ['medium', 'high', 'xhigh', 'xhigh']],
+    ['opencode', 'anthropic/claude-opus-5-5', 'variant', ['high', 'high', 'xhigh', 'xhigh']],
+    ['claudeAgent', 'claude-opus-4-5', 'effort', ['medium', 'high', 'high', 'high']],
+    ['claudeAgent_openrouter', 'claude-opus-5-5', 'effort', ['medium', 'high', 'xhigh', 'xhigh']],
   ]) {
     setPool([[provider, model]]);
     for (const [difficulty, effort] of levels.entries()) {

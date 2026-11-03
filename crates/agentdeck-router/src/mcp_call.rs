@@ -18,6 +18,8 @@ const TOOLS: &[&str] = &[
     "delegate_task",
     "task_status",
     "task_cancel",
+    // `route dispatch` archives a child it replaced after a usage limit.
+    "t3_thread_organize",
 ];
 
 pub const USAGE: &str =

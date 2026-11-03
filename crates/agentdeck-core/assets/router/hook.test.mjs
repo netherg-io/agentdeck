@@ -13,14 +13,17 @@ fs.writeFileSync(path.join(home, '.t3/userdata/settings.json'), JSON.stringify({
   codex_second: { driver: 'codex', config: { shadowHomePath: path.join(home, 'second') } },
   claude_second: { driver: 'claudeAgent', config: { homePath: path.join(home, 'claude-second') } },
 } }));
-const target = { providerInstanceId: 'codex', model: 'gpt-6.1-sol', options: { reasoningEffort: 'medium' } };
+const target = { providerInstanceId: 'codex', model: 'gpt-6.1-sol', options: { reasoningEffort: 'high' } };
 const route = { target, requestedTarget: target, size: '1: focused', difficulty: '1: bounded', jevConfidence: 0.9,
   reason: 'test', blocked: [], ranking: [], validation: { allowed: true, reason: 'selected winner' } };
 
 function run({ harness = 'codex', args = { task_name: 'nested', message: 'Actual child task' },
   tool = 'spawn_agent', routed = route, inT3 = true, second = false, error = false, malformed = false,
   model = 'gpt-6-astra', wrapMcp = false, mcpServer = 't3-code', source = 'codex_second', sdk = false,
-  transcript, session = 'root-session' } = {}) {
+  transcript, session = 'root-session', direct = false } = {}) {
+  // Validation cases on Claude/agy use a workflow payload: their direct delegate_task goes to `route dispatch`.
+  if (!direct && ['claude', 'agy'].includes(harness) && /delegate_task$/.test(tool) && args.clientRequestId === undefined
+    && !/^\[route:user-choice\]/.test(args.task ?? '')) args = { ...args, clientRequestId: 'routed-workflow-test' };
   const input = harness === 'agy' ? { toolCall: wrapMcp
     ? { name: 'call_mcp_tool', args: { ServerName: mcpServer, ToolName: tool, Arguments: args } } : { name: tool, args }, conversationId: session }
     : { tool_name: tool, tool_input: args, inT3, model, source, session_id: session,
@@ -148,12 +151,21 @@ try {
   }
 
   const delegate = { task: actual, target };
-  assert.equal(run({ harness: 'agy', tool: 'delegate_task', args: delegate, wrapMcp: true }).decision, 'allow');
-  assert.equal(run({ harness: 'agy', tool: 'delegate_task', args: { task: actual, target: { providerInstanceId: 'codex', model: target.model } },
+  // Claude and agy hand direct delegation to `route dispatch`; workflow payloads and user choices still validate.
+  const wf = { ...delegate, clientRequestId: 'routed-workflow-run-step' };
+  for (const harness of ['claude', 'agy']) {
+    r = run({ harness, tool: 'delegate_task', args: delegate, wrapMcp: harness === 'agy', direct: true });
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /agentdeck route dispatch/);
+    assert.equal(r.call, undefined); // Denied before routing.
+  }
+  assert.equal(run({ harness: 'codex', tool: 'delegate_task', args: delegate }).decision, 'allow');
+  assert.equal(run({ harness: 'agy', tool: 'delegate_task', args: wf, wrapMcp: true }).decision, 'allow');
+  assert.equal(run({ harness: 'agy', tool: 'delegate_task', args: { ...wf, target: { providerInstanceId: 'codex', model: target.model } },
     wrapMcp: true }).decision, 'deny');
-  assert.equal(run({ harness: 'agy', tool: 'delegate_task', args: delegate, wrapMcp: true,
+  assert.equal(run({ harness: 'agy', tool: 'delegate_task', args: wf, wrapMcp: true,
     routed: { ...route, validation: { allowed: false, reason: 'quota' } } }).decision, 'deny');
-  assert.equal(run({ harness: 'agy', tool: 'delegate_task', args: delegate, wrapMcp: true, mcpServer: 'unrelated' }).call, undefined);
+  assert.equal(run({ harness: 'agy', tool: 'delegate_task', args: wf, wrapMcp: true, mcpServer: 'unrelated' }).call, undefined);
   for (const tool of ['mcp__t3_code__delegate_task', 'mcp__t3-code__delegate_task', 'delegate_task']) {
     r = run({ tool, args: delegate });
     assert.equal(r.decision, 'allow');
@@ -161,7 +173,7 @@ try {
     assert.deepEqual(r.call.argv, ['--source', 'codex', '--validate-target', 'codex', target.model, '-']);
     assert.equal(r.output[0].hookSpecificOutput.permissionDecision, undefined);
   }
-  assert.equal(run({ harness: 'claude', tool: 'delegate_task', args: delegate })
+  assert.equal(run({ harness: 'claude', tool: 'delegate_task', args: wf })
     .output[0].hookSpecificOutput.permissionDecision, undefined);
   assert.equal(run({ tool: 'delegate_task', args: { task: 'Missing target' } }).decision, 'deny');
   // The shared policy and family hint must both reach the child, unchanged.
@@ -169,7 +181,7 @@ try {
   const familyHint = 'Long commands: test.';
   const hint = commonHint + '\n\n' + familyHint;
   const hinted = { ...route, requestedBriefHint: hint };
-  for (const harness of ['codex', 'claude', 'agy', 'opencode', 'shell']) {
+  for (const harness of ['codex', 'opencode', 'shell']) {
     r = run({ harness, tool: 'delegate_task', args: delegate, routed: hinted });
     assert.equal(r.decision, 'deny');
     assert.ok(r.reason.includes('needs this hint appended to the task verbatim: ' + JSON.stringify(hint)));
@@ -194,7 +206,7 @@ try {
     assert.match(r.reason, /no accepted or uncertain earlier launch/);
     assert.match(r.reason, /Do not change the saved payload/);
     assert.doesNotMatch(r.reason, /Use target/);
-    assert.match(run({ harness, tool: 'delegate_task', args: delegate,
+    if (!['claude', 'agy'].includes(harness)) assert.match(run({ harness, tool: 'delegate_task', args: delegate,
       routed: { ...route, validation: { allowed: false, reason: 'current ranking changed' } } }).reason, /Use target/);
     r = run({ harness, tool: 'delegate_task', args: { ...delegate,
       clientRequestId: 'routed-workflow-run-step', target: { ...target, options: {} } } });
@@ -208,7 +220,7 @@ try {
   assert.equal(run({ tool: 'delegate_task', args: { ...delegate, task: '[route:native] MCP cannot escape' },
     routed: { ...route, validation: { allowed: false, reason: 'quota' } } }).decision, 'deny');
   // The calibrate prefix is gone; a user-chosen model passes routing with a warning.
-  const lower = { ...route, target: { providerInstanceId: 'claudeAgent', model: 'claude-sonnet-5-5', options: { effort: 'medium' } },
+  const lower = { ...route, target: { providerInstanceId: 'claudeAgent', model: 'claude-sonnet-5-5', options: { effort: 'high' } },
     validation: { allowed: false, reason: 'fit 0.460 below 0.7' } };
   r = run({ tool: 'delegate_task', args: { ...delegate, task: '[route:calibrate] Measure cost' }, routed: lower });
   assert.equal(r.decision, 'deny');
@@ -295,10 +307,13 @@ try {
   ]) {
     const requestedTarget = { providerInstanceId, model, options: { [key]: 'high' } };
     const winner = key === 'effort' ? target
-      : { providerInstanceId: 'claudeAgent', model: 'claude-opus-5-5', options: { effort: 'medium' } };
+      : { providerInstanceId: 'claudeAgent', model: 'claude-opus-5-5', options: { effort: 'high' } };
     const routed = { ...route, target: winner, requestedTarget };
     for (const harness of ['codex', 'claude']) {
-      for (const level of levels) {
+      for (const low of ['low'])
+        assert.equal(run({ harness, tool: 'delegate_task', args: { task: 'Below the router minimum',
+          target: { providerInstanceId, model, options: { [key]: low } } }, routed }).decision, 'deny');
+      for (const level of levels.filter(l => l !== 'low')) {
         for (const options of [{ [key]: level }, [{ id: key, value: level }]]) {
           const args = { task: 'Explicit supported effort', target: { providerInstanceId, model, options } };
           r = run({ harness, tool: 'delegate_task', args, routed });
@@ -340,7 +355,7 @@ try {
     ['codex', 'gpt-6-luna', { reasoningEffort: 'ultra' }, 'deny'],
     ['claudeAgent', 'claude-opus-4-5', { effort: 'xhigh' }, 'deny'],
     ['claudeAgent', 'claude-haiku-4-5', { thinking: true }, 'allow'],
-    ['claudeAgent', 'claude-haiku-4-5', { thinking: false }, 'allow'],
+    ['claudeAgent', 'claude-haiku-4-5', { thinking: false }, 'deny'],
     ['claudeAgent', 'claude-haiku-4-5', { thinking: 'high' }, 'deny'],
     ['claudeAgent', 'claude-haiku-4-5', {}, 'deny'],
   ]) assert.equal(run({ tool: 'delegate_task', args: { task: 'Exact profile', target: { providerInstanceId, model, options } } }).decision, expected);

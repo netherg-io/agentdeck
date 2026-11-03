@@ -330,14 +330,21 @@ pub fn router_block(exe: &Path) -> String {
     let route = format!("{} route", exe.display());
     format!(
         "## Delegation routing (agentdeck router)\n\n\
-        - Route every `delegate_task`/subagent target first: `{route} \"<goal, inputs, read-only or edits, expected size>\"` \
+        - Claude and Antigravity: the router delegates. Write the complete task to a file and run \
+        `{route} dispatch FILE --title TITLE [--isolation worktree] [--role ROLE]`. It picks the model, appends any \
+        `briefHint`, delegates and prints a dispatch ID; its watcher cancels and archives a child that hit a usage limit \
+        and re-dispatches it on another account. When T3 reports a dispatched child ended, run `{route} dispatch --status ID`: \
+        `running` means a replacement is already working, so end your turn; otherwise use its `status` and `summary`. \
+        Direct `delegate_task` is denied, except for a model the user named: start that task with `[route:user-choice]`. \
+        `status: no_model`: split the work or do it yourself.\n\
+        - Codex and OpenCode: route every `delegate_task` target first: `{route} \"<goal, inputs, read-only or edits, expected size>\"` \
         (add `--source <provider instance>` when the source is unknown). Only exact active pool entries are candidates; \
-        never restore removed entries under another id.\n\
-        - Before routing, call T3 `orchestrator_capabilities` and pipe its `structuredContent` JSON to `{route} --catalog`; \
-        refresh after provider/model changes. Pass the complete returned `target` (including `options`) as the `delegate_task` \
-        target; append a returned `briefHint` verbatim. Never set `runtimeMode` unless asked.\n\
-        - `jevConfidence` < 0.4: compare quality and quota penalties of the top two eligible candidates. `target: null`: \
-        split the work or do it yourself. A denied target: use the next `eligible` model in `ranking`.\n"
+        never restore removed entries under another id. Before routing, call T3 `orchestrator_capabilities` and pipe its \
+        `structuredContent` JSON to `{route} --catalog`; refresh after provider/model changes. Pass the complete returned \
+        `target` (including `options`) as the `delegate_task` target; append a returned `briefHint` verbatim. \
+        `jevConfidence` < 0.4: compare quality and quota penalties of the top two eligible candidates. `target: null`: \
+        split the work or do it yourself. A denied target: use the next `eligible` model in `ranking`.\n\
+        - Never set `runtimeMode` unless asked.\n"
     )
 }
 
@@ -651,11 +658,13 @@ fn claude_hook_targets(home: &Path, paths: &Paths, exe: &Path) -> Vec<PathBuf> {
 
 /// Plan hook registration (files only; the old standalone copy stays
 /// untouched). Fails closed: any malformed harness file aborts the plan.
+/// `replace` backs up a foreign OpenCode plugin file instead of refusing.
 pub fn plan_hooks_enable(
     home: &Path,
     paths: &Paths,
     exe: &Path,
     state_dir: &Path,
+    replace: bool,
 ) -> anyhow::Result<Vec<Change>> {
     let mut changes = Vec::new();
     // Claude.
@@ -744,11 +753,12 @@ pub fn plan_hooks_enable(
                 .as_deref()
                 .is_some_and(|b| String::from_utf8_lossy(b).contains("model-route/hook.mjs"));
             if old.is_some()
+                && !replace
                 && !standalone
                 && old.as_deref() != Some(opencode_plugin_text_legacy(paths).as_bytes())
             {
                 anyhow::bail!(
-                    "{} exists and was not written by agentdeck; remove it by hand",
+                    "{} exists and was not written by agentdeck; remove it by hand or retry with --replace",
                     path.display()
                 );
             }
@@ -1090,7 +1100,7 @@ mod tests {
         std::fs::create_dir_all(plugin.parent().unwrap()).unwrap();
         std::fs::write(&plugin, "// spawns model-route/hook.mjs\n").unwrap();
 
-        let changes = plan_hooks_enable(&home, &paths, &exe, &paths.state_dir).unwrap();
+        let changes = plan_hooks_enable(&home, &paths, &exe, &paths.state_dir, false).unwrap();
         crate::changes::apply_changes(&changes).unwrap();
 
         for dir in [".claude", ".claude-second"] {

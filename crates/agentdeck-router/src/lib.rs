@@ -3,6 +3,7 @@
 //! talks to Jev the same way, and prints byte-compatible JSON.
 
 pub mod admission;
+pub mod dispatch;
 pub mod hook;
 pub mod load;
 pub mod mcp_call;

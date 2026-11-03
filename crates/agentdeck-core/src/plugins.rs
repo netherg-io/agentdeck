@@ -471,6 +471,7 @@ fn plan_enable_router(
         paths,
         exe,
         &paths.state_dir,
+        replace,
     )?);
     changes.extend(crate::router::plan_shell_link(
         home,

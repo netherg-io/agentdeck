@@ -21,7 +21,8 @@ const catalog = { providers: [
   { providerInstanceId: 'custom-claude', driverKind: 'claudeAgent', models: [model('meta/muse', claude)] },
 ] };
 
-for (const [difficulty, value] of ['low', 'medium', 'high', 'xhigh'].entries()) {
+// Delegates never run on low: difficulty 0 maps to medium, 1 to high, 2-3 to xhigh.
+for (const [difficulty, value] of ['medium', 'high', 'xhigh', 'xhigh'].entries()) {
   for (const provider of ['codex', 'codex_second'])
     assert.deepEqual(reasoningTarget(catalog, provider, 'sol', difficulty).options, { reasoningEffort: value });
   for (const provider of ['claudeAgent', 'claudeAgent_openrouter'])
@@ -34,19 +35,22 @@ const museVariant = select('variant', ['minimal', 'low', 'medium', 'high', 'xhig
 const museCatalog = { providers: [{ providerInstanceId: 'opencode', driverKind: 'opencode',
   models: [model('openrouter/meta/muse-spark-1.3-contributor', museVariant), model('openrouter/other/model', museVariant)] }] };
 const muse = { providerInstanceId: 'opencode', model: 'openrouter/meta/muse-spark-1.3-contributor' };
-for (const [difficulty, value] of ['high', 'high', 'high', 'xhigh'].entries())
+for (const [difficulty, value] of ['high', 'high', 'xhigh', 'xhigh'].entries())
   assert.deepEqual(reasoningTarget(museCatalog, muse.providerInstanceId, muse.model, difficulty).options, { variant: value });
-assert.deepEqual(reasoningTarget(museCatalog, 'opencode', 'openrouter/other/model', 0).options, { variant: 'low' });
+assert.deepEqual(reasoningTarget(museCatalog, 'opencode', 'openrouter/other/model', 0).options, { variant: 'medium' });
 for (const low of ['minimal', 'low', 'medium'])
   assert.match(validateReasoning(museCatalog, { ...muse, options: { variant: low } }), /below this model family's minimum high/);
 for (const ok of ['high', 'xhigh', 'max'])
   assert.equal(validateReasoning(museCatalog, { ...muse, options: { variant: ok } }), null);
-assert.equal(validateReasoning(museCatalog, { providerInstanceId: 'opencode', model: 'openrouter/other/model', options: { variant: 'low' } }), null);
+assert.match(validateReasoning(museCatalog, { providerInstanceId: 'opencode', model: 'openrouter/other/model', options: { variant: 'low' } }), /router minimum medium/);
 assert.deepEqual(repairReasoning(museCatalog, { ...muse, options: { variant: 'medium' } },
   reasoningTarget(museCatalog, muse.providerInstanceId, muse.model, 1)).options, { variant: 'high' });
-assert.deepEqual(reasoningTarget(catalog, 'claudeAgent', 'claude-haiku', 0).options, { thinking: false });
+assert.deepEqual(reasoningTarget(catalog, 'claudeAgent', 'claude-haiku', 0).options, { thinking: true });
+assert.match(validateReasoning(catalog, { providerInstanceId: 'claudeAgent', model: 'claude-haiku', options: { thinking: false } }), /must be true/);
 assert.deepEqual(reasoningTarget(catalog, 'claudeAgent', 'claude-haiku', 2).options, { thinking: true });
-assert.deepEqual(reasoningTarget(catalog, 'opencode', 'ordinary', 1).options, { variant: 'low' });
+assert.deepEqual(reasoningTarget(catalog, 'opencode', 'ordinary', 1).options, { variant: 'high' });
+// medium is not offered: the next supported level above it, never low.
+assert.deepEqual(reasoningTarget(catalog, 'opencode', 'ordinary', 0).options, { variant: 'high' });
 assert.deepEqual(reasoningTarget(catalog, 'opencode', 'opaque', 2).options, { variant: 'deep' });
 assert.throws(() => reasoningTarget(catalog, 'opencode', 'unknown', 2), /cannot map/);
 assert.equal(reasoningTarget(catalog, 'opencode', 'none', 2).options, undefined);
@@ -58,7 +62,8 @@ assert.match(validateReasoning(catalog, { providerInstanceId: 'custom-claude', m
 const target = { providerInstanceId: 'codex_second', model: 'sol' };
 for (const options of [undefined, {}, [], { serviceTier: 'priority' }])
   assert.match(validateReasoning(catalog, { ...target, options }), /explicit.*required/);
-for (const value of ['low', 'ultra']) {
+assert.match(validateReasoning(catalog, { ...target, options: { reasoningEffort: 'low' } }), /router minimum medium/);
+for (const value of ['medium', 'ultra']) {
   assert.equal(validateReasoning(catalog, { ...target, options: { reasoningEffort: value, serviceTier: 'priority' } }), null);
   assert.equal(validateReasoning(catalog, { ...target, options: [{ id: 'reasoningEffort', value }] }), null);
 }
@@ -70,7 +75,7 @@ for (const value of ['', false, 2, 'invented'])
 assert.match(validateReasoning(catalog, { providerInstanceId: 'codex', model: 'luna', options: { reasoningEffort: 'ultra' } }), /unsupported/);
 assert.equal(validateReasoning(catalog, { providerInstanceId: 'claudeAgent', model: 'claude-haiku', options: { thinking: true } }), null);
 assert.match(validateReasoning(catalog, { providerInstanceId: 'antigravity', model: 'gemini-high', options: { reasoningEffort: 'high' } }), /another harness/);
-const recommended = reasoningTarget(catalog, 'codex_second', 'sol', 2);
+const recommended = reasoningTarget(catalog, 'codex_second', 'sol', 1);
 const partial = { ...target, options: { serviceTier: 'priority' } };
 assert.deepEqual(repairReasoning(catalog, partial, recommended).options, { serviceTier: 'priority', reasoningEffort: 'high' });
 assert.deepEqual(partial.options, { serviceTier: 'priority' });

@@ -286,11 +286,13 @@ pub fn reasoning_target(
     catalog: &Value,
     provider: &str,
     model: &str,
-    mut difficulty: i64,
+    difficulty: i64,
 ) -> anyhow::Result<Value> {
     let target = serde_json::json!({"providerInstanceId": provider, "model": model});
     let d = reasoning_descriptor(catalog, provider, model)?;
     let Some(d) = d else { return Ok(target) };
+    // Delegates never run on low or an implicit default: difficulty 0 medium, 1 high, 2-3 xhigh.
+    let mut difficulty: i64 = (difficulty.max(0) + 1).min(3);
     if d.get("type").and_then(Value::as_str) == Some("boolean") {
         let mut target = serde_json::Map::new();
         target.insert("providerInstanceId".into(), Value::from(provider));
@@ -301,7 +303,7 @@ pub fn reasoning_target(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
-            Value::from(difficulty > 0),
+            Value::from(true),
         );
         target.insert("options".into(), Value::Object(opts));
         return Ok(Value::Object(target));
@@ -321,9 +323,12 @@ pub fn reasoning_target(
     if floor > difficulty {
         difficulty = floor;
     }
-    let mut value = LEVELS[..=(difficulty.clamp(0, 3) as usize)]
+    // Highest supported level up to the wanted one but not below medium, else the next one above.
+    let wanted = difficulty.clamp(1, 3) as usize;
+    let mut value = LEVELS[1..=wanted]
         .iter()
         .rev()
+        .chain(LEVELS[wanted + 1..].iter())
         .find(|v| supported.iter().any(|s| s == *v))
         .map(|v| v.to_string())
         .or_else(|| {
@@ -442,6 +447,7 @@ pub fn validate_reasoning(catalog: &Value, target: &Value) -> anyhow::Result<Opt
             "unsupported target.options.{did} for this model"
         )));
     }
+    let raw = value;
     let value = normalize_option_value("", value);
     if let Some(floor) = min_effort(model)
         && let (Some(pos), Some(min)) = (
@@ -452,6 +458,26 @@ pub fn validate_reasoning(catalog: &Value, target: &Value) -> anyhow::Result<Opt
     {
         return Ok(Some(format!(
             "target.options.{did} {value} is below this model family's minimum {floor}"
+        )));
+    }
+    if d.get("type").and_then(Value::as_str) == Some("boolean") {
+        if raw != &Value::Bool(true) {
+            return Ok(Some(format!("target.options.{did} must be true")));
+        }
+    } else if d.get("options").and_then(Value::as_array).is_some_and(|o| {
+        o.iter().any(|x| {
+            x.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| LEVELS[1..].contains(&id))
+        })
+    }) && let (Some(pos), Some(min)) = (
+        RANK.iter().position(|r| Some(*r) == raw.as_str()),
+        RANK.iter().position(|r| *r == "medium"),
+    ) && pos < min
+    {
+        return Ok(Some(format!(
+            "target.options.{did} {} is below the router minimum medium",
+            raw.as_str().unwrap_or_default()
         )));
     }
     Ok(None)
@@ -563,7 +589,23 @@ mod catalog_tests {
         // No roster family, but an exact catalog entry: routable, no invented profile.
         let t = reasoning_target(&catalog(), "codex", "some-new-model-9", 1).unwrap();
         assert_eq!(t["model"], "some-new-model-9");
-        assert_eq!(t["options"]["reasoningEffort"], "medium");
+        assert_eq!(t["options"]["reasoningEffort"], "high");
+        let easy = reasoning_target(&catalog(), "codex", "some-new-model-9", 0).unwrap();
+        assert_eq!(easy["options"]["reasoningEffort"], "medium");
+        let hard = reasoning_target(&catalog(), "codex", "some-new-model-9", 3).unwrap();
+        // xhigh is not offered: the highest supported level below it.
+        assert_eq!(hard["options"]["reasoningEffort"], "high");
+        let at = |v: &str| {
+            serde_json::json!({"providerInstanceId": "codex",
+            "model": "some-new-model-9", "options": {"reasoningEffort": v}})
+        };
+        assert!(
+            validate_reasoning(&catalog(), &at("low"))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(validate_reasoning(&catalog(), &at("medium")).unwrap(), None);
+        assert_eq!(validate_reasoning(&catalog(), &at("high")).unwrap(), None);
         let bare = reasoning_target(&catalog(), "codex", "plain-model", 2).unwrap();
         assert_eq!(bare["model"], "plain-model");
         assert!(bare.get("options").is_none());

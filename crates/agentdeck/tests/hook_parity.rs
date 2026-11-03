@@ -541,6 +541,17 @@ fn hook_parity_with_node() {
         input["source"] = "codex".into();
         check_case("deny-invalid-shell", &fx, "shell", &input);
     }
+    // 3b. Direct Claude delegate_task goes to `route dispatch`: deny:use-dispatch.
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        let input = delegate_input(
+            "mcp__t3-code__delegate_task",
+            &hinted("Fix the typo"),
+            sol.clone(),
+            serde_json::json!({}),
+        );
+        check_case("deny-use-dispatch-claude", &fx, "claude", &input);
+    }
     // 4. Shell source outside the live catalog: deny:shell-source.
     {
         let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);

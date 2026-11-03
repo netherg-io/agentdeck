@@ -14,6 +14,10 @@ use crate::reasoning::{read_catalog, repair_reasoning, validate_reasoning};
 const ROUTE_TIMEOUT_SECS: u64 = 55;
 const ROUTE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const USER_CHOICE: &str = "[route:user-choice]";
+/// Claude and agy reach the T3 shell bridge, so `route dispatch` replaces
+/// their direct `delegate_task`; Codex and OpenCode keep target validation.
+/// Routed workflow payloads and explicit user choices still validate.
+const USE_DISPATCH: &str = "model-route: the router delegates tasks itself. Write the complete task to a file and run `agentdeck route dispatch FILE --title TITLE [--isolation worktree] [--role ROLE]`: it picks the model, delegates and prints a dispatch ID; its watcher cancels and re-dispatches the child after a usage limit. When T3 reports the child ended, run `agentdeck route dispatch --status ID` (running means a replacement is already working). Do not call delegate_task directly.";
 const USER_CHOICE_HINT: &str = " If the user explicitly asked for a specific model, call delegate_task with that exact target and start the task with [route:user-choice]; routing then only warns.";
 
 const NOISE: &[&str] = &[
@@ -458,8 +462,11 @@ fn ancestors() -> Vec<Vec<String>> {
     out
 }
 
+/// Older T3 ran a Node server; current T3 is a native `t3 serve` binary.
 fn t3_server(cmd: &[String]) -> bool {
     cmd.iter().any(|a| a.ends_with("/apps/server/dist/bin.mjs"))
+        || (cmd.first().is_some_and(|a| a == "t3" || a.ends_with("/t3"))
+            && cmd.get(1).is_some_and(|a| a == "serve"))
 }
 
 fn under_server(chain: &[Vec<String>], pred: impl Fn(&[String]) -> bool) -> bool {
@@ -634,10 +641,10 @@ pub fn run(argv: &[String]) -> i32 {
             &Value::Null,
             None,
             "deny:router-error",
-            reason,
+            // The cause goes to the log only; the agent gets the fixed text.
+            &format!("{reason} Cause: {e:#}"),
         );
         ctx.emit(false, reason);
-        let _ = e;
     }
     use std::io::Write;
     let _ = std::io::stdout().write_all(&ctx.out);
@@ -708,7 +715,9 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
         return Ok(());
     }
     let chain = ancestors();
-    if !in_t3(&harness, &chain, &input) {
+    // delegate_task exists only in T3, so it is always routed: a missed T3
+    // detection must not skip routing.
+    if !delegate && !in_t3(&harness, &chain, &input) {
         ctx.emit(true, "");
         return Ok(());
     }
@@ -839,6 +848,23 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
                 None,
                 "deny:invalid-delegate",
                 reason,
+            );
+            return Ok(());
+        }
+        if matches!(harness.as_str(), "claude" | "agy")
+            && !task.starts_with(USER_CHOICE)
+            && !str_field(&args, "clientRequestId")
+                .unwrap_or_default()
+                .starts_with("routed-workflow-")
+        {
+            let reason = format!("{USE_DISPATCH}{USER_CHOICE_HINT}");
+            ctx.deny(
+                instance.as_deref(),
+                Some(&tool_name),
+                &args_obj,
+                None,
+                "deny:use-dispatch",
+                &reason,
             );
             return Ok(());
         }
@@ -1196,7 +1222,22 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_tags;
+    use super::{strip_tags, t3_server};
+
+    #[test]
+    fn recognizes_node_and_native_t3_servers() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(t3_server(&v(&["node", "/x/apps/server/dist/bin.mjs"])));
+        assert!(t3_server(&v(&[
+            "/h/.t3/runtime/versions/0.1.4/t3",
+            "serve"
+        ])));
+        assert!(!t3_server(&v(&[
+            "/h/.t3/runtime/versions/0.1.4/t3",
+            "__service-launcher"
+        ])));
+        assert!(!t3_server(&v(&["/usr/bin/mt3", "serve"])));
+    }
 
     #[test]
     fn strips_matching_pair_and_keeps_unclosed() {
