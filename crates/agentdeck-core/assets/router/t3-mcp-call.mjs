@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createConnection } from 'node:net';
 
-const TOOLS = ['orchestrator_capabilities', 'delegate_task', 'task_status', 'task_cancel'];
+const TOOLS = ['orchestrator_capabilities', 'delegate_task', 'task_status', 'task_cancel', 't3_thread_organize'];
 const USAGE = 'usage: t3-mcp-call TOOL JSON_FILE|- (orchestrator_capabilities needs no file)';
 const fail = message => { throw new Error(message); };
 const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
