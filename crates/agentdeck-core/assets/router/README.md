@@ -13,7 +13,7 @@ same way: `claudeAgent`, `claude_second`, `claude_third` and `claude_fourth` mat
 - Every target's `briefHint` combines the shared delegated-agent policy with any family hint, in that order separated by a blank line. Append the entire string verbatim; hooks require it. The shared policy text lives only in `roster.json` (`briefHint`): no nesting, scope, verification, report format and the `BLOCKED:` contract.
 - `route.mjs --source claudeAgent "<task>"`: explicitly identify the orchestrator; otherwise detected from executable names in the process chain. Other sources: `codex`, `codex_second`, `antigravity`, `opencode`, `claudeAgent_openrouter`. Codex shadow homes identify separate accounts. Unknown source is reported and cannot receive shared-quota protection.
 - `route.mjs --source codex --validate-target PROVIDER MODEL -`: read the complete task from stdin and validate an already selected target. Output includes `validation.allowed` and its reason. A denied target exits 0; malformed input or router failure exits nonzero.
-- `agentdeck route dispatch FILE [--title T] [--role R] [--isolation shared|worktree] [--id ID] [--max-hours H]`
+- `agentdeck route dispatch FILE [--title T] [--role implementation|research|review|design|test|general] [--isolation shared|worktree] [--id ID] [--max-hours H]`
   (Rust binary only): the router delegates. It routes the task, calls T3 `delegate_task` through the session bridge with
   the winner and `briefHint`, saves `~/.local/state/model-route/dispatch/<id>.json` and returns. A detached watcher
   (`--watch ID`, log beside the state file, at most `--max-hours`, default 24) polls `task_status`. When the child's
@@ -21,7 +21,10 @@ same way: `claudeAgent`, `claude_second`, `claude_third` and `claude_fourth` mat
   the child thread (T3's auto-resume skips archived threads, so the replaced child never resumes) and re-routes with
   `--exclude` for that account, at most 4 attempts. `--status ID` prints the state. Claude and agy must use it: their
   direct `delegate_task` is denied (`deny:use-dispatch`) unless it is a routed workflow payload or `[route:user-choice]`.
-  Codex and OpenCode have no shell bridge and keep target validation.
+  Invalid roles fail before dispatch. An initial launch failure is saved as `failed` with its reason;
+  only a response with a nonempty `taskId` records a running attempt. JSON-RPC validation rejections
+  preserve the server's code and message; transport or internal errors still require task recovery
+  before retrying. Codex and OpenCode have no shell bridge and keep target validation.
 - `route.mjs --exclude INSTANCE`: ban every favorite on that instance's account for this call (repeatable).
 - `route.mjs --check`: quota, per-size cost and allowed sizes per favorite; favorites without a family
   profile are flagged `UNPROFILED` (report-only, exit 0: they route on their Jev judgment with

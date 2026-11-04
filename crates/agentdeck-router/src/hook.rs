@@ -17,7 +17,7 @@ const USER_CHOICE: &str = "[route:user-choice]";
 /// Claude and agy reach the T3 shell bridge, so `route dispatch` replaces
 /// their direct `delegate_task`; Codex and OpenCode keep target validation.
 /// Routed workflow payloads and explicit user choices still validate.
-const USE_DISPATCH: &str = "model-route: the router delegates tasks itself. Write the complete task to a file and run `agentdeck route dispatch FILE --title TITLE [--isolation worktree] [--role ROLE]`: it picks the model, delegates and prints a dispatch ID; its watcher cancels and re-dispatches the child after a usage limit. When T3 reports the child ended, run `agentdeck route dispatch --status ID` (running means a replacement is already working). Do not call delegate_task directly.";
+const USE_DISPATCH: &str = "model-route: the router delegates tasks itself. Write the complete task to a file and run `agentdeck route dispatch FILE --title TITLE [--isolation worktree] [--role implementation|research|review|design|test|general]`: it picks the model, delegates and prints a dispatch ID; its watcher cancels and re-dispatches the child after a usage limit. When T3 reports the child ended, run `agentdeck route dispatch --status ID` (running means a replacement is already working). Do not call delegate_task directly.";
 const USER_CHOICE_HINT: &str = " If the user explicitly asked for a specific model, call delegate_task with that exact target and start the task with [route:user-choice]; routing then only warns.";
 
 const NOISE: &[&str] = &[

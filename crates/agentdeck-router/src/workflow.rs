@@ -20,7 +20,7 @@ and may incur a first or repeat charge. With workflowEval.auto in the router JSO
 spawns a detached eval after a settled success and reports autoEval started|skipped:<reason>,
 additive only when auto is on or the config is invalid. eval-budget prints today's judge
 request count/USD against the workflowEval limits. --force never bypasses the daily budget.";
-const ROLES: &[&str] = &[
+pub(crate) const ROLES: &[&str] = &[
     "implementation",
     "research",
     "review",

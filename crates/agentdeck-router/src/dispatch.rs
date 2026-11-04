@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 
 use crate::mcp_call::{Hooks, call_tool, scoped_connection};
 
-pub const USAGE: &str = "usage: agentdeck route dispatch TASK_FILE|- [--title TITLE] [--role ROLE] [--isolation shared|worktree] [--id ID] [--max-hours H]\n       agentdeck route dispatch --status ID\n\nRoutes the task, delegates it through T3 and prints the launched attempt with its dispatch ID.\nA detached watcher follows the child: after a usage-limit failure it cancels and archives that\nchild and re-dispatches to another account (at most 4 attempts). T3 still wakes the parent when\neach child ends; then read `--status ID` (status running means a replacement is already working).";
+pub const USAGE: &str = "usage: agentdeck route dispatch TASK_FILE|- [--title TITLE] [--role implementation|research|review|design|test|general] [--isolation shared|worktree] [--id ID] [--max-hours H]\n       agentdeck route dispatch --status ID\n\nRoutes the task, delegates it through T3 and prints the launched attempt with its dispatch ID.\nA detached watcher follows the child: after a usage-limit failure it cancels and archives that\nchild and re-dispatches to another account (at most 4 attempts). T3 still wakes the parent when\neach child ends; then read `--status ID` (status running means a replacement is already working).";
 
 const MAX_ATTEMPTS: usize = 4;
 const POLL: Duration = Duration::from_secs(30);
@@ -50,7 +50,16 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         };
         match arg.as_str() {
             "--title" => a.title = Some(value("--title")?),
-            "--role" => a.role = Some(value("--role")?),
+            "--role" => {
+                let role = value("--role")?;
+                if !crate::workflow::ROLES.contains(&role.as_str()) {
+                    return Err(format!(
+                        "--role must be one of {}",
+                        crate::workflow::ROLES.join("|")
+                    ));
+                }
+                a.role = Some(role);
+            }
             "--isolation" => {
                 let v = value("--isolation")?;
                 if v != "shared" && v != "worktree" {
@@ -181,6 +190,20 @@ fn str_of<'a>(v: &'a Value, key: &str) -> &'a str {
 /// Route (skipping excluded accounts) and delegate the next attempt. Returns
 /// false when no model is eligible; the state then holds `no_model`.
 async fn launch(state: &mut Value) -> anyhow::Result<bool> {
+    let result = launch_inner(state).await;
+    save_launch_result(state, result)
+}
+
+fn save_launch_result(state: &mut Value, result: anyhow::Result<bool>) -> anyhow::Result<bool> {
+    if let Err(error) = &result {
+        state["status"] = json!("failed");
+        state["reason"] = json!(format!("dispatch failed: {error:#}"));
+    }
+    save(state)?;
+    result
+}
+
+async fn launch_inner(state: &mut Value) -> anyhow::Result<bool> {
     let task = str_of(state, "task").to_string();
     let source = str_of(state, "source").to_string();
     let exclude: Vec<String> = state["excluded"]
@@ -217,6 +240,15 @@ async fn launch(state: &mut Value) -> anyhow::Result<bool> {
         }
     }
     let started = tool("delegate_task", payload).await?;
+    if started
+        .get("taskId")
+        .and_then(Value::as_str)
+        .is_none_or(|s| s.trim().is_empty())
+    {
+        anyhow::bail!(
+            "T3 tool-call outcome unknown: response has no taskId. Do not retry delegation: recover its taskId from parent activity first."
+        );
+    }
     let attempt = json!({
         "taskId": started.get("taskId"),
         "childThreadId": started.get("childThreadId"),
@@ -329,11 +361,9 @@ async fn start(args: Args) -> anyhow::Result<i32> {
     });
     save(&mut state)?;
     if !launch(&mut state).await? {
-        save(&mut state)?;
         println!("{}", serde_json::to_string_pretty(&summary(&state))?);
         return Ok(1);
     }
-    save(&mut state)?;
     state["watcherPid"] = json!(spawn_watcher(&id)?);
     state["next"] = json!(format!(
         "T3 wakes you when the child ends; then run `agentdeck route dispatch --status {id}`. Status running means a replacement after a usage limit is already working."
@@ -484,10 +514,37 @@ mod tests {
         assert!(parse(&v(&[])).is_err());
         assert!(parse(&v(&["a", "b"])).is_err());
         assert!(parse(&v(&["a", "--isolation", "x"])).is_err());
+        assert!(parse(&v(&["a", "--role", "implement"])).is_err());
+        assert!(parse(&v(&["a", "--role", "boss"])).is_err());
+        assert_eq!(
+            parse(&v(&["a", "--role", "implementation"]))
+                .unwrap()
+                .role
+                .as_deref(),
+            Some("implementation")
+        );
         assert!(parse(&v(&["a", "--max-hours", "0"])).is_err());
         for bad in ["../x", ".hidden", "a/b", ""] {
             assert!(parse(&v(&["a", "--id", bad])).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn failed_initial_launch_is_saved_without_a_confirmed_attempt() {
+        let id = format!("test-launch-failure-{}", std::process::id());
+        let mut state = json!({"id": id, "status": "starting", "attempts": []});
+        let result = save_launch_result(
+            &mut state,
+            Err(anyhow::anyhow!(
+                "T3 MCP rejected request (-32602): invalid role"
+            )),
+        );
+        assert!(result.is_err());
+        let saved = load(&id).unwrap();
+        std::fs::remove_file(state_path(&id).unwrap()).unwrap();
+        assert_eq!(saved["status"], "failed");
+        assert!(saved["reason"].as_str().unwrap().contains("-32602"));
+        assert_eq!(saved["attempts"], json!([]));
     }
 
     #[test]
