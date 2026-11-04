@@ -204,6 +204,8 @@ fn save_launch_result(state: &mut Value, result: anyhow::Result<bool>) -> anyhow
 }
 
 async fn launch_inner(state: &mut Value) -> anyhow::Result<bool> {
+    let caps = tool("orchestrator_capabilities", json!({})).await?;
+    crate::mcp_call::catalog_refresh(&caps)?;
     let task = str_of(state, "task").to_string();
     let source = str_of(state, "source").to_string();
     let exclude: Vec<String> = state["excluded"]
@@ -360,9 +362,12 @@ async fn start(args: Args) -> anyhow::Result<i32> {
         "attempts": [],
     });
     save(&mut state)?;
-    if !launch(&mut state).await? {
-        println!("{}", serde_json::to_string_pretty(&summary(&state))?);
-        return Ok(1);
+    match launch(&mut state).await {
+        Ok(true) => {}
+        result => {
+            println!("{}", serde_json::to_string_pretty(&summary(&state))?);
+            return result.map(|_| 1);
+        }
     }
     state["watcherPid"] = json!(spawn_watcher(&id)?);
     state["next"] = json!(format!(
