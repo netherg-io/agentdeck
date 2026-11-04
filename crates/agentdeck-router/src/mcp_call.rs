@@ -199,16 +199,15 @@ pub fn validate_payload(tool: &str, payload: &Value) -> anyhow::Result<()> {
         {
             anyhow::bail!("Shell delegation requires mode=async and a stable clientRequestId.");
         }
-        if let Some(role) = payload.get("role") {
-            if !role
+        if let Some(role) = payload.get("role")
+            && !role
                 .as_str()
                 .is_some_and(|r| crate::workflow::ROLES.contains(&r))
-            {
-                anyhow::bail!(
-                    "delegate_task role must be one of {}.",
-                    crate::workflow::ROLES.join("|")
-                );
-            }
+        {
+            anyhow::bail!(
+                "delegate_task role must be one of {}.",
+                crate::workflow::ROLES.join("|")
+            );
         }
         if payload.get("runtimeMode").is_some() {
             anyhow::bail!("Omit runtimeMode to inherit the parent permissions.");
