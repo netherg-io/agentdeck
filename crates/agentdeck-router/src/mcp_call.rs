@@ -199,6 +199,16 @@ pub fn validate_payload(tool: &str, payload: &Value) -> anyhow::Result<()> {
         {
             anyhow::bail!("Shell delegation requires mode=async and a stable clientRequestId.");
         }
+        if let Some(role) = payload.get("role")
+            && !role
+                .as_str()
+                .is_some_and(|r| crate::workflow::ROLES.contains(&r))
+        {
+            anyhow::bail!(
+                "delegate_task role must be one of {}.",
+                crate::workflow::ROLES.join("|")
+            );
+        }
         if payload.get("runtimeMode").is_some() {
             anyhow::bail!("Omit runtimeMode to inherit the parent permissions.");
         }
@@ -403,6 +413,18 @@ impl Hooks {
     }
 }
 
+// Only protocol validation errors prove that delegation never reached the handler.
+#[derive(Debug)]
+struct RequestRejected(String);
+
+impl std::fmt::Display for RequestRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RequestRejected {}
+
 struct Rpc {
     client: reqwest::Client,
     endpoint: String,
@@ -495,6 +517,16 @@ impl Rpc {
                 .await
                 .map_err(|_| anyhow::anyhow!("Invalid T3 MCP JSON envelope."))?
         };
+        if envelope.get("id") == id.map(Value::from).as_ref()
+            && let Some(error) = envelope.get("error")
+            && let Some(code @ (-32700 | -32600 | -32601 | -32602)) =
+                error.get("code").and_then(Value::as_i64)
+            && let Some(message) = error.get("message").and_then(Value::as_str)
+        {
+            return Err(
+                RequestRejected(format!("T3 MCP rejected request ({code}): {message}")).into(),
+            );
+        }
         if envelope.get("id") != id.map(Value::from).as_ref()
             || envelope.get("error").is_some()
             || !envelope.get("result").is_some_and(is_obj)
@@ -640,6 +672,7 @@ pub async fn call_tool(
     {
         Ok(Some(result)) => Ok(result),
         Ok(None) => anyhow::bail!("T3 MCP tool call failed."),
+        Err(error) if error.is::<RequestRejected>() => Err(error),
         Err(_) if tool == "delegate_task" => {
             anyhow::bail!(
                 "T3 tool-call outcome unknown. Do not retry delegation: recover its taskId from parent activity first."

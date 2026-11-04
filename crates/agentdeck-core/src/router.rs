@@ -331,7 +331,7 @@ pub fn router_block(exe: &Path) -> String {
     format!(
         "## Delegation routing (agentdeck router)\n\n\
         - Claude and Antigravity: the router delegates. Write the complete task to a file and run \
-        `{route} dispatch FILE --title TITLE [--isolation worktree] [--role ROLE]`. It picks the model, appends any \
+        `{route} dispatch FILE --title TITLE [--isolation worktree] [--role implementation|research|review|design|test|general]`. It picks the model, appends any \
         `briefHint`, delegates and prints a dispatch ID; its watcher cancels and archives a child that hit a usage limit \
         and re-dispatches it on another account. When T3 reports a dispatched child ended, run `{route} dispatch --status ID`: \
         `running` means a replacement is already working, so end your turn; otherwise use its `status` and `summary`. \

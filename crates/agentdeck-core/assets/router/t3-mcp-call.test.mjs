@@ -60,7 +60,8 @@ for (const response of [JSON.stringify(connection) + '\n', '{"error":"not_config
 validatePayload('delegate_task', payload);
 for (const bad of [{ ...payload, mode: 'wait' }, { ...payload, clientRequestId: '' },
   { ...payload, runtimeMode: 'full-access' }, { ...payload, runtimeMode: null },
-  { ...payload, task: 'x'.repeat(120001) }, { ...payload, target: {} }])
+  { ...payload, task: 'x'.repeat(120001) }, { ...payload, target: {} },
+  { ...payload, role: 'implement' }, { ...payload, role: null }])
   assert.throws(() => validatePayload('delegate_task', bad));
 assert.throws(() => validatePayload('t3_thread_launch', {}), /Supported tools/);
 assert.deepEqual(readPayload('/fixture/prepared.json', () => JSON.stringify({ payload, route: { target: payload.target } })), payload);
@@ -78,7 +79,7 @@ assert.throws(() => checkRoute(payload, capabilities, () => ({ status: 0,
 assert.throws(() => checkRoute(payload, capabilities, () => ({ status: 1, stdout: 'private error' })), /nothing dispatched/);
 
 function fixture({ sse = false, lost = false, denied = false, capabilityData = capabilities,
-  httpError = false, invalidJson = false, rpcError = false, mcpError = false } = {}) {
+  httpError = false, invalidJson = false, rpcError = false, invalidParams = false, mcpError = false } = {}) {
   const calls = [], events = [];
   const fetchImpl = async (url, options) => {
     assert.equal(url, connection.endpoint);
@@ -97,7 +98,8 @@ function fixture({ sse = false, lost = false, denied = false, capabilityData = c
     if (lost) throw new Error('Socket lost; fixture-secret must not leak');
     if (httpError) return new Response('fixture-secret must not leak', { status: 401 });
     if (invalidJson) return new Response('fixture-secret must not leak', { headers: { 'content-type': 'application/json' } });
-    const envelope = { jsonrpc: '2.0', id: message.id, ...(rpcError ? { error: { code: -32603, message: 'private' } }
+    const envelope = { jsonrpc: '2.0', id: message.id, ...(invalidParams ? { error: { code: -32602, message: 'Invalid parameters: role must be implementation' } }
+      : rpcError ? { error: { code: -32603, message: 'private' } }
       : { result: mcpError ? { isError: true, content: [{ type: 'text', text: 'Rejected input' }] } : { structuredContent: launched } }) };
     if (!sse) return new Response(JSON.stringify(envelope), { headers: { 'content-type': 'application/json' } });
     const source = ': comment\r\ndata: null\r\n\r\nevent: message\r\ndata: {"jsonrpc":"2.0","method":"notifications/progress"}\r\n\r\n'
@@ -117,6 +119,15 @@ for (const sse of [false, true]) {
   const f = fixture({ sse });
   const result = await callTool('delegate_task', payload, connection, f.options);
   assert.deepEqual(result.structuredContent, launched);
+  assert.equal(f.calls.filter(c => c.params?.name === 'delegate_task').length, 1);
+}
+for (const sse of [false, true]) {
+  const f = fixture({ sse, invalidParams: true });
+  await assert.rejects(callTool('delegate_task', payload, connection, f.options), error => {
+    assert.match(error.message, /-32602.*role must be implementation/);
+    assert.ok(!error.message.includes('outcome unknown'));
+    return true;
+  });
   assert.equal(f.calls.filter(c => c.params?.name === 'delegate_task').length, 1);
 }
 const denied = fixture({ denied: true });

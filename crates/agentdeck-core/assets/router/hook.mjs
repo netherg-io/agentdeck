@@ -182,7 +182,7 @@ function run() {
   // routed workflow payloads and explicit user choices still validate.
   if (delegate && ['claude', 'agy'].includes(harness) && !USER_CHOICE.test(args.task)
     && !String(args.clientRequestId ?? '').startsWith('routed-workflow-')) {
-    const reason = 'model-route: the router delegates tasks itself. Write the complete task to a file and run `agentdeck route dispatch FILE --title TITLE [--isolation worktree] [--role ROLE]`: it picks the model, delegates and prints a dispatch ID; its watcher cancels and re-dispatches the child after a usage limit. When T3 reports the child ended, run `agentdeck route dispatch --status ID` (running means a replacement is already working). Do not call delegate_task directly.' + USER_CHOICE_HINT;
+    const reason = 'model-route: the router delegates tasks itself. Write the complete task to a file and run `agentdeck route dispatch FILE --title TITLE [--isolation worktree] [--role implementation|research|review|design|test|general]`: it picks the model, delegates and prints a dispatch ID; its watcher cancels and re-dispatches the child after a usage limit. When T3 reports the child ended, run `agentdeck route dispatch --status ID` (running means a replacement is already working). Do not call delegate_task directly.' + USER_CHOICE_HINT;
     record('deny:use-dispatch', reason);
     return emit(false, reason);
   }

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { createConnection } from 'node:net';
 
 const TOOLS = ['orchestrator_capabilities', 'delegate_task', 'task_status', 'task_cancel', 't3_thread_organize'];
+const ROLES = ['implementation', 'research', 'review', 'design', 'test', 'general'];
 const USAGE = 'usage: t3-mcp-call TOOL JSON_FILE|- (orchestrator_capabilities needs no file)';
 const fail = message => { throw new Error(message); };
 const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -79,6 +80,9 @@ export function discoverConnection({ env = process.env, pid = process.ppid, read
   fail('No inherited T3 MCP connection. Run inside a T3 Claude/ACP session; use native MCP in Codex.');
 }
 
+// Only protocol validation errors prove that delegation never reached the handler.
+class RequestRejected extends Error {}
+
 // MCP streamable HTTP can return one JSON envelope or an SSE stream.
 export async function rpc(connection, fetchImpl = fetch) {
   let session, protocol, id = 0;
@@ -118,6 +122,9 @@ export async function rpc(connection, fetchImpl = fetch) {
     } else {
       try { envelope = await response.json(); } catch { fail('Invalid T3 MCP JSON envelope.'); }
     }
+    if (envelope?.id === requestId && [-32700, -32600, -32601, -32602].includes(envelope.error?.code)
+      && typeof envelope.error.message === 'string')
+      throw new RequestRejected(`T3 MCP rejected request (${envelope.error.code}): ${envelope.error.message}`);
     if (!envelope || envelope.id !== requestId || envelope.error || !object(envelope.result))
       fail('T3 MCP rejected the request or returned an invalid response.');
     protocol = envelope.result.protocolVersion ?? protocol;
@@ -135,6 +142,7 @@ export function validatePayload(tool, payload) {
       fail('delegate_task needs a complete task (at most 120000 characters) and exact target.');
     if (payload.mode !== 'async' || typeof payload.clientRequestId !== 'string' || !payload.clientRequestId.trim())
       fail('Shell delegation requires mode=async and a stable clientRequestId.');
+    if ('role' in payload && !ROLES.includes(payload.role)) fail('delegate_task role must be one of ' + ROLES.join('|') + '.');
     if ('runtimeMode' in payload) fail('Omit runtimeMode to inherit the parent permissions.');
   }
 }
@@ -169,7 +177,9 @@ export async function callTool(tool, payload, connection, { fetchImpl = fetch, r
     route(payload, capabilities);
   }
   try { return await send('tools/call', { name: tool, arguments: payload }); }
-  catch { fail(tool === 'delegate_task'
+  catch (error) {
+    if (error instanceof RequestRejected) throw error;
+    fail(tool === 'delegate_task'
     ? 'T3 tool-call outcome unknown. Do not retry delegation: recover its taskId from parent activity first.'
     : 'T3 MCP tool call failed.'); }
 }

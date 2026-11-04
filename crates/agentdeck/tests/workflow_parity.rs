@@ -96,6 +96,10 @@ fn ops() -> Vec<serde_json::Value> {
         serde_json::json!({"op": "prepare", "step": "x", "source": "s", "route": {"target": t}}),
         serde_json::json!({"op": "prepare", "step": "y", "source": "s", "route": {"target": t}}),
         serde_json::json!({"op": "prepare", "step": "z", "source": "s", "route": {"target": t}}),
+        serde_json::json!({"op": "new", "plan": {"title": "PR handoff", "steps": [{"id": "pr", "task": "Push the fix", "role": "implementation"}]}, "thread": "th"}),
+        serde_json::json!({"op": "prepare", "step": "pr", "source": "s", "route": {"target": t}}),
+        serde_json::json!({"op": "record", "step": "pr", "response": done("t-pr", "PR https://github.com/example/repo/pull/1, head abc123, checks and reviews pending")}),
+        serde_json::json!({"op": "next"}),
     ]
 }
 
@@ -277,6 +281,9 @@ fn state_machine_matches_node() {
     let node: Vec<serde_json::Value> = node_run(&dir);
     let rust = rust_run();
     assert_eq!(node.len(), rust.len());
+    assert_eq!(rust[rust.len() - 2]["value"]["state"], "completed");
+    assert_eq!(rust.last().unwrap()["value"]["complete"], true);
+    assert_eq!(node[node.len() - 2]["value"]["state"], "completed");
     let n = normalize(&serde_json::to_string(&node).unwrap());
     let r = normalize(&serde_json::to_string(&rust).unwrap());
     if n != r {

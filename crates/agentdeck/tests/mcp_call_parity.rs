@@ -39,7 +39,7 @@ fn payload() -> serde_json::Value {
 
 /// Cases for connection/validation discovery (JSON in/out).
 fn cases() -> Vec<serde_json::Value> {
-    vec![
+    let mut cases = vec![
         serde_json::json!({"kind": "config", "config": {"mcpServers": good_servers()}}),
         serde_json::json!({"kind": "config", "config": {"mcpServers": {"unrelated": good_servers()["t3-code"]}}}),
         serde_json::json!({"kind": "config", "config": {"mcpServers": {"t3-code": {"url": "https://evil.test/mcp", "headers": {"Authorization": GOOD_AUTH}}}}}),
@@ -56,7 +56,18 @@ fn cases() -> Vec<serde_json::Value> {
         serde_json::json!({"kind": "discover-acp", "endpoint": GOOD_CONN, "auth": null}),
         serde_json::json!({"kind": "discover-proc"}),
         serde_json::json!({"kind": "discover-none"}),
-    ]
+    ];
+    for role in [
+        serde_json::json!("implementation"),
+        serde_json::json!("implement"),
+        serde_json::json!("boss"),
+        serde_json::Value::Null,
+    ] {
+        let mut p = payload();
+        p["role"] = role;
+        cases.push(serde_json::json!({"kind": "validate", "tool": "delegate_task", "payload": p}));
+    }
+    cases
 }
 
 fn rust_results() -> Vec<serde_json::Value> {
@@ -290,18 +301,28 @@ fn start_mock(mode: &str) -> Mock {
                             == Some("initialize")
                         {
                             serde_json::json!({"protocolVersion": "2025-06-18"})
+                        } else if name == "orchestrator_capabilities" && mode == "invalid-catalog" {
+                            serde_json::json!({"structuredContent": {
+                                "parentThreadId": "parent-fixture", "inheritedProviderInstanceId": "claude_second",
+                                "providers": [], "features": {"appOwnedSubagents": true}}})
                         } else if name == "orchestrator_capabilities" {
                             serde_json::json!({"content": [], "structuredContent": {
                                 "parentThreadId": "parent-fixture", "inheritedProviderInstanceId": "claude_second",
-                                "providers": [{"providerInstanceId": "claude_second"}],
+                                "providers": [{"providerInstanceId": "claude_second", "driverKind": "claudeAgent", "models": []},
+                                    {"providerInstanceId": "opencode", "driverKind": "opencode", "models": []}],
                                 "features": {"appOwnedSubagents": true}}})
                         } else {
                             serde_json::json!({"content": [], "structuredContent": {"taskId": "actual-task-id", "status": "running"}})
                         };
-                        let envelope =
+                        let envelope = if mode.starts_with("invalid-params") && name == "delegate_task" {
+                            serde_json::json!({"jsonrpc": "2.0", "id": id,
+                                "error": {"code": -32602, "message": "Invalid parameters: role must be implementation"}})
+                        } else {
                             serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
-                                .to_string();
-                        if mode == "sse" && name == "delegate_task" {
+                        }.to_string();
+                        if (mode == "sse" || mode == "invalid-params-sse")
+                            && name == "delegate_task"
+                        {
                             let sse = format!(
                                 ": comment\r\ndata: null\r\n\r\nevent: message\r\ndata: {envelope}\r\n\r\n"
                             );
@@ -424,4 +445,133 @@ fn no_inherited_connection_cli_error_matches_node() {
     let node_err = String::from_utf8_lossy(&run_node.stderr).into_owned();
     assert_eq!(run_node.status.code(), Some(1));
     assert_eq!(node_err.trim(), rust_err.trim());
+}
+
+#[test]
+fn delegate_invalid_params_preserves_rejection() {
+    for mode in ["invalid-params", "invalid-params-sse"] {
+        let mock = start_mock(mode);
+        let conn = agentdeck_router::mcp_call::Connection {
+            endpoint: format!("http://{}/mcp", mock.addr),
+            authorization: GOOD_AUTH.into(),
+        };
+        let err = block_on(agentdeck_router::mcp_call::call_tool(
+            "delegate_task",
+            payload(),
+            conn,
+            &test_hooks(),
+        ))
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("-32602") && message.contains("role must be implementation"),
+            "{message}"
+        );
+        assert!(!message.contains("outcome unknown"), "{message}");
+        assert_eq!(
+            mock.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|name| *name == "delegate_task")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn dispatch_refreshes_catalog_before_selecting_a_target() {
+    for mode in ["json", "invalid-catalog"] {
+        let dir =
+            std::env::temp_dir().join(format!("dispatch-fresh-catalog-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".t3/userdata")).unwrap();
+        std::fs::create_dir_all(dir.join("rt")).unwrap();
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        agentdeck_router::reasoning::save_catalog(
+            &state,
+            serde_json::json!({"providers": [
+        {"providerInstanceId": "opencode", "driverKind": "opencode", "models": [
+            {"id": "opencode-go/muse-spark-1.3-contributor", "options": [
+                {"id": "variant", "values": ["high", "xhigh"]}]}]}]}),
+        )
+        .unwrap();
+        std::fs::write(dir.join(".t3/userdata/settings.json"), "{}").unwrap();
+        std::fs::write(dir.join("usage.json"), r#"{"accounts":[]}"#).unwrap();
+        std::fs::write(dir.join("router.json"), serde_json::json!({"version": 1,
+        "pool": [{"providerInstanceId": "opencode", "model": "opencode-go/muse-spark-1.3-contributor"}],
+        "accounts": {}, "usageStatePath": dir.join("usage.json")}).to_string()).unwrap();
+        let answer = serde_json::json!({"score": 2, "confidence": 0.9,
+        "probabilities": {"0": 0, "1": 0, "2": 1, "3": 0}});
+        std::fs::write(
+            dir.join("jev.json"),
+            serde_json::json!({"answers": {
+        "size": answer, "difficulty": answer,
+        "opencode_opencode_go_muse_spark_1_3_contributor": answer}})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("task.txt"), "Implement a bounded change").unwrap();
+        let mock = start_mock(mode);
+        let output = Command::new(env!("CARGO_BIN_EXE_agentdeck"))
+            .args([
+                "route",
+                "dispatch",
+                "task.txt",
+                "--id",
+                "fresh",
+                "--role",
+                "implementation",
+                "--isolation",
+                "worktree",
+            ])
+            .current_dir(&dir)
+            .env("HOME", &dir)
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_RUNTIME_DIR", dir.join("rt"))
+            .env("MODEL_ROUTE_ROUTER_JSON", dir.join("router.json"))
+            .env("AGENTDECK_ROUTE_MOCK_JEV", dir.join("jev.json"))
+            .env("T3_ACP_MCP_ENDPOINT", format!("http://{}/mcp", mock.addr))
+            .env("T3_ACP_MCP_AUTHORIZATION", GOOD_AUTH)
+            .env_remove("T3_SHELL_MCP_SOCKET")
+            .output()
+            .unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(state.join("model-route/dispatch/fresh.json")).unwrap(),
+        )
+        .unwrap();
+        let catalog = agentdeck_router::reasoning::read_catalog(&state).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let expected = if mode == "json" { "no_model" } else { "failed" };
+        assert_eq!(
+            saved["status"],
+            expected,
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(summary["id"], "fresh");
+        assert_eq!(summary["status"], expected);
+        assert_eq!(summary["attempts"], serde_json::json!([]));
+        if mode == "json" {
+            assert_eq!(catalog["providers"][1]["models"], serde_json::json!([]));
+        } else {
+            assert!(
+                summary["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Cannot refresh")
+            );
+        }
+        assert!(
+            !mock
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|n| n == "delegate_task")
+        );
+    }
 }
