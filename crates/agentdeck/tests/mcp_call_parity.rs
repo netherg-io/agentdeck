@@ -39,7 +39,7 @@ fn payload() -> serde_json::Value {
 
 /// Cases for connection/validation discovery (JSON in/out).
 fn cases() -> Vec<serde_json::Value> {
-    vec![
+    let mut cases = vec![
         serde_json::json!({"kind": "config", "config": {"mcpServers": good_servers()}}),
         serde_json::json!({"kind": "config", "config": {"mcpServers": {"unrelated": good_servers()["t3-code"]}}}),
         serde_json::json!({"kind": "config", "config": {"mcpServers": {"t3-code": {"url": "https://evil.test/mcp", "headers": {"Authorization": GOOD_AUTH}}}}}),
@@ -56,7 +56,18 @@ fn cases() -> Vec<serde_json::Value> {
         serde_json::json!({"kind": "discover-acp", "endpoint": GOOD_CONN, "auth": null}),
         serde_json::json!({"kind": "discover-proc"}),
         serde_json::json!({"kind": "discover-none"}),
-    ]
+    ];
+    for role in [
+        serde_json::json!("implementation"),
+        serde_json::json!("implement"),
+        serde_json::json!("boss"),
+        serde_json::Value::Null,
+    ] {
+        let mut p = payload();
+        p["role"] = role;
+        cases.push(serde_json::json!({"kind": "validate", "tool": "delegate_task", "payload": p}));
+    }
+    cases
 }
 
 fn rust_results() -> Vec<serde_json::Value> {
@@ -293,15 +304,21 @@ fn start_mock(mode: &str) -> Mock {
                         } else if name == "orchestrator_capabilities" {
                             serde_json::json!({"content": [], "structuredContent": {
                                 "parentThreadId": "parent-fixture", "inheritedProviderInstanceId": "claude_second",
-                                "providers": [{"providerInstanceId": "claude_second"}],
+                                "providers": [{"providerInstanceId": "claude_second", "driverKind": "claudeAgent", "models": []},
+                                    {"providerInstanceId": "opencode", "driverKind": "opencode", "models": []}],
                                 "features": {"appOwnedSubagents": true}}})
                         } else {
                             serde_json::json!({"content": [], "structuredContent": {"taskId": "actual-task-id", "status": "running"}})
                         };
-                        let envelope =
+                        let envelope = if mode.starts_with("invalid-params") && name == "delegate_task" {
+                            serde_json::json!({"jsonrpc": "2.0", "id": id,
+                                "error": {"code": -32602, "message": "Invalid parameters: role must be implementation"}})
+                        } else {
                             serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
-                                .to_string();
-                        if mode == "sse" && name == "delegate_task" {
+                        }.to_string();
+                        if (mode == "sse" || mode == "invalid-params-sse")
+                            && name == "delegate_task"
+                        {
                             let sse = format!(
                                 ": comment\r\ndata: null\r\n\r\nevent: message\r\ndata: {envelope}\r\n\r\n"
                             );
@@ -424,4 +441,37 @@ fn no_inherited_connection_cli_error_matches_node() {
     let node_err = String::from_utf8_lossy(&run_node.stderr).into_owned();
     assert_eq!(run_node.status.code(), Some(1));
     assert_eq!(node_err.trim(), rust_err.trim());
+}
+
+#[test]
+fn delegate_invalid_params_preserves_rejection() {
+    for mode in ["invalid-params", "invalid-params-sse"] {
+        let mock = start_mock(mode);
+        let conn = agentdeck_router::mcp_call::Connection {
+            endpoint: format!("http://{}/mcp", mock.addr),
+            authorization: GOOD_AUTH.into(),
+        };
+        let err = block_on(agentdeck_router::mcp_call::call_tool(
+            "delegate_task",
+            payload(),
+            conn,
+            &test_hooks(),
+        ))
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("-32602") && message.contains("role must be implementation"),
+            "{message}"
+        );
+        assert!(!message.contains("outcome unknown"), "{message}");
+        assert_eq!(
+            mock.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|name| *name == "delegate_task")
+                .count(),
+            1
+        );
+    }
 }

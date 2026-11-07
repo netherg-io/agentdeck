@@ -99,6 +99,16 @@ pub fn opencode_plugin(home: &Path) -> PathBuf {
     home.join(".config/opencode/plugin/model-route.ts")
 }
 
+/// OpenCode agent for delegated children: short invariants-first prompt, low
+/// temperature, no history rewrites. T3 offers it as the `agent` option of
+/// every OpenCode model once OpenCode loads it.
+pub fn opencode_worker_agent(home: &Path) -> PathBuf {
+    home.join(".config/opencode/agent")
+        .join(format!("{WORKER_AGENT}.md"))
+}
+
+pub const WORKER_AGENT: &str = "agentdeck-worker";
+
 /// Account key from a usage id: `claude-main` -> `claude`,
 /// `codex-second` -> `codex_second`.
 fn account_key(id: &str) -> String {
@@ -330,15 +340,8 @@ pub fn router_block(exe: &Path) -> String {
     let route = format!("{} route", exe.display());
     format!(
         "## Delegation routing (agentdeck router)\n\n\
-        - Claude and Antigravity: the router delegates. Write the complete task to a file and run \
-        `{route} dispatch FILE --title TITLE [--isolation worktree] [--role ROLE]`. It picks the model, appends any \
-        `briefHint`, delegates and prints a dispatch ID; its watcher cancels and archives a child that hit a usage limit \
-        and re-dispatches it on another account. When T3 reports a dispatched child ended, run `{route} dispatch --status ID`: \
-        `running` means a replacement is already working, so end your turn; otherwise use its `status` and `summary`. \
-        Direct `delegate_task` is denied, except for a model the user named: start that task with `[route:user-choice]`. \
-        `status: no_model`: split the work or do it yourself.\n\
-        - Codex and OpenCode: route every `delegate_task` target first: `{route} \"<goal, inputs, read-only or edits, expected size>\"` \
-        (add `--source <provider instance>` when the source is unknown). Only exact active pool entries are candidates; \
+        - Route every `delegate_task` target first: `{route} \"<goal, inputs, read-only or edits, expected size>\"` \
+        (add `--source <provider instance>` when the source is unknown; `--effort medium|high|xhigh` overrides the reasoning level). Only exact active pool entries are candidates; \
         never restore removed entries under another id. Before routing, call T3 `orchestrator_capabilities` and pipe its \
         `structuredContent` JSON to `{route} --catalog`; refresh after provider/model changes. Pass the complete returned \
         `target` (including `options`) as the `delegate_task` target; append a returned `briefHint` verbatim. \
@@ -551,6 +554,28 @@ export default Plugin.define({
     })
   },
 })
+"#;
+
+/// Rules every project can share; project-specific ones belong in that
+/// project's own AGENTS.md. The first lines weigh most for small-context models.
+pub const WORKER_AGENT_TEXT: &str = r#"---
+description: Delegated worker for one bounded implementation or research task
+mode: all
+temperature: 0.1
+permission:
+  bash:
+    "*": allow
+    "git push*--force*": deny
+    "git push*-f *": deny
+    "git push*+*": deny
+---
+<!-- managed by agentdeck; edits are overwritten by `agentdeck plugin enable router` -->
+Priority rules, highest first:
+1. Work only inside the workspace the brief names. Keep evidence files there, not in /tmp.
+2. Finish every item of the brief in this turn. Wait only on foreground commands with a timeout; never end the turn with work still running.
+3. Fix root causes and show the failure before the fix. Never call a failure pre-existing or unrelated without checking the base commit.
+4. Never rewrite published history; never force-push.
+5. Final response: first line DONE:, PARTIAL: or BLOCKED:, then evidence for each acceptance item of the brief and anything unverified.
 "#;
 
 fn opencode_plugin_text(exe: &Path) -> String {
@@ -772,6 +797,29 @@ pub fn plan_hooks_enable(
             });
         }
     }
+    {
+        let path = opencode_worker_agent(home);
+        let old = std::fs::read(&path).ok();
+        if old.as_deref() != Some(WORKER_AGENT_TEXT.as_bytes()) {
+            let ours = old
+                .as_deref()
+                .is_some_and(|b| String::from_utf8_lossy(b).contains("managed by agentdeck"));
+            if old.is_some() && !ours && !replace {
+                anyhow::bail!(
+                    "{} exists and was not written by agentdeck; remove it by hand or retry with --replace",
+                    path.display()
+                );
+            }
+            changes.push(Change::WriteFile {
+                backup: old
+                    .is_some()
+                    .then(|| crate::changes::backup_dest(state_dir, "agentdeck-worker.md")),
+                path,
+                contents: WORKER_AGENT_TEXT.as_bytes().to_vec(),
+                old,
+            });
+        }
+    }
     Ok(changes)
 }
 
@@ -836,6 +884,10 @@ pub fn plan_hooks_disable(
             && (old == opencode_plugin_text(exe).as_bytes()
                 || old == opencode_plugin_text_legacy(paths).as_bytes())
         {
+            changes.push(Change::Remove { path });
+        }
+        let path = opencode_worker_agent(home);
+        if std::fs::read(&path).is_ok_and(|old| old == WORKER_AGENT_TEXT.as_bytes()) {
             changes.push(Change::Remove { path });
         }
     }

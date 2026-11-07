@@ -383,16 +383,50 @@ pub fn reasoning_target(
     }
 }
 
+/// Adds the worker agent to `target.options` when T3 advertises it for the
+/// model (OpenCode lists agents after loading `~/.config/opencode/agent`).
+pub fn with_worker_agent(catalog: &Value, target: &mut Value) {
+    let name = agentdeck_core::router::WORKER_AGENT;
+    let listed = find_model(
+        catalog,
+        target["providerInstanceId"].as_str().unwrap_or_default(),
+        target["model"].as_str().unwrap_or_default(),
+    )
+    .and_then(|m| m.get("options")?.as_array())
+    .is_some_and(|opts| {
+        opts.iter().any(|d| {
+            d.get("id").and_then(Value::as_str) == Some("agent")
+                && d.get("options").and_then(Value::as_array).is_some_and(|o| {
+                    o.iter()
+                        .any(|x| x.get("id").and_then(Value::as_str) == Some(name))
+                })
+        })
+    });
+    if listed {
+        target["options"]
+            .as_object_mut()
+            .map(|o| o.insert("agent".into(), Value::from(name)))
+            .unwrap_or_else(|| {
+                target["options"] = serde_json::json!({"agent": name});
+                None
+            });
+    }
+}
+
 fn target_entries(target: &Value) -> anyhow::Result<Vec<(String, Value)>> {
-    // Mirrors the .mjs exactly: missing, null or wrongly typed `options`
-    // throws (the hook fails closed) instead of validating.
+    // Missing/null `options` is empty like the .mjs; a wrongly typed value
+    // fails closed.
     match target.get("options") {
         Some(Value::Object(m)) => Ok(m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
         Some(Value::Array(a)) => Ok(a
             .iter()
             .filter_map(|e| Some((e.get("id")?.as_str()?.to_string(), e.get("value")?.clone())))
             .collect()),
-        _ => Err(anyhow::anyhow!("invalid target options")),
+        // Models without a reasoning knob legitimately get no `options`.
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(_) => Err(anyhow::anyhow!(
+            "target.options must be an object or an array of {{id, value}}"
+        )),
     }
 }
 
@@ -609,5 +643,48 @@ mod catalog_tests {
         let bare = reasoning_target(&catalog(), "codex", "plain-model", 2).unwrap();
         assert_eq!(bare["model"], "plain-model");
         assert!(bare.get("options").is_none());
+    }
+}
+
+#[cfg(test)]
+mod worker_agent_tests {
+    use super::*;
+
+    fn catalog(agents: &[&str]) -> Value {
+        let agent = serde_json::json!({"id": "agent", "type": "select",
+            "options": agents.iter().map(|a| serde_json::json!({"id": a})).collect::<Vec<_>>()});
+        serde_json::json!({"providers": [{"providerInstanceId": "opencode", "models": [
+            {"id": "m", "options": [agent]}]}]})
+    }
+
+    #[test]
+    fn worker_agent_is_added_only_when_listed() {
+        let base = serde_json::json!({"providerInstanceId": "opencode", "model": "m",
+            "options": {"variant": "high"}});
+        let mut t = base.clone();
+        with_worker_agent(&catalog(&["build"]), &mut t);
+        assert_eq!(t, base);
+        with_worker_agent(&catalog(&["build", "agentdeck-worker"]), &mut t);
+        assert_eq!(
+            t["options"],
+            serde_json::json!({"variant": "high", "agent": "agentdeck-worker"})
+        );
+        let mut bare = serde_json::json!({"providerInstanceId": "opencode", "model": "m"});
+        with_worker_agent(&catalog(&["agentdeck-worker"]), &mut bare);
+        assert_eq!(bare["options"]["agent"], "agentdeck-worker");
+    }
+
+    #[test]
+    fn missing_options_are_empty_and_wrong_type_fails() {
+        let catalog = serde_json::json!({"providers": [{"providerInstanceId": "antigravity",
+            "models": [{"id": "gemini-4-argon-high", "options": []}]}]});
+        let target = serde_json::json!({"providerInstanceId": "antigravity", "model": "gemini-4-argon-high"});
+        assert_eq!(validate_reasoning(&catalog, &target).unwrap(), None);
+        let mut null = target.clone();
+        null["options"] = Value::Null;
+        assert_eq!(validate_reasoning(&catalog, &null).unwrap(), None);
+        let mut bad = target;
+        bad["options"] = Value::from("high");
+        assert!(validate_reasoning(&catalog, &bad).is_err());
     }
 }

@@ -618,3 +618,34 @@ fn route_parity_with_node() {
         assert!(nout.is_empty() && rout.is_empty());
     }
 }
+
+/// `--effort` replaces the JEV difficulty only for the reasoning level.
+#[test]
+fn effort_flag_overrides_the_reasoning_level() {
+    let pool = [OPUS, SOL];
+    let keys = ["claudeagent_claude_opus_5_5", "codex_gpt_6_1_sol"];
+    let target = |diff: f64, flags: &[&str]| {
+        let fx = Fixture::new(&pool);
+        let jev = answers_for(
+            &keys
+                .iter()
+                .map(|k| (*k, level(2.4, 0.95)))
+                .collect::<Vec<_>>(),
+            1.0,
+            diff,
+        );
+        let mock = write_mock(&fx, &jev);
+        let mut args = vec!["--source", "claudeAgent"];
+        args.extend_from_slice(flags);
+        args.push("Do the task");
+        let (code, out, _) = run_rust(&fx, &args, &mock, None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap_or_default();
+        (code, v["target"].clone())
+    };
+    let (_, base_low) = target(0.0, &[]);
+    let (_, base_high) = target(2.0, &[]);
+    assert_ne!(base_low, base_high, "fixture must distinguish levels");
+    assert_eq!(target(0.0, &["--effort", "xhigh"]).1, base_high);
+    assert_eq!(target(3.0, &["--effort", "medium"]).1, base_low);
+    assert_eq!(target(0.0, &["--effort", "bogus"]).0, 2);
+}

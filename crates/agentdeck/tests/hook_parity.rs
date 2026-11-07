@@ -51,11 +51,37 @@ fn embedded_muse_hint_matches_the_runtime_asset() {
     let hint = family["briefHint"].as_str().unwrap();
     assert!(hint.starts_with("Long commands:"));
     assert!(hint.contains("PARTIAL:"));
+    assert!(hint.contains("bounded waits apply only to local commands"));
+    assert!(hint.contains("never to PRs, CI, review bots or merges"));
     assert!(!hint.to_lowercase().contains("skill"));
     assert_eq!(
         agentdeck_router::policy::hint_of("opencode-go/muse-spark-1.3-contributor"),
         Some(format!("{}\n\n{hint}", shared_hint()))
     );
+}
+
+#[test]
+fn shared_hint_hands_pr_waits_to_the_coordinator() {
+    for model in [
+        "gpt-6.1-terra",
+        "claude-opus-5-5",
+        "opencode-go/muse-spark-1.3-contributor",
+        "gemini-4-argon-high",
+        "unprofiled/example",
+    ] {
+        let hint = agentdeck_router::policy::hint_of(model).unwrap();
+        assert!(
+            hint.contains("Do not wait for or poll CI, review bots or PR merges"),
+            "{model}"
+        );
+        assert!(
+            hint.contains("PR <url>, head <sha>, checks and reviews <state>"),
+            "{model}"
+        );
+        assert!(hint.contains("The coordinator waits for PRs"), "{model}");
+        assert!(hint.contains("a normal handoff, not BLOCKED"), "{model}");
+        assert!(hint.contains("Waiting for local commands"), "{model}");
+    }
 }
 
 struct Fixture {
@@ -550,17 +576,6 @@ fn hook_parity_with_node() {
             "tool_input": {"task": "Fix the typo"}, "inT3": true});
         input["source"] = "codex".into();
         check_case("deny-invalid-shell", &fx, "shell", &input);
-    }
-    // 3b. Direct Claude delegate_task goes to `route dispatch`: deny:use-dispatch.
-    {
-        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
-        let input = delegate_input(
-            "mcp__t3-code__delegate_task",
-            &hinted("Fix the typo"),
-            sol.clone(),
-            serde_json::json!({}),
-        );
-        check_case("deny-use-dispatch-claude", &fx, "claude", &input);
     }
     // 4. Shell source outside the live catalog: deny:shell-source.
     {

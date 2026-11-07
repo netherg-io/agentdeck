@@ -34,6 +34,7 @@ function record(decision, reason) {
   } catch { console.error('model-route: decision log unavailable'); }
 }
 
+const SHOWN_ERROR = 'model-route: routing failed or timed out; delegation was blocked. The cause is in the latest deny:router-error entry of model-route/decisions.jsonl. Retry the router or do the work yourself.';
 const USER_CHOICE = /^\[route:user-choice\]/;
 const USER_CHOICE_HINT = ' If the user explicitly asked for a specific model, call delegate_task with that exact target'
   + ' and start the task with [route:user-choice]; routing then only warns.';
@@ -178,14 +179,6 @@ function run() {
     record('deny:invalid-delegate', reason);
     return emit(false, reason);
   }
-  // Claude and agy reach the T3 shell bridge, so `route dispatch` replaces their direct delegate_task;
-  // routed workflow payloads and explicit user choices still validate.
-  if (delegate && ['claude', 'agy'].includes(harness) && !USER_CHOICE.test(args.task)
-    && !String(args.clientRequestId ?? '').startsWith('routed-workflow-')) {
-    const reason = 'model-route: the router delegates tasks itself. Write the complete task to a file and run `agentdeck route dispatch FILE --title TITLE [--isolation worktree] [--role ROLE]`: it picks the model, delegates and prints a dispatch ID; its watcher cancels and re-dispatches the child after a usage limit. When T3 reports the child ended, run `agentdeck route dispatch --status ID` (running means a replacement is already working). Do not call delegate_task directly.' + USER_CHOICE_HINT;
-    record('deny:use-dispatch', reason);
-    return emit(false, reason);
-  }
   const command = ['--source', instance];
   if (delegate) command.push('--validate-target', args.target.providerInstanceId, args.target.model);
   command.push('-');
@@ -267,8 +260,9 @@ function run() {
   emit(false, reason);
 }
 
-try { run(); } catch {
-  const reason = 'model-route: routing failed or timed out; delegation was blocked. Retry the router or do the work yourself.';
-  record('deny:router-error', reason);
-  emit(false, reason);
+try { run(); } catch (e) {
+  // Stderr and parser text stay out of the model-visible reason; the log keeps the real cause.
+  const cause = String(e?.message ?? e);
+  record('deny:router-error', `${cause} | ${SHOWN_ERROR}`);
+  emit(false, SHOWN_ERROR);
 }

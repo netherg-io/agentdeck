@@ -906,6 +906,12 @@ mod tests {
             plugin.contains(r#"["route", "hook", "--harness", "opencode"]"#),
             "{plugin}"
         );
+        let worker = home.join(".config/opencode/agent/agentdeck-worker.md");
+        assert!(
+            fs::read_to_string(&worker)
+                .unwrap()
+                .contains("temperature: 0.1")
+        );
         let text = fs::read_to_string(&files[0]).unwrap();
         assert!(text.contains("<!-- model-route:begin -->"));
         assert!(text.contains("route \"<goal"), "{text}");
@@ -929,6 +935,7 @@ mod tests {
         assert!(!settings.contains("route hook"));
         assert!(!settings.contains("hook.mjs"));
         assert!(!home.join(".config/opencode/plugin/model-route.ts").exists());
+        assert!(!worker.exists());
         assert!(dir.join("router.json").exists(), "data is kept");
         assert_eq!(fs::read(&files[0]).unwrap(), b"handwritten\n");
         unsafe {
