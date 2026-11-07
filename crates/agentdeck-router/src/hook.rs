@@ -14,10 +14,6 @@ use crate::reasoning::{read_catalog, repair_reasoning, validate_reasoning};
 const ROUTE_TIMEOUT_SECS: u64 = 55;
 const ROUTE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const USER_CHOICE: &str = "[route:user-choice]";
-/// Claude and agy reach the T3 shell bridge, so `route dispatch` replaces
-/// their direct `delegate_task`; Codex and OpenCode keep target validation.
-/// Routed workflow payloads and explicit user choices still validate.
-const USE_DISPATCH: &str = "model-route: the router delegates tasks itself. Write the complete task to a file and run `agentdeck route dispatch FILE --title TITLE [--isolation worktree] [--role implementation|research|review|design|test|general]`: it picks the model, delegates and prints a dispatch ID; its watcher cancels and re-dispatches the child after a usage limit. When T3 reports the child ended, run `agentdeck route dispatch --status ID` (running means a replacement is already working). Do not call delegate_task directly.";
 const USER_CHOICE_HINT: &str = " If the user explicitly asked for a specific model, call delegate_task with that exact target and start the task with [route:user-choice]; routing then only warns.";
 
 const NOISE: &[&str] = &[
@@ -113,6 +109,8 @@ fn is_native_tool(name: &str) -> bool {
 }
 
 /// Append a verdict line to `decisions.jsonl`; never fails the hook.
+const SHOWN_ERROR: &str = "model-route: routing failed or timed out; delegation was blocked. The cause is in the latest deny:router-error entry of model-route/decisions.jsonl. Retry the router or do the work yourself.";
+
 fn record(
     harness: &str,
     instance: Option<&str>,
@@ -539,7 +537,7 @@ fn run_route(
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    anyhow::bail!("route timed out");
+                    anyhow::bail!("route timed out after {ROUTE_TIMEOUT_SECS}s");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
@@ -550,7 +548,9 @@ fn run_route(
         anyhow::bail!("route output too large");
     }
     if !status.success() {
-        anyhow::bail!("route failed");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim().chars().take(300).collect::<String>();
+        anyhow::bail!("route exited with {status}: {detail}");
     }
     Ok(serde_json::from_slice(&output.stdout)?)
 }
@@ -633,7 +633,8 @@ pub fn run(argv: &[String]) -> i32 {
         out: Vec::new(),
     };
     if let Err(e) = run_inner(&mut ctx) {
-        let reason = "model-route: routing failed or timed out; delegation was blocked. Retry the router or do the work yourself.";
+        // Stderr and parser text stay out of the model-visible reason; the log keeps the real cause.
+        let shown = SHOWN_ERROR;
         record(
             &ctx.harness,
             None,
@@ -641,9 +642,9 @@ pub fn run(argv: &[String]) -> i32 {
             &Value::Null,
             None,
             "deny:router-error",
-            // The cause goes to the log only; the agent gets the fixed text.
-            &format!("{reason} Cause: {e:#}"),
+            &format!("{e:#} | {shown}"),
         );
+        let reason = shown;
         ctx.emit(false, reason);
     }
     use std::io::Write;
@@ -848,23 +849,6 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
                 None,
                 "deny:invalid-delegate",
                 reason,
-            );
-            return Ok(());
-        }
-        if matches!(harness.as_str(), "claude" | "agy")
-            && !task.starts_with(USER_CHOICE)
-            && !str_field(&args, "clientRequestId")
-                .unwrap_or_default()
-                .starts_with("routed-workflow-")
-        {
-            let reason = format!("{USE_DISPATCH}{USER_CHOICE_HINT}");
-            ctx.deny(
-                instance.as_deref(),
-                Some(&tool_name),
-                &args_obj,
-                None,
-                "deny:use-dispatch",
-                &reason,
             );
             return Ok(());
         }

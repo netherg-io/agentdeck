@@ -33,7 +33,7 @@ const CAPABILITY: [&str; 4] = [
     "Specific relevant strengths should produce a substantially better result on THIS task. A merely stronger model with no practical advantage does not qualify.",
 ];
 
-const USAGE: &str = "usage: agentdeck route [--source <provider instance>] [--validate-target <provider instance> <model>] [--exclude <provider instance>]... \"<task brief>\" | - (brief on stdin) | --check | --catalog (orchestrator_capabilities structuredContent on stdin) | hook --harness <name> | claude-shell [args...] | t3-mcp-call TOOL FILE | workflow CMD ... | dispatch TASK_FILE [flags] | outcomes record|list|evaluate ...";
+const USAGE: &str = "usage: agentdeck route [--source <provider instance>] [--validate-target <provider instance> <model>] [--exclude <provider instance>]... [--effort medium|high|xhigh] \"<task brief>\" | - (brief on stdin) | --check | --catalog (orchestrator_capabilities structuredContent on stdin) | hook --harness <name> | claude-shell [args...] | t3-mcp-call TOOL FILE | workflow CMD ... | outcomes record|list|evaluate ...";
 
 pub struct Env {
     pub home: std::path::PathBuf,
@@ -1296,7 +1296,6 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         Some("claude-shell") => return Ok(crate::shell::run(&argv[1..])),
         Some("t3-mcp-call") => return Ok(crate::mcp_call::run(&argv[1..]).await),
         Some("workflow") => return Ok(crate::workflow::run(&argv[1..]).await),
-        Some("dispatch") => return Ok(crate::dispatch::run(&argv[1..]).await),
         Some("outcomes") => return Ok(crate::outcomes::run(&argv[1..]).await),
         _ => {}
     }
@@ -1325,6 +1324,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     let mut source: Option<String> = None;
     let mut requested: Option<ValidatedTarget> = None;
     let mut exclude: Vec<String> = Vec::new();
+    let mut effort: Option<i64> = None;
     while args.first().is_some_and(|a| a.starts_with("--")) && args[0] != "--check" {
         let flag = args[0].clone();
         args = &args[1..];
@@ -1342,6 +1342,14 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
             args = &args[2..];
         } else if flag == "--exclude" && !args.is_empty() {
             exclude.push(args[0].clone());
+            args = &args[1..];
+        } else if flag == "--effort"
+            && let Some(level) = args
+                .first()
+                .and_then(|l| ["medium", "high", "xhigh"].iter().position(|x| x == l))
+        {
+            // Same scale as `reasoning_target`: difficulty 0 medium, 1 high, 2 xhigh.
+            effort = Some(level as i64);
             args = &args[1..];
         } else {
             eprintln!("{USAGE}");
@@ -1804,8 +1812,11 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
             .cloned()
             .unwrap_or(Value::Null);
         let (target, reasoning_error) =
-            match reasoning_target(&catalog, provider, model, difficulty) {
-                Ok(t) => (t, None),
+            match reasoning_target(&catalog, provider, model, effort.unwrap_or(difficulty)) {
+                Ok(mut t) => {
+                    crate::reasoning::with_worker_agent(&catalog, &mut t);
+                    (t, None)
+                }
                 Err(e) => (
                     serde_json::json!({"providerInstanceId": provider, "model": model}),
                     Some(e.to_string()),

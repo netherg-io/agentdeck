@@ -301,10 +301,6 @@ fn start_mock(mode: &str) -> Mock {
                             == Some("initialize")
                         {
                             serde_json::json!({"protocolVersion": "2025-06-18"})
-                        } else if name == "orchestrator_capabilities" && mode == "invalid-catalog" {
-                            serde_json::json!({"structuredContent": {
-                                "parentThreadId": "parent-fixture", "inheritedProviderInstanceId": "claude_second",
-                                "providers": [], "features": {"appOwnedSubagents": true}}})
                         } else if name == "orchestrator_capabilities" {
                             serde_json::json!({"content": [], "structuredContent": {
                                 "parentThreadId": "parent-fixture", "inheritedProviderInstanceId": "claude_second",
@@ -476,102 +472,6 @@ fn delegate_invalid_params_preserves_rejection() {
                 .filter(|name| *name == "delegate_task")
                 .count(),
             1
-        );
-    }
-}
-
-#[test]
-fn dispatch_refreshes_catalog_before_selecting_a_target() {
-    for mode in ["json", "invalid-catalog"] {
-        let dir =
-            std::env::temp_dir().join(format!("dispatch-fresh-catalog-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join(".t3/userdata")).unwrap();
-        std::fs::create_dir_all(dir.join("rt")).unwrap();
-        let state = dir.join("state");
-        std::fs::create_dir_all(&state).unwrap();
-        agentdeck_router::reasoning::save_catalog(
-            &state,
-            serde_json::json!({"providers": [
-        {"providerInstanceId": "opencode", "driverKind": "opencode", "models": [
-            {"id": "opencode-go/muse-spark-1.3-contributor", "options": [
-                {"id": "variant", "values": ["high", "xhigh"]}]}]}]}),
-        )
-        .unwrap();
-        std::fs::write(dir.join(".t3/userdata/settings.json"), "{}").unwrap();
-        std::fs::write(dir.join("usage.json"), r#"{"accounts":[]}"#).unwrap();
-        std::fs::write(dir.join("router.json"), serde_json::json!({"version": 1,
-        "pool": [{"providerInstanceId": "opencode", "model": "opencode-go/muse-spark-1.3-contributor"}],
-        "accounts": {}, "usageStatePath": dir.join("usage.json")}).to_string()).unwrap();
-        let answer = serde_json::json!({"score": 2, "confidence": 0.9,
-        "probabilities": {"0": 0, "1": 0, "2": 1, "3": 0}});
-        std::fs::write(
-            dir.join("jev.json"),
-            serde_json::json!({"answers": {
-        "size": answer, "difficulty": answer,
-        "opencode_opencode_go_muse_spark_1_3_contributor": answer}})
-            .to_string(),
-        )
-        .unwrap();
-        std::fs::write(dir.join("task.txt"), "Implement a bounded change").unwrap();
-        let mock = start_mock(mode);
-        let output = Command::new(env!("CARGO_BIN_EXE_agentdeck"))
-            .args([
-                "route",
-                "dispatch",
-                "task.txt",
-                "--id",
-                "fresh",
-                "--role",
-                "implementation",
-                "--isolation",
-                "worktree",
-            ])
-            .current_dir(&dir)
-            .env("HOME", &dir)
-            .env("XDG_STATE_HOME", &state)
-            .env("XDG_RUNTIME_DIR", dir.join("rt"))
-            .env("MODEL_ROUTE_ROUTER_JSON", dir.join("router.json"))
-            .env("AGENTDECK_ROUTE_MOCK_JEV", dir.join("jev.json"))
-            .env("T3_ACP_MCP_ENDPOINT", format!("http://{}/mcp", mock.addr))
-            .env("T3_ACP_MCP_AUTHORIZATION", GOOD_AUTH)
-            .env_remove("T3_SHELL_MCP_SOCKET")
-            .output()
-            .unwrap();
-        let saved: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(state.join("model-route/dispatch/fresh.json")).unwrap(),
-        )
-        .unwrap();
-        let catalog = agentdeck_router::reasoning::read_catalog(&state).unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(output.status.code(), Some(1));
-        let expected = if mode == "json" { "no_model" } else { "failed" };
-        assert_eq!(
-            saved["status"],
-            expected,
-            "stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(summary["id"], "fresh");
-        assert_eq!(summary["status"], expected);
-        assert_eq!(summary["attempts"], serde_json::json!([]));
-        if mode == "json" {
-            assert_eq!(catalog["providers"][1]["models"], serde_json::json!([]));
-        } else {
-            assert!(
-                summary["reason"]
-                    .as_str()
-                    .unwrap()
-                    .contains("Cannot refresh")
-            );
-        }
-        assert!(
-            !mock
-                .seen
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|n| n == "delegate_task")
         );
     }
 }

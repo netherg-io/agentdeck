@@ -66,6 +66,8 @@ jobs:
             dist/*.tar.gz
             dist/agentdeck.desktop
           if-no-files-found: error
+          # Only hands the files to the publish job; the release keeps them.
+          retention-days: 1
 
   publish:
     needs: build

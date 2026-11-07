@@ -20,10 +20,7 @@ const route = { target, requestedTarget: target, size: '1: focused', difficulty:
 function run({ harness = 'codex', args = { task_name: 'nested', message: 'Actual child task' },
   tool = 'spawn_agent', routed = route, inT3 = true, second = false, error = false, malformed = false,
   model = 'gpt-6-astra', wrapMcp = false, mcpServer = 't3-code', source = 'codex_second', sdk = false,
-  transcript, session = 'root-session', direct = false } = {}) {
-  // Validation cases on Claude/agy use a workflow payload: their direct delegate_task goes to `route dispatch`.
-  if (!direct && ['claude', 'agy'].includes(harness) && /delegate_task$/.test(tool) && args.clientRequestId === undefined
-    && !/^\[route:user-choice\]/.test(args.task ?? '')) args = { ...args, clientRequestId: 'routed-workflow-test' };
+  transcript, session = 'root-session' } = {}) {
   const input = harness === 'agy' ? { toolCall: wrapMcp
     ? { name: 'call_mcp_tool', args: { ServerName: mcpServer, ToolName: tool, Arguments: args } } : { name: tool, args }, conversationId: session }
     : { tool_name: tool, tool_input: args, inT3, model, source, session_id: session,
@@ -151,17 +148,12 @@ try {
   }
 
   const delegate = { task: actual, target };
-  // Claude and agy hand direct delegation to `route dispatch`; workflow payloads and user choices still validate.
   const wf = { ...delegate, clientRequestId: 'routed-workflow-run-step' };
   for (const harness of ['claude', 'agy']) {
-    r = run({ harness, tool: 'delegate_task', args: delegate, wrapMcp: harness === 'agy', direct: true });
-    assert.equal(r.decision, 'deny');
-    assert.match(r.reason, /agentdeck route dispatch/);
-    assert.equal(r.call, undefined); // Denied before routing.
+    assert.equal(run({ harness, tool: 'delegate_task', args: delegate, wrapMcp: harness === 'agy' }).decision, 'allow');
   }
   assert.equal(run({ harness: 'codex', tool: 'delegate_task', args: delegate }).decision, 'allow');
-  assert.equal(run({ harness: 'agy', tool: 'delegate_task', args: wf, wrapMcp: true }).decision, 'allow');
-  assert.equal(run({ harness: 'agy', tool: 'delegate_task', args: { ...wf, target: { providerInstanceId: 'codex', model: target.model } },
+  assert.equal(run({ harness: 'agy', tool: 'delegate_task', args: { ...delegate, target: { providerInstanceId: 'codex', model: target.model } },
     wrapMcp: true }).decision, 'deny');
   assert.equal(run({ harness: 'agy', tool: 'delegate_task', args: wf, wrapMcp: true,
     routed: { ...route, validation: { allowed: false, reason: 'quota' } } }).decision, 'deny');
