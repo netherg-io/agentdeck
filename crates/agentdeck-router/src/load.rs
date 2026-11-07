@@ -30,6 +30,7 @@ const ACTIVE_AGENTS_SQL: &str = "
       WHERE n.origin = 'provider_native' AND n.status = 'running' AND n.provider_thread_id IS NULL
         AND (s.status IS NULL OR s.status = 'ready')
       UNION ALL
+      -- A held queued run (queueHeld) waits for a manual release and may never start: no slot.
       SELECT r.run_id AS id, r.provider_instance_id AS provider,
         CASE WHEN r.status = 'waiting'
           THEN COALESCE(s.model, json_extract(r.payload_json, '$.modelSelection.model'))
@@ -38,6 +39,7 @@ const ACTIVE_AGENTS_SQL: &str = "
       LEFT JOIN orchestration_v2_projection_provider_threads p USING (provider_thread_id)
       LEFT JOIN orchestration_v2_projection_provider_sessions s USING (provider_session_id)
       WHERE r.status IN ('queued', 'preparing', 'starting', 'waiting', 'running')
+        AND NOT (r.status = 'queued' AND json_extract(r.payload_json, '$.queueHeld') IS 1)
         AND NOT (r.status = 'running' AND EXISTS (SELECT 1 FROM active_turns live WHERE live.id = r.provider_thread_id))
         AND NOT EXISTS (
           SELECT 1 FROM orchestration_v2_projection_provider_turns v

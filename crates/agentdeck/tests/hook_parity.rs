@@ -514,6 +514,16 @@ fn instance_capacity_blocks_launch_override_and_recommends_another_instance() {
         &fx.dir.join(".local/state/model-route/admissions.sqlite"),
         "DELETE FROM pending",
     );
+    // A held queued run (left behind by a failed task) never starts, so it frees the slot.
+    sql(
+        &t3,
+        "INSERT INTO orchestration_v2_projection_runs VALUES ('held', 'codex', NULL, '{\"modelSelection\":{\"model\":\"gpt-6-astra\"},\"queueHeld\":true}', 'queued', 'held')",
+    );
+    assert_eq!(verdict(input("With held run"))["decision"], "allow");
+    sql(
+        &fx.dir.join(".local/state/model-route/admissions.sqlite"),
+        "DELETE FROM pending",
+    );
     // An ordinary queued branch occupies the same instance slot, without a subagent.
     sql(
         &t3,
