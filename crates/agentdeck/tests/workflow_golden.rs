@@ -1,24 +1,16 @@
-//! Differential test: the Rust `route workflow` state machine must answer
-//! like the Node `workflow.mjs` on the same scripted ops (mocks, no real
-//! router). CLI storage (private dir, permissions, thread binding) is tested
-//! against the built binary on temp dirs. Skips the Node half without Node.
+//! Golden-file test: the Rust `route workflow` state machine must match the
+//! committed snapshot in `tests/golden/workflow/` (captured once from the
+//! legacy Node `workflow.mjs`; `UPDATE_GOLDEN=1` rewrites it from the Rust
+//! output) on the same scripted ops. CLI storage (private dir, permissions,
+//! thread binding) is tested against the built binary on temp dirs.
+//! No Node needed.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-fn workspace_root() -> PathBuf {
-    let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    d.pop();
-    d.pop();
-    d
-}
-
-fn node_available() -> bool {
-    Command::new("node")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
+fn golden_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/workflow/state-machine.json")
 }
 
 fn t_target() -> serde_json::Value {
@@ -119,7 +111,7 @@ fn is_uuid_at(b: &[u8], i: usize) -> bool {
         && (24..36).all(hex)
 }
 
-/// Mask every runId so Node/Rust randomness compares equal.
+/// Mask every runId so run-to-run randomness compares equal.
 fn normalize(text: &str) -> String {
     let b = text.as_bytes();
     let mut out = String::with_capacity(text.len());
@@ -200,92 +192,33 @@ fn rust_run() -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn node_run(dir: &std::path::Path) -> Vec<serde_json::Value> {
-    let driver = dir.join("driver.mjs");
-    std::fs::write(
-        &driver,
-        format!(
-            r#"import fs from 'node:fs';
-import {{ validatePlan, newState, next, prepare, release, record, stop }} from {url};
-const ops = JSON.parse(fs.readFileSync(0, 'utf8'));
-let state = null;
-const snap = v => JSON.parse(JSON.stringify(v));
-const out = ops.map(op => {{
-  try {{
-    if (op.op === 'validate') return {{ ok: true, value: snap(validatePlan(op.plan)) }};
-    if (op.op === 'new') {{ state = newState(op.plan, op.thread); return {{ ok: true, value: snap(state) }}; }}
-    if (op.op === 'next') return {{ ok: true, value: snap(next(state)) }};
-    if (op.op === 'prepare') {{
-      const route = op.route === null ? null : op.route;
-      return {{ ok: true, value: snap(prepare(state, op.step, op.source ?? '', (task, source) => {{
-        if (route === null || route === undefined) return null;
-        return snap(route);
-      }})) }};
-    }}
-    if (op.op === 'release') return {{ ok: true, value: snap(release(state, op.step, op.notDispatched)) }};
-    if (op.op === 'record') return {{ ok: true, value: snap(record(state, op.step, snap(op.response))) }};
-    if (op.op === 'stop') return {{ ok: true, value: snap(stop(state)) }};
-    if (op.op === 'resume') {{ state.stopped = false; return {{ ok: true, value: snap(next(state)) }}; }}
-  }} catch (e) {{ return {{ ok: false, usage: !!e.usage, message: e.message }}; }}
-}});
-process.stdout.write(JSON.stringify(out));
-"#,
-            url = serde_json::to_string(&format!(
-                "file://{}",
-                workspace_root()
-                    .join("crates/agentdeck-core/assets/router/workflow.mjs")
-                    .to_string_lossy()
-            ))
-            .unwrap()
-        ),
-    )
-    .unwrap();
-    let mut child = Command::new("node")
-        .arg(&driver)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn node");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(serde_json::to_string(&ops()).unwrap().as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("node output");
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    serde_json::from_slice(&out.stdout).unwrap()
-}
-
 #[test]
-fn state_machine_matches_node() {
-    if !node_available() {
-        eprintln!("SKIP: node absent");
-        return;
-    }
-    let dir = std::env::temp_dir().join(format!(
-        "agentdeck-wf-parity-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let node: Vec<serde_json::Value> = node_run(&dir);
+fn state_machine_matches_golden() {
     let rust = rust_run();
-    assert_eq!(node.len(), rust.len());
     assert_eq!(rust[rust.len() - 2]["value"]["state"], "completed");
     assert_eq!(rust.last().unwrap()["value"]["complete"], true);
-    assert_eq!(node[node.len() - 2]["value"]["state"], "completed");
-    let n = normalize(&serde_json::to_string(&node).unwrap());
     let r = normalize(&serde_json::to_string(&rust).unwrap());
+    if std::env::var("UPDATE_GOLDEN").is_ok() {
+        let path = golden_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(
+                &serde_json::from_str::<serde_json::Value>(&r).unwrap(),
+            )
+            .unwrap()
+                + "\n",
+        )
+        .unwrap();
+    }
+    // The golden was captured once from the legacy Node router; the golden
+    // file is the contract and Node is no longer needed.
+    if !golden_path().exists() {
+        panic!("state-machine: missing golden; regenerate with UPDATE_GOLDEN=1");
+    }
+    let golden: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(golden_path()).unwrap()).unwrap();
+    let n = serde_json::to_string(&golden).unwrap();
     if n != r {
         let a: serde_json::Value = serde_json::from_str(&n).unwrap();
         let b: serde_json::Value = serde_json::from_str(&r).unwrap();
@@ -304,7 +237,6 @@ fn state_machine_matches_node() {
             );
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// CLI storage contract on temp dirs: private dir/files, thread binding,
