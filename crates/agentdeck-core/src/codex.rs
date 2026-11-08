@@ -4,7 +4,7 @@
 //! The primary instance owns the main home (`~/.codex`); every other Codex
 //! instance home is a shadow home holding absolute symlinks into the main
 //! home for every main entry except private and shadow-local names. Private
-//! files (`auth.json`, `auth.lock`, `models_cache.json`) are never linked or
+//! files (`auth.json`, its locks, `models_cache.json`) are never linked or
 //! created by us; the login flow creates them. `.hook-trust` records are
 //! keyed per home, so a real shadow copy is merged (never overwritten) before
 //! it is backed up and replaced with a link.
@@ -33,7 +33,14 @@ const SHARED_DIRS: [&str; 11] = [
     "thread-writer-locks",
 ];
 /// Never linked from the shared home; login creates them.
-const PRIVATE: [&str; 3] = ["auth.json", "auth.lock", "models_cache.json"];
+/// T3 lists only `auth.json` and `models_cache.json`; the lock files Codex
+/// creates beside the login are per-account too.
+const PRIVATE: [&str; 4] = [
+    "auth.json",
+    "auth.lock",
+    "auth.json.lock",
+    "models_cache.json",
+];
 /// Kept per shadow home, never fanned out.
 const SHADOW_LOCAL: [&str; 4] = ["log", "memories", "tmp", ".DS_Store"];
 /// Real entries T3 removes recursively, then links (disposable lock state).
@@ -67,7 +74,7 @@ pub enum Drift {
     ExtraEntry {
         path: PathBuf,
     },
-    /// Shadow private file (`auth.json`, `auth.lock`, `models_cache.json`)
+    /// Shadow private file (`auth.json`, its locks, `models_cache.json`)
     /// that is a symlink: it would share the account's credentials/cache with
     /// another home. Never repaired by copying; the link is removed and the
     /// user logs in again for that account.
@@ -740,6 +747,10 @@ mod tests {
             fs::read(fx.shadow.join("auth.json")).unwrap(),
             b"shadow-login"
         );
+        assert!(check(&fx.main, &fx.shadow).unwrap().is_empty());
+        // Codex's own login lock exists only in the shadow: not drift.
+        fs::remove_file(fx.main.join("auth.json.lock")).unwrap();
+        fs::write(fx.shadow.join("auth.json.lock"), "").unwrap();
         assert!(check(&fx.main, &fx.shadow).unwrap().is_empty());
     }
 

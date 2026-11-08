@@ -198,6 +198,12 @@ fn remove_confirm_shows_and_cancels() {
             binary: None,
             no_t3: false,
         })?;
+        r.add_pool(agentdeck_core::pool::PoolEntry {
+            instance: "gone".into(),
+            model: "m1".into(),
+            options: Default::default(),
+            enabled: false,
+        })?;
         Ok(())
     })
     .unwrap();
@@ -207,6 +213,13 @@ fn remove_confirm_shows_and_cancels() {
     {
         let mut ui = iced_test::simulator(app::view(&state));
         ui.find("The login dir is kept.").expect("keep-home note");
+        // The pool entry goes with the instance; the dialog names it.
+        let pool_line: String = i18n_embed_fl::fl!(
+            agentdeck_gui::i18n::loader(),
+            "remove-pool",
+            models = "m1".to_string()
+        );
+        ui.find(pool_line.as_str()).expect("pool line");
         ui.click("Keep").expect("cancel button");
         for message in ui.into_messages() {
             update(&mut state, message);
@@ -219,12 +232,12 @@ fn remove_confirm_shows_and_cancels() {
             "panel closes on cancel"
         );
     }
-    // A core refusal (pool/usage reference) stays visible in the panel.
+    // A core refusal (usage reference) stays visible in the panel.
     update(&mut state, Message::RemoveAsk("gone".into()));
     update(
         &mut state,
         Message::RemoveDone(Err(
-            "cannot remove instance \"gone\": still used by pool entries:\n  m".into(),
+            "cannot remove instance \"gone\": still used by usage entries:\n  u".into(),
         )),
     );
     let mut ui = iced_test::simulator(app::view(&state));

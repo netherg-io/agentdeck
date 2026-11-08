@@ -246,19 +246,9 @@ impl Registry {
         self.validate()
     }
 
+    /// Removes the instance and its pool entries (they cannot route without
+    /// it); usage entries refuse, since they hold account configuration.
     pub fn remove(&mut self, id: &str) -> anyhow::Result<Instance> {
-        let refs: Vec<String> = self
-            .pool
-            .iter()
-            .filter(|e| e.instance == id)
-            .map(|e| e.describe())
-            .collect();
-        if !refs.is_empty() {
-            anyhow::bail!(
-                "cannot remove instance {id:?}: still used by pool entries:\n  {}",
-                refs.join("\n  ")
-            );
-        }
         let used_by: Vec<String> = self
             .usage
             .iter()
@@ -276,6 +266,7 @@ impl Registry {
             .iter()
             .position(|i| i.id == id)
             .ok_or_else(|| anyhow::anyhow!("unknown instance id {id:?}"))?;
+        self.pool.retain(|e| e.instance != id);
         Ok(self.instances.remove(pos))
     }
 
