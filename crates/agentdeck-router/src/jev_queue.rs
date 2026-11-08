@@ -84,6 +84,11 @@ where
                 let led = lead(spool, &id, deadline, &mut fetch).await;
                 let _ = lock.unlock();
                 led?;
+                if let Some(r) = take_done(&done_path) {
+                    return r;
+                }
+                // Not answered (own request unreadable): don't spin on the lock.
+                tokio::time::sleep(POLL).await;
             }
             Err(std::fs::TryLockError::WouldBlock) => tokio::time::sleep(POLL).await,
             Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
@@ -197,7 +202,7 @@ fn collect(spool: &Path, own: &str) -> Vec<Pending> {
                 body: v["body"].as_str().unwrap_or_default().to_string(),
             };
             all.push((modified, p, group));
-        } else if name.ends_with(".done")
+        } else if (name.ends_with(".done") || name.ends_with(".tmp"))
             && SystemTime::now()
                 .duration_since(modified)
                 .is_ok_and(|age| age > STALE)
