@@ -1088,7 +1088,7 @@ mod tests {
         .unwrap();
         let reg = Registry::load(&paths).unwrap();
         let changes = plan_router_files(&paths, &reg).unwrap();
-        // Only router.json; the .mjs assets stay in the repo as fixtures.
+        // Only router.json; nothing else is extracted anymore.
         assert_eq!(changes.len(), 1);
         crate::changes::apply_changes(&changes).unwrap();
         let text = std::fs::read_to_string(router_json_path(&paths)).unwrap();
