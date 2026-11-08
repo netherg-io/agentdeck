@@ -1,6 +1,6 @@
 [package]
 name = "agentdeck"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 description = "Manage Claude Code, Codex, OpenCode and Antigravity accounts"
 license = "GPL-3.0-or-later"
