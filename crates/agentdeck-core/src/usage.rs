@@ -402,24 +402,29 @@ mod tests {
     }
 
     #[test]
-    fn instance_removal_refused_with_usage() {
-        let (paths, _g) = test_paths("refuse");
+    fn instance_removal_drops_its_usage_entries() {
+        let (paths, _g) = test_paths("cascade");
         Registry::update(&paths, |r| {
             r.add(spec("a"))?;
+            r.add(spec("b"))?;
             let mut e = entry("u", UsageKind::Claude);
             e.instance = Some("a".into());
+            r.add_usage(e)?;
+            let mut e = entry("v", UsageKind::Claude);
+            e.instance = Some("b".into());
             r.add_usage(e)?;
             Ok(())
         })
         .unwrap();
-        let err = Registry::update(&paths, |r| {
+        Registry::update(&paths, |r| {
             r.remove("a")?;
             Ok(())
         })
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("usage"), "{err}");
-        assert!(Registry::load(&paths).unwrap().get("a").is_some());
+        .unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        assert!(reg.get("a").is_none());
+        let left: Vec<&str> = reg.usage.iter().map(|u| u.id.as_str()).collect();
+        assert_eq!(left, ["v"]);
     }
 
     #[test]

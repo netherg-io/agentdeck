@@ -122,6 +122,8 @@ pub struct RemoveAsk {
     pub threads: Option<u64>,
     /// Pool models removed together with the instance.
     pub pool: Vec<String>,
+    /// Quota sources removed together with the instance.
+    pub usage: Vec<String>,
     pub error: Option<String>,
     pub working: bool,
 }
@@ -500,15 +502,17 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::RemoveAsk(id) => {
-            // Read-only thread count and pool entries for the confirmation;
-            // core refuses the removal itself when usage entries reference the id.
+            // Read-only thread count plus the pool and usage entries that go
+            // with the instance, for the confirmation.
             let threads = agentdeck_core::t3::t3_root()
                 .ok()
                 .and_then(|root| agentdeck_core::t3::thread_count(&root, &id).unwrap_or(None));
-            let pool = state
+            let reg = state
                 .paths
                 .as_ref()
-                .and_then(|p| agentdeck_core::registry::Registry::load(p).ok())
+                .and_then(|p| agentdeck_core::registry::Registry::load(p).ok());
+            let pool = reg
+                .as_ref()
                 .map(|reg| {
                     reg.pool
                         .iter()
@@ -517,10 +521,21 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let usage = reg
+                .as_ref()
+                .map(|reg| {
+                    reg.usage
+                        .iter()
+                        .filter(|u| u.instance.as_deref() == Some(id.as_str()))
+                        .map(|u| u.id.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
             state.remove = Some(RemoveAsk {
                 id,
                 threads,
                 pool,
+                usage,
                 error: None,
                 working: false,
             });

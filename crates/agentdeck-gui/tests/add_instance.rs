@@ -204,6 +204,18 @@ fn remove_confirm_shows_and_cancels() {
             options: Default::default(),
             enabled: false,
         })?;
+        r.add_usage(agentdeck_core::usage::UsageEntry {
+            id: "gone-quota".into(),
+            kind: agentdeck_core::usage::UsageKind::Claude,
+            instance: Some("gone".into()),
+            display: String::new(),
+            config_dir: Some("/fake/gone".into()),
+            codex_home: None,
+            token_file: None,
+            api_key_env: None,
+            db_file: None,
+            extra: Default::default(),
+        })?;
         Ok(())
     })
     .unwrap();
@@ -220,6 +232,12 @@ fn remove_confirm_shows_and_cancels() {
             models = "m1".to_string()
         );
         ui.find(pool_line.as_str()).expect("pool line");
+        let usage_line: String = i18n_embed_fl::fl!(
+            agentdeck_gui::i18n::loader(),
+            "remove-usage",
+            sources = "gone-quota".to_string()
+        );
+        ui.find(usage_line.as_str()).expect("usage line");
         ui.click("Keep").expect("cancel button");
         for message in ui.into_messages() {
             update(&mut state, message);
