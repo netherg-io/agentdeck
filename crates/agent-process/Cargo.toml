@@ -1,6 +1,6 @@
 [package]
 name = "agent-process"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 description = "Own long-running agent processes: separate process group plus ownership registry"
 license = "GPL-3.0-or-later"
