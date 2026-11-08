@@ -161,7 +161,7 @@ fn parse_usage_state(path: &std::path::Path) -> anyhow::Result<Vec<UsageAccountF
 
 // --- Codex cost calibration (route.mjs codexCosts) --------------------------
 
-const COST_VERSION: u64 = 7;
+const COST_VERSION: u64 = 8;
 const RESET_JITTER: f64 = 600.0;
 const QUIET_MS: f64 = 120_000.0;
 const MIN_RATE_PERCENT: f64 = 10.0;
@@ -252,29 +252,25 @@ struct CodexEvent {
     tokens: f64,
 }
 
+/// `~/.codex/sessions/YYYY/MM/DD/*.jsonl`, like the Node router's `*/*/*/*.jsonl`.
 fn codex_session_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut out = vec![];
-    let Ok(l1) = std::fs::read_dir(root) else {
-        return out;
-    };
-    for a in l1.flatten() {
-        let Ok(l2) = std::fs::read_dir(a.path()) else {
-            continue;
-        };
-        for b in l2.flatten() {
-            let Ok(l3) = std::fs::read_dir(b.path()) else {
-                continue;
-            };
-            for c in l3.flatten() {
-                if c.path().extension().and_then(|e| e.to_str()) == Some("jsonl")
-                    && c.file_type().is_ok_and(|t| t.is_file())
-                {
-                    out.push(c.path());
-                }
-            }
-        }
+    let mut dirs = vec![root.to_path_buf()];
+    for _ in 0..3 {
+        dirs = dirs
+            .iter()
+            .flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| e.path())
+            .collect();
     }
-    out
+    dirs.iter()
+        .flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten())
+        .filter(|e| {
+            e.path().extension().and_then(|x| x.to_str()) == Some("jsonl")
+                && e.file_type().is_ok_and(|t| t.is_file())
+        })
+        .map(|e| e.path())
+        .collect()
 }
 
 fn compute_codex_costs(env: &Env) -> Measured {
@@ -2298,11 +2294,8 @@ mod quota_estimate_tests {
                 .unwrap()
                 .subsec_nanos()
         ));
-        // NOTE: the legacy Node suite reads `.codex/sessions/*/*/*/*.jsonl`
-        // (year/month/day/file); the Rust walk below only descends to
-        // `*/*/*.jsonl`, so this fixture uses that depth. Flagged in the
-        // handoff; router behaviour is frozen by this task's brief.
-        let sessions = home.join(".codex/sessions/2026/10");
+        // Real Codex layout: sessions/YYYY/MM/DD/<file>.jsonl.
+        let sessions = home.join(".codex/sessions/2026/10/01");
         std::fs::create_dir_all(&sessions).unwrap();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -589,7 +589,13 @@ fn route_matches_golden() {
     {
         let fx = Fixture::new(&[OPUS, HAIKU]);
         let jev = serde_json::json!({});
-        check_case("check", &fx, &["--check"], &jev, None);
+        check_case(
+            "check",
+            &fx,
+            &["--source", "claudeAgent", "--check"],
+            &jev,
+            None,
+        );
     }
 
     // Missing router JSON fails closed; bad Jev fails (legacy Node asserted

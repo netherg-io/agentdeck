@@ -1,4 +1,4 @@
 {
   "exit": 0,
-  "stdout": "source: opencode\nlive T3 agent metadata unavailable\nok  claudeAgent/claude-opus-5-5\n    left: Week 60% left; resets in Rh, 5h 20% left; resets in Rh (0 active agents; count unknown)\n    weekly % per size 0..3: 0.1 / 0.4 / 1.2 / 3 (Max 5x estimate × burn 1)\n    allowed sizes: 0,1,2,3\nok  claudeAgent/claude-haiku-5-5\n    left: Week 60% left; resets in Rh, 5h 20% left; resets in Rh (0 active agents; count unknown)\n    weekly % per size 0..3: 0.01 / 0.04 / 0.12 / 0.3 (Max 5x estimate × burn 0.1)\n    allowed sizes: 0,1,2,3\n"
+  "stdout": "source: claudeAgent\nlive T3 agent metadata unavailable\nok  claudeAgent/claude-opus-5-5\n    left: Week 60% left; resets in Rh, 5h 20% left; resets in Rh (0 active agents; count unknown)\n    weekly % per size 0..3: 0.1 / 0.4 / 1.2 / 3 (Max 5x estimate × burn 1)\n    allowed sizes: 0,1,2,3\nok  claudeAgent/claude-haiku-5-5\n    left: Week 60% left; resets in Rh, 5h 20% left; resets in Rh (0 active agents; count unknown)\n    weekly % per size 0..3: 0.01 / 0.04 / 0.12 / 0.3 (Max 5x estimate × burn 0.1)\n    allowed sizes: 0,1,2,3\n"
 }
