@@ -1,7 +1,8 @@
-//! Differential test: the Rust `route claude-shell` must behave like the
-//! Node `claude-shell-mcp.mjs` — same pure-function results, same
-//! passthrough/streaming CLI contract. Skips the Node half when Node is
-//! absent; the no-Node `--check` case always runs.
+//! Golden-file test: the Rust `route claude-shell` must match the committed
+//! snapshots in `tests/golden/shell/` (captured once from the legacy Node
+//! `claude-shell-mcp.mjs`; `UPDATE_GOLDEN=1` rewrites them from the Rust
+//! output) — same pure-function results, same passthrough/streaming CLI
+//! contract. No Node needed.
 
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -15,16 +16,24 @@ fn workspace_root() -> PathBuf {
     d
 }
 
-fn node_available() -> bool {
-    Command::new("node")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
+fn golden_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/shell")
+        .join(format!("{name}.json"))
 }
 
-fn asset_url() -> String {
-    let p = workspace_root().join("crates/agentdeck-core/assets/router/claude-shell-mcp.mjs");
-    format!("file://{}", p.to_string_lossy())
+fn write_golden(name: &str, value: &serde_json::Value) {
+    let path = golden_path(name);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_string_pretty(value).unwrap() + "\n").unwrap();
+}
+
+fn read_golden(name: &str) -> serde_json::Value {
+    let path = golden_path(name);
+    if !path.exists() {
+        panic!("{name}: missing golden {}; regenerate with UPDATE_GOLDEN=1", path.display());
+    }
+    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
 }
 
 const GOOD: &str = r#"{"t3-code": {"type": "http", "url": "http://127.0.0.1:3773/mcp", "headers": {"Authorization": "Bearer first-secret"}}}"#;
@@ -129,79 +138,20 @@ fn hex_encode(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn node_results(dir: &std::path::Path) -> Vec<serde_json::Value> {
-    let driver = dir.join("driver.mjs");
-    std::fs::write(
-        &driver,
-        format!(
-            r#"import fs from 'node:fs';
-import {{ isStreamingArgs, extractConnection, updateConnection, seedFromArgs, formatResponse, createSnoop }} from {url};
-const cases = JSON.parse(fs.readFileSync(0, 'utf8'));
-const out = [];
-for (const c of cases) {{
-  if (c.kind === 'streaming') out.push(isStreamingArgs(c.argv));
-  else if (c.kind === 'extract') out.push(extractConnection(c.servers) ?? null);
-  else if (c.kind === 'update') out.push(updateConnection(c.current ?? null, c.text));
-  else if (c.kind === 'seed') out.push(seedFromArgs(c.argv, name => {{ if (name in c.files) return c.files[name]; throw new Error('private'); }}));
-  else if (c.kind === 'format') out.push(formatResponse(c.conn ?? null));
-  else if (c.kind === 'snoop') {{
-    const lines = [], fwd = [];
-    const s = createSnoop(line => lines.push(line));
-    s.on('data', chunk => fwd.push(chunk));
-    for (const h of c.chunks) s.write(Buffer.from(h, 'hex'));
-    s.end();
-    await new Promise(resolve => s.on('end', resolve));
-    out.push({{ lines, forwarded: Buffer.concat(fwd).toString('hex') }});
-  }}
-}}
-process.stdout.write(JSON.stringify(out));
-"#,
-            url = serde_json::to_string(&asset_url()).unwrap()
-        ),
-    )
-    .unwrap();
-    let mut child = Command::new("node")
-        .arg(&driver)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn node");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(serde_json::to_string(&cases()).unwrap().as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("node output");
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    serde_json::from_slice(&out.stdout).unwrap()
-}
-
 #[test]
-fn pure_functions_match_node() {
-    if !node_available() {
-        eprintln!("SKIP: node absent");
-        return;
-    }
-    let dir = std::env::temp_dir().join(format!(
-        "agentdeck-shell-parity-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let node = node_results(&dir);
+fn pure_functions_match_golden() {
     let rust = rust_results();
-    assert_eq!(node.len(), rust.len());
-    for (i, (n, r)) in node.iter().zip(rust.iter()).enumerate() {
+    if std::env::var("UPDATE_GOLDEN").is_ok() {
+        write_golden("pure", &serde_json::to_value(&rust).unwrap());
+    }
+    // The golden was captured once from the legacy Node router; the golden
+    // file is the contract and Node is no longer needed.
+    if !golden_path("pure").exists() {
+        panic!("pure: missing golden; regenerate with UPDATE_GOLDEN=1");
+    }
+    let golden: Vec<serde_json::Value> = serde_json::from_value(read_golden("pure")).unwrap();
+    assert_eq!(golden.len(), rust.len());
+    for (i, (n, r)) in golden.iter().zip(rust.iter()).enumerate() {
         assert_eq!(
             n,
             r,
@@ -209,37 +159,33 @@ fn pure_functions_match_node() {
             serde_json::to_string(&cases()[i]).unwrap()
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Fake original shared by both launchers: after stdin ends, read the pushed
-/// socket line, dump both, exit 0.
+/// Fake original shared by the launcher under test: after stdin ends, read
+/// the pushed socket line, dump both, exit 0. Plain Python (no Node): the
+/// fake is just the spawned `ORIGINAL`, unrelated to the router.
 fn write_fake(dir: &std::path::Path) {
     std::fs::write(
-        dir.join("fake.mjs"),
-        r#"import fs from 'node:fs';
-import net from 'node:net';
-let data = '';
-process.stdin.on('data', c => { data += c; });
-process.stdin.on('end', () => {
-  fs.writeFileSync(process.env.DUMP_STDIN, data);
-  const sock = net.connect(process.env.T3_SHELL_MCP_SOCKET);
-  let line = '';
-  sock.on('data', c => { line += c; });
-  sock.on('end', () => { fs.writeFileSync(process.env.DUMP_SOCK, line); process.exit(0); });
-  sock.on('error', e => { fs.writeFileSync(process.env.DUMP_SOCK, 'ERR ' + e.message); process.exit(3); });
-});
+        dir.join("fake.py"),
+        r#"import os, socket, sys
+data = sys.stdin.buffer.read()
+open(os.environ['DUMP_STDIN'], 'wb').write(data)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(os.environ['T3_SHELL_MCP_SOCKET'])
+line = b''
+while not line.endswith(b'\n'):
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    line += chunk
+open(os.environ['DUMP_SOCK'], 'wb').write(line)
 "#,
     )
     .unwrap();
 }
 
 #[test]
-fn streaming_proxy_matches_node() {
-    if !node_available() {
-        eprintln!("SKIP: node absent");
-        return;
-    }
+fn streaming_proxy_matches_golden() {
     let dir = std::env::temp_dir().join(format!(
         "agentdeck-shell-cli-{}-{}",
         std::process::id(),
@@ -251,13 +197,13 @@ fn streaming_proxy_matches_node() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     write_fake(&dir);
-    // ORIGINAL=node with the fake as its first argv is fiddly; instead wrap
-    // the fake in a shell script for the Node side too.
+    // Wrap the fake in a shell script: the launcher spawns ORIGINAL with
+    // the user argv, and exec of the wrapper keeps argv handling identical.
     std::fs::write(
         dir.join("fake.sh"),
         format!(
-            "#!/bin/sh\nexec node {} \"$@\"\n",
-            dir.join("fake.mjs").display()
+            "#!/bin/sh\nexec python3 {} \"$@\"\n",
+            dir.join("fake.py").display()
         ),
     )
     .unwrap();
@@ -265,32 +211,17 @@ fn streaming_proxy_matches_node() {
     std::fs::set_permissions(dir.join("fake.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
     let frame_text = frame(GOOD);
     let input = format!("{frame_text}\nuser line\n");
-    // Temporarily point the helper at the wrapper by overriding env inside run_launcher is overkill;
-    // reuse run_launcher with CLAUDE_SHELL_MCP_ORIGINAL=fake.sh via env swap below.
-    let run = |rust: bool| {
-        let tag = if rust { "rust" } else { "node" };
-        std::fs::create_dir_all(dir.join(format!("rt-{tag}"))).unwrap();
-        let mut child = if rust {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentdeck"));
-            cmd.arg("route").arg("claude-shell")
-                .arg("--input-format").arg("stream-json")
-                .arg("--mcp-config").arg(serde_json::json!({"mcpServers": serde_json::from_str::<serde_json::Value>(GOOD).unwrap()}).to_string());
-            child_env(&mut cmd, &dir, tag);
-            cmd.stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            cmd.spawn().expect("spawn agentdeck")
-        } else {
-            let mut cmd = Command::new("node");
-            cmd.arg(workspace_root().join("crates/agentdeck-core/assets/router/claude-shell-mcp.mjs"))
-                .arg("--input-format").arg("stream-json")
-                .arg("--mcp-config").arg(serde_json::json!({"mcpServers": serde_json::from_str::<serde_json::Value>(GOOD).unwrap()}).to_string());
-            child_env(&mut cmd, &dir, tag);
-            cmd.stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            cmd.spawn().expect("spawn node")
-        };
+    let run = || {
+        std::fs::create_dir_all(dir.join("rt-rust")).unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentdeck"));
+        cmd.arg("route").arg("claude-shell")
+            .arg("--input-format").arg("stream-json")
+            .arg("--mcp-config").arg(serde_json::json!({"mcpServers": serde_json::from_str::<serde_json::Value>(GOOD).unwrap()}).to_string());
+        child_env(&mut cmd, &dir, "rust");
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn agentdeck");
         child
             .stdin
             .take()
@@ -300,36 +231,35 @@ fn streaming_proxy_matches_node() {
         let out = child.wait_with_output().expect("launcher output");
         (
             out.status.code().unwrap_or(-1),
-            std::fs::read_to_string(dir.join(format!("stdin-{tag}"))).unwrap_or_default(),
-            std::fs::read_to_string(dir.join(format!("sock-{tag}"))).unwrap_or_default(),
+            std::fs::read_to_string(dir.join("stdin-rust")).unwrap_or_default(),
+            std::fs::read_to_string(dir.join("sock-rust")).unwrap_or_default(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
     };
-    let (nc, nstdin, nsock, nerr) = run(false);
-    let (rc, rstdin, rsock, rerr) = run(true);
-    let want_sock = String::from(
-        "{\"endpoint\":\"http://127.0.0.1:3773/mcp\",\"authorization\":\"Bearer first-secret\"}\n",
-    );
-    assert_eq!(
-        (nc, nstdin.clone(), nsock.clone()),
-        (0, input.clone(), want_sock),
-        "node: {nerr}"
-    );
+    let golden = read_golden("streaming-proxy");
+    if std::env::var("UPDATE_GOLDEN").is_ok() {
+        let (rc, rstdin, rsock, _) = run();
+        write_golden(
+            "streaming-proxy",
+            &serde_json::json!({"exit": rc, "stdin": rstdin, "sock": rsock}),
+        );
+    }
+    let (rc, rstdin, rsock, rerr) = run();
     assert_eq!(
         (rc, rstdin, rsock),
-        (nc, nstdin, nsock),
+        (
+            golden["exit"].as_i64().unwrap() as i32,
+            golden["stdin"].as_str().unwrap().to_string(),
+            golden["sock"].as_str().unwrap().to_string(),
+        ),
         "rust stderr: {rerr}"
     );
     // The proxy removes its own session directory on exit.
-    for tag in ["node", "rust"] {
-        let leftovers: Vec<_> = std::fs::read_dir(dir.join(format!("rt-{tag}")))
-            .unwrap()
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "leftover runtime files: {leftovers:?}"
-        );
-    }
+    let leftovers: Vec<_> = std::fs::read_dir(dir.join("rt-rust")).unwrap().collect();
+    assert!(
+        leftovers.is_empty(),
+        "leftover runtime files: {leftovers:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -341,11 +271,7 @@ fn child_env(cmd: &mut Command, dir: &std::path::Path, tag: &str) {
 }
 
 #[test]
-fn passthrough_exit_code_matches_node() {
-    if !node_available() {
-        eprintln!("SKIP: node absent");
-        return;
-    }
+fn passthrough_exit_code_matches_golden() {
     let dir = std::env::temp_dir().join(format!(
         "agentdeck-shell-pass-{}-{}",
         std::process::id(),
@@ -363,40 +289,42 @@ fn passthrough_exit_code_matches_node() {
     .unwrap();
     #[cfg(unix)]
     std::fs::set_permissions(dir.join("fake.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    let run = |rust: bool| {
-        let child = if rust {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentdeck"));
-            cmd.arg("route")
-                .arg("claude-shell")
-                .arg("--print")
-                .arg("hi");
-            cmd.env("CLAUDE_SHELL_MCP_ORIGINAL", dir.join("fake.sh"));
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            cmd.spawn().expect("spawn agentdeck")
-        } else {
-            let mut cmd = Command::new("node");
-            cmd.arg(
-                workspace_root().join("crates/agentdeck-core/assets/router/claude-shell-mcp.mjs"),
-            )
+    let run = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentdeck"));
+        cmd.arg("route")
+            .arg("claude-shell")
             .arg("--print")
             .arg("hi");
-            cmd.env("CLAUDE_SHELL_MCP_ORIGINAL", dir.join("fake.sh"));
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            cmd.spawn().expect("spawn node")
-        };
-        child.wait_with_output().expect("output")
+        cmd.env("CLAUDE_SHELL_MCP_ORIGINAL", dir.join("fake.sh"));
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.spawn().expect("spawn agentdeck").wait_with_output().expect("output")
     };
-    let n = run(false);
-    let r = run(true);
+    let golden = read_golden("passthrough");
+    if std::env::var("UPDATE_GOLDEN").is_ok() {
+        let r = run();
+        write_golden(
+            "passthrough",
+            &serde_json::json!({"exit": r.status.code(),
+                "stdout": String::from_utf8_lossy(&r.stdout),
+                "stderr": String::from_utf8_lossy(&r.stderr)}),
+        );
+    }
+    let r = run();
     assert_eq!(
-        (n.status.code(), &n.stdout, &n.stderr),
-        (r.status.code(), &r.stdout, &r.stderr)
+        (
+            r.status.code(),
+            String::from_utf8_lossy(&r.stdout).into_owned(),
+            String::from_utf8_lossy(&r.stderr).into_owned(),
+        ),
+        (
+            golden["exit"].as_i64().map(|c| c as i32),
+            golden["stdout"].as_str().unwrap().to_string(),
+            golden["stderr"].as_str().unwrap().to_string(),
+        )
     );
-    assert_eq!(n.status.code(), Some(7));
+    assert_eq!(r.status.code(), Some(7));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

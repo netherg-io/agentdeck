@@ -1,0 +1,5 @@
+{
+  "exit": 0,
+  "stdin": "{\"type\": \"control_request\", \"request\": {\"subtype\": \"mcp_set_servers\", \"servers\": {\"t3-code\": {\"type\": \"http\", \"url\": \"http://127.0.0.1:3773/mcp\", \"headers\": {\"Authorization\": \"Bearer first-secret\"}}}}}\nuser line\n",
+  "sock": "{\"endpoint\":\"http://127.0.0.1:3773/mcp\",\"authorization\":\"Bearer first-secret\"}\n"
+}
