@@ -1136,9 +1136,21 @@ async fn post_json(url: &str, key: &str, body: String) -> anyhow::Result<Value> 
         .map_err(|e| anyhow::anyhow!("Jev request failed: {e}"))?;
     if !res.status().is_success() {
         let status = res.status().as_u16();
+        let retry_after = res
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()?.trim().parse::<u64>().ok());
         let text = res.text().await.unwrap_or_default();
         let snippet: String = text.chars().take(300).collect();
-        return Err(anyhow::anyhow!("Jev HTTP {status}: {snippet}"));
+        let message = format!("Jev HTTP {status}: {snippet}");
+        if status == 429 {
+            return Err(crate::jev_queue::RateLimited {
+                retry_after: std::time::Duration::from_secs(retry_after.unwrap_or(30)),
+                message,
+            }
+            .into());
+        }
+        return Err(anyhow::anyhow!(message));
     }
     res.json()
         .await
@@ -1687,11 +1699,15 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     let (answers, cost) = match cached {
         Some(a) => (a, Some(0.0)),
         None => {
-            let (answers, cost) = jev_fetch(
-                cfg.decision_provider.as_deref(),
+            let provider = cfg.decision_provider.clone();
+            let (answers, cost) = crate::jev_queue::ask(
+                &env.runtime.join("model-route-jev-queue"),
                 &request_value,
                 &body_json,
-                None,
+                move |request, body| {
+                    let provider = provider.clone();
+                    async move { jev_fetch(provider.as_deref(), &request, &body, None).await }
+                },
             )
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2143,7 +2159,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
 /// Serialize exactly like `JSON.stringify` for the Jev body and the cache-key
 /// hash: same key order and separators, plus `\u2028`/`\u2029` escaping which
 /// serde omits but V8 emits.
-fn stringify_like_node(v: &Value) -> String {
+pub(crate) fn stringify_like_node(v: &Value) -> String {
     serde_json::to_string(v)
         .unwrap_or_default()
         .replace('\u{2028}', "\\u2028")

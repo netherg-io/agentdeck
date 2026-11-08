@@ -4,6 +4,7 @@
 
 pub mod admission;
 pub mod hook;
+pub mod jev_queue;
 pub mod load;
 pub mod mcp_call;
 pub mod outcomes;
