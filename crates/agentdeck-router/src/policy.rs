@@ -1363,6 +1363,7 @@ mod legacy_suite_edges {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn cand(
         provider: &str,
         model: &str,

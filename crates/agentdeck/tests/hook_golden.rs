@@ -323,12 +323,12 @@ fn decisions(dir: &Path) -> Vec<serde_json::Value> {
                     v["t"] = serde_json::Value::from("");
                     // The embedded JSON parse error is engine-specific (V8 vs
                     // serde_json); only the shared suffix must match.
-                    if let Some(reason) = v.get("reason").and_then(|r| r.as_str()) {
-                        if let Some((_, suffix)) = reason.split_once(" | model-route:") {
-                            v["reason"] = serde_json::Value::from(format!(
-                                "<parse error> | model-route:{suffix}"
-                            ));
-                        }
+                    if let Some(reason) = v.get("reason").and_then(|r| r.as_str())
+                        && let Some((_, suffix)) = reason.split_once(" | model-route:")
+                    {
+                        v["reason"] = serde_json::Value::from(format!(
+                            "<parse error> | model-route:{suffix}"
+                        ));
                     }
                     // Wall-clock drift leaks into resets strings (see canon).
                     serde_json::from_slice(&canon_output(&serde_json::to_vec(&v).unwrap())).unwrap()
@@ -367,7 +367,7 @@ fn check_case_raw(name: &str, fx: &Fixture, harness: &str, stdin_text: &str) {
             path.display()
         );
     }
-    let (rc, rout_raw, rerr) = run_rust(fx, harness, &stdin_text);
+    let (rc, rout_raw, rerr) = run_rust(fx, harness, stdin_text);
     let rout = canon_output(&rout_raw);
     if std::env::var("UPDATE_GOLDEN").is_ok() {
         let golden = serde_json::json!({"exit": rc,

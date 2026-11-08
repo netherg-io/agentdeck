@@ -377,12 +377,12 @@ fn oversized_dependency_results_fail_prepare_before_routing() {
         "options": {"reasoningEffort": "high"}});
     let mut state = new_state(&plan, "th").unwrap();
     let calls = Cell::new(0);
-    let route = |_: &str, _: &str| {
+    let route = &|_: &str, _: &str| {
         calls.set(calls.get() + 1);
         Ok(serde_json::json!({"target": t, "reason": "r"}))
     };
     for id in ["a", "b"] {
-        prepare(&mut state, id, "src", &route).unwrap();
+        prepare(&mut state, id, "src", route).unwrap();
         record(
             &mut state,
             id,
@@ -394,7 +394,7 @@ fn oversized_dependency_results_fail_prepare_before_routing() {
         .unwrap();
     }
     let before = calls.get();
-    let err = prepare(&mut state, "join", "src", &route).unwrap_err();
+    let err = prepare(&mut state, "join", "src", route).unwrap_err();
     assert!(
         err.message
             .contains("brief plus dependency results exceeds"),

@@ -340,7 +340,7 @@ mod legacy_suite_tests {
             .map(|a| (a.id.clone(), a.provider.clone(), a.model.clone()))
             .collect();
         got.sort();
-        let mut want = vec![
+        let mut want = [
             ("pt-claude", "claudeAgent", Some("claude-opus-5-5")),
             ("kid-sonnet", "claudeAgent", Some("claude-sonnet-5-5")),
             ("kid-unknown", "claudeAgent", None),
