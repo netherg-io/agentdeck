@@ -777,3 +777,208 @@ fn hook_matches_golden() {
         check_case("allow-low-confidence", &fx, "shell", &input);
     }
 }
+
+/// Runs the hook binary under a spoofed T3 ancestry (ported from the legacy
+/// Node `hook.test.mjs`, which faked `/proc` reads instead): a `t3 serve`
+/// grandparent frame and a harness-matching parent frame. The grandparent is
+/// the `flock` binary (it spawns its child and waits, keeping its argv);
+/// the parent is `bash -c` (a binary, so its argv survives — a script frame
+/// would lose argv[0] to the shebang interpreter). The parent stages stdin
+/// to a file and runs the hook in the foreground: background children of
+/// `bash -c` lose piped stdin, and the foreground run keeps the frame alive
+/// as the waiting parent anyway. No Node involved.
+fn run_under_t3(
+    fx: &Fixture,
+    parent_argv0: &str,
+    parent_mid: &[&str],
+    harness: &str,
+    stdin_text: &str,
+) -> (i32, Vec<u8>, Vec<u8>) {
+    let dir = fx.dir.join("frames");
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe = env!("CARGO_BIN_EXE_agentdeck").to_string();
+    // Grandparent argv: [<t3-path>, serve, ...] satisfies the T3-server
+    // shape; the lock file is literally `serve` (cwd is the frames dir).
+    // `exec -a` crafts argv[0] of the flock binary (which spawns its child
+    // and waits, keeping the spoofed argv visible).
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg("exec -a \"$0\" flock \"$@\"")
+        .arg(dir.join("t3").to_str().unwrap())
+        .arg("serve")
+        .arg("bash")
+        .arg("-c")
+        .arg(format!(
+            "cat > .stdin.json; shift {}; \"$@\" < .stdin.json",
+            parent_mid.len()
+        ))
+        .arg(parent_argv0)
+        .args(parent_mid)
+        .arg(&exe)
+        .arg("route")
+        .arg("hook")
+        .arg("--harness")
+        .arg(harness)
+        .current_dir(&dir)
+        .envs(fx.base_env("rt-rust"));
+    cmd.env("AGENTDECK_ROUTE_MOCK_JEV", &fx.mock_jev);
+    for v in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "MODEL_ROUTE_HOOK_DEBUG"] {
+        cmd.env_remove(v);
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn t3 frames");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin_text.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("hook output");
+    (out.status.code().unwrap_or(-1), out.stdout, out.stderr)
+}
+
+fn last_record(fx: &Fixture) -> serde_json::Value {
+    decisions(&fx.dir).pop().expect("a decision record")
+}
+
+/// Native-harness decisions (ported from the legacy Node `hook.test.mjs`).
+/// `delegate_task` is always routed; native tools route only under a T3
+/// ancestry (spoofed here), else pass through silently. Codex/claude verdicts
+/// use the PreToolUse envelope (additional context on allow); agy prints
+/// the `{decision, reason}` verdict like shell/opencode.
+#[test]
+fn native_harness_decisions() {
+    let hint = shared_hint();
+    let sol = serde_json::json!({"providerInstanceId": "codex", "model": "gpt-6.1-sol",
+        "options": {"reasoningEffort": "medium"}});
+    let hinted = |base: &str| format!("{base}\n\n{hint}");
+    // Fresh fixture per verdict: hook runs record admissions, so sharing
+    // one dir would let an earlier verdict shape a later one.
+    let fx_for = || Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+
+    // Codex delegate with the hint: allow (delegate is always routed).
+    {
+        let fx = fx_for();
+        let input = serde_json::json!({"tool_name": "delegate_task",
+            "tool_input": {"task": hinted("Fix the typo"), "target": sol},
+            "inT3": true});
+        let (code, out, err) = run_rust(&fx, "codex", &input.to_string());
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(
+            v["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("selected winner")
+        );
+        assert_eq!(last_record(&fx)["decision"], "allow:delegate");
+    }
+    // Codex delegate without a target: deny:invalid-delegate envelope.
+    {
+        let fx = fx_for();
+        let input = serde_json::json!({"tool_name": "delegate_task",
+            "tool_input": {"task": "Fix the typo"}, "inT3": true});
+        let (code, out, err) = run_rust(&fx, "codex", &input.to_string());
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            v["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("explicit exact providerInstanceId/model")
+        );
+    }
+    // Codex native tool outside T3 passes through silently.
+    {
+        let fx = fx_for();
+        let input = serde_json::json!({"tool_name": "spawn_agent",
+            "tool_input": {"task": hinted("Fix the typo"), "target": sol},
+            "inT3": true, "model": "gpt-6-astra"});
+        let (code, out, err) = run_rust(&fx, "codex", &input.to_string());
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        assert_eq!(out, b"");
+        assert!(decisions(&fx.dir).is_empty());
+    }
+    // Codex native tool under a T3 ancestry routes, then reroutes to
+    // delegate_task (native launches never dispatch directly).
+    {
+        let fx = fx_for();
+        let input = serde_json::json!({"tool_name": "spawn_agent",
+            "tool_input": {"task": hinted("Fix the typo"), "target": sol},
+            "inT3": true, "model": "gpt-6-astra"});
+        let (code, out, err) = run_under_t3(&fx, "codex app-server", &[], "codex", &input.to_string());
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            v["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("Call the T3 MCP tool delegate_task with target")
+        );
+        assert_eq!(last_record(&fx)["decision"], "deny:delegate codex/gpt-6.1-sol");
+    }
+    // Claude Workflow entry point: always deny (under a T3 ancestry;
+    // outside T3 it passes through like any non-delegate tool).
+    {
+        let fx = fx_for();
+        let input = serde_json::json!({"tool_name": "Workflow",
+            "tool_input": {"task": "Do the thing"}, "inT3": true, "session_id": "root"});
+        let (code, out, err) = run_under_t3(
+            &fx,
+            "claude",
+            &["--mcp-config", "{\"t3-code\":{}}"],
+            "claude",
+            &input.to_string(),
+        );
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            v["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("Route each child task separately")
+        );
+    }
+    // Claude delegate under a T3 ancestry: allow.
+    {
+        let fx = fx_for();
+        let input = serde_json::json!({"tool_name": "delegate_task",
+            "tool_input": {"task": hinted("Fix the typo"), "target": sol},
+            "inT3": true, "session_id": "root"});
+        let (code, out, err) = run_under_t3(
+            &fx,
+            "claude",
+            &["--mcp-config", "{\"t3-code\":{}}"],
+            "claude",
+            &input.to_string(),
+        );
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        // Allow carries the route reason as additional context.
+        if !out.is_empty() {
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert!(
+                v["hookSpecificOutput"]["additionalContext"]
+                    .as_str()
+                    .unwrap()
+                    .contains("selected winner")
+            );
+        }
+        assert_eq!(last_record(&fx)["decision"], "allow:delegate");
+    }
+    // Agy delegate with the hint: allow (delegate is always routed).
+    {
+        let fx = fx_for();
+        let input = serde_json::json!({"toolCall": {"name": "delegate_task",
+            "args": {"task": hinted("Fix the typo"), "target": sol}},
+            "conversationId": "root"});
+        let (code, out, err) = run_rust(&fx, "agy", &input.to_string());
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["decision"], "allow");
+    }
+}

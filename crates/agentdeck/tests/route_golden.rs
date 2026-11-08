@@ -670,3 +670,169 @@ fn effort_flag_overrides_the_reasoning_level() {
     assert_eq!(target(3.0, &["--effort", "medium"]).1, base_low);
     assert_eq!(target(0.0, &["--effort", "bogus"]).0, 2);
 }
+
+/// Jev answer cache through the actual CLI (ported from the legacy Node
+/// `jev-cache.test.mjs`): miss then hit, validation reuses the cached
+/// answers, quota is re-read on a hit, corrupt entries refetch, private
+/// cache permissions.
+#[test]
+fn jev_cache_contract() {
+    use std::os::unix::fs::PermissionsExt;
+    let pool = [OPUS, SOL];
+    let fx = Fixture::new(&pool);
+    let prefers_opus = answers_for(
+        &[
+            ("claudeagent_claude_opus_5_5", level(2.9, 0.95)),
+            ("codex_gpt_6_1_sol", level(2.0, 0.95)),
+        ],
+        0.0,
+        0.0,
+    );
+    let mock = write_mock(&fx, &prefers_opus);
+    let task = ["--source", "claudeAgent", "Implement the feature in parser.c"];
+    let run = |args: &[&str]| {
+        let (code, out, err) = run_rust(&fx, args, &mock, None);
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+    let out = run(&task);
+    assert_eq!(out["jevCache"], "miss");
+    assert_eq!(out["target"]["model"], "claude-opus-5-5");
+    let cache_dir = fx.dir.join("rt-rust/model-route-jev-cache");
+    let files: Vec<_> = std::fs::read_dir(&cache_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(".json"))
+        .collect();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].len(), 64 + ".json".len());
+    assert_eq!(
+        std::fs::metadata(cache_dir.join(&files[0])).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(&cache_dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    // A fresh sample would prefer Sol; validation reuses the cached answers.
+    let out = run(&[
+        "--source",
+        "claudeAgent",
+        "--validate-target",
+        "claudeAgent",
+        "claude-opus-5-5",
+        "Implement the feature in parser.c",
+    ]);
+    assert_eq!(out["jevCache"], "hit");
+    assert_eq!(out["validation"]["allowed"], true);
+    // Quota is re-read on a hit: an exhausted winner is blocked, still
+    // without a new Jev request (same single cache file).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64() as i64;
+    let usage = serde_json::json!({"accounts": [
+        {"provider": "claude", "id": "claude-main", "plan": "Max 5x", "status": "ok", "updated_at": now, "balances": [],
+         "windows": [{"key": "weekly_all", "label": "Week", "remaining_percent": 0.05, "duration_mins": 10080, "resets_at": now + 30 * 3600},
+            {"key": "session", "label": "5h", "remaining_percent": 0, "duration_mins": 300, "resets_at": now + 3600}]},
+        {"provider": "codex", "id": "codex-main", "plan": "Pro 5x", "status": "ok", "updated_at": now, "balances": [],
+         "windows": [{"key": "weekly", "label": "Week", "remaining_percent": 80, "duration_mins": 10080, "resets_at": now + 3 * 86400}]},
+    ]});
+    std::fs::write(
+        fx.dir.join(".local/state/ai-usage/state.json"),
+        serde_json::to_string(&usage).unwrap(),
+    )
+    .unwrap();
+    let out = run(&[
+        "--source",
+        "claudeAgent",
+        "--validate-target",
+        "claudeAgent",
+        "claude-opus-5-5",
+        "Implement the feature in parser.c",
+    ]);
+    assert_eq!(out["jevCache"], "hit");
+    assert_eq!(out["validation"]["allowed"], false);
+    assert_eq!(out["target"]["model"], "gpt-6.1-sol");
+    // Corrupt cache entries refetch instead of failing.
+    std::fs::write(cache_dir.join(&files[0]), "{").unwrap();
+    let out = run(&task);
+    assert_eq!(out["jevCache"], "miss");
+    assert_eq!(out["target"]["model"], "gpt-6.1-sol");
+}
+
+/// `--check` over cached quota states (ported from the legacy Node
+/// `policy.test.mjs` CLI tail): stale/error snapshots report cached quota
+/// and gate sizes; unknown quota allows all sizes.
+#[test]
+fn check_reports_cached_quota_states() {
+    let fx = Fixture::new(&[OPUS]);
+    let run_check = |usage: serde_json::Value| {
+        std::fs::write(
+            fx.dir.join(".local/state/ai-usage/state.json"),
+            serde_json::to_string(&usage).unwrap(),
+        )
+        .unwrap();
+        let mock = write_mock(&fx, &serde_json::json!({}));
+        let (code, out, _) = run_rust(&fx, &["--check"], &mock, None);
+        assert_eq!(code, 0);
+        String::from_utf8(out).unwrap()
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64() as i64;
+    let cached = |status: &str| {
+        serde_json::json!({"accounts": [{
+            "provider": "claude", "id": "claude-main", "plan": "Max 5x",
+            "status": status, "error": "quota HTTP 429", "updated_at": now - 2400,
+            "balances": [], "windows": [
+                {"key": "weekly_all", "label": "Week", "remaining_percent": 0.05,
+                 "duration_mins": 10080, "resets_at": now + 30 * 3600}]}]})
+    };
+    for status in ["ok", "stale", "error"] {
+        let output = run_check(cached(status));
+        assert!(output.contains("allowed sizes: none"), "{status}: {output}");
+        if status != "ok" {
+            assert!(output.contains("cached quota"), "{status}: {output}");
+        }
+    }
+    let mut unknown = cached("ok");
+    unknown["accounts"][0]["windows"] = serde_json::json!([]);
+    unknown["accounts"][0]["balances"] = serde_json::json!([]);
+    let output = run_check(unknown);
+    assert!(output.contains("quota unknown"), "{output}");
+    assert!(output.contains("allowed sizes: 0,1,2,3"), "{output}");
+}
+
+/// `--catalog` install contract (ported from the legacy Node
+/// `policy.test.mjs` CLI tail): providers are saved with private
+/// permissions; bad input fails without touching the file.
+#[test]
+fn catalog_save_contract() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new(&[OPUS]);
+    let catalog_path = fx.dir.join(".local/state/model-route/catalog.json");
+    let fixture: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            workspace_root().join("crates/agentdeck/tests/fixtures/catalog.fixture.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mock = write_mock(&fx, &serde_json::json!({}));
+    let run = |stdin: &str| run_rust(&fx, &["--catalog"], &mock, Some(stdin));
+    let (code, _, _) = run(&serde_json::to_string(&fixture).unwrap());
+    assert_eq!(code, 0);
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&catalog_path).unwrap()).unwrap();
+    assert_eq!(saved["providers"], fixture["providers"]);
+    assert_eq!(
+        std::fs::metadata(&catalog_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let before = std::fs::read(&catalog_path).unwrap();
+    let (code, _, _) = run("{}");
+    assert_ne!(code, 0);
+    assert_eq!(std::fs::read(&catalog_path).unwrap(), before);
+}

@@ -92,6 +92,17 @@ fn ops() -> Vec<serde_json::Value> {
         serde_json::json!({"op": "prepare", "step": "pr", "source": "s", "route": {"target": t}}),
         serde_json::json!({"op": "record", "step": "pr", "response": done("t-pr", "PR https://github.com/example/repo/pull/1, head abc123, checks and reviews pending")}),
         serde_json::json!({"op": "next"}),
+        // Title/task length limits (ported from the legacy workflow.test.mjs).
+        serde_json::json!({"op": "validate", "plan": {"title": "x".repeat(509), "steps": [{"id": "a", "task": "x"}]}}),
+        serde_json::json!({"op": "validate", "plan": {"title": "x".repeat(509), "steps": [{"id": "ab", "task": "x"}]}}),
+        serde_json::json!({"op": "validate", "plan": {"title": "x".repeat(510), "steps": [{"id": "a", "task": "x"}]}}),
+        serde_json::json!({"op": "validate", "plan": {"title": "t", "steps": [{"id": "a", "task": "x".repeat(120_000)}]}}),
+        serde_json::json!({"op": "validate", "plan": {"title": "t", "steps": [{"id": "a", "task": "x".repeat(120_001)}]}}),
+        // A confirmed non-dispatch releases a prepared step back to pending.
+        serde_json::json!({"op": "new", "plan": {"title": "rel", "steps": [{"id": "x", "task": "x"}]}, "thread": "th"}),
+        serde_json::json!({"op": "prepare", "step": "x", "source": "s", "route": {"target": t}}),
+        serde_json::json!({"op": "release", "step": "x", "notDispatched": true}),
+        serde_json::json!({"op": "next"}),
     ]
 }
 
@@ -195,8 +206,10 @@ fn rust_run() -> Vec<serde_json::Value> {
 #[test]
 fn state_machine_matches_golden() {
     let rust = rust_run();
-    assert_eq!(rust[rust.len() - 2]["value"]["state"], "completed");
-    assert_eq!(rust.last().unwrap()["value"]["complete"], true);
+    let ops_list = ops();
+    let pr_record = ops_list.iter().position(|op| op["op"] == "record" && op["step"] == "pr").unwrap();
+    assert_eq!(rust[pr_record]["value"]["state"], "completed");
+    assert_eq!(rust[pr_record + 1]["value"]["complete"], true);
     let r = normalize(&serde_json::to_string(&rust).unwrap());
     if std::env::var("UPDATE_GOLDEN").is_ok() {
         let path = golden_path();
@@ -294,8 +307,9 @@ fn cli_storage_contract() {
     let file = init["state"].as_str().unwrap().to_string();
     assert!(file.starts_with(state_home.join("model-route/workflows").to_str().unwrap()));
     #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         assert_eq!(
             std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
             0o600
@@ -329,5 +343,48 @@ fn cli_storage_contract() {
     assert_eq!(out.status.code(), Some(0));
     let out = run(&["release", &file, "a", "--thread", "parent"], None);
     assert_eq!(out.status.code(), Some(2));
+    // Only a prepared step releases: `--not-dispatched` on a pending step
+    // fails in both implementations (usage error, exit 2).
+    let out = run(&["release", &file, "a", "--thread", "parent", "--not-dispatched"], None);
+    assert_eq!(out.status.code(), Some(2));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Oversized dependency results fail `prepare` before routing (ported from
+/// the legacy Node `workflow.test.mjs`): the route stub must stay untouched
+/// and the step stays pending.
+#[test]
+fn oversized_dependency_results_fail_prepare_before_routing() {
+    use agentdeck_router::workflow::*;
+    use std::cell::Cell;
+    let plan = serde_json::json!({"title": "large", "steps": [
+        {"id": "a", "task": "a"},
+        {"id": "b", "task": "b"},
+        {"id": "join", "task": "join", "needs": ["a", "b"]},
+    ]});
+    let t = serde_json::json!({"providerInstanceId": "codex", "model": "gpt-6.1-sol",
+        "options": {"reasoningEffort": "high"}});
+    let mut state = new_state(&plan, "th").unwrap();
+    let calls = Cell::new(0);
+    let route = |_: &str, _: &str| {
+        calls.set(calls.get() + 1);
+        Ok(serde_json::json!({"target": t, "reason": "r"}))
+    };
+    for id in ["a", "b"] {
+        prepare(&mut state, id, "src", &route).unwrap();
+        record(
+            &mut state,
+            id,
+            &serde_json::json!({"taskId": format!("large-{id}"), "status": "completed",
+                "workState": "result_available", "hasPendingChildRuns": false,
+                "providerInstanceId": "codex", "model": "gpt-6.1-sol",
+                "latestTerminalSummary": "\"".repeat(63_000)}),
+        )
+        .unwrap();
+    }
+    let before = calls.get();
+    let err = prepare(&mut state, "join", "src", &route).unwrap_err();
+    assert!(err.message.contains("brief plus dependency results exceeds"), "{}", err.message);
+    assert_eq!(calls.get(), before);
+    assert_eq!(next(&state)["ready"], serde_json::json!(["join"]));
 }
