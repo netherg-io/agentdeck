@@ -333,9 +333,12 @@ pub fn remove_modal(ask: &RemoveAsk) -> Modal<'_, Message> {
     if let Some(n) = ask.threads.filter(|&n| n > 0) {
         body.push(st::body(fl!(loader(), "remove-threads", count = n)).into());
     }
+    if !ask.pool.is_empty() {
+        body.push(st::body(fl!(loader(), "remove-pool", models = ask.pool.join(", "))).into());
+    }
     body.push(st::muted(fl!(loader(), "remove-keep-home")).into());
     if let Some(error) = &ask.error {
-        body.push(st::body(fl!(loader(), "load-error", what = error)).into());
+        body.push(st::body(fl!(loader(), "remove-failed", what = error)).into());
     }
     Modal {
         title: fl!(loader(), "remove-ask", id = ask.id.clone()),

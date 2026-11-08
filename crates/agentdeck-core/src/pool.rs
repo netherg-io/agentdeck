@@ -476,22 +476,25 @@ mod tests {
     }
 
     #[test]
-    fn instance_removal_refused_with_pool() {
-        let (paths, _g) = test_paths("refuse");
+    fn instance_removal_drops_its_pool_entries() {
+        let (paths, _g) = test_paths("cascade");
         Registry::update(&paths, |r| {
             r.add(spec("a"))?;
+            r.add(spec("b"))?;
             r.add_pool(entry("a", "m"))?;
+            r.add_pool(entry("b", "m"))?;
             Ok(())
         })
         .unwrap();
-        let err = Registry::update(&paths, |r| {
+        Registry::update(&paths, |r| {
             r.remove("a")?;
             Ok(())
         })
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("pool"), "{err}");
-        assert!(Registry::load(&paths).unwrap().get("a").is_some());
+        .unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        assert!(reg.get("a").is_none());
+        let left: Vec<&str> = reg.pool.iter().map(|e| e.instance.as_str()).collect();
+        assert_eq!(left, ["b"]);
     }
 
     #[test]

@@ -105,6 +105,8 @@ remove-ask = Remove { $id }?
 remove-confirm = Remove
 remove-cancel = Keep
 remove-keep-home = The login dir is kept.
+remove-pool = Also removed from the pool: { $models }
+remove-failed = Removal failed: { $what }
 remove-threads =
     { $count ->
         [one] T3 keeps { $count } thread for this id; history stays but cannot launch.

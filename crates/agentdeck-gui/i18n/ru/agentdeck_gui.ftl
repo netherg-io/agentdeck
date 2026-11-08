@@ -107,6 +107,8 @@ remove-ask = Удалить { $id }?
 remove-confirm = Удалить
 remove-cancel = Оставить
 remove-keep-home = Каталог входа сохраняется.
+remove-pool = Из пула уберутся: { $models }
+remove-failed = Не удалось удалить: { $what }
 remove-threads =
     { $count ->
         [one] У T3 остался { $count } тред этого id; история сохранится, но не запустится.

@@ -120,6 +120,8 @@ pub struct RemoveOutcome {
 pub struct RemoveAsk {
     pub id: String,
     pub threads: Option<u64>,
+    /// Pool models removed together with the instance.
+    pub pool: Vec<String>,
     pub error: Option<String>,
     pub working: bool,
 }
@@ -498,14 +500,27 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::RemoveAsk(id) => {
-            // Read-only thread count for the confirmation; core refuses the
-            // removal itself when pool/usage entries still reference the id.
+            // Read-only thread count and pool entries for the confirmation;
+            // core refuses the removal itself when usage entries reference the id.
             let threads = agentdeck_core::t3::t3_root()
                 .ok()
                 .and_then(|root| agentdeck_core::t3::thread_count(&root, &id).unwrap_or(None));
+            let pool = state
+                .paths
+                .as_ref()
+                .and_then(|p| agentdeck_core::registry::Registry::load(p).ok())
+                .map(|reg| {
+                    reg.pool
+                        .iter()
+                        .filter(|e| e.instance == id)
+                        .map(|e| e.model.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
             state.remove = Some(RemoveAsk {
                 id,
                 threads,
+                pool,
                 error: None,
                 working: false,
             });
