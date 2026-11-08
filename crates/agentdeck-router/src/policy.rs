@@ -1305,3 +1305,396 @@ mod unknown_models_tests {
         assert_eq!(v.reason, "not an exact active favorite");
     }
 }
+
+/// Ported from the legacy Node `policy.test.mjs` (deleted with the router
+/// `.mjs` sources): the numeric edges of window matching, budgeting,
+/// active-quota reserve, ranking and answer validation.
+#[cfg(test)]
+mod legacy_suite_edges {
+    use super::*;
+
+    fn w(
+        key: &str,
+        remaining: f64,
+        mins: f64,
+        resets: Option<f64>,
+        scope: Option<&str>,
+    ) -> QuotaWindow {
+        QuotaWindow {
+            key: key.into(),
+            label: None,
+            scope: scope.map(str::to_string),
+            remaining_percent: remaining,
+            duration_mins: mins,
+            resets_at: resets,
+            cost_factor: None,
+            pending: 0.0,
+        }
+    }
+
+    fn allowed(
+        windows: &[QuotaWindow],
+        weekly: [f64; 4],
+        burn: f64,
+        balances: &[f64],
+        now: f64,
+        size: usize,
+    ) -> bool {
+        budget_allowed(windows, balances, &weekly, burn, 5.0, now)[size]
+    }
+
+    fn cfg(accounts: &[(&str, &str)]) -> RouterConfig {
+        RouterConfig {
+            file: String::new(),
+            version: Value::Null,
+            pool: vec![],
+            instance_limits: Default::default(),
+            usage_state_path: None,
+            decision_model: None,
+            decision_provider: None,
+            workflow_eval: WorkflowEvalConfig::default(),
+            user_rules: UserRules::default(),
+            account: accounts
+                .iter()
+                .map(|(i, a)| ((*i).into(), (*a).into()))
+                .collect(),
+            usage_id: Default::default(),
+            meta: vec![],
+        }
+    }
+
+    fn cand(
+        provider: &str,
+        model: &str,
+        fit: f64,
+        quality: f64,
+        allowed: bool,
+        task_cost: f64,
+        burn: Option<f64>,
+        agents: usize,
+    ) -> Candidate {
+        Candidate {
+            provider: provider.into(),
+            model: model.into(),
+            profiled: true,
+            burn,
+            target: serde_json::json!({"providerInstanceId": provider, "model": model}),
+            reasoning_error: None,
+            no_review: false,
+            policy_ban: None,
+            fit,
+            quality,
+            confidence: 0.9,
+            allowed,
+            task_cost: Some(task_cost),
+            quota_note: String::new(),
+            active_agents: agents,
+            quota_provenance: QuotaProvenance {
+                basis: "estimate",
+                detail: String::new(),
+                sample_sessions: None,
+                stale_minutes: None,
+                load_unknown: true,
+                windows: vec![],
+                balances: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn scoped_and_argon_windows_match() {
+        let claude = [
+            w("weekly_all", 0.0, 10080.0, None, None),
+            w("weekly_scoped:fable", 0.0, 10080.0, None, Some("Fable")),
+        ];
+        assert_eq!(quota_windows("claudeAgent", "claude-fable-5-1", &claude).len(), 2);
+        assert_eq!(
+            quota_windows("claudeAgent", "claude-opus-5-5", &claude)
+                .iter()
+                .map(|x| x.key.clone())
+                .collect::<Vec<_>>(),
+            ["weekly_all"]
+        );
+        let agy = [
+            w("3p-weekly", 0.0, 10080.0, None, None),
+            w("gemini-weekly", 0.0, 10080.0, None, None),
+            w("gemini-argon-weekly", 0.0, 10080.0, None, None),
+        ];
+        assert_eq!(
+            quota_windows("antigravity", "gemini-3.8-flash-high", &agy)
+                .iter()
+                .map(|x| x.key.clone())
+                .collect::<Vec<_>>(),
+            ["gemini-weekly"]
+        );
+        assert_eq!(
+            quota_windows("antigravity", "gemini-4-argon-high", &agy)
+                .iter()
+                .map(|x| x.key.clone())
+                .collect::<Vec<_>>(),
+            ["gemini-argon-weekly"]
+        );
+        assert_eq!(
+            quota_windows("antigravity", "claude-opus-5-5", &agy)
+                .iter()
+                .map(|x| x.key.clone())
+                .collect::<Vec<_>>(),
+            ["3p-weekly"]
+        );
+    }
+
+    #[test]
+    fn weekly_thresholds_and_expired_snapshots() {
+        let weekly = [0.5, 2.0, 6.0, 15.0];
+        assert!(!allowed(&[w("w", 7.0, 10080.0, None, None)], weekly, 1.0, &[], 0.0, 1));
+        assert!(allowed(&[w("w", 8.0, 10080.0, None, None)], weekly, 1.0, &[], 0.0, 1));
+        assert!(allowed(&[w("w", 5.0, 300.0, None, None)], weekly, 1.0, &[], 0.0, 0));
+        assert!(allowed(&[], weekly, 1.0, &[3.8], 0.0, 3));
+        assert!(!allowed(&[], weekly, 3.0, &[3.8], 0.0, 3));
+        assert_eq!(budget_cost_full(&[], &[], &weekly, 1.0, 5.0, 0.0), None);
+        // Near reset the reserve is released; an expired snapshot implies no budget.
+        let now = 1000.0;
+        let timed = |remaining: f64, hours: f64| {
+            [w("w", remaining, 10080.0, Some(now + hours * 3600.0), None)]
+        };
+        assert!(!allowed(&timed(5.0, 30.0), weekly, 1.0, &[], now, 1));
+        assert!(allowed(&timed(5.0, 1.0), weekly, 1.0, &[], now, 1));
+        assert!(!allowed(&timed(1.0, 1.0), weekly, 1.0, &[], now, 1));
+        assert!(!allowed(&timed(5.0, 0.0), weekly, 1.0, &[], now, 1));
+        assert!(!allowed(&timed(5.0, -1.0), weekly, 1.0, &[], now, 1));
+    }
+
+    #[test]
+    fn active_quota_reserve_never_mutates_the_live_snapshot() {
+        let costs = |_: &str, m: Option<&str>| {
+            if m.is_some_and(|m| m.contains("fable")) {
+                ([1.5, 6.0, 18.0, 45.0], 3.0)
+            } else {
+                ([0.5, 2.0, 6.0, 15.0], 1.0)
+            }
+        };
+        let account = UsageSnapshot {
+            id: None,
+            provider: "claude".into(),
+            windows: vec![
+                w("weekly_all", 14.0, 10080.0, None, None),
+                w("weekly_scoped:fable", 91.0, 10080.0, None, Some("Fable")),
+            ],
+            balances: vec![],
+        };
+        let agents = |model: Option<&str>| ActiveAgent {
+            id: "a".into(),
+            provider: "claudeAgent".into(),
+            model: model.map(str::to_string),
+        };
+        let cfg = cfg(&[
+            ("claudeAgent", "claude"),
+            ("codex", "codex"),
+            ("claudeAgent_openrouter", "openrouter"),
+            ("opencode", "openrouter"),
+        ]);
+        let reserved = reserve_active_quota(
+            &cfg,
+            &account,
+            &[
+                agents(Some("claude-opus-5-5")),
+                agents(Some("claude-fable-5-1")),
+                ActiveAgent {
+                    id: "b".into(),
+                    provider: "codex".into(),
+                    model: Some("gpt-6.1-sol".into()),
+                },
+            ],
+            &costs,
+        );
+        assert_eq!(reserved.active_agents, 2);
+        assert_eq!(reserved.windows[0].remaining_percent, 6.0);
+        assert_eq!(reserved.windows[1].remaining_percent, 85.0);
+        assert!(!allowed(&reserved.windows, [0.5, 2.0, 6.0, 15.0], 1.0, &[], 0.0, 1));
+        assert_eq!(account.windows[0].remaining_percent, 14.0);
+        let unknown = reserve_active_quota(
+            &cfg,
+            &account,
+            &[agents(None)],
+            &|_: &str, _: Option<&str>| ([1.5, 6.0, 18.0, 45.0], 3.0),
+        );
+        assert_eq!(unknown.windows[0].remaining_percent, 8.0);
+        assert_eq!(unknown.windows[1].remaining_percent, 85.0);
+        // Balances fund both agents' size-1 dollar cost.
+        let money = reserve_active_quota(
+            &cfg,
+            &UsageSnapshot {
+                id: None,
+                provider: "openrouter".into(),
+                windows: vec![],
+                balances: vec![1.0],
+            },
+            &[
+                ActiveAgent {
+                    id: "o".into(),
+                    provider: "claudeAgent_openrouter".into(),
+                    model: Some("muse-spark".into()),
+                },
+                ActiveAgent {
+                    id: "c".into(),
+                    provider: "opencode".into(),
+                    model: Some("muse-spark".into()),
+                },
+            ],
+            &costs,
+        );
+        assert_eq!(money.active_agents, 2);
+        assert!((money.balances[0] - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn shared_quota_ranking_spreads_to_the_idler() {
+        let weights = (0.05, 0.0, 0.15);
+        let cfg = cfg(&[
+            ("claudeAgent", "claude"),
+            ("codex", "codex"),
+            ("codex_second", "codex"),
+            ("antigravity", "antigravity"),
+            ("claudeAgent_openrouter", "openrouter"),
+        ]);
+        // A quota-denied favorite cannot take the task even with a quality edge.
+        let ranked = rank_candidates(
+            &cfg,
+            vec![
+                cand("claudeAgent", "claude-opus-5-5", 0.95, 1.0, false, 0.1, Some(1.0), 0),
+                cand("codex", "gpt-6.1-sol", 0.95, 0.8, true, 0.1, Some(1.0), 0),
+            ],
+            3,
+            Some("claudeAgent"),
+            weights,
+        );
+        assert_eq!(ranked.iter().find(|r| r.eligible).unwrap().candidate.provider, "codex");
+        // A small quality edge does not spend the orchestrator's shared quota.
+        let ranked = rank_candidates(
+            &cfg,
+            vec![
+                cand("claudeAgent", "claude-opus-5-5", 0.95, 0.82, true, 0.1, Some(1.0), 0),
+                cand("codex", "gpt-6.1-sol", 0.95, 0.8, true, 0.1, Some(1.0), 0),
+            ],
+            1,
+            Some("claudeAgent"),
+            weights,
+        );
+        assert_eq!(ranked.iter().find(|r| r.eligible).unwrap().candidate.provider, "codex");
+        // One model on two accounts pools one verdict; parallel work goes idle-first.
+        let spread = rank_candidates(
+            &cfg,
+            vec![
+                cand("codex", "gpt-6.1-sol", 0.95, 0.86, true, 0.5, Some(1.0), 1),
+                cand("codex_second", "gpt-6.1-sol", 0.95, 0.84, true, 0.6, Some(1.0), 0),
+                cand("antigravity", "gemini-x", 0.95, 0.849, true, 0.5, Some(1.0), 0),
+            ],
+            3,
+            Some("claudeAgent"),
+            weights,
+        );
+        assert_eq!(spread[0].candidate.provider, "codex_second");
+        assert_eq!(spread[0].candidate.quality, spread[1].candidate.quality);
+        // Cheap-model bonus wins a small gap, never a whole Jev level; halved when hard.
+        let cheap = |model: &str, burn: f64, quality: f64| {
+            cand("claude_third", model, 0.95, quality, true, 0.1, Some(burn), 0)
+        };
+        let pick = |a: Candidate, b: Candidate, difficulty: i64| {
+            rank_candidates(&cfg, vec![a, b], difficulty, Some("codex"), weights)
+                .into_iter()
+                .find(|r| r.eligible)
+                .unwrap()
+                .candidate
+                .model
+        };
+        assert_eq!(
+            pick(
+                cheap("claude-sonnet-5-5", 0.6, 0.75),
+                cheap("claude-haiku-5-5", 0.2, 0.72),
+                0
+            ),
+            "claude-haiku-5-5"
+        );
+        assert_eq!(
+            pick(
+                cheap("claude-sonnet-5-5", 0.6, 0.75),
+                cheap("claude-haiku-5-5", 0.2, 0.72),
+                2
+            ),
+            "claude-sonnet-5-5"
+        );
+        // Eligibility uses the raw fit, never a rounded one.
+        let fit = |f: f64| {
+            rank_candidates(&cfg, vec![cand("codex", "m", f, 0.8, true, 0.1, Some(1.0), 0)], 1, None, weights)[0]
+                .eligible
+        };
+        assert!(!fit(MIN_FIT - 0.0004));
+    }
+
+    #[test]
+    fn answers_must_be_bounded_and_coherent() {
+        let answer = |score: f64, probs: Value, confidence: f64| {
+            serde_json::json!({"score": score, "confidence": confidence, "probabilities": probs})
+        };
+        let p = || serde_json::json!({"0": 0.0, "1": 0.1, "2": 0.6, "3": 0.3});
+        assert!(valid_answer(&answer(2.2, p(), 0.8), true));
+        assert!(!valid_answer(&answer(9.0, serde_json::json!({"0": 0.0, "1": 0.0, "2": 1.0, "3": 1.0}), 0.8), true));
+        assert!(!valid_answer(&answer(-0.1, p(), 0.8), true));
+        assert!(!valid_answer(&answer(2.0, p(), 1.2), true));
+        assert!(!valid_answer(
+            &answer(2.0, serde_json::json!({"1": 0.1, "2": 0.6, "3": 0.3}), 0.8),
+            true
+        ));
+        assert!(!valid_answer(
+            &answer(2.0, serde_json::json!({"0": 0.0, "1": 0.1, "2": 0.2, "3": 0.2}), 0.8),
+            true
+        ));
+        assert!(!valid_answer(
+            &answer(2.0, serde_json::json!({"0": -0.1, "1": 0.2, "2": 0.6, "3": 0.3}), 0.8),
+            true
+        ));
+    }
+
+    #[test]
+    fn target_validation_reports_winner_gap_quota_fit() {
+        let cfg = cfg(&[
+            ("codex", "codex"),
+            ("codex_second", "codex"),
+            ("antigravity", "antigravity"),
+            ("claudeAgent", "claude"),
+            ("opencode", "openrouter"),
+        ]);
+        let ranked = rank_candidates(
+            &cfg,
+            vec![
+                cand("codex", "sol", 0.95, 0.8, true, 0.1, Some(1.0), 0),
+                cand("antigravity", "flash", 0.95, 0.79, true, 0.1, Some(1.0), 0),
+                cand("claudeAgent", "opus", 0.95, 0.7, true, 0.1, Some(1.0), 0),
+                cand("opencode", "muse", 0.95, 0.85, false, 0.1, Some(1.0), 0),
+                cand("codex_second", "sol2", 0.6, 0.9, true, 0.1, Some(1.0), 0),
+            ],
+            1,
+            Some("claudeAgent"),
+            (0.05, 0.0, 0.15),
+        );
+        let v = validate_target(&ranked, "codex", "sol");
+        assert!(v.allowed);
+        assert_eq!(v.reason, "selected winner");
+        assert!(validate_target(&ranked, "antigravity", "flash").allowed);
+        assert!(!validate_target(&ranked, "claudeAgent", "opus").allowed);
+        assert!(
+            validate_target(&ranked, "opencode", "muse").reason.contains("quota"),
+            "{}",
+            validate_target(&ranked, "opencode", "muse").reason
+        );
+        assert!(
+            validate_target(&ranked, "codex_second", "sol2").reason.contains("fit"),
+            "{}",
+            validate_target(&ranked, "codex_second", "sol2").reason
+        );
+        assert_eq!(
+            validate_target(&ranked, "codex", "gpt-other").reason,
+            "not an exact active favorite"
+        );
+    }
+}
