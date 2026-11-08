@@ -1,0 +1,12 @@
+{
+  "exit": 0,
+  "stdout": "{\"decision\":\"deny\",\"reason\":\"model-route: routing failed or timed out; delegation was blocked. The cause is in the latest deny:router-error entry of model-route/decisions.jsonl. Retry the router or do the work yourself.\"}",
+  "records": [
+    {
+      "t": "",
+      "harness": "shell",
+      "decision": "deny:router-error",
+      "reason": "<parse error> | model-route: routing failed or timed out; delegation was blocked. The cause is in the latest deny:router-error entry of model-route/decisions.jsonl. Retry the router or do the work yourself."
+    }
+  ]
+}

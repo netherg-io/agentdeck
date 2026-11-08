@@ -688,3 +688,233 @@ mod worker_agent_tests {
         assert!(validate_reasoning(&catalog, &bad).is_err());
     }
 }
+
+/// Ported from the legacy Node `reasoning.test.mjs` (deleted with the
+/// router `.mjs` sources): effort mapping, family minimums, opaque
+/// variants, validation/repair rules and catalog persistence.
+#[cfg(test)]
+mod legacy_suite_tests {
+    use super::*;
+
+    fn select(id: &str, values: &[&str]) -> Value {
+        serde_json::json!({"id": id, "type": "select",
+            "options": values.iter().map(|v| serde_json::json!({"id": v})).collect::<Vec<_>>()})
+    }
+
+    fn catalog() -> Value {
+        serde_json::json!({"providers": [
+            {"providerInstanceId": "codex", "driverKind": "codex", "models": [
+                {"id": "sol", "options": [select("reasoningEffort", &["low", "medium", "high", "xhigh", "max", "ultra"])]},
+                {"id": "luna", "options": [select("reasoningEffort", &["low", "medium", "high", "xhigh", "max"])]},
+            ]},
+            {"providerInstanceId": "codex_second", "driverKind": "codex", "models": [
+                {"id": "sol", "options": [select("reasoningEffort", &["low", "medium", "high", "xhigh", "max", "ultra"])]},
+            ]},
+            {"providerInstanceId": "claudeAgent", "driverKind": "claudeAgent", "models": [
+                {"id": "claude-opus", "options": [select("effort", &["low", "medium", "high", "xhigh", "max", "ultracode", "ultrathink"])]},
+                {"id": "claude-old", "options": [select("effort", &["low", "medium", "high", "max"])]},
+                {"id": "claude-haiku", "options": [{"id": "thinking", "type": "boolean"}]},
+            ]},
+            {"providerInstanceId": "opencode", "driverKind": "opencode", "models": [
+                {"id": "ordinary", "options": [select("variant", &["low", "high", "xhigh"])]},
+                {"id": "opaque", "options": [{"id": "variant", "type": "select",
+                    "options": [{"id": "quick"}, {"id": "deep"}], "currentValue": "deep"}]},
+                {"id": "unknown", "options": [select("variant", &["quick", "deep"])]},
+                {"id": "none"},
+                {"id": "other-only", "options": [select("serviceTier", &["default", "priority"])]},
+            ]},
+            {"providerInstanceId": "antigravity", "driverKind": "antigravity", "models": [
+                {"id": "gemini-high"},
+            ]},
+            {"providerInstanceId": "custom-claude", "driverKind": "claudeAgent", "models": [
+                {"id": "meta/muse", "options": [select("effort", &["low", "medium", "high", "xhigh", "max", "ultracode", "ultrathink"])]},
+            ]},
+        ]})
+    }
+
+    fn target(provider: &str, model: &str, options: Value) -> Value {
+        serde_json::json!({"providerInstanceId": provider, "model": model, "options": options})
+    }
+
+    #[test]
+    fn difficulty_maps_to_effort_without_low() {
+        let c = catalog();
+        // Delegates never run on low: difficulty 0 medium, 1 high, 2-3 xhigh.
+        for (difficulty, value) in ["medium", "high", "xhigh", "xhigh"].iter().enumerate() {
+            for provider in ["codex", "codex_second"] {
+                assert_eq!(
+                    reasoning_target(&c, provider, "sol", difficulty as i64).unwrap()["options"],
+                    serde_json::json!({"reasoningEffort": value})
+                );
+            }
+            for provider in ["claudeAgent", "claudeAgent_openrouter"] {
+                // claudeAgent_openrouter is absent here; covered by the missing-model error below.
+                if provider == "claudeAgent" {
+                    assert_eq!(
+                        reasoning_target(&c, provider, "claude-opus", difficulty as i64).unwrap()["options"],
+                        serde_json::json!({"effort": value})
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            reasoning_target(&c, "claudeAgent", "claude-old", 3).unwrap()["options"],
+            serde_json::json!({"effort": "high"})
+        );
+        // Medium is not offered: the next supported level above it, never low.
+        assert_eq!(
+            reasoning_target(&c, "opencode", "ordinary", 0).unwrap()["options"],
+            serde_json::json!({"variant": "high"})
+        );
+        assert_eq!(
+            reasoning_target(&c, "opencode", "ordinary", 1).unwrap()["options"],
+            serde_json::json!({"variant": "high"})
+        );
+        // Opaque variants use the advertised default; without one routing fails.
+        assert_eq!(
+            reasoning_target(&c, "opencode", "opaque", 2).unwrap()["options"],
+            serde_json::json!({"variant": "deep"})
+        );
+        assert!(reasoning_target(&c, "opencode", "unknown", 2).is_err());
+        assert_eq!(
+            reasoning_target(&c, "opencode", "none", 2)
+                .unwrap()
+                .get("options"),
+            None
+        );
+        assert_eq!(
+            reasoning_target(&c, "antigravity", "gemini-high", 2).unwrap(),
+            serde_json::json!({"providerInstanceId": "antigravity", "model": "gemini-high"})
+        );
+        assert!(reasoning_target(&c, "missing", "sol", 2).is_err());
+        assert!(reasoning_target(&c, "custom-claude", "meta/muse", 2).is_err());
+    }
+
+    #[test]
+    fn explicit_options_are_validated_and_repaired() {
+        let c = catalog();
+        let t = target("codex_second", "sol", serde_json::Value::Null);
+        assert!(
+            validate_reasoning(&c, &t)
+                .unwrap()
+                .unwrap()
+                .contains("required")
+        );
+        assert!(
+            validate_reasoning(
+                &c,
+                &target(
+                    "codex_second",
+                    "sol",
+                    serde_json::json!({"reasoningEffort": "low"})
+                )
+            )
+            .unwrap()
+            .unwrap()
+            .contains("minimum medium")
+        );
+        for value in ["medium", "ultra"] {
+            assert_eq!(
+                validate_reasoning(
+                    &c,
+                    &target(
+                        "codex_second",
+                        "sol",
+                        serde_json::json!({"reasoningEffort": value, "serviceTier": "priority"})
+                    )
+                )
+                .unwrap(),
+                None
+            );
+        }
+        assert!(
+            validate_reasoning(
+                &c,
+                &target("codex_second", "sol", serde_json::json!({"effort": "high"}))
+            )
+            .unwrap()
+            .unwrap()
+            .contains("another harness")
+        );
+        for value in [
+            serde_json::json!(""),
+            serde_json::json!(false),
+            serde_json::json!(2),
+            serde_json::json!("invented"),
+        ] {
+            assert!(
+                validate_reasoning(
+                    &c,
+                    &target(
+                        "codex_second",
+                        "sol",
+                        serde_json::json!({"reasoningEffort": value})
+                    )
+                )
+                .unwrap()
+                .is_some()
+            );
+        }
+        assert!(
+            validate_reasoning(
+                &c,
+                &target(
+                    "codex",
+                    "luna",
+                    serde_json::json!({"reasoningEffort": "ultra"})
+                )
+            )
+            .unwrap()
+            .is_some()
+        );
+        // Repair keeps unrelated options and replaces only the reasoning knob.
+        let recommended = reasoning_target(&c, "codex_second", "sol", 1).unwrap();
+        let partial = target(
+            "codex_second",
+            "sol",
+            serde_json::json!({"serviceTier": "priority"}),
+        );
+        assert_eq!(
+            repair_reasoning(&c, &partial, &recommended).unwrap()["options"],
+            serde_json::json!({"serviceTier": "priority", "reasoningEffort": "high"})
+        );
+        assert_eq!(
+            partial["options"],
+            serde_json::json!({"serviceTier": "priority"})
+        );
+    }
+
+    #[test]
+    fn boolean_thinking_must_stay_true() {
+        let c = catalog();
+        assert_eq!(
+            reasoning_target(&c, "claudeAgent", "claude-haiku", 0).unwrap()["options"],
+            serde_json::json!({"thinking": true})
+        );
+        assert!(
+            validate_reasoning(
+                &c,
+                &target(
+                    "claudeAgent",
+                    "claude-haiku",
+                    serde_json::json!({"thinking": false})
+                )
+            )
+            .unwrap()
+            .unwrap()
+            .contains("must be true")
+        );
+        assert_eq!(
+            validate_reasoning(
+                &c,
+                &target(
+                    "claudeAgent",
+                    "claude-haiku",
+                    serde_json::json!({"thinking": true})
+                )
+            )
+            .unwrap(),
+            None
+        );
+    }
+}

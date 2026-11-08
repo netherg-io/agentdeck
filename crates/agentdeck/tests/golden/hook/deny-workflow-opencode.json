@@ -1,0 +1,14 @@
+{
+  "exit": 0,
+  "stdout": "{\"decision\":\"deny\",\"reason\":\"model-route: Workflow can launch or resume agents with unchecked inherited models. Route each child task separately with route.mjs and use T3 delegate_task with its exact target and no runtimeMode. Same-model inheritance does not bypass routing. Do not retry Workflow to evade this check.\"}",
+  "records": [
+    {
+      "t": "",
+      "harness": "opencode",
+      "instance": "opencode",
+      "toolName": "Workflow",
+      "decision": "deny:workflow",
+      "reason": "model-route: Workflow can launch or resume agents with unchecked inherited models. Route each child task separately with route.mjs and use T3 delegate_task with its exact target and no runtimeMode. Same-model inheritance does not bypass routing. Do not retry Workflow to evade this check."
+    }
+  ]
+}

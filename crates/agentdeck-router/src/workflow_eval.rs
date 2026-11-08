@@ -3,7 +3,7 @@
 //! The coordinator runs `agentdeck route workflow eval STATE STEP --thread ID`
 //! explicitly after `record` saved a settled success. Nothing here runs
 //! automatically: `record` never contacts the judge, so default workflow use
-//! (and its Node parity) costs nothing and sends nothing anywhere.
+//! costs nothing and sends nothing anywhere.
 //!
 //! Privacy: invoking `eval` sends the dispatched brief and the delegated
 //! agent's summary to the configured external decision provider (the same

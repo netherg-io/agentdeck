@@ -1,0 +1,13 @@
+{
+  "exit": 0,
+  "stdout": "{\"decision\":\"deny\",\"reason\":\"model-route: you are a delegated child agent; nested delegation is disabled. Do this task yourself with your own tools. If it is too large, complete what fits and report the remainder in your final response.\"}",
+  "records": [
+    {
+      "t": "",
+      "harness": "opencode",
+      "toolName": "subagent",
+      "decision": "deny:nested",
+      "reason": "model-route: you are a delegated child agent; nested delegation is disabled. Do this task yourself with your own tools. If it is too large, complete what fits and report the remainder in your final response."
+    }
+  ]
+}

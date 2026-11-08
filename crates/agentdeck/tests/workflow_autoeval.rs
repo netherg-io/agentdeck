@@ -233,13 +233,8 @@ fn record_returns_before_eval_child_finishes() {
             .unwrap()
             .success()
     );
-    // O_RDWR never blocks: the child can open its read side while we hold
-    // the write side closed, and EOF arrives only when we drop it.
-    let fifo_hold = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&fifo)
-        .unwrap();
+    // No writer yet: the eval child blocks opening the FIFO (the judge stays
+    // pending) until the test opens the write side below.
     let state = prepared_state(&home, "thread-1");
     let child = run_record(&home, &router, &fifo, &state, "thread-1");
     // record must exit while the judge is still blocked (nothing written yet).
@@ -259,11 +254,22 @@ fn record_returns_before_eval_child_finishes() {
         !journal_mentions(&home, "auto-t1"),
         "record returned before the eval finished"
     );
-    // Release the judge: the writer hold is the only other end, so EOF
-    // follows this write once the handle drops.
-    fifo_hold
-        .try_clone()
-        .unwrap()
+    // Release the judge only once its read side is open: the budget ledger
+    // is written before the judge opens the FIFO, and data written with no
+    // reader is discarded when the last handle closes, hanging the child.
+    // O_NONBLOCK write-only open fails (ENXIO) until a reader exists.
+    let mut writer = None;
+    wait_for(20, || {
+        use std::os::unix::fs::OpenOptionsExt;
+        writer = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .ok();
+        writer.is_some()
+    });
+    let mut writer = writer.unwrap();
+    writer
         .write_all(
             serde_json::json!({"answers": {"outcome": {"score": 2, "confidence": 0.8}},
                 "usage": {}})
@@ -271,7 +277,8 @@ fn record_returns_before_eval_child_finishes() {
             .as_bytes(),
         )
         .unwrap();
-    drop(fifo_hold);
+    // EOF reaches the reader once the only writer closes.
+    drop(writer);
     wait_for(20, || {
         state_eval_status(&home).as_deref() == Some("evaluated")
     });

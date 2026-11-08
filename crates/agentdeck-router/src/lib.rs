@@ -1,9 +1,11 @@
-//! Rust port of the model-route Node router (`route.mjs`, `policy.mjs`,
-//! `load.mjs`, `reasoning.mjs`). It reads the same generated `router.json`,
+//! Rust router for model delegation (`agentdeck route`, `agentdeck route
+//! hook`, `agentdeck route workflow`, `agentdeck route claude-shell`,
+//! `agentdeck route t3-mcp-call`). It reads the generated `router.json`,
 //! talks to Jev the same way, and prints byte-compatible JSON.
 
 pub mod admission;
 pub mod hook;
+pub mod jev_queue;
 pub mod load;
 pub mod mcp_call;
 pub mod outcomes;

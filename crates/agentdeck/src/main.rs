@@ -96,8 +96,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: cmd_router::RouterCmd,
     },
-    /// Route a delegation target through the router (port of route.mjs),
-    /// or run the pre-tool hook (port of hook.mjs: `route hook --harness …`).
+    /// Route a delegation target through the router, or run the pre-tool
+    /// hook (`route hook --harness …`).
     Route {
         /// Passthrough router args: [--source S] [--check] [--catalog]
         /// [--validate-target PROVIDER MODEL] ["<task brief>" | -],

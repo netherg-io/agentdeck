@@ -728,3 +728,123 @@ mod url {
 pub fn env_map() -> HashMap<String, String> {
     std::env::vars().collect()
 }
+
+/// Ported from the legacy Node `t3-mcp-call.test.mjs` (deleted with the
+/// router `.mjs` sources): payload validation, payload-file reading and
+/// the socket bridge contract. Envelope flows stay covered by the
+/// `mcp_call_golden` CLI tests against the mock MCP server.
+#[cfg(test)]
+mod legacy_suite_tests {
+    use super::*;
+
+    fn payload() -> Value {
+        serde_json::json!({
+            "task": "Do the thing",
+            "target": {"providerInstanceId": "opencode", "model": "m", "options": {"variant": "high"}},
+            "mode": "async",
+            "clientRequestId": "routed-workflow-fixture-step",
+        })
+    }
+
+    #[test]
+    fn validation_rejects_bad_delegations() {
+        assert!(validate_payload("delegate_task", &payload()).is_ok());
+        let mut long = payload();
+        long["task"] = Value::from("x".repeat(120_001));
+        assert!(validate_payload("delegate_task", &long).is_err());
+        for bad in [
+            serde_json::json!({"mode": "wait"}),
+            serde_json::json!({"clientRequestId": ""}),
+            serde_json::json!({"runtimeMode": "full-access"}),
+            serde_json::json!({"runtimeMode": Value::Null}),
+            serde_json::json!({"task": "x", "target": {}}),
+            serde_json::json!({"role": "implement"}),
+            serde_json::json!({"role": Value::Null}),
+        ] {
+            let mut p = payload();
+            for (k, v) in bad.as_object().unwrap() {
+                p[k] = v.clone();
+            }
+            assert!(validate_payload("delegate_task", &p).is_err(), "{p}");
+        }
+        for role in ["implementation", "research", "review"] {
+            let mut p = payload();
+            p["role"] = Value::from(role);
+            assert!(validate_payload("delegate_task", &p).is_ok(), "{role}");
+        }
+        assert!(validate_payload("t3_thread_launch", &payload()).is_err());
+        assert!(validate_payload("task_status", &serde_json::json!({"taskId": "t"})).is_ok());
+        assert!(validate_payload("nope", &payload()).is_err());
+    }
+
+    #[test]
+    fn payload_files_unwrap_prepared_output() {
+        let dir = std::env::temp_dir().join(format!("mcp-payload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            read_payload(None).unwrap(),
+            Value::Object(Default::default())
+        );
+        let file = dir.join("prepared.json");
+        std::fs::write(
+            &file,
+            serde_json::to_string(&serde_json::json!({"payload": payload()})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_payload(Some(file.to_str().unwrap())).unwrap(),
+            payload()
+        );
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, "{").unwrap();
+        assert!(read_payload(Some(bad.to_str().unwrap())).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn serve_once(text: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mcp-sock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let text = text.to_string();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let (mut s, _) = listener.accept().unwrap();
+            s.write_all(text.as_bytes()).unwrap();
+        });
+        path
+    }
+
+    #[test]
+    fn socket_bridge_reads_one_line_and_redacts_secrets() {
+        let good = serde_json::json!({"endpoint": "http://127.0.0.1:3773/mcp",
+            "authorization": "Bearer fixture-secret"});
+        let path = serve_once(&(good.to_string() + "\n"));
+        let conn = read_socket_response(&path).unwrap();
+        assert_eq!(conn.endpoint, "http://127.0.0.1:3773/mcp");
+        // Error and garbage lines never echo the secret.
+        for text in [
+            "{\"error\":\"not_configured\"}\n".to_string(),
+            "invalid fixture-secret".to_string(),
+        ] {
+            let path = serve_once(&text);
+            let err = read_socket_response(&path).unwrap_err().to_string();
+            assert!(!err.contains("fixture-secret"), "{err}");
+        }
+        // scoped_connection prefers the socket over /proc discovery.
+        let path = serve_once(&(good.to_string() + "\n"));
+        // `set_var` is process-global; no other test in this target reads
+        // this variable, so the brief critical section is safe.
+        unsafe { std::env::set_var("T3_SHELL_MCP_SOCKET", &path) };
+        let conn = scoped_connection().unwrap();
+        unsafe { std::env::remove_var("T3_SHELL_MCP_SOCKET") };
+        assert_eq!(conn.endpoint, "http://127.0.0.1:3773/mcp");
+    }
+}
