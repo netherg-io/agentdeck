@@ -20,3 +20,6 @@ notify = "8"
 notify-debouncer-mini = "0.7"
 serde_json = "1.0"
 tokio = { version = "1.47", features = ["rt", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }

@@ -1,7 +1,7 @@
-//! Differential test: the Rust `agentdeck route` must print byte-identical JSON
-//! (and exit codes) to the Node `route.mjs` on the same fixtures with Jev
-//! mocked. No real API calls, no real key file. Skips with a note when Node
-//! is absent.
+//! Golden-file test: the Rust `agentdeck route` output must match the committed
+//! snapshots in `tests/golden/route/` (captured once from the legacy Node
+//! `route.mjs`; `UPDATE_GOLDEN=1` rewrites them from the Rust output).
+//! No real API calls, no real key file, no Node needed.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,11 +14,58 @@ fn workspace_root() -> PathBuf {
     d
 }
 
-fn node_available() -> bool {
-    Command::new("node")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
+fn golden_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/route")
+        .join(format!("{name}.json"))
+}
+
+/// Canonicalize run-specific drift so goldens compare equal across runs:
+/// wall-clock drift between fixture setup and the run leaks into
+/// `resets in Xh` / `resetsInHours`. JSON outputs are re-serialized with
+/// sorted keys; text outputs keep their bytes.
+fn canon_output(bytes: &[u8]) -> Vec<u8> {
+    let s = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s.as_ref();
+    while let Some(i) = rest.find("resets in ") {
+        let head = &rest[..i + "resets in ".len()];
+        let tail = &rest[i + "resets in ".len()..];
+        let num_end = tail
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(tail.len());
+        if num_end > 0 && tail[num_end..].starts_with('h') {
+            out.push_str(head);
+            out.push_str("Rh");
+            rest = &tail[num_end + 1..];
+        } else {
+            out.push_str(head);
+            rest = tail;
+        }
+    }
+    out.push_str(rest);
+    match serde_json::from_str::<serde_json::Value>(&out) {
+        Ok(mut v) => {
+            fn zero_resets(v: &mut serde_json::Value) {
+                match v {
+                    serde_json::Value::Object(o) => {
+                        for (k, val) in o.iter_mut() {
+                            if k == "resetsInHours" {
+                                *val = serde_json::json!(0);
+                            } else {
+                                zero_resets(val);
+                            }
+                        }
+                    }
+                    serde_json::Value::Array(a) => a.iter_mut().for_each(zero_resets),
+                    _ => {}
+                }
+            }
+            zero_resets(&mut v);
+            serde_json::to_vec(&v).unwrap()
+        }
+        Err(_) => out.into_bytes(),
+    }
 }
 
 struct Fixture {
@@ -28,7 +75,7 @@ struct Fixture {
 impl Fixture {
     fn new(pool: &[(&str, &str)]) -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "agentdeck-route-parity-{}-{}",
+            "agentdeck-route-golden-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -40,13 +87,13 @@ impl Fixture {
             ".t3/userdata",
             ".local/state/ai-usage",
             ".local/state/model-route",
-            "rt-node",
+
             "rt-rust",
         ] {
             std::fs::create_dir_all(dir.join(rel)).unwrap();
         }
         std::fs::copy(
-            workspace_root().join("crates/agentdeck-core/assets/router/catalog.fixture.json"),
+            workspace_root().join("crates/agentdeck/tests/fixtures/catalog.fixture.json"),
             dir.join(".local/state/model-route/catalog.json"),
         )
         .unwrap();
@@ -124,48 +171,6 @@ fn write_mock(fx: &Fixture, answers: &serde_json::Value) -> PathBuf {
     p
 }
 
-fn run_node(
-    fx: &Fixture,
-    args: &[&str],
-    mock: &Path,
-    stdin: Option<&str>,
-) -> (i32, Vec<u8>, Vec<u8>) {
-    let wrapper = fx.dir.join("wrap.mjs");
-    let route = workspace_root().join("crates/agentdeck-core/assets/router/route.mjs");
-    std::fs::write(
-        &wrapper,
-        format!(
-            "import fs from 'node:fs';\nimport os from 'node:os';\nos.homedir = () => process.cwd();\n\
-             globalThis.fetch = async () => ({{ ok: true, json: async () => JSON.parse(fs.readFileSync(process.env.MOCK_JEV, 'utf8')) }});\n\
-             process.argv = [process.execPath, 'route.mjs', ...JSON.parse(process.env.ROUTE_ARGS)];\n\
-             await import({});\n",
-            serde_json::to_string(route.to_str().unwrap()).unwrap()
-        ),
-    )
-    .unwrap();
-    let mut cmd = Command::new("node");
-    cmd.arg(&wrapper)
-        .current_dir(&fx.dir)
-        .envs(fx.env("rt-node"));
-    cmd.env("ROUTE_ARGS", serde_json::to_string(args).unwrap());
-    cmd.env("MOCK_JEV", mock);
-    if stdin.is_some() {
-        cmd.stdin(Stdio::piped());
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn node");
-    if let Some(input) = stdin {
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
-    }
-    let out = child.wait_with_output().expect("node output");
-    (out.status.code().unwrap_or(-1), out.stdout, out.stderr)
-}
-
 fn run_rust(
     fx: &Fixture,
     args: &[&str],
@@ -195,6 +200,23 @@ fn run_rust(
     (out.status.code().unwrap_or(-1), out.stdout, out.stderr)
 }
 
+/// Map Rust output back to the legacy Node shape for `UPDATE_GOLDEN=1`:
+/// drop the additive-only default-rules line (`--check`) or the Rust-only
+/// `userRules`/`quotaEstimate` provenance (JSON), then canonicalize.
+fn to_golden_shape(args: &[&str], rout: &[u8]) -> Vec<u8> {
+    if args.contains(&"--check") {
+        let actual = std::str::from_utf8(rout).unwrap();
+        let line = "user rules (source: default): no-review: gemini-.*argon; denied: (none)\n";
+        return canon_output(actual.replacen(line, "", 1).as_bytes());
+    }
+    let mut v: serde_json::Value = serde_json::from_slice(rout).unwrap();
+    v.as_object_mut().unwrap().remove("userRules");
+    for entry in v["ranking"].as_array_mut().unwrap() {
+        entry.as_object_mut().unwrap().remove("quotaEstimate");
+    }
+    canon_output(&serde_json::to_vec(&v).unwrap())
+}
+
 fn check_case(
     name: &str,
     fx: &Fixture,
@@ -203,12 +225,30 @@ fn check_case(
     stdin: Option<&str>,
 ) {
     let mock = write_mock(fx, jev);
-    let (nc, nout, _nerr) = run_node(fx, args, &mock, stdin);
-    let (rc, rout, rerr) = run_rust(fx, args, &mock, stdin);
+    let (rc, raw_out, rerr) = run_rust(fx, args, &mock, stdin);
+    let rout = canon_output(&raw_out);
+    let path = golden_path(name);
+    if std::env::var("UPDATE_GOLDEN").is_ok() {
+        let golden =
+            serde_json::json!({"exit": rc, "stdout": String::from_utf8(to_golden_shape(args, &rout)).unwrap()});
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&golden).unwrap() + "\n").unwrap();
+    }
+    // The golden was captured once from the legacy Node router; the golden
+    // file is the contract and Node is no longer needed.
+    if !path.exists() {
+        panic!(
+            "{name}: missing golden {}; regenerate with UPDATE_GOLDEN=1",
+            path.display()
+        );
+    }
+    let golden: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let nc = golden["exit"].as_i64().unwrap() as i32;
+    let nout = golden["stdout"].as_str().unwrap().as_bytes().to_vec();
     assert_eq!(
-        nc,
-        rc,
-        "{name}: exit codes differ (node {nc}, rust {rc}): {}",
+        nc, rc,
+        "{name}: exit codes differ (golden {nc}, rust {rc}): {}",
         String::from_utf8_lossy(&rerr)
     );
     if nout == rout {
@@ -267,10 +307,10 @@ fn check_case(
         return;
     }
     if nout != rout {
-        let dir = std::env::temp_dir().join(format!("route-parity-{name}"));
+        let dir = std::env::temp_dir().join(format!("route-golden-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("node.json"), &nout).unwrap();
+        std::fs::write(dir.join("golden.json"), &nout).unwrap();
         std::fs::write(dir.join("rust.json"), &rout).unwrap();
     }
     assert_eq!(
@@ -278,7 +318,7 @@ fn check_case(
         rout,
         "{name}: stdout differs; see {}",
         std::env::temp_dir()
-            .join(format!("route-parity-{name}"))
+            .join(format!("route-golden-{name}"))
             .display()
     );
 }
@@ -310,11 +350,7 @@ fn answers_for(
 }
 
 #[test]
-fn route_parity_with_node() {
-    if !node_available() {
-        eprintln!("SKIP: node is absent, cannot differentially test against the Node router");
-        return;
-    }
+fn route_matches_golden() {
     let full_pool = [OPUS, HAIKU, SOL, OAI_OPUS, HAIKU45];
     let keys: Vec<String> = full_pool
         .iter()
@@ -332,7 +368,7 @@ fn route_parity_with_node() {
         })
         .collect();
 
-    // Effort mapping per descriptor, difficulties 0..3 (winner content unchecked here, only parity).
+    // Effort mapping per descriptor, difficulties 0..3 (winner content unchecked here).
     for (i, diff) in [0.0, 1.0, 2.0, 3.0].iter().enumerate() {
         let fx = Fixture::new(&full_pool);
         let jev = answers_for(
@@ -558,19 +594,12 @@ fn route_parity_with_node() {
         check_case("check", &fx, &["--check"], &jev, None);
     }
 
-    // Missing router JSON fails closed with the same message; bad Jev fails.
+    // Missing router JSON fails closed; bad Jev fails (legacy Node asserted
+    // the same exit codes and the shared "router JSON unusable" message).
     {
         let fx = Fixture::new(&[OPUS]);
         let missing = fx.dir.join("no-such-router.json");
         let mock = write_mock(&fx, &serde_json::json!({}));
-        let node = Command::new("node")
-            .arg(workspace_root().join("crates/agentdeck-core/assets/router/route.mjs"))
-            .args(["--source", "claudeAgent", "task"])
-            .current_dir(&fx.dir)
-            .envs(fx.env("rt-node"))
-            .env("MODEL_ROUTE_ROUTER_JSON", &missing)
-            .output()
-            .unwrap();
         let rust = Command::new(env!("CARGO_BIN_EXE_agentdeck"))
             .args(["route", "--source", "claudeAgent", "task"])
             .current_dir(&fx.dir)
@@ -578,17 +607,15 @@ fn route_parity_with_node() {
             .env("MODEL_ROUTE_ROUTER_JSON", &missing)
             .output()
             .unwrap();
-        assert_eq!(node.status.code(), Some(1));
         assert_eq!(rust.status.code(), Some(1));
-        assert!(node.stdout.is_empty() && rust.stdout.is_empty());
-        // Fail-closed with the same message; only the trailing OS error text
-        // is platform/Node-specific.
-        for err in [&node.stderr, &rust.stderr] {
-            assert!(
-                String::from_utf8_lossy(err).contains("router JSON unusable"),
-                "stderr: {err:?}"
-            );
-        }
+        assert!(rust.stdout.is_empty());
+        // Fail-closed with the shared message; only the trailing OS error
+        // text is platform-specific.
+        assert!(
+            String::from_utf8_lossy(&rust.stderr).contains("router JSON unusable"),
+            "stderr: {:?}",
+            rust.stderr
+        );
         let _ = mock;
     }
     {
@@ -602,20 +629,14 @@ fn route_parity_with_node() {
             0.0,
         );
         let mock = write_mock(&fx, &bad);
-        let (nc, nout, _) = run_node(
-            &fx,
-            &["--source", "claudeAgent", "Fix the typo"],
-            &mock,
-            None,
-        );
         let (rc, rout, _) = run_rust(
             &fx,
             &["--source", "claudeAgent", "Fix the typo"],
             &mock,
             None,
         );
-        assert_eq!((nc, rc), (1, 1));
-        assert!(nout.is_empty() && rout.is_empty());
+        assert_eq!(rc, 1);
+        assert!(rout.is_empty());
     }
 }
 

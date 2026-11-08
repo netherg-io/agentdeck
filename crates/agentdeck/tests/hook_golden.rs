@@ -117,7 +117,7 @@ impl Fixture {
             std::fs::create_dir_all(dir.join(rel)).unwrap();
         }
         std::fs::copy(
-            workspace_root().join("crates/agentdeck-core/assets/router/catalog.fixture.json"),
+            workspace_root().join("crates/agentdeck/tests/fixtures/catalog.fixture.json"),
             dir.join(".local/state/model-route/catalog.json"),
         )
         .unwrap();
