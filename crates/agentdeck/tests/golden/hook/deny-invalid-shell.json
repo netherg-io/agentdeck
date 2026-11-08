@@ -1,0 +1,14 @@
+{
+  "exit": 0,
+  "stdout": "{\"decision\":\"deny\",\"reason\":\"model-route: delegate_task requires a task and an explicit exact providerInstanceId/model target.\"}",
+  "records": [
+    {
+      "t": "",
+      "harness": "shell",
+      "instance": "codex",
+      "toolName": "delegate_task",
+      "decision": "deny:invalid-delegate",
+      "reason": "model-route: delegate_task requires a task and an explicit exact providerInstanceId/model target."
+    }
+  ]
+}

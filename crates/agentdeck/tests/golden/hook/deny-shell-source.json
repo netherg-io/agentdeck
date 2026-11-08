@@ -1,0 +1,21 @@
+{
+  "exit": 0,
+  "stdout": "{\"decision\":\"deny\",\"reason\":\"model-route: shell source must be a provider from live scoped orchestrator_capabilities.\"}",
+  "records": [
+    {
+      "t": "",
+      "harness": "shell",
+      "instance": "spoofed",
+      "toolName": "delegate_task",
+      "decision": "deny:shell-source",
+      "reason": "model-route: shell source must be a provider from live scoped orchestrator_capabilities.",
+      "requestedTarget": {
+        "providerInstanceId": "codex",
+        "model": "gpt-6.1-sol",
+        "options": {
+          "reasoningEffort": "medium"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,82 @@
+{
+  "exit": 0,
+  "stdout": "{\"decision\":\"deny\",\"reason\":\"model-route: no adequate model with enough quota and usable reasoning controls (blocked: codex/gpt-6.1-sol, claudeAgent/claude-opus-5-5). Split the task or do it yourself. Confidence is low (0); compare expected quality and quota penalties: [].\"}",
+  "records": [
+    {
+      "t": "",
+      "harness": "opencode",
+      "instance": "opencode",
+      "toolName": "subagent",
+      "decision": "deny:no-target",
+      "reason": "model-route: no adequate model with enough quota and usable reasoning controls (blocked: codex/gpt-6.1-sol, claudeAgent/claude-opus-5-5). Split the task or do it yourself. Confidence is low (0); compare expected quality and quota penalties: [].",
+      "target": null,
+      "size": "1: a focused change or review of a few files",
+      "confidence": 0,
+      "blocked": [
+        "codex/gpt-6.1-sol",
+        "claudeAgent/claude-opus-5-5"
+      ],
+      "ranking": [
+        {
+          "provider": "codex",
+          "model": "gpt-6.1-sol",
+          "profiled": true,
+          "burn": 1,
+          "target": {
+            "providerInstanceId": "codex",
+            "model": "gpt-6.1-sol",
+            "options": {
+              "reasoningEffort": "high"
+            }
+          },
+          "fit": 0.95,
+          "quality": 0.967,
+          "confidence": 0.9,
+          "allowed": false,
+          "taskCost": 8,
+          "quota": "Week 0% left; resets in Rh (0 active agents; count unknown)",
+          "activeAgents": 0,
+          "account": "codex",
+          "sharedQuota": false,
+          "sharedQuotaPenalty": 0,
+          "paidCreditPenalty": 0,
+          "cheapModelBonus": 0,
+          "eligible": false,
+          "score": 0.967
+        },
+        {
+          "provider": "claudeAgent",
+          "model": "claude-opus-5-5",
+          "profiled": true,
+          "burn": 1,
+          "target": {
+            "providerInstanceId": "claudeAgent",
+            "model": "claude-opus-5-5",
+            "options": {
+              "effort": "high"
+            }
+          },
+          "fit": 0.95,
+          "quality": 0.8,
+          "confidence": 0.9,
+          "allowed": false,
+          "taskCost": 2000,
+          "quota": "Week 0% left; resets in Rh, 5h 0% left; resets in Rh (0 active agents; count unknown)",
+          "activeAgents": 0,
+          "account": "claude",
+          "sharedQuota": false,
+          "sharedQuotaPenalty": 0,
+          "paidCreditPenalty": 0,
+          "cheapModelBonus": 0,
+          "eligible": false,
+          "score": 0.8
+        }
+      ],
+      "activeLoad": {
+        "known": false,
+        "agents": [],
+        "note": "live T3 agent metadata unavailable"
+      }
+    }
+  ]
+}

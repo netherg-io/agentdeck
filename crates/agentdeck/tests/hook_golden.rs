@@ -1,8 +1,9 @@
-//! Differential test: the Rust `agentdeck route hook` must print byte-identical
-//! stdout (and exit codes) to the Node `hook.mjs` on the same fixtures with
-//! Jev mocked and the route answers driven by the same mock. Covers
+//! Golden-file test: the Rust `agentdeck route hook` output (stdout, exit
+//! code, `decisions.jsonl` record) must match the committed snapshots in
+//! `tests/golden/hook/` (captured once from the legacy Node `hook.mjs`;
+//! `UPDATE_GOLDEN=1` rewrites them from the Rust output). Covers
 //! allow/deny/hand-back across harnesses. No real API calls, no real key
-//! file. Skips with a note when Node is absent.
+//! file, no Node needed.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -15,11 +16,57 @@ fn workspace_root() -> PathBuf {
     d
 }
 
-fn node_available() -> bool {
-    Command::new("node")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
+fn golden_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/hook")
+        .join(format!("{name}.json"))
+}
+
+/// Canonicalize run-specific drift (see route_golden.rs): wall-clock drift
+/// between fixture setup and the run leaks into `resets in Xh` /
+/// `resetsInHours`. JSON is re-serialized with sorted keys.
+fn canon_output(bytes: &[u8]) -> Vec<u8> {
+    let s = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s.as_ref();
+    while let Some(i) = rest.find("resets in ") {
+        let head = &rest[..i + "resets in ".len()];
+        let tail = &rest[i + "resets in ".len()..];
+        let num_end = tail
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(tail.len());
+        if num_end > 0 && tail[num_end..].starts_with('h') {
+            out.push_str(head);
+            out.push_str("Rh");
+            rest = &tail[num_end + 1..];
+        } else {
+            out.push_str(head);
+            rest = tail;
+        }
+    }
+    out.push_str(rest);
+    match serde_json::from_str::<serde_json::Value>(&out) {
+        Ok(mut v) => {
+            fn zero_resets(v: &mut serde_json::Value) {
+                match v {
+                    serde_json::Value::Object(o) => {
+                        for (k, val) in o.iter_mut() {
+                            if k == "resetsInHours" {
+                                *val = serde_json::json!(0);
+                            } else {
+                                zero_resets(val);
+                            }
+                        }
+                    }
+                    serde_json::Value::Array(a) => a.iter_mut().for_each(zero_resets),
+                    _ => {}
+                }
+            }
+            zero_resets(&mut v);
+            serde_json::to_vec(&v).unwrap()
+        }
+        Err(_) => out.into_bytes(),
+    }
 }
 
 fn shared_hint() -> String {
@@ -99,7 +146,7 @@ impl Fixture {
         usage: Option<serde_json::Value>,
     ) -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "agentdeck-hook-parity-{}-{}",
+            "agentdeck-hook-golden-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -111,7 +158,7 @@ impl Fixture {
             ".t3/userdata",
             ".local/state/ai-usage",
             ".local/state/model-route",
-            "rt-node",
+
             "rt-rust",
         ] {
             std::fs::create_dir_all(dir.join(rel)).unwrap();
@@ -155,32 +202,6 @@ impl Fixture {
         .unwrap();
         let mock_jev = dir.join("mock.json");
         std::fs::write(&mock_jev, serde_json::to_string(jev).unwrap()).unwrap();
-        // Preloads fetch with the same Jev answers for route.mjs children.
-        std::fs::write(
-            dir.join("mock-fetch.mjs"),
-            "globalThis.fetch = async () => ({ ok: true, json: async () => JSON.parse(process.env.MOCK_JEV_JSON) });\n",
-        )
-        .unwrap();
-        // Runs hook.mjs in-process with a stubbed route spawn (same Jev mock).
-        std::fs::write(
-            dir.join("wrap-hook.mjs"),
-            r#"import fs from 'node:fs';
-import os from 'node:os';
-import cp from 'node:child_process';
-import { syncBuiltinESMExports } from 'node:module';
-os.homedir = () => process.cwd();
-const realExec = cp.execFileSync;
-cp.execFileSync = (file, argv, opts) => {
-  if (String(file).endsWith('route.mjs'))
-    return realExec(process.execPath, ['--import', process.env.MOCK_FETCH, file, ...argv], { ...opts });
-  return realExec(file, argv, opts);
-};
-syncBuiltinESMExports();
-process.argv = [process.execPath, 'hook.mjs', ...JSON.parse(process.env.HOOK_ARGS)];
-await import(process.env.HOOK_SRC);
-"#,
-        )
-        .unwrap();
         Self { dir, mock_jev }
     }
 
@@ -211,24 +232,16 @@ await import(process.env.HOOK_SRC);
 
     fn sqlite_nested_child(&self) {
         // One app-owned delegated child: session child-session is nested.
-        // Built with node:sqlite (the suite requires node anyway).
         let db = self.dir.join(".t3/userdata/statev2.sqlite");
-        let status = Command::new("node")
-            .arg("--input-type=module")
-            .arg("-e")
-            .arg(format!(
-                "import {{ DatabaseSync }} from 'node:sqlite'; \
-                const db = new DatabaseSync('{}'); \
-                db.exec(`CREATE TABLE orchestration_v2_projection_subagents (subagent_id TEXT, child_thread_id TEXT); \
-                CREATE TABLE orchestration_v2_projection_provider_threads (provider_thread_id TEXT, thread_id TEXT, payload_json TEXT); \
-                INSERT INTO orchestration_v2_projection_subagents VALUES ('node:child', 'thread:child'); \
-                INSERT INTO orchestration_v2_projection_provider_threads VALUES ('pt', 'thread:child', '{{\"nativeThreadRef\":{{\"nativeId\":\"child-session\"}}}}');`); \
-                db.close();",
-                db.to_string_lossy()
-            ))
-            .status()
-            .expect("node for sqlite fixture");
-        assert!(status.success());
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE orchestration_v2_projection_subagents (subagent_id TEXT, child_thread_id TEXT);
+             CREATE TABLE orchestration_v2_projection_provider_threads (provider_thread_id TEXT, thread_id TEXT, payload_json TEXT);
+             INSERT INTO orchestration_v2_projection_subagents VALUES ('node:child', 'thread:child');
+             INSERT INTO orchestration_v2_projection_provider_threads VALUES ('pt', 'thread:child', '{\"nativeThreadRef\":{\"nativeId\":\"child-session\"}}');",
+        )
+        .unwrap();
+        conn.close().unwrap();
     }
 }
 
@@ -274,42 +287,6 @@ fn healthy_jev() -> serde_json::Value {
     )
 }
 
-fn run_node(fx: &Fixture, harness: &str, stdin_text: &str) -> (i32, Vec<u8>, Vec<u8>) {
-    let route = workspace_root().join("crates/agentdeck-core/assets/router/hook.mjs");
-    let mut cmd = Command::new("node");
-    cmd.arg(fx.dir.join("wrap-hook.mjs"))
-        .current_dir(&fx.dir)
-        .envs(fx.base_env("rt-node"));
-    cmd.env(
-        "HOOK_ARGS",
-        serde_json::to_string(&["--harness", harness]).unwrap(),
-    );
-    cmd.env("HOOK_SRC", route.to_str().unwrap());
-    cmd.env(
-        "MOCK_FETCH",
-        fx.dir.join("mock-fetch.mjs").to_str().unwrap(),
-    );
-    cmd.env(
-        "MOCK_JEV_JSON",
-        std::fs::read_to_string(&fx.mock_jev).unwrap(),
-    );
-    for v in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "MODEL_ROUTE_HOOK_DEBUG"] {
-        cmd.env_remove(v);
-    }
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn node hook");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin_text.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("node hook output");
-    (out.status.code().unwrap_or(-1), out.stdout, out.stderr)
-}
-
 fn run_rust(fx: &Fixture, harness: &str, stdin_text: &str) -> (i32, Vec<u8>, Vec<u8>) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentdeck"));
     cmd.args(["route", "hook", "--harness", harness])
@@ -345,44 +322,87 @@ fn decisions(dir: &Path) -> Vec<serde_json::Value> {
                 .map(|mut v| {
                     // Timestamps always differ; everything else must match.
                     v["t"] = serde_json::Value::from("");
-                    v
+                    // The embedded JSON parse error is engine-specific (V8 vs
+                    // serde_json); only the shared suffix must match.
+                    if let Some(reason) = v.get("reason").and_then(|r| r.as_str()) {
+                        if let Some((_, suffix)) = reason.split_once(" | model-route:") {
+                            v["reason"] = serde_json::Value::from(format!(
+                                "<parse error> | model-route:{suffix}"
+                            ));
+                        }
+                    }
+                    // Wall-clock drift leaks into resets strings (see canon).
+                    serde_json::from_slice(&canon_output(
+                        &serde_json::to_vec(&v).unwrap(),
+                    ))
+                    .unwrap()
                 })
         })
         .collect()
 }
 
+/// Node-shaped records for `UPDATE_GOLDEN=1`: strip the Rust-only
+/// `quotaEstimate` provenance per ranking entry.
+fn to_golden_records(records: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut out = records.to_vec();
+    for rec in out.iter_mut() {
+        if let Some(ranking) = rec.get_mut("ranking").and_then(|v| v.as_array_mut()) {
+            for entry in ranking.iter_mut() {
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.remove("quotaEstimate");
+                }
+            }
+        }
+    }
+    out
+}
+
 fn check_case(name: &str, fx: &Fixture, harness: &str, input: &serde_json::Value) {
-    let stdin_text = serde_json::to_string(input).unwrap();
-    let (nc, nout, _) = run_node(fx, harness, &stdin_text);
-    let node_records = decisions(&fx.dir);
-    let (rc, rout, rerr) = run_rust(fx, harness, &stdin_text);
+    check_case_raw(name, fx, harness, &serde_json::to_string(input).unwrap());
+}
+
+fn check_case_raw(name: &str, fx: &Fixture, harness: &str, stdin_text: &str) {
+    let path = golden_path(name);
+    // The golden was captured once from the legacy Node hook; the golden
+    // file is the contract and Node is no longer needed.
+    if !path.exists() {
+        panic!(
+            "{name}: missing golden {}; regenerate with UPDATE_GOLDEN=1",
+            path.display()
+        );
+    }
+    let (rc, rout_raw, rerr) = run_rust(fx, harness, &stdin_text);
+    let rout = canon_output(&rout_raw);
+    if std::env::var("UPDATE_GOLDEN").is_ok() {
+        let golden = serde_json::json!({"exit": rc,
+            "stdout": String::from_utf8(rout.clone()).unwrap(),
+            "records": to_golden_records(&decisions(&fx.dir))});
+        std::fs::write(&path, serde_json::to_string_pretty(&golden).unwrap() + "\n").unwrap();
+    }
+    let golden: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let nc = golden["exit"].as_i64().unwrap() as i32;
+    let nout = golden["stdout"].as_str().unwrap().as_bytes().to_vec();
+    let golden_records: Vec<serde_json::Value> =
+        serde_json::from_value(golden["records"].clone()).unwrap();
     assert_eq!(
-        nc,
-        rc,
-        "{name}: exit codes differ (node {nc}, rust {rc}): {}",
+        nc, rc,
+        "{name}: exit codes differ (golden {nc}, rust {rc}): {}",
         String::from_utf8_lossy(&rerr)
     );
     assert_eq!(
-        nout,
-        rout,
-        "{name}: stdout differs:\nnode: {}\nrust: {}",
         String::from_utf8_lossy(&nout),
-        String::from_utf8_lossy(&rout)
+        String::from_utf8_lossy(&rout),
+        "{name}: stdout differs"
     );
-    // One fixture dir, one record per run: the tail after the Node record is
-    // the Rust record and must match it, up to the additive-only
+    // One fixture dir, one record per run: the golden record is the Node
+    // record and must match the Rust record, up to the additive-only
     // `quotaEstimate` provenance per ranking entry (same allowance as
-    // route_parity.rs: strip it from both sides, require everything else
+    // route_golden.rs: strip it from both sides, require everything else
     // to match, then validate the new field's shape on the Rust side).
-    let all = decisions(&fx.dir);
-    assert_eq!(
-        node_records,
-        &all[..node_records.len()],
-        "{name}: node record not stable"
-    );
-    let rust_records = &all[node_records.len()..];
-    if node_records != rust_records {
-        let mut n = node_records.clone();
+    let rust_records = decisions(&fx.dir);
+    if golden_records != rust_records {
+        let mut n = golden_records.clone();
         let mut r = rust_records.to_vec();
         for records in [&mut n, &mut r] {
             for rec in records.iter_mut() {
@@ -396,7 +416,7 @@ fn check_case(name: &str, fx: &Fixture, harness: &str, input: &serde_json::Value
             }
         }
         assert_eq!(n, r, "{name}: non-quotaEstimate decisions.jsonl differs");
-        for rec in rust_records {
+        for rec in &rust_records {
             if let Some(ranking) = rec.get("ranking").and_then(|v| v.as_array()) {
                 for entry in ranking {
                     let q = &entry["quotaEstimate"];
@@ -434,10 +454,6 @@ fn delegate_input(
 
 #[test]
 fn instance_capacity_blocks_launch_override_and_recommends_another_instance() {
-    if !node_available() {
-        eprintln!("SKIP: node is absent (SQLite fixture builder)");
-        return;
-    }
     let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
     let path = fx.dir.join("router.json");
     let mut cfg: serde_json::Value =
@@ -445,10 +461,10 @@ fn instance_capacity_blocks_launch_override_and_recommends_another_instance() {
     cfg["instanceLimits"] = serde_json::json!({"codex": 1});
     std::fs::write(path, cfg.to_string()).unwrap();
     let sql = |file: &Path, schema: &str| {
-        let status = Command::new("node").arg("-e")
-            .arg("const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync(process.argv[1]);db.exec(process.argv[2]);db.close();")
-            .arg(file).arg(schema).status().unwrap();
-        assert!(status.success());
+        rusqlite::Connection::open(file)
+            .unwrap()
+            .execute_batch(schema)
+            .unwrap();
     };
     let t3 = fx.dir.join(".t3/userdata/statev2.sqlite");
     sql(&t3, "CREATE TABLE orchestration_v2_projection_subagents (
@@ -535,11 +551,7 @@ fn instance_capacity_blocks_launch_override_and_recommends_another_instance() {
 }
 
 #[test]
-fn hook_parity_with_node() {
-    if !node_available() {
-        eprintln!("SKIP: node is absent, cannot differentially test the hook");
-        return;
-    }
+fn hook_matches_golden() {
     let hint = shared_hint();
     let sol = serde_json::json!({"providerInstanceId": "codex", "model": "gpt-6.1-sol",
         "options": {"reasoningEffort": "medium"}});
@@ -726,22 +738,19 @@ fn hook_parity_with_node() {
         input["source"] = "antigravity".into();
         check_case("deny-review-role", &fx, "shell", &input);
     }
-    // 14. Malformed stdin: fail closed.
+    // 14. Malformed stdin: fail closed (legacy Node agreed byte-for-byte;
+    // the golden pins the exact denial).
     {
         let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
-        let (nc, nout, _) = run_node(&fx, "shell", "{");
-        let (rc, rout, _) = run_rust(&fx, "shell", "{");
-        assert_eq!(nc, rc, "malformed: exit codes differ");
-        assert_eq!(
-            nout,
-            rout,
-            "malformed: stdout differs:\nnode: {}\nrust: {}",
-            String::from_utf8_lossy(&nout),
-            String::from_utf8_lossy(&rout)
-        );
+        check_case_raw("malformed", &fx, "shell", "{");
+        let golden: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(golden_path("malformed")).unwrap(),
+        )
+        .unwrap();
         assert!(
-            rout.starts_with(b"{\"decision\":\"deny\""),
-            "must deny: {rout:?}"
+            golden["stdout"].as_str().unwrap().starts_with("{\"decision\":\"deny\""),
+            "must deny: {}",
+            golden["stdout"].as_str().unwrap()
         );
     }
     // 15. Delegated child session: nested delegation is disabled.
