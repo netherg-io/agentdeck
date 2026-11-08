@@ -106,6 +106,7 @@ remove-confirm = Remove
 remove-cancel = Keep
 remove-keep-home = The login dir is kept.
 remove-pool = Also removed from the pool: { $models }
+remove-usage = Also removed from Quotas: { $sources }
 remove-failed = Removal failed: { $what }
 remove-threads =
     { $count ->

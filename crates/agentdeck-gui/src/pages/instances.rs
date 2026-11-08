@@ -336,6 +336,16 @@ pub fn remove_modal(ask: &RemoveAsk) -> Modal<'_, Message> {
     if !ask.pool.is_empty() {
         body.push(st::body(fl!(loader(), "remove-pool", models = ask.pool.join(", "))).into());
     }
+    if !ask.usage.is_empty() {
+        body.push(
+            st::body(fl!(
+                loader(),
+                "remove-usage",
+                sources = ask.usage.join(", ")
+            ))
+            .into(),
+        );
+    }
     body.push(st::muted(fl!(loader(), "remove-keep-home")).into());
     if let Some(error) = &ask.error {
         body.push(st::body(fl!(loader(), "remove-failed", what = error)).into());
