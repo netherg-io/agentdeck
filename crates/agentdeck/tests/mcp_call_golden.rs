@@ -1,24 +1,18 @@
-//! Differential test: the Rust `route t3-mcp-call` must answer like the Node
-//! `t3-mcp-call.mjs` — same connection discovery, validation messages and
-//! MCP envelope handling (mock HTTP server, temp dirs; no real T3, no real
-//! credentials). Skips the Node half when Node is absent.
+//! Golden-file test: the Rust `route t3-mcp-call` must match the committed
+//! snapshots in `tests/golden/mcp_call/` (captured once from the legacy Node
+//! `t3-mcp-call.mjs`; `UPDATE_GOLDEN=1` rewrites them from the Rust output)
+//! — same connection discovery, validation messages and MCP envelope
+//! handling (mock HTTP server, temp dirs; no real T3, no real credentials).
+//! No Node needed.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
-fn workspace_root() -> PathBuf {
-    let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    d.pop();
-    d.pop();
-    d
-}
-
-fn node_available() -> bool {
-    Command::new("node")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
+fn golden_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/mcp_call")
+        .join(format!("{name}.json"))
 }
 
 const GOOD_CONN: &str = "http://127.0.0.1:3773/mcp";
@@ -120,102 +114,23 @@ fn rust_results() -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn node_results(dir: &std::path::Path) -> Vec<serde_json::Value> {
-    let driver = dir.join("driver.mjs");
-    std::fs::write(
-        &driver,
-        format!(
-            r#"import fs from 'node:fs';
-import {{ connectionFromConfig, validatePayload, discoverConnection }} from {url};
-const GOOD = {good};
-const cases = JSON.parse(fs.readFileSync(0, 'utf8'));
-const out = cases.map(c => {{
-  try {{
-    if (c.kind === 'config') return connectionFromConfig(c.config) ?? null;
-    if (c.kind === 'validate') {{ validatePayload(c.tool, c.payload); return 'ok'; }}
-    if (c.kind === 'discover-acp') {{
-      const env = {{ T3_ACP_MCP_ENDPOINT: c.endpoint ?? undefined, T3_ACP_MCP_AUTHORIZATION: c.auth ?? undefined }};
-      return {{ endpoint: discoverConnection({{ env, read: () => {{ throw new Error('ACP must not read /proc'); }} }}).endpoint }};
-    }}
-    if (c.kind === 'discover-proc') {{
-      const config = JSON.stringify({{ mcpServers: GOOD }});
-      const read = name => ({{ '/proc/20/cmdline': 'bash\0-c\0command\0', '/proc/20/stat': '20 (bash child) S 10 rest',
-        '/proc/10/cmdline': `claude\0--mcp-config\0${{config}}\0`, '/proc/10/stat': '10 (claude) S 1 rest' }}[name]
-        ?? (() => {{ throw new Error('Must not inspect another process: ' + name); }})());
-      return {{ endpoint: discoverConnection({{ env: {{}}, pid: 20, read }}).endpoint }};
-    }}
-    if (c.kind === 'discover-none') {{
-      try {{ discoverConnection({{ env: {{}}, pid: 20, read: () => {{ throw new Error('private'); }} }}); return 'UNEXPECTED'; }}
-      catch (e) {{ return {{ error: e.message }}; }}
-    }}
-  }} catch (e) {{ return {{ error: e.message }}; }}
-}});
-process.stdout.write(JSON.stringify(out));
-"#,
-            url = serde_json::to_string(&format!(
-                "file://{}",
-                workspace_root()
-                    .join("crates/agentdeck-core/assets/router/t3-mcp-call.mjs")
-                    .to_string_lossy()
-            ))
-            .unwrap(),
-            good = serde_json::json!({"t3-code": {"type": "http", "url": GOOD_CONN, "headers": {"Authorization": GOOD_AUTH}}}),
-        ),
-    )
-    .unwrap();
-    let mut child = Command::new("node")
-        .arg(&driver)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn node");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(serde_json::to_string(&cases()).unwrap().as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("node output");
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // Node returns full connections; trim to endpoint for parity with Rust.
-    let raw: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
-    raw.into_iter()
-        .zip(cases())
-        .map(|(v, c)| match c["kind"].as_str().unwrap() {
-            "config" if v.is_object() && v.get("error").is_none() => {
-                serde_json::json!({"endpoint": v["endpoint"], "authorization": v["authorization"]})
-            }
-            "discover-acp" | "discover-proc" => v,
-            _ => v,
-        })
-        .collect()
-}
-
 #[test]
-fn discovery_and_validation_match_node() {
-    if !node_available() {
-        eprintln!("SKIP: node absent");
-        return;
-    }
-    let dir = std::env::temp_dir().join(format!(
-        "agentdeck-mcp-parity-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let node = node_results(&dir);
+fn discovery_and_validation_match_golden() {
     let rust = rust_results();
-    assert_eq!(node.len(), rust.len());
-    for (i, (n, r)) in node.iter().zip(rust.iter()).enumerate() {
+    if std::env::var("UPDATE_GOLDEN").is_ok() {
+        let path = golden_path("discovery");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&rust).unwrap() + "\n").unwrap();
+    }
+    // The golden was captured once from the legacy Node router; the golden
+    // file is the contract and Node is no longer needed.
+    if !golden_path("discovery").exists() {
+        panic!("discovery: missing golden; regenerate with UPDATE_GOLDEN=1");
+    }
+    let golden: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(golden_path("discovery")).unwrap()).unwrap();
+    assert_eq!(golden.len(), rust.len());
+    for (i, (n, r)) in golden.iter().zip(rust.iter()).enumerate() {
         assert_eq!(
             n,
             r,
@@ -223,7 +138,6 @@ fn discovery_and_validation_match_node() {
             serde_json::to_string(&cases()[i]).unwrap()
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Minimal in-test HTTP/1.1 mock speaking MCP streamable HTTP (JSON and SSE
@@ -409,7 +323,7 @@ fn delegate_http_failure_reports_outcome_unknown() {
 }
 
 #[test]
-fn no_inherited_connection_cli_error_matches_node() {
+fn no_inherited_connection_cli_error_matches_golden() {
     // Deterministic failure: ACP endpoint set without authorization.
     let run_rust = Command::new(env!("CARGO_BIN_EXE_agentdeck"))
         .arg("route")
@@ -426,21 +340,28 @@ fn no_inherited_connection_cli_error_matches_node() {
         rust_err.contains("Expected a loopback T3 MCP endpoint with session authorization."),
         "{rust_err}"
     );
-    if !node_available() {
-        eprintln!("SKIP node half: node absent");
-        return;
+    let path = golden_path("no-inherited-connection");
+    if std::env::var("UPDATE_GOLDEN").is_ok() {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(
+                &serde_json::json!({"exit": run_rust.status.code(), "stderr": rust_err}),
+            )
+            .unwrap()
+                + "\n",
+        )
+        .unwrap();
     }
-    let run_node = Command::new("node")
-        .arg(workspace_root().join("crates/agentdeck-core/assets/router/t3-mcp-call.mjs"))
-        .arg("orchestrator_capabilities")
-        .env("T3_ACP_MCP_ENDPOINT", GOOD_CONN)
-        .env_remove("T3_ACP_MCP_AUTHORIZATION")
-        .env_remove("T3_SHELL_MCP_SOCKET")
-        .output()
-        .expect("spawn node");
-    let node_err = String::from_utf8_lossy(&run_node.stderr).into_owned();
-    assert_eq!(run_node.status.code(), Some(1));
-    assert_eq!(node_err.trim(), rust_err.trim());
+    // The golden was captured once from the legacy Node CLI; the golden
+    // file is the contract and Node is no longer needed.
+    if !path.exists() {
+        panic!("no-inherited-connection: missing golden; regenerate with UPDATE_GOLDEN=1");
+    }
+    let golden: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(golden["exit"].as_i64().unwrap() as i32, run_rust.status.code().unwrap());
+    assert_eq!(golden["stderr"].as_str().unwrap(), rust_err);
 }
 
 #[test]

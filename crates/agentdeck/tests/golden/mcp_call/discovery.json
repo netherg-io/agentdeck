@@ -1,0 +1,55 @@
+[
+  {
+    "endpoint": "http://127.0.0.1:3773/mcp",
+    "authorization": "Bearer fixture-secret"
+  },
+  null,
+  {
+    "error": "Expected a loopback T3 MCP endpoint with session authorization."
+  },
+  {
+    "error": "Expected a loopback T3 MCP endpoint with session authorization."
+  },
+  {
+    "error": "Expected a loopback T3 MCP endpoint with session authorization."
+  },
+  "ok",
+  {
+    "error": "delegate_task needs a complete task (at most 120000 characters) and exact target."
+  },
+  {
+    "error": "delegate_task needs a complete task (at most 120000 characters) and exact target."
+  },
+  {
+    "error": "Shell delegation requires mode=async and a stable clientRequestId."
+  },
+  {
+    "error": "Omit runtimeMode to inherit the parent permissions."
+  },
+  {
+    "error": "Supported tools: orchestrator_capabilities, delegate_task, task_status, task_cancel"
+  },
+  "ok",
+  {
+    "endpoint": "http://127.0.0.1:3773/mcp"
+  },
+  {
+    "error": "Expected a loopback T3 MCP endpoint with session authorization."
+  },
+  {
+    "endpoint": "http://127.0.0.1:3773/mcp"
+  },
+  {
+    "error": "No inherited T3 MCP connection. Run inside a T3 Claude/ACP session; use native MCP in Codex."
+  },
+  "ok",
+  {
+    "error": "delegate_task role must be one of implementation|research|review|design|test|general."
+  },
+  {
+    "error": "delegate_task role must be one of implementation|research|review|design|test|general."
+  },
+  {
+    "error": "delegate_task role must be one of implementation|research|review|design|test|general."
+  }
+]
