@@ -158,7 +158,6 @@ impl Fixture {
             ".t3/userdata",
             ".local/state/ai-usage",
             ".local/state/model-route",
-
             "rt-rust",
         ] {
             std::fs::create_dir_all(dir.join(rel)).unwrap();
@@ -332,10 +331,7 @@ fn decisions(dir: &Path) -> Vec<serde_json::Value> {
                         }
                     }
                     // Wall-clock drift leaks into resets strings (see canon).
-                    serde_json::from_slice(&canon_output(
-                        &serde_json::to_vec(&v).unwrap(),
-                    ))
-                    .unwrap()
+                    serde_json::from_slice(&canon_output(&serde_json::to_vec(&v).unwrap())).unwrap()
                 })
         })
         .collect()
@@ -379,14 +375,14 @@ fn check_case_raw(name: &str, fx: &Fixture, harness: &str, stdin_text: &str) {
             "records": to_golden_records(&decisions(&fx.dir))});
         std::fs::write(&path, serde_json::to_string_pretty(&golden).unwrap() + "\n").unwrap();
     }
-    let golden: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let golden: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let nc = golden["exit"].as_i64().unwrap() as i32;
     let nout = golden["stdout"].as_str().unwrap().as_bytes().to_vec();
     let golden_records: Vec<serde_json::Value> =
         serde_json::from_value(golden["records"].clone()).unwrap();
     assert_eq!(
-        nc, rc,
+        nc,
+        rc,
         "{name}: exit codes differ (golden {nc}, rust {rc}): {}",
         String::from_utf8_lossy(&rerr)
     );
@@ -743,12 +739,13 @@ fn hook_matches_golden() {
     {
         let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
         check_case_raw("malformed", &fx, "shell", "{");
-        let golden: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(golden_path("malformed")).unwrap(),
-        )
-        .unwrap();
+        let golden: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(golden_path("malformed")).unwrap()).unwrap();
         assert!(
-            golden["stdout"].as_str().unwrap().starts_with("{\"decision\":\"deny\""),
+            golden["stdout"]
+                .as_str()
+                .unwrap()
+                .starts_with("{\"decision\":\"deny\""),
             "must deny: {}",
             golden["stdout"].as_str().unwrap()
         );
@@ -909,7 +906,8 @@ fn native_harness_decisions() {
         let input = serde_json::json!({"tool_name": "spawn_agent",
             "tool_input": {"task": hinted("Fix the typo"), "target": sol},
             "inT3": true, "model": "gpt-6-astra"});
-        let (code, out, err) = run_under_t3(&fx, "codex app-server", &[], "codex", &input.to_string());
+        let (code, out, err) =
+            run_under_t3(&fx, "codex app-server", &[], "codex", &input.to_string());
         assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
@@ -919,7 +917,10 @@ fn native_harness_decisions() {
                 .unwrap()
                 .contains("Call the T3 MCP tool delegate_task with target")
         );
-        assert_eq!(last_record(&fx)["decision"], "deny:delegate codex/gpt-6.1-sol");
+        assert_eq!(
+            last_record(&fx)["decision"],
+            "deny:delegate codex/gpt-6.1-sol"
+        );
     }
     // Claude Workflow entry point: always deny (under a T3 ancestry;
     // outside T3 it passes through like any non-delegate tool).

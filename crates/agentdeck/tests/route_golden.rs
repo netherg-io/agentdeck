@@ -87,7 +87,6 @@ impl Fixture {
             ".t3/userdata",
             ".local/state/ai-usage",
             ".local/state/model-route",
-
             "rt-rust",
         ] {
             std::fs::create_dir_all(dir.join(rel)).unwrap();
@@ -229,8 +228,7 @@ fn check_case(
     let rout = canon_output(&raw_out);
     let path = golden_path(name);
     if std::env::var("UPDATE_GOLDEN").is_ok() {
-        let golden =
-            serde_json::json!({"exit": rc, "stdout": String::from_utf8(to_golden_shape(args, &rout)).unwrap()});
+        let golden = serde_json::json!({"exit": rc, "stdout": String::from_utf8(to_golden_shape(args, &rout)).unwrap()});
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, serde_json::to_string_pretty(&golden).unwrap() + "\n").unwrap();
     }
@@ -242,12 +240,12 @@ fn check_case(
             path.display()
         );
     }
-    let golden: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let golden: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let nc = golden["exit"].as_i64().unwrap() as i32;
     let nout = golden["stdout"].as_str().unwrap().as_bytes().to_vec();
     assert_eq!(
-        nc, rc,
+        nc,
+        rc,
         "{name}: exit codes differ (golden {nc}, rust {rc}): {}",
         String::from_utf8_lossy(&rerr)
     );
@@ -689,7 +687,11 @@ fn jev_cache_contract() {
         0.0,
     );
     let mock = write_mock(&fx, &prefers_opus);
-    let task = ["--source", "claudeAgent", "Implement the feature in parser.c"];
+    let task = [
+        "--source",
+        "claudeAgent",
+        "Implement the feature in parser.c",
+    ];
     let run = |args: &[&str]| {
         let (code, out, err) = run_rust(&fx, args, &mock, None);
         assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
@@ -707,7 +709,11 @@ fn jev_cache_contract() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].len(), 64 + ".json".len());
     assert_eq!(
-        std::fs::metadata(cache_dir.join(&files[0])).unwrap().permissions().mode() & 0o777,
+        std::fs::metadata(cache_dir.join(&files[0]))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
         0o600
     );
     assert_eq!(
@@ -828,7 +834,11 @@ fn catalog_save_contract() {
         serde_json::from_str(&std::fs::read_to_string(&catalog_path).unwrap()).unwrap();
     assert_eq!(saved["providers"], fixture["providers"]);
     assert_eq!(
-        std::fs::metadata(&catalog_path).unwrap().permissions().mode() & 0o777,
+        std::fs::metadata(&catalog_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
         0o600
     );
     let before = std::fs::read(&catalog_path).unwrap();

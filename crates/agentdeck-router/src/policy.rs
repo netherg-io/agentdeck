@@ -1407,7 +1407,10 @@ mod legacy_suite_edges {
             w("weekly_all", 0.0, 10080.0, None, None),
             w("weekly_scoped:fable", 0.0, 10080.0, None, Some("Fable")),
         ];
-        assert_eq!(quota_windows("claudeAgent", "claude-fable-5-1", &claude).len(), 2);
+        assert_eq!(
+            quota_windows("claudeAgent", "claude-fable-5-1", &claude).len(),
+            2
+        );
         assert_eq!(
             quota_windows("claudeAgent", "claude-opus-5-5", &claude)
                 .iter()
@@ -1446,9 +1449,30 @@ mod legacy_suite_edges {
     #[test]
     fn weekly_thresholds_and_expired_snapshots() {
         let weekly = [0.5, 2.0, 6.0, 15.0];
-        assert!(!allowed(&[w("w", 7.0, 10080.0, None, None)], weekly, 1.0, &[], 0.0, 1));
-        assert!(allowed(&[w("w", 8.0, 10080.0, None, None)], weekly, 1.0, &[], 0.0, 1));
-        assert!(allowed(&[w("w", 5.0, 300.0, None, None)], weekly, 1.0, &[], 0.0, 0));
+        assert!(!allowed(
+            &[w("w", 7.0, 10080.0, None, None)],
+            weekly,
+            1.0,
+            &[],
+            0.0,
+            1
+        ));
+        assert!(allowed(
+            &[w("w", 8.0, 10080.0, None, None)],
+            weekly,
+            1.0,
+            &[],
+            0.0,
+            1
+        ));
+        assert!(allowed(
+            &[w("w", 5.0, 300.0, None, None)],
+            weekly,
+            1.0,
+            &[],
+            0.0,
+            0
+        ));
         assert!(allowed(&[], weekly, 1.0, &[3.8], 0.0, 3));
         assert!(!allowed(&[], weekly, 3.0, &[3.8], 0.0, 3));
         assert_eq!(budget_cost_full(&[], &[], &weekly, 1.0, 5.0, 0.0), None);
@@ -1510,7 +1534,14 @@ mod legacy_suite_edges {
         assert_eq!(reserved.active_agents, 2);
         assert_eq!(reserved.windows[0].remaining_percent, 6.0);
         assert_eq!(reserved.windows[1].remaining_percent, 85.0);
-        assert!(!allowed(&reserved.windows, [0.5, 2.0, 6.0, 15.0], 1.0, &[], 0.0, 1));
+        assert!(!allowed(
+            &reserved.windows,
+            [0.5, 2.0, 6.0, 15.0],
+            1.0,
+            &[],
+            0.0,
+            1
+        ));
         assert_eq!(account.windows[0].remaining_percent, 14.0);
         let unknown = reserve_active_quota(
             &cfg,
@@ -1561,33 +1592,85 @@ mod legacy_suite_edges {
         let ranked = rank_candidates(
             &cfg,
             vec![
-                cand("claudeAgent", "claude-opus-5-5", 0.95, 1.0, false, 0.1, Some(1.0), 0),
+                cand(
+                    "claudeAgent",
+                    "claude-opus-5-5",
+                    0.95,
+                    1.0,
+                    false,
+                    0.1,
+                    Some(1.0),
+                    0,
+                ),
                 cand("codex", "gpt-6.1-sol", 0.95, 0.8, true, 0.1, Some(1.0), 0),
             ],
             3,
             Some("claudeAgent"),
             weights,
         );
-        assert_eq!(ranked.iter().find(|r| r.eligible).unwrap().candidate.provider, "codex");
+        assert_eq!(
+            ranked
+                .iter()
+                .find(|r| r.eligible)
+                .unwrap()
+                .candidate
+                .provider,
+            "codex"
+        );
         // A small quality edge does not spend the orchestrator's shared quota.
         let ranked = rank_candidates(
             &cfg,
             vec![
-                cand("claudeAgent", "claude-opus-5-5", 0.95, 0.82, true, 0.1, Some(1.0), 0),
+                cand(
+                    "claudeAgent",
+                    "claude-opus-5-5",
+                    0.95,
+                    0.82,
+                    true,
+                    0.1,
+                    Some(1.0),
+                    0,
+                ),
                 cand("codex", "gpt-6.1-sol", 0.95, 0.8, true, 0.1, Some(1.0), 0),
             ],
             1,
             Some("claudeAgent"),
             weights,
         );
-        assert_eq!(ranked.iter().find(|r| r.eligible).unwrap().candidate.provider, "codex");
+        assert_eq!(
+            ranked
+                .iter()
+                .find(|r| r.eligible)
+                .unwrap()
+                .candidate
+                .provider,
+            "codex"
+        );
         // One model on two accounts pools one verdict; parallel work goes idle-first.
         let spread = rank_candidates(
             &cfg,
             vec![
                 cand("codex", "gpt-6.1-sol", 0.95, 0.86, true, 0.5, Some(1.0), 1),
-                cand("codex_second", "gpt-6.1-sol", 0.95, 0.84, true, 0.6, Some(1.0), 0),
-                cand("antigravity", "gemini-x", 0.95, 0.849, true, 0.5, Some(1.0), 0),
+                cand(
+                    "codex_second",
+                    "gpt-6.1-sol",
+                    0.95,
+                    0.84,
+                    true,
+                    0.6,
+                    Some(1.0),
+                    0,
+                ),
+                cand(
+                    "antigravity",
+                    "gemini-x",
+                    0.95,
+                    0.849,
+                    true,
+                    0.5,
+                    Some(1.0),
+                    0,
+                ),
             ],
             3,
             Some("claudeAgent"),
@@ -1597,7 +1680,16 @@ mod legacy_suite_edges {
         assert_eq!(spread[0].candidate.quality, spread[1].candidate.quality);
         // Cheap-model bonus wins a small gap, never a whole Jev level; halved when hard.
         let cheap = |model: &str, burn: f64, quality: f64| {
-            cand("claude_third", model, 0.95, quality, true, 0.1, Some(burn), 0)
+            cand(
+                "claude_third",
+                model,
+                0.95,
+                quality,
+                true,
+                0.1,
+                Some(burn),
+                0,
+            )
         };
         let pick = |a: Candidate, b: Candidate, difficulty: i64| {
             rank_candidates(&cfg, vec![a, b], difficulty, Some("codex"), weights)
@@ -1625,20 +1717,31 @@ mod legacy_suite_edges {
         );
         // Eligibility uses the raw fit, never a rounded one.
         let fit = |f: f64| {
-            rank_candidates(&cfg, vec![cand("codex", "m", f, 0.8, true, 0.1, Some(1.0), 0)], 1, None, weights)[0]
-                .eligible
+            rank_candidates(
+                &cfg,
+                vec![cand("codex", "m", f, 0.8, true, 0.1, Some(1.0), 0)],
+                1,
+                None,
+                weights,
+            )[0]
+            .eligible
         };
         assert!(!fit(MIN_FIT - 0.0004));
     }
 
     #[test]
     fn answers_must_be_bounded_and_coherent() {
-        let answer = |score: f64, probs: Value, confidence: f64| {
-            serde_json::json!({"score": score, "confidence": confidence, "probabilities": probs})
-        };
+        let answer = |score: f64, probs: Value, confidence: f64| serde_json::json!({"score": score, "confidence": confidence, "probabilities": probs});
         let p = || serde_json::json!({"0": 0.0, "1": 0.1, "2": 0.6, "3": 0.3});
         assert!(valid_answer(&answer(2.2, p(), 0.8), true));
-        assert!(!valid_answer(&answer(9.0, serde_json::json!({"0": 0.0, "1": 0.0, "2": 1.0, "3": 1.0}), 0.8), true));
+        assert!(!valid_answer(
+            &answer(
+                9.0,
+                serde_json::json!({"0": 0.0, "1": 0.0, "2": 1.0, "3": 1.0}),
+                0.8
+            ),
+            true
+        ));
         assert!(!valid_answer(&answer(-0.1, p(), 0.8), true));
         assert!(!valid_answer(&answer(2.0, p(), 1.2), true));
         assert!(!valid_answer(
@@ -1646,11 +1749,19 @@ mod legacy_suite_edges {
             true
         ));
         assert!(!valid_answer(
-            &answer(2.0, serde_json::json!({"0": 0.0, "1": 0.1, "2": 0.2, "3": 0.2}), 0.8),
+            &answer(
+                2.0,
+                serde_json::json!({"0": 0.0, "1": 0.1, "2": 0.2, "3": 0.2}),
+                0.8
+            ),
             true
         ));
         assert!(!valid_answer(
-            &answer(2.0, serde_json::json!({"0": -0.1, "1": 0.2, "2": 0.6, "3": 0.3}), 0.8),
+            &answer(
+                2.0,
+                serde_json::json!({"0": -0.1, "1": 0.2, "2": 0.6, "3": 0.3}),
+                0.8
+            ),
             true
         ));
     }
@@ -1683,12 +1794,16 @@ mod legacy_suite_edges {
         assert!(validate_target(&ranked, "antigravity", "flash").allowed);
         assert!(!validate_target(&ranked, "claudeAgent", "opus").allowed);
         assert!(
-            validate_target(&ranked, "opencode", "muse").reason.contains("quota"),
+            validate_target(&ranked, "opencode", "muse")
+                .reason
+                .contains("quota"),
             "{}",
             validate_target(&ranked, "opencode", "muse").reason
         );
         assert!(
-            validate_target(&ranked, "codex_second", "sol2").reason.contains("fit"),
+            validate_target(&ranked, "codex_second", "sol2")
+                .reason
+                .contains("fit"),
             "{}",
             validate_target(&ranked, "codex_second", "sol2").reason
         );

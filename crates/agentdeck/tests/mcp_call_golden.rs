@@ -358,9 +358,11 @@ fn no_inherited_connection_cli_error_matches_golden() {
     if !path.exists() {
         panic!("no-inherited-connection: missing golden; regenerate with UPDATE_GOLDEN=1");
     }
-    let golden: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    assert_eq!(golden["exit"].as_i64().unwrap() as i32, run_rust.status.code().unwrap());
+    let golden: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        golden["exit"].as_i64().unwrap() as i32,
+        run_rust.status.code().unwrap()
+    );
     assert_eq!(golden["stderr"].as_str().unwrap(), rust_err);
 }
 

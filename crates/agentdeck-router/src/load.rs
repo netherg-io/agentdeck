@@ -227,26 +227,84 @@ mod legacy_suite_tests {
         // and a waiting run already live.
         session("sc", "claudeAgent", "ready", "claude-opus-5-5");
         pthread("pt-claude", "claudeAgent", "sc", "active");
-        run("run-c", "claudeAgent", "pt-claude", "running", Some("claude-opus-5-5"));
-        run("run-c-wait", "claudeAgent", "pt-claude", "waiting", Some("claude-opus-5-5"));
-        run("run-c-next", "claudeAgent", "pt-claude", "queued", Some("claude-sonnet-5-5"));
+        run(
+            "run-c",
+            "claudeAgent",
+            "pt-claude",
+            "running",
+            Some("claude-opus-5-5"),
+        );
+        run(
+            "run-c-wait",
+            "claudeAgent",
+            "pt-claude",
+            "waiting",
+            Some("claude-opus-5-5"),
+        );
+        run(
+            "run-c-next",
+            "claudeAgent",
+            "pt-claude",
+            "queued",
+            Some("claude-sonnet-5-5"),
+        );
         attempt("att-c", "run-c-wait", "pt-claude");
         turn("turn-c", "pt-claude", Some("att-c"), "running");
-        child("kid-sonnet", "claudeAgent", "run-c", None, "running", Some("claude-sonnet-5-5"));
+        child(
+            "kid-sonnet",
+            "claudeAgent",
+            "run-c",
+            None,
+            "running",
+            Some("claude-sonnet-5-5"),
+        );
         child("kid-unknown", "claudeAgent", "run-c", None, "running", None);
-        child("kid-done", "claudeAgent", "run-c", None, "completed", Some("claude-opus-5-5"));
-        child("kid-cancel", "claudeAgent", "run-c", None, "cancelled", Some("claude-opus-5-5"));
+        child(
+            "kid-done",
+            "claudeAgent",
+            "run-c",
+            None,
+            "completed",
+            Some("claude-opus-5-5"),
+        );
+        child(
+            "kid-cancel",
+            "claudeAgent",
+            "run-c",
+            None,
+            "cancelled",
+            Some("claude-opus-5-5"),
+        );
         // agy: an idle (finished) child and a running one with no model in payload.
         session("sa", "antigravity", "ready", "gemini-3.8-pro");
         pthread("pt-agy", "antigravity", "sa", "idle");
-        run("run-a", "antigravity", "pt-agy", "completed", Some("gemini-3.8-pro"));
+        run(
+            "run-a",
+            "antigravity",
+            "pt-agy",
+            "completed",
+            Some("gemini-3.8-pro"),
+        );
         child("agy-idle", "antigravity", "run-a", None, "idle", None);
         child("agy-running", "antigravity", "run-a", None, "running", None);
         // Leftover 'running' child whose parent session stopped.
         session("ss", "claudeAgent", "stopped", "claude-opus-5-5");
         pthread("pt-stale", "claudeAgent", "ss", "idle");
-        run("run-s", "claudeAgent", "pt-stale", "completed", Some("claude-opus-5-5"));
-        child("kid-stale", "claudeAgent", "run-s", None, "running", Some("claude-opus-5-5"));
+        run(
+            "run-s",
+            "claudeAgent",
+            "pt-stale",
+            "completed",
+            Some("claude-opus-5-5"),
+        );
+        child(
+            "kid-stale",
+            "claudeAgent",
+            "run-s",
+            None,
+            "running",
+            Some("claude-opus-5-5"),
+        );
         // Codex parent and native child with its own thread and turn: counted once via its turn.
         session("sx", "codex", "ready", "gpt-6.1-sol");
         pthread("pt-codex", "codex", "sx", "active");
@@ -254,10 +312,23 @@ mod legacy_suite_tests {
         run("run-x", "codex", "pt-codex", "running", Some("gpt-6.1-sol"));
         turn("turn-x", "pt-codex", None, "running");
         turn("turn-x-kid", "pt-codex-kid", None, "running");
-        child("codex-kid", "codex", "run-x", Some("pt-codex-kid"), "running", Some("gpt-6-astra"));
+        child(
+            "codex-kid",
+            "codex",
+            "run-x",
+            Some("pt-codex-kid"),
+            "running",
+            Some("gpt-6-astra"),
+        );
         // Running is projected before the provider's first turn: the branch still occupies a slot.
         pthread("pt-warm", "codex", "sx", "active");
-        run("run-warm", "codex", "pt-warm", "running", Some("gpt-6.1-sol"));
+        run(
+            "run-warm",
+            "codex",
+            "pt-warm",
+            "running",
+            Some("gpt-6.1-sol"),
+        );
         db.close().unwrap();
 
         let before = std::fs::read(&file).unwrap();

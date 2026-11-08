@@ -31,7 +31,10 @@ fn write_golden(name: &str, value: &serde_json::Value) {
 fn read_golden(name: &str) -> serde_json::Value {
     let path = golden_path(name);
     if !path.exists() {
-        panic!("{name}: missing golden {}; regenerate with UPDATE_GOLDEN=1", path.display());
+        panic!(
+            "{name}: missing golden {}; regenerate with UPDATE_GOLDEN=1",
+            path.display()
+        );
     }
     serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
 }
@@ -299,7 +302,10 @@ fn passthrough_exit_code_matches_golden() {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        cmd.spawn().expect("spawn agentdeck").wait_with_output().expect("output")
+        cmd.spawn()
+            .expect("spawn agentdeck")
+            .wait_with_output()
+            .expect("output")
     };
     let golden = read_golden("passthrough");
     if std::env::var("UPDATE_GOLDEN").is_ok() {

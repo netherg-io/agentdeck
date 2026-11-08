@@ -34,15 +34,42 @@ const FILES: &[(&str, &[u8])] = &[];
 /// the ones still matching the recorded SHA-256 (hex) of the deleted
 /// legacy sources, so user-modified copies are never touched.
 const LEGACY_FILES: &[(&str, &str)] = &[
-    ("route.mjs", "646340bcbc54465f129bb65c2c39eced2021b0dc36c116ea7d93f595703a75f4"),
-    ("policy.mjs", "a4f4d8f8e29b38c05947185abccee6fb6970f34fd59bc246bf44c2dacbe0a305"),
-    ("hook.mjs", "92a63217fb657fddba7f8e946d1a92355afc4cef19d0943b9befa74c6a107c3e"),
-    ("reasoning.mjs", "6b953c8c033f80315970b189fce69890dfcce7b0d168863a2d8198e771d88619"),
-    ("load.mjs", "a21c7ae03455dc3a87cb7b7415c4c730307640cdb98cc4158f941088ace00889"),
-    ("workflow.mjs", "588953c8b0a9cb25e4c00cc616207b9a181cbae00edc59a9f7df18310eadb202"),
-    ("t3-mcp-call.mjs", "0f1d8375aeefd332bc83d22f05f89acc63aa21098bbb6c95d7b995f29229d274"),
-    ("claude-shell-mcp.mjs", "802014f483fe7d82587a051a5b754f4707367badc4f1483e198f50a77ec892f3"),
-    ("roster.json", "9b4307384aa12064be5a6e6b42d3926c97d0d43620cb48499531ef21e81751b3"),
+    (
+        "route.mjs",
+        "646340bcbc54465f129bb65c2c39eced2021b0dc36c116ea7d93f595703a75f4",
+    ),
+    (
+        "policy.mjs",
+        "a4f4d8f8e29b38c05947185abccee6fb6970f34fd59bc246bf44c2dacbe0a305",
+    ),
+    (
+        "hook.mjs",
+        "92a63217fb657fddba7f8e946d1a92355afc4cef19d0943b9befa74c6a107c3e",
+    ),
+    (
+        "reasoning.mjs",
+        "6b953c8c033f80315970b189fce69890dfcce7b0d168863a2d8198e771d88619",
+    ),
+    (
+        "load.mjs",
+        "a21c7ae03455dc3a87cb7b7415c4c730307640cdb98cc4158f941088ace00889",
+    ),
+    (
+        "workflow.mjs",
+        "588953c8b0a9cb25e4c00cc616207b9a181cbae00edc59a9f7df18310eadb202",
+    ),
+    (
+        "t3-mcp-call.mjs",
+        "0f1d8375aeefd332bc83d22f05f89acc63aa21098bbb6c95d7b995f29229d274",
+    ),
+    (
+        "claude-shell-mcp.mjs",
+        "802014f483fe7d82587a051a5b754f4707367badc4f1483e198f50a77ec892f3",
+    ),
+    (
+        "roster.json",
+        "9b4307384aa12064be5a6e6b42d3926c97d0d43620cb48499531ef21e81751b3",
+    ),
 ];
 
 fn sha256_hex(bytes: &[u8]) -> String {

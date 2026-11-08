@@ -777,7 +777,9 @@ mod legacy_suite_tests {
         );
         assert!(reasoning_target(&c, "opencode", "unknown", 2).is_err());
         assert_eq!(
-            reasoning_target(&c, "opencode", "none", 2).unwrap().get("options"),
+            reasoning_target(&c, "opencode", "none", 2)
+                .unwrap()
+                .get("options"),
             None
         );
         assert_eq!(
@@ -793,12 +795,19 @@ mod legacy_suite_tests {
         let c = catalog();
         let t = target("codex_second", "sol", serde_json::Value::Null);
         assert!(
-            validate_reasoning(&c, &t).unwrap().unwrap().contains("required")
+            validate_reasoning(&c, &t)
+                .unwrap()
+                .unwrap()
+                .contains("required")
         );
         assert!(
             validate_reasoning(
                 &c,
-                &target("codex_second", "sol", serde_json::json!({"reasoningEffort": "low"}))
+                &target(
+                    "codex_second",
+                    "sol",
+                    serde_json::json!({"reasoningEffort": "low"})
+                )
             )
             .unwrap()
             .unwrap()
@@ -808,8 +817,11 @@ mod legacy_suite_tests {
             assert_eq!(
                 validate_reasoning(
                     &c,
-                    &target("codex_second", "sol",
-                        serde_json::json!({"reasoningEffort": value, "serviceTier": "priority"}))
+                    &target(
+                        "codex_second",
+                        "sol",
+                        serde_json::json!({"reasoningEffort": value, "serviceTier": "priority"})
+                    )
                 )
                 .unwrap(),
                 None
@@ -833,7 +845,11 @@ mod legacy_suite_tests {
             assert!(
                 validate_reasoning(
                     &c,
-                    &target("codex_second", "sol", serde_json::json!({"reasoningEffort": value}))
+                    &target(
+                        "codex_second",
+                        "sol",
+                        serde_json::json!({"reasoningEffort": value})
+                    )
                 )
                 .unwrap()
                 .is_some()
@@ -842,19 +858,30 @@ mod legacy_suite_tests {
         assert!(
             validate_reasoning(
                 &c,
-                &target("codex", "luna", serde_json::json!({"reasoningEffort": "ultra"}))
+                &target(
+                    "codex",
+                    "luna",
+                    serde_json::json!({"reasoningEffort": "ultra"})
+                )
             )
             .unwrap()
             .is_some()
         );
         // Repair keeps unrelated options and replaces only the reasoning knob.
         let recommended = reasoning_target(&c, "codex_second", "sol", 1).unwrap();
-        let partial = target("codex_second", "sol", serde_json::json!({"serviceTier": "priority"}));
+        let partial = target(
+            "codex_second",
+            "sol",
+            serde_json::json!({"serviceTier": "priority"}),
+        );
         assert_eq!(
             repair_reasoning(&c, &partial, &recommended).unwrap()["options"],
             serde_json::json!({"serviceTier": "priority", "reasoningEffort": "high"})
         );
-        assert_eq!(partial["options"], serde_json::json!({"serviceTier": "priority"}));
+        assert_eq!(
+            partial["options"],
+            serde_json::json!({"serviceTier": "priority"})
+        );
     }
 
     #[test]
@@ -867,7 +894,11 @@ mod legacy_suite_tests {
         assert!(
             validate_reasoning(
                 &c,
-                &target("claudeAgent", "claude-haiku", serde_json::json!({"thinking": false}))
+                &target(
+                    "claudeAgent",
+                    "claude-haiku",
+                    serde_json::json!({"thinking": false})
+                )
             )
             .unwrap()
             .unwrap()
@@ -876,7 +907,11 @@ mod legacy_suite_tests {
         assert_eq!(
             validate_reasoning(
                 &c,
-                &target("claudeAgent", "claude-haiku", serde_json::json!({"thinking": true}))
+                &target(
+                    "claudeAgent",
+                    "claude-haiku",
+                    serde_json::json!({"thinking": true})
+                )
             )
             .unwrap(),
             None

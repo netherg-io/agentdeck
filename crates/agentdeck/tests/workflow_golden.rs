@@ -207,7 +207,10 @@ fn rust_run() -> Vec<serde_json::Value> {
 fn state_machine_matches_golden() {
     let rust = rust_run();
     let ops_list = ops();
-    let pr_record = ops_list.iter().position(|op| op["op"] == "record" && op["step"] == "pr").unwrap();
+    let pr_record = ops_list
+        .iter()
+        .position(|op| op["op"] == "record" && op["step"] == "pr")
+        .unwrap();
     assert_eq!(rust[pr_record]["value"]["state"], "completed");
     assert_eq!(rust[pr_record + 1]["value"]["complete"], true);
     let r = normalize(&serde_json::to_string(&rust).unwrap());
@@ -216,10 +219,8 @@ fn state_machine_matches_golden() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            serde_json::to_string_pretty(
-                &serde_json::from_str::<serde_json::Value>(&r).unwrap(),
-            )
-            .unwrap()
+            serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(&r).unwrap())
+                .unwrap()
                 + "\n",
         )
         .unwrap();
@@ -345,7 +346,17 @@ fn cli_storage_contract() {
     assert_eq!(out.status.code(), Some(2));
     // Only a prepared step releases: `--not-dispatched` on a pending step
     // fails in both implementations (usage error, exit 2).
-    let out = run(&["release", &file, "a", "--thread", "parent", "--not-dispatched"], None);
+    let out = run(
+        &[
+            "release",
+            &file,
+            "a",
+            "--thread",
+            "parent",
+            "--not-dispatched",
+        ],
+        None,
+    );
     assert_eq!(out.status.code(), Some(2));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -384,7 +395,12 @@ fn oversized_dependency_results_fail_prepare_before_routing() {
     }
     let before = calls.get();
     let err = prepare(&mut state, "join", "src", &route).unwrap_err();
-    assert!(err.message.contains("brief plus dependency results exceeds"), "{}", err.message);
+    assert!(
+        err.message
+            .contains("brief plus dependency results exceeds"),
+        "{}",
+        err.message
+    );
     assert_eq!(calls.get(), before);
     assert_eq!(next(&state)["ready"], serde_json::json!(["join"]));
 }

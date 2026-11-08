@@ -781,7 +781,10 @@ mod legacy_suite_tests {
     fn payload_files_unwrap_prepared_output() {
         let dir = std::env::temp_dir().join(format!("mcp-payload-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(read_payload(None).unwrap(), Value::Object(Default::default()));
+        assert_eq!(
+            read_payload(None).unwrap(),
+            Value::Object(Default::default())
+        );
         let file = dir.join("prepared.json");
         std::fs::write(
             &file,

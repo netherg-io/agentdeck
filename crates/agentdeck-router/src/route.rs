@@ -2335,8 +2335,7 @@ mod quota_estimate_tests {
         }
         let mut logs: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
-        let mut totals: std::collections::HashMap<String, f64> =
-            std::collections::HashMap::new();
+        let mut totals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
         let mut event = |file: &str,
                          minute: f64,
                          model: &str,
