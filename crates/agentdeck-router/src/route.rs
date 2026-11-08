@@ -2285,6 +2285,130 @@ mod quota_estimate_tests {
         m
     }
 
+    /// Ported from the legacy Node `costs.test.mjs` (deleted with the router
+    /// `.mjs` sources): session-log calibration deduplicates repeats, ignores
+    /// stale snapshot jumps and excludes mixed-plan sessions.
+    #[test]
+    fn session_log_calibration_ignores_repeats_jumps_and_mixed_plans() {
+        let home = std::env::temp_dir().join(format!(
+            "codex-costs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        // NOTE: the legacy Node suite reads `.codex/sessions/*/*/*/*.jsonl`
+        // (year/month/day/file); the Rust walk below only descends to
+        // `*/*/*.jsonl`, so this fixture uses that depth. Flagged in the
+        // handoff; router behaviour is frozen by this task's brief.
+        let sessions = home.join(".codex/sessions/2026/10");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0);
+        let start = now_ms - 3.0 * 86400e3;
+        let resets = (now_ms / 1000.0).round() as i64 + 3 * 86400;
+        // ISO-8601 timestamps; only spacing and ordering matter.
+        fn iso(ms: f64) -> String {
+            let secs = (ms / 1000.0) as i64;
+            let millis = (ms % 1000.0).rem_euclid(1000.0) as i64;
+            // Days since epoch to civil date (Hinnant's algorithm).
+            let z = secs.div_euclid(86400) + 719468;
+            let era = z.div_euclid(146097);
+            let doe = z.rem_euclid(146097);
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+            let y = yoe + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d = doy - (153 * mp + 2) / 5 + 1;
+            let m = if mp < 10 { mp + 3 } else { mp - 9 };
+            let y = if m <= 2 { y + 1 } else { y };
+            let tod = secs.rem_euclid(86400);
+            format!(
+                "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+                tod / 3600,
+                (tod % 3600) / 60,
+                tod % 60
+            )
+        }
+        let mut logs: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut totals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        let mut event = |file: &str,
+                         minute: f64,
+                         model: &str,
+                         plan: &str,
+                         used: f64,
+                         tokens: f64,
+                         repeat: bool| {
+            let total = totals.entry(file.to_string()).or_insert(0.0);
+            if !repeat {
+                *total += tokens;
+            }
+            let lines = logs.entry(file.to_string()).or_default();
+            lines.push(
+                serde_json::json!({"timestamp": iso(start + minute * 60e3), "type": "turn_context",
+                    "payload": {"model": model}})
+                .to_string(),
+            );
+            lines.push(
+                serde_json::json!({"timestamp": iso(start + minute * 60e3), "type": "event_msg",
+                    "payload": {"type": "token_count",
+                        "info": {"last_token_usage": {"total_tokens": tokens},
+                            "total_token_usage": {"total_tokens": *total}},
+                        "rate_limits": {"primary": {"used_percent": used, "window_minutes": 10080,
+                            "resets_at": resets}, "secondary": null, "plan_type": plan}}})
+                .to_string(),
+            );
+        };
+        // Pro 5x gpt-x: 1 point per 1000 tokens; repeats log no new tokens.
+        for i in 0..10 {
+            for k in 0..3 {
+                event(
+                    &format!("x{i}"),
+                    (i * 10 + k) as f64,
+                    "gpt-x",
+                    "prolite",
+                    (10 + i * 3 + k) as f64,
+                    1000.0,
+                    false,
+                );
+            }
+            event(
+                &format!("x{i}"),
+                i as f64 * 10.0 + 2.5,
+                "gpt-x",
+                "prolite",
+                (12 + i * 3) as f64,
+                1000.0,
+                true,
+            );
+        }
+        // A stale snapshot jump inside a session is not consumption.
+        event("x0", 3.0, "gpt-x", "prolite", 60.0, 0.0, false);
+        event("x0", 4.0, "gpt-x", "prolite", 12.0, 0.0, false);
+        // A session mixing both accounts cannot be one account's sample.
+        event("mix", 150.0, "gpt-x", "prolite", 45.0, 1000.0, false);
+        event("mix", 151.0, "gpt-x", "plus", 1.0, 1000.0, false);
+        for (name, lines) in &logs {
+            std::fs::write(sessions.join(format!("{name}.jsonl")), lines.join("\n")).unwrap();
+        }
+        let env = Env {
+            home: home.clone(),
+            runtime: home.join("rt"),
+            state_home: home.join("state"),
+            router_json: None,
+        };
+        let m = compute_codex_costs(&env);
+        let (n, pct) = m.costs.get("prolite|gpt-x").expect("measured costs");
+        assert_eq!(*n, 10);
+        assert_eq!(*pct, [3.0, 3.0, 3.0, 3.0]);
+        assert!(!m.costs.contains_key("plus|gpt-x"));
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
     #[test]
     fn measured_basis_reports_sample_count() {
         let cfg = test_cfg();

@@ -1,0 +1,63 @@
+[
+  true,
+  true,
+  false,
+  false,
+  {
+    "endpoint": "http://127.0.0.1:3773/mcp",
+    "authorization": "Bearer first-secret"
+  },
+  {
+    "endpoint": "http://127.0.0.1:3773/mcp",
+    "authorization": "Bearer second-secret"
+  },
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  {
+    "endpoint": "http://127.0.0.1:3773/mcp",
+    "authorization": "Bearer first-secret"
+  },
+  {
+    "endpoint": "http://127.0.0.1:3773/mcp",
+    "authorization": "Bearer second-secret"
+  },
+  null,
+  {
+    "endpoint": "http://127.0.0.1:1/mcp",
+    "authorization": "Bearer old"
+  },
+  {
+    "endpoint": "http://127.0.0.1:1/mcp",
+    "authorization": "Bearer old"
+  },
+  null,
+  {
+    "endpoint": "http://127.0.0.1:3773/mcp",
+    "authorization": "Bearer first-secret"
+  },
+  null,
+  null,
+  {
+    "endpoint": "http://127.0.0.1:3773/mcp",
+    "authorization": "Bearer first-secret"
+  },
+  {
+    "endpoint": "http://127.0.0.1:3773/mcp",
+    "authorization": "Bearer first-secret"
+  },
+  "{\"error\":\"not_configured\"}\n",
+  "{\"endpoint\":\"http://127.0.0.1:1/mcp\",\"authorization\":\"Bearer s\"}\n",
+  {
+    "lines": [
+      "{\"type\":\"user\"}",
+      "{\"a\": \"π\"}"
+    ],
+    "forwarded": "7b2274797065223a2275736572227d0a7b2261223a2022cf80227d0d0a"
+  }
+]

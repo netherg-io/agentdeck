@@ -56,7 +56,7 @@ agentdeck skills | instructions | mcp   shared skills, AGENTS.md links, MCP list
 agentdeck wrapper       terminal wrappers and legacy launcher cleanup
 agentdeck service       install/remove/inspect the systemd user unit (never starts it)
 agentdeck plugin        enable/disable built-in plugins (agent-process, ai-usage, router)
-agentdeck route         route a task through the router (route.mjs port)
+agentdeck route         route a task through the router (`agentdeck route`, hook, workflow, shell bridge)
 agentdeck router        refresh the generated router.json
 agentdeck ps            live agent-process tree (read-only)
 agentdeck migrate       copy-only migration from the old ai-usage tree

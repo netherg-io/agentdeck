@@ -19,3 +19,8 @@ Replace (one owner session, temp dirs only for checks):
 Roll back: `agentdeck plugin disable router` (keeps `router.json`),
 restore the old provider `binaryPath`, detach the session again.
 The standalone `~/.general/scripts/model-route` tree is untouched.
+
+Status: the cutover is complete. The legacy Node router sources are
+deleted; `agentdeck route` (route, hook, workflow, shell bridge,
+`t3-mcp-call`) is the only router. No Node is needed at runtime or
+in tests.

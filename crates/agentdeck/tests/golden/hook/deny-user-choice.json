@@ -1,0 +1,94 @@
+{
+  "exit": 0,
+  "stdout": "{\"decision\":\"deny\",\"reason\":\"model-route: [route:user-choice] needs a recent user message that names gpt-6.1-sol. Do not use it for models the user did not ask for.\"}",
+  "records": [
+    {
+      "t": "",
+      "harness": "shell",
+      "instance": "codex",
+      "toolName": "delegate_task",
+      "decision": "deny:user-choice",
+      "reason": "model-route: [route:user-choice] needs a recent user message that names gpt-6.1-sol. Do not use it for models the user did not ask for.",
+      "target": {
+        "providerInstanceId": "claudeAgent",
+        "model": "claude-opus-5-5",
+        "options": {
+          "effort": "high"
+        }
+      },
+      "size": "1: a focused change or review of a few files",
+      "confidence": 0.9,
+      "requestedTarget": {
+        "providerInstanceId": "codex",
+        "model": "gpt-6.1-sol",
+        "options": {
+          "reasoningEffort": "medium"
+        }
+      },
+      "blocked": [
+        "codex/gpt-6.1-sol"
+      ],
+      "ranking": [
+        {
+          "provider": "claudeAgent",
+          "model": "claude-opus-5-5",
+          "profiled": true,
+          "burn": 1,
+          "target": {
+            "providerInstanceId": "claudeAgent",
+            "model": "claude-opus-5-5",
+            "options": {
+              "effort": "high"
+            }
+          },
+          "fit": 0.95,
+          "quality": 0.8,
+          "confidence": 0.9,
+          "allowed": true,
+          "taskCost": 0.1,
+          "quota": "Week 60% left; resets in Rh, 5h 20% left; resets in Rh (0 active agents; count unknown)",
+          "activeAgents": 0,
+          "account": "claude",
+          "sharedQuota": false,
+          "sharedQuotaPenalty": 0,
+          "paidCreditPenalty": 0,
+          "cheapModelBonus": 0,
+          "eligible": true,
+          "score": 0.8
+        },
+        {
+          "provider": "codex",
+          "model": "gpt-6.1-sol",
+          "profiled": true,
+          "burn": 1,
+          "target": {
+            "providerInstanceId": "codex",
+            "model": "gpt-6.1-sol",
+            "options": {
+              "reasoningEffort": "high"
+            }
+          },
+          "fit": 0.95,
+          "quality": 0.967,
+          "confidence": 0.9,
+          "allowed": false,
+          "taskCost": 8,
+          "quota": "Week 0% left; resets in Rh (0 active agents; count unknown)",
+          "activeAgents": 0,
+          "account": "codex",
+          "sharedQuota": true,
+          "sharedQuotaPenalty": 0.05,
+          "paidCreditPenalty": 0,
+          "cheapModelBonus": 0,
+          "eligible": false,
+          "score": 0.917
+        }
+      ],
+      "activeLoad": {
+        "known": false,
+        "agents": [],
+        "note": "live T3 agent metadata unavailable"
+      }
+    }
+  ]
+}

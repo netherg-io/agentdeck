@@ -1,8 +1,7 @@
-//! Agentdeck copy of the model-route Node router: the `router.json`
-//! generator (pool + account maps), hook registration and the instruction
-//! marker block. The router itself runs from this binary (`agentdeck route`,
-//! `agentdeck route hook`), so no `.mjs` files are extracted at runtime: the
-//! assets stay in the repo as parity-test fixtures.
+//! Agentdeck copy of the model-route router: the `router.json` generator
+//! (pool + account maps), hook registration and the instruction marker
+//! block. The router runs from this binary (`agentdeck route`,
+//! `agentdeck route hook`); the legacy Node `.mjs` sources are deleted.
 //!
 //! Everything lands in `<state_dir>/router/` (just `router.json`). The old
 //! standalone copy in `~/.general/scripts/model-route` is never touched.
@@ -27,39 +26,56 @@ pub const USAGE_STATE_PATH: &str = "~/.local/state/ai-usage/state.json";
 pub const ROUTER_MARKER: &str = "model-route";
 
 /// Runtime files extracted next to `router.json`. The ported router
-/// (`route`, `hook`) runs from the binary, so nothing is extracted any more:
-/// every `.mjs` asset stays in the repo only as the parity-test fixture.
+/// (`route`, `hook`) runs from the binary, so nothing is extracted any more.
 /// `router.json` is generated data and is kept.
 const FILES: &[(&str, &[u8])] = &[];
 
 /// Previously extracted files: enable wrote them, disable/upgrade removes
-/// the ones still matching the embedded bytes.
-const LEGACY_FILES: &[(&str, &[u8])] = &[
-    ("route.mjs", include_bytes!("../assets/router/route.mjs")),
-    ("policy.mjs", include_bytes!("../assets/router/policy.mjs")),
-    ("hook.mjs", include_bytes!("../assets/router/hook.mjs")),
+/// the ones still matching the recorded SHA-256 (hex) of the deleted
+/// legacy sources, so user-modified copies are never touched.
+const LEGACY_FILES: &[(&str, &str)] = &[
+    (
+        "route.mjs",
+        "646340bcbc54465f129bb65c2c39eced2021b0dc36c116ea7d93f595703a75f4",
+    ),
+    (
+        "policy.mjs",
+        "a4f4d8f8e29b38c05947185abccee6fb6970f34fd59bc246bf44c2dacbe0a305",
+    ),
+    (
+        "hook.mjs",
+        "92a63217fb657fddba7f8e946d1a92355afc4cef19d0943b9befa74c6a107c3e",
+    ),
     (
         "reasoning.mjs",
-        include_bytes!("../assets/router/reasoning.mjs"),
+        "6b953c8c033f80315970b189fce69890dfcce7b0d168863a2d8198e771d88619",
     ),
-    ("load.mjs", include_bytes!("../assets/router/load.mjs")),
+    (
+        "load.mjs",
+        "a21c7ae03455dc3a87cb7b7415c4c730307640cdb98cc4158f941088ace00889",
+    ),
     (
         "workflow.mjs",
-        include_bytes!("../assets/router/workflow.mjs"),
+        "588953c8b0a9cb25e4c00cc616207b9a181cbae00edc59a9f7df18310eadb202",
     ),
     (
         "t3-mcp-call.mjs",
-        include_bytes!("../assets/router/t3-mcp-call.mjs"),
+        "0f1d8375aeefd332bc83d22f05f89acc63aa21098bbb6c95d7b995f29229d274",
     ),
     (
         "claude-shell-mcp.mjs",
-        include_bytes!("../assets/router/claude-shell-mcp.mjs"),
+        "802014f483fe7d82587a051a5b754f4707367badc4f1483e198f50a77ec892f3",
     ),
     (
         "roster.json",
-        include_bytes!("../assets/router/roster.json"),
+        "9b4307384aa12064be5a6e6b42d3926c97d0d43620cb48499531ef21e81751b3",
     ),
 ];
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
 
 pub const CLAUDE_MATCHER: &str = "^(?:Agent|Workflow)$|.*delegate_task$";
 pub const CODEX_MATCHER: &str = "^(?:collaboration\\.?)?spawn_agent$|^Agent$|.*delegate_task$";
@@ -319,14 +335,14 @@ pub fn plan_router_files(paths: &Paths, reg: &Registry) -> anyhow::Result<Vec<Ch
 }
 
 /// Plan removing previously extracted files (only ones matching the
-/// embedded bytes). `router.json` is data and is kept.
+/// recorded SHA-256). `router.json` is data and is kept.
 pub fn plan_remove_router_files(paths: &Paths) -> Vec<Change> {
     let dir = router_dir(paths);
     let mut changes = Vec::new();
-    for (name, bytes) in LEGACY_FILES {
+    for (name, hash) in LEGACY_FILES {
         let path = dir.join(name);
         if let Ok(old) = std::fs::read(&path)
-            && old.as_slice() == *bytes
+            && sha256_hex(&old) == *hash
         {
             changes.push(Change::Remove { path });
         }
@@ -995,6 +1011,34 @@ pub fn plan_remove_shell_link(home: &Path, exe: &Path) -> Vec<Change> {
 mod tests {
     use super::*;
     use crate::registry::{AddSpec, Harness};
+
+    #[test]
+    fn legacy_cleanup_matches_recorded_hashes_only() {
+        let (paths, dir) = test_paths("legacy-cleanup");
+        let router = router_dir(&paths);
+        std::fs::create_dir_all(&router).unwrap();
+        // roster.json stays in the repo: a pristine copy is removed, a
+        // modified one (and unknown files) are kept.
+        let pristine = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/router/roster.json"
+        ))
+        .unwrap();
+        std::fs::write(router.join("roster.json"), &pristine).unwrap();
+        let mut modified = pristine.clone();
+        modified.push(b'\n');
+        std::fs::write(router.join("route.mjs"), &modified).unwrap();
+        std::fs::write(router.join("custom.mjs"), b"user file").unwrap();
+        let removed: Vec<PathBuf> = plan_remove_router_files(&paths)
+            .into_iter()
+            .filter_map(|c| match c {
+                Change::Remove { path } => Some(path),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(removed, vec![router.join("roster.json")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     use crate::usage::{UsageEntry, UsageKind};
 
     pub(crate) fn test_paths(tag: &str) -> (Paths, PathBuf) {
@@ -1071,7 +1115,7 @@ mod tests {
         .unwrap();
         let reg = Registry::load(&paths).unwrap();
         let changes = plan_router_files(&paths, &reg).unwrap();
-        // Only router.json; the .mjs assets stay in the repo as fixtures.
+        // Only router.json; nothing else is extracted anymore.
         assert_eq!(changes.len(), 1);
         crate::changes::apply_changes(&changes).unwrap();
         let text = std::fs::read_to_string(router_json_path(&paths)).unwrap();

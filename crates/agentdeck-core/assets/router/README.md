@@ -8,18 +8,20 @@ Both Codex logins appear in ai-usage as provider `codex`; instances `codex` and 
 account id (`codex-main`, `codex-second`), so each sees and reserves only its own quota. The Claude logins work the
 same way: `claudeAgent`, `claude_second`, `claude_third` and `claude_fourth` match `claude-main`, `claude-second`, `claude-third` and `claude-fourth`.
 
-- `route.mjs "<goal, inputs, read-only or edits, size>"`: JSON with `target` for `delegate_task`, `ranking`, `blocked`, `unprofiled`.
-- Before routing in a task, call T3 `orchestrator_capabilities` and pass its `structuredContent` JSON on stdin to `route.mjs --catalog`. Refresh after provider/model settings change or a catalog mismatch. Only model IDs and option descriptors are saved in `~/.local/state/model-route/catalog.json`; T3 settings stay app-owned.
+- `agentdeck route "<goal, inputs, read-only or edits, size>"`: JSON with `target` for `delegate_task`, `ranking`, `blocked`, `unprofiled`.
+- Before routing in a task, call T3 `orchestrator_capabilities` and pass its `structuredContent` JSON on stdin to `agentdeck route --catalog`. Refresh after provider/model settings change or a catalog mismatch. Only model IDs and option descriptors are saved in `~/.local/state/model-route/catalog.json`; T3 settings stay app-owned.
 - Every target's `briefHint` combines the shared delegated-agent policy with any family hint, in that order separated by a blank line. Append the entire string verbatim; hooks require it. The shared policy text lives only in `roster.json` (`briefHint`): no nesting, scope, verification, report format and the `BLOCKED:` contract. Children hand pending PR checks/reviews/merges to the coordinator without polling or watching, ending with `PR <url>, head <sha>, checks and reviews <state>`. Local command waits remain allowed; pending PRs are a normal completed handoff, not `BLOCKED:`.
-- `route.mjs --source claudeAgent "<task>"`: explicitly identify the orchestrator; otherwise detected from executable names in the process chain. Other sources: `codex`, `codex_second`, `antigravity`, `opencode`, `claudeAgent_openrouter`. Codex shadow homes identify separate accounts. Unknown source is reported and cannot receive shared-quota protection.
-- `route.mjs --source codex --validate-target PROVIDER MODEL -`: read the complete task from stdin and validate an already selected target. Output includes `validation.allowed` and its reason. A denied target exits 0; malformed input or router failure exits nonzero.
-- `agentdeck route --effort medium|high|xhigh` (Rust binary only): replaces the estimated difficulty when choosing the reasoning level of the returned target. The model choice is unchanged.
+- `agentdeck route --source claudeAgent "<task>"`: explicitly identify the orchestrator; otherwise detected from executable names in the process chain. Other sources: `codex`, `codex_second`, `antigravity`, `opencode`, `claudeAgent_openrouter`. Codex shadow homes identify separate accounts. Unknown source is reported and cannot receive shared-quota protection.
+- `agentdeck route --source codex --validate-target PROVIDER MODEL -`: read the complete task from stdin and validate an already selected target. Output includes `validation.allowed` and its reason. A denied target exits 0; malformed input or router failure exits nonzero.
+- `agentdeck route --effort medium|high|xhigh`: replaces the estimated difficulty when choosing the reasoning level of the returned target. The model choice is unchanged.
 - OpenCode worker agent: `agentdeck plugin enable router` writes `~/.config/opencode/agent/agentdeck-worker.md` (short invariants-first prompt, temperature 0.1, force-push denied; project rules stay in the project's own AGENTS.md). Once OpenCode loads it, T3 lists it as the `agent` option and `route` adds `options.agent` to OpenCode targets. Restart the OpenCode server and refresh the catalog after enabling.
-- `route.mjs --exclude INSTANCE`: ban every favorite on that instance's account for this call (repeatable).
-- `route.mjs --check`: quota, per-size cost and allowed sizes per favorite; favorites without a family
+- `agentdeck route --exclude INSTANCE`: ban every favorite on that instance's account for this call (repeatable).
+- `agentdeck route --check`: quota, per-size cost and allowed sizes per favorite; favorites without a family
   profile are flagged `UNPROFILED` (report-only, exit 0: they route on their Jev judgment with
   conservative max-burn quota, no manual roster edit required).
-- Tests: `for t in *.test.mjs; do node "$t" || break; done`. All offline, with isolated quota/log/SQLite fixtures and mocked Jev; run `claude-shell-mcp.test.mjs` through `agent-process` (it opens sockets).
+- Tests: `cargo test -p agentdeck --test route_golden --test hook_golden --test shell_golden --test mcp_call_golden --test workflow_golden` plus unit tests in `crates/agentdeck-router`. Golden snapshots in `crates/agentdeck/tests/golden/` pin the router CLI contract (`UPDATE_GOLDEN=1` rewrites them). All offline, with isolated quota/log/SQLite fixtures and mocked Jev.
+
+Concurrent routes share a queue in `$XDG_RUNTIME_DIR/model-route-jev-queue`; compatible pending requests go to the judge as one batched decision. HTTP 429 is waited out per Retry-After within 50 s (see `crates/agentdeck-router/src/jev_queue.rs`).
 
 Selection policy:
 - Jev difficulty selects explicit effort: 0/1/2/3 maps to low/medium/high/xhigh. The exact T3 model descriptor supplies the option ID and supported values: Codex `reasoningEffort`, Claude `effort` (older Haiku: boolean `thinking`), OpenCode `variant`. Missing tiers fall back to a supported lower ordinary tier, or the lowest ordinary tier when none is lower. Opaque variants use an advertised default; without one, routing fails instead of guessing. Special Claude `ultracode`/`ultrathink` modes are never selected automatically. Antigravity's Gemini favorites remain eligible without a separate effort option; their exact model IDs encode the reasoning level and are preserved.
@@ -79,7 +81,7 @@ Selection policy:
   counted separately from the current turn, and a delegated child is never counted twice for its run/turn.
   Unknown models reserve the highest profiled burn against every applicable pool. Remaining work size is
   an estimate; this is not an atomic reservation for route choices that have not been dispatched yet.
-  `load.mjs` uses Node's built-in SQLite read-only API: the standalone hook has no MCP transport to list live
+  `the Rust `load` module` uses Node's built-in SQLite read-only API: the standalone hook has no MCP transport to list live
   agents. Only projection metadata is read, never conversation bodies; no app database writes or cleanup.
   Missing/incompatible metadata is explicitly flagged rather than claiming there are no active agents. The quota/load snapshots are refreshed after Jev and before ranking.
 - Only exact active favorites are candidates. Removed OpenCode providers can leave hidden stale entries in
@@ -110,7 +112,7 @@ Selection policy:
 ## Routed workflow replacement
 
 Use `$t3-routed-workflow` ([skill](../../skills/t3-routed-workflow/SKILL.md)) inside the current T3 thread.
-`workflow.mjs` validates a declarative dependency plan, routes each complete child brief through `route.mjs`,
+`agentdeck route workflow` validates a declarative dependency plan, routes each complete child brief through `agentdeck route`,
 and checkpoints prepared payloads, real task IDs and final results in private run files. The coordinator uses
 the current thread's `delegate_task`, `task_status` and `task_cancel` tools; T3 owns execution and completion
 notifications. Supported commands: `init`, `next`, `prepare`, `record`, `release`, `stop`, `resume`, all bound to the
@@ -133,15 +135,15 @@ reproduce native phase UI, or schedule work without a coordinator. Native `Workf
 
 ### Shell dispatch from JSON
 
-`t3-mcp-call delegate_task PREPARED.json > RESPONSE.json` sends the exact `.payload` from
-`workflow.mjs prepare` (or a plain argument object) through the current session's T3 MCP connection.
-Then feed the actual `RESPONSE.json` to `workflow.mjs record`; never construct task IDs yourself.
+`agentdeck route t3-mcp-call delegate_task PREPARED.json > RESPONSE.json` sends the exact `.payload` from
+`agentdeck route workflow prepare` (or a plain argument object) through the current session's T3 MCP connection.
+Then feed the actual `RESPONSE.json` to `agentdeck route workflow record`; never construct task IDs yourself.
 It also accepts JSON on stdin (`-`) and supports `orchestrator_capabilities`, `task_status` and `task_cancel`.
 
 Connection discovery uses an inherited `T3_SHELL_MCP_SOCKET`, inherited ACP variables, or this process's
 ancestor Claude `--mcp-config`. Modern T3 Claude injects MCP through SDK `mcp_set_servers` frames rather
 than command-line config: its provider's `binaryPath` must point to `~/.local/bin/claude-t3-shell`
-(symlink to `claude-shell-mcp.mjs`). The launcher forwards the official Claude CLI's args and byte streams,
+(symlink to the agentdeck binary). The launcher forwards the official Claude CLI's args and byte streams,
 captures its own SDK MCP frames in memory, and passes a private Unix socket path to its own child.
 The socket is `0600` inside a per-launch `0700` runtime directory, removed when the child exits;
 MCP removal/rotation clears/replaces the in-memory connection. Non-streaming CLI commands pass through.
@@ -155,18 +157,18 @@ need not restart. Do not use instance logout or switch accounts for this.
 The shell client never searches other sessions, reads T3's credential store, or starts provider CLIs.
 Credentials remain in memory. Native Codex keeps its scoped MCP config in app-server memory; use its
 native MCP tools/code mode when no shell connection is inherited. Probe from the target shell with
-`t3-mcp-call orchestrator_capabilities` before preparing new launches.
+`agentdeck route t3-mcp-call orchestrator_capabilities` before preparing new launches.
 
 Before delegation the bridge reads live capabilities, refreshes the catalog and invokes the same
-`hook.mjs` checks with the actual provider instance as source. It retains target options, task text and
+`agentdeck route hook` checks with the actual provider instance as source. It retains target options, task text and
 request ID, requires `mode: async`, and rejects explicit `runtimeMode`. Shell decisions are logged with
 `harness: shell`. No transport retry is automatic; after a lost response recover the real task ID from
 parent activity before redispatching. Existing workflow launch-recovery rules still apply.
 
 ```sh
-node ~/.general/scripts/model-route/workflow.mjs prepare "$state" "$step" --thread "$parent" --source "$source" > prepared.json &&
-t3-mcp-call delegate_task prepared.json > response.json &&
-node ~/.general/scripts/model-route/workflow.mjs record "$state" "$step" --thread "$parent" < response.json
+agentdeck route workflow prepare "$state" "$step" --thread "$parent" --source "$source" > prepared.json &&
+agentdeck route t3-mcp-call delegate_task prepared.json > response.json &&
+agentdeck route workflow record "$state" "$step" --thread "$parent" < response.json
 ```
 
 Keep prepared payloads and responses private (`umask 077`) until checkpointing/recovery is complete.
@@ -176,7 +178,7 @@ Keep prepared payloads and responses private (`umask 077`) until checkpointing/r
 - `families`: regex per model family, first match wins. Profiles describe durable family strengths, not versions.
 - `minEffort` (optional, per family): lowest ordinary effort the router selects or the hook accepts for that family (Muse Spark: `high`, user rule 2026-10-10). Difficulty above the floor still raises effort; explicit lower requests are denied with a repaired target.
 - `spendToZero` (optional, per family): ignores any weekly reserve and uses task cost 0 for tie-breaks; the task must still fit the remaining quota (Muse Spark, user rule 2026-10-14).
-- `briefHint` (optional, per family): fixed text for gaps a model reliably has (Muse Spark needs the long-command/PARTIAL guidance). The coordinator chooses and names skills in each task brief; family hints do not ask children to select skills. `route.mjs` composes it after the shared policy and returns the entire string as `briefHint` (winner) and `requestedBriefHint` (validated target); the hook denies a `delegate_task` whose task lacks it verbatim, and `workflow.mjs prepare` appends it.
+- `briefHint` (optional, per family): fixed text for gaps a model reliably has (Muse Spark needs the long-command/PARTIAL guidance). The coordinator chooses and names skills in each task brief; family hints do not ask children to select skills. `agentdeck route` composes it after the shared policy and returns the entire string as `briefHint` (winner) and `requestedBriefHint` (validated target); the hook denies a `delegate_task` whose task lacks it verbatim, and `agentdeck route workflow prepare` appends it.
   Built 2026-10-04 from multi-generation benchmark trends (Artificial Analysis, Arena, Epoch, OSWorld, SWE-bench,
   vendor cards) plus the user's experience. GPT is ranked best at computer use and debugging from the user's own
   tasks, although OSWorld puts Claude first. Many 2026 numbers were vendor-reported; re-check after major releases.
@@ -194,7 +196,7 @@ Volatile areas deliberately left out of profiles: long-context leader, Arena tex
 hallucination rate, Terminal-Bench. OpenAI tier suffixes (sol, astra, luna, terra) change meaning between
 generations, so price comes from quota data, never from the name.
 
-`hook.mjs --harness <claude|codex|agy|opencode|shell>`: guards the delegation entry points below inside T3. The AGENTS.md rule
+`agentdeck route hook --harness <claude|codex|agy|opencode|shell>`: guards the delegation entry points below inside T3. The AGENTS.md rule
 alone was ignored (agents used native subagents and never ran the router), so each harness calls this hook:
 
 | Harness | Event | Registered in | Redirect mechanism |
@@ -204,10 +206,10 @@ alone was ignored (agents used native subagents and never ran the router), so ea
 | Codex | PreToolUse `spawn_agent` / `collaborationspawn_agent` / `Agent` / T3 `delegate_task` | `~/.codex/hooks.json`, trust hash in `~/.codex/config.toml` `[hooks.state]` | native calls redirect to an exact T3 target; MCP calls validate the requested target |
 | agy (T3 ACP) | PreToolUse `start_subagent` / `invoke_subagent` / T3 `delegate_task` | `$GEMINI_HOME/config/hooks.json` (symlink into `~/.gemini/config/plugins/model-route/`) | native subagent calls are denied; direct MCP `delegate_task` calls validate the requested target |
 | OpenCode | `execute.before` on `subagent` / T3 `delegate_task` | `~/.config/opencode/plugin/model-route.ts` | throws `Tool.Error` on a denied or failed hook |
-| Shell bridge | explicit pre-dispatch check | `t3-mcp-call.mjs` | same MCP target validation; source from live scoped capabilities |
+| Shell bridge | explicit pre-dispatch check | `agentdeck route t3-mcp-call` | same MCP target validation; source from live scoped capabilities |
 
 - Only processes T3 launched are routed (Claude: `t3-code` in `--mcp-config` or stream-json under T3's server;
-  Codex/agy: app-server/ACP under T3's server, either the Node `apps/server/dist/bin.mjs` or the native `t3 serve`;
+  Codex/agy: app-server/ACP under T3's server, the native `t3 serve` (older T3 used the Node `apps/server/dist/bin.mjs`);
   OpenCode: server from T3's AppImage). Outside T3 native calls pass through. `delegate_task` exists only in T3, so it
   is always routed: a missed T3 detection must not silently disable routing. Router errors/timeouts deny and
   are logged. Native subagent calls have no escape hatch: they are always routed and handed back to
@@ -230,7 +232,7 @@ alone was ignored (agents used native subagents and never ran the router), so ea
 - Delegated children cannot delegate further: before routing, the hook maps the caller's native session id
   (Claude/Codex `session_id`, agy `conversationId`, OpenCode `sessionID` passed by the plugin; the shell bridge
   passes the T3 `parentThreadId`) to a T3 thread and denies every entry point when that thread is an app-owned
-  subagent's child (`load.mjs` `isDelegatedChild`, logged `deny:nested`). Earlier, a routing denial told such
+  subagent's child (`the Rust `load` module` `isDelegatedChild`, logged `deny:nested`). Earlier, a routing denial told such
   children to use `delegate_task`; lacking it, they silently did the work themselves. Unreadable metadata allows
   routing to continue; the shared `briefHint` forbids nesting as well.
 - Native calls redirect to T3 delegation because aliases, inherited models and role configs cannot pin an exact

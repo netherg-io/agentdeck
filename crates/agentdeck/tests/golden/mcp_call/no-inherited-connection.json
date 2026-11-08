@@ -1,0 +1,4 @@
+{
+  "exit": 1,
+  "stderr": "Expected a loopback T3 MCP endpoint with session authorization.\n"
+}
