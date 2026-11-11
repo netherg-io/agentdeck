@@ -1229,7 +1229,7 @@ fn instruction_actions_preview_cancel_apply_and_import() {
         };
         let mut state = app::State::for_tests(paths, Default::default());
         let _ = app::update(&mut state, app::Message::SelectPage(app::Page::Drift));
-        let _ = app::update(&mut state, app::Message::Drift(drift::load(&ctx)));
+        let _ = app::update(&mut state, app::Message::Drift(drift::load(ctx.clone())));
         agentdeck_gui::i18n::set_language("en");
         let mut ui = iced_test::simulator(app::view(&state));
         ui.click(english).expect("instruction resolution button");
