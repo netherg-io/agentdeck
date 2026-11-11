@@ -294,3 +294,11 @@ settings-eval-workflow = workflow { $run }/{ $step }
 settings-eval-minutes-ago = { $count } min ago
 settings-eval-hours-ago = { $count } h ago
 settings-eval-days-ago = { $count } d ago
+
+drift-instr-use-shared = Use shared file
+drift-instr-use-local = Make shared
+drift-instr-link-consequence = { $path } will link to ~/AGENTS.md.
+drift-instr-import-consequence = This version will replace ~/AGENTS.md and update every file linked to it.
+drift-instr-backup = Backup will be saved to { $path }
+drift-instr-resolved = Instruction file resolved.
+drift-instr-compare = Compare instructions

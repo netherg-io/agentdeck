@@ -42,6 +42,8 @@ pub struct SyncItem {
     pub kind: ItemKind,
     /// Value-free summary (key/path names only, never secret values).
     pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
 }
 
 impl SyncItem {
@@ -51,6 +53,7 @@ impl SyncItem {
             harness: harness.to_string(),
             kind,
             detail,
+            path: None,
         }
     }
 }
@@ -136,12 +139,14 @@ pub fn instruction_items(home: &Path) -> Vec<SyncItem> {
                 _ => ItemKind::Decision,
             };
             let relative = status.path.strip_prefix(home).unwrap_or(&status.path);
-            SyncItem::new(
+            let mut item = SyncItem::new(
                 INSTRUCTIONS_GROUP_ID,
                 "instructions",
                 kind,
                 format!("~/{}: {}", relative.display(), status.state.describe()),
-            )
+            );
+            item.path = Some(status.path);
+            item
         })
         .collect()
 }

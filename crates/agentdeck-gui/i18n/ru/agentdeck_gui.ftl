@@ -301,3 +301,11 @@ settings-eval-workflow = workflow { $run }/{ $step }
 settings-eval-minutes-ago = { $count } мин назад
 settings-eval-hours-ago = { $count } ч назад
 settings-eval-days-ago = { $count } дн назад
+
+drift-instr-use-shared = Использовать общий
+drift-instr-use-local = Сделать общим
+drift-instr-link-consequence = { $path } будет связан с ~/AGENTS.md.
+drift-instr-import-consequence = Эта версия заменит ~/AGENTS.md и обновит все связанные с ним файлы.
+drift-instr-backup = Резервная копия сохранится в { $path }
+drift-instr-resolved = Файл инструкций согласован.
+drift-instr-compare = Сравнение инструкций

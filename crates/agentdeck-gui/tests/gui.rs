@@ -1206,3 +1206,111 @@ fn global_instructions_appear_in_drift_without_secondary_accounts() {
     );
     agentdeck_gui::i18n::set_language("en");
 }
+
+#[test]
+fn instruction_actions_preview_cancel_apply_and_import() {
+    let _env = lock_env();
+    for (choice, english, russian) in [
+        (drift::Kind::Apply, "Use shared file", "Использовать общий"),
+        (drift::Kind::Import, "Make shared", "Сделать общим"),
+    ] {
+        let (paths, directory, _guard) = fixture_paths("instruction-actions");
+        let home = directory.join("home");
+        let target = home.join(".claude/CLAUDE.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let source = home.join("AGENTS.md");
+        std::fs::write(&source, "shared rules\n").unwrap();
+        std::fs::write(&target, "local rules\n").unwrap();
+        Registry::update(&paths, |_| Ok(())).unwrap();
+        let ctx = drift::Ctx {
+            paths: paths.clone(),
+            home,
+            t3_root: None,
+        };
+        let mut state = app::State::for_tests(paths, Default::default());
+        let _ = app::update(&mut state, app::Message::SelectPage(app::Page::Drift));
+        let _ = app::update(&mut state, app::Message::Drift(drift::load(&ctx)));
+        agentdeck_gui::i18n::set_language("en");
+        let mut ui = iced_test::simulator(app::view(&state));
+        ui.click(english).expect("instruction resolution button");
+        let (group, key, kind) = ui
+            .into_messages()
+            .find_map(|message| match message {
+                app::Message::Drift(drift::Message::Act { group, key, kind }) => {
+                    Some((group, key, kind))
+                }
+                _ => None,
+            })
+            .expect("resolution action");
+        assert_eq!(kind, choice);
+        assert_eq!(key, target.to_string_lossy());
+        let pending = drift::preview(&ctx, &group, &key, kind).expect("instruction preview");
+        assert!(pending.instruction.is_some());
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "shared rules\n");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "local rules\n");
+        assert!(!ctx.paths.backup_dir().exists());
+        let _ = app::update(
+            &mut state,
+            app::Message::Drift(drift::Message::PreviewReady(pending.clone())),
+        );
+        for (language, label) in [("en", english), ("ru", russian)] {
+            agentdeck_gui::i18n::set_language(language);
+            for (name, size) in [("wide", (900.0, 620.0)), ("narrow", (520.0, 620.0))] {
+                let mut ui = iced_test::Simulator::with_size(
+                    iced::Settings::default(),
+                    size,
+                    app::view(&state),
+                );
+                ui.find(label).expect("localized instruction action");
+                let screenshot = ui
+                    .snapshot(&agentdeck_gui::style::theme(true))
+                    .expect("instruction preview render");
+                if let Some(directory) = std::env::var_os("AGENTDECK_SHOTS").map(PathBuf::from) {
+                    let path =
+                        directory.join(format!("instruction_{choice:?}_{name}_{language}.png"));
+                    assert!(
+                        screenshot
+                            .matches_image(path)
+                            .expect("save instruction preview")
+                    );
+                }
+            }
+        }
+        agentdeck_gui::i18n::set_language("en");
+        let mut ui = iced_test::simulator(app::view(&state));
+        ui.click("Cancel").expect("cancel resolution");
+        for message in ui.into_messages() {
+            let _ = app::update(&mut state, message);
+        }
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "local rules\n");
+        assert!(!ctx.paths.backup_dir().exists());
+        let pending = drift::preview(&ctx, &group, &key, kind).unwrap();
+        let _ = app::update(
+            &mut state,
+            app::Message::Drift(drift::Message::PreviewReady(pending.clone())),
+        );
+        let mut ui = iced_test::simulator(app::view(&state));
+        ui.click(english).expect("confirm instruction resolution");
+        assert!(
+            ui.into_messages()
+                .any(|message| matches!(message, app::Message::Drift(drift::Message::Confirm)))
+        );
+        let notice = drift::apply(&ctx, &pending);
+        assert!(!notice.starts_with("failed:"), "{notice}");
+        assert_eq!(std::fs::read_link(&target).unwrap(), source);
+        let expected = if choice == drift::Kind::Apply {
+            "shared rules\n"
+        } else {
+            "local rules\n"
+        };
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), expected);
+        assert_eq!(
+            drift::open_items(drift_group(
+                &drift::snapshot(&ctx),
+                agentdeck_core::sync::INSTRUCTIONS_GROUP_ID
+            )),
+            0
+        );
+    }
+    agentdeck_gui::i18n::set_language("en");
+}

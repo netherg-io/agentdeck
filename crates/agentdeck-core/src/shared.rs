@@ -603,50 +603,232 @@ pub fn plan_instructions_link(
     if !src.is_file() {
         anyhow::bail!("shared source {} missing, cannot link", src.display());
     }
+    let contents = fs::read(&src)?;
     let mut changes = Vec::new();
     for (path, _) in instruction_targets(home) {
-        match fs::symlink_metadata(&path) {
-            Err(e) if e.kind() == ErrorKind::NotFound => changes.push(Change::Symlink {
-                link: path,
-                target: src.clone(),
-            }),
-            Err(e) => return Err(e.into()),
-            Ok(m) if m.file_type().is_symlink() => {
-                if fs::read_link(&path).ok().as_deref() != Some(src.as_path()) {
-                    changes.push(Change::Symlink {
-                        link: path,
-                        target: src.clone(),
-                    });
-                }
-            }
-            Ok(_) => {
-                let same = fs::read(&path)
-                    .ok()
-                    .zip(fs::read(&src).ok())
-                    .is_some_and(|(a, b)| a == b);
-                if same || replace {
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "instructions".to_string());
-                    changes.push(Change::BackupRemove {
-                        path: path.clone(),
-                        backup: backup_dest(state_dir, &name),
-                    });
-                    changes.push(Change::Symlink {
-                        link: path,
-                        target: src.clone(),
-                    });
-                } else {
-                    anyhow::bail!(
-                        "{} is a real file with different content; remove it by hand or retry with --replace",
-                        path.display()
-                    );
-                }
-            }
-        }
+        changes.extend(plan_instruction_link(
+            home, state_dir, &path, &contents, replace,
+        )?);
     }
     Ok(changes)
+}
+
+fn plan_instruction_link(
+    home: &Path,
+    state_dir: &Path,
+    path: &Path,
+    shared_contents: &[u8],
+    replace: bool,
+) -> anyhow::Result<Vec<Change>> {
+    if !instruction_targets(home)
+        .iter()
+        .any(|(target, _)| target == path)
+    {
+        anyhow::bail!("{} is not a global instruction target", path.display());
+    }
+    let src = instruction_source(home);
+    let mut changes = Vec::new();
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() && fs::read_link(path)? == src {
+                return Ok(changes);
+            }
+            if !metadata.file_type().is_symlink() && !replace && fs::read(path)? != shared_contents
+            {
+                anyhow::bail!(
+                    "{} is a real file with different content; remove it by hand or retry with --replace",
+                    path.display()
+                );
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            changes.push(Change::BackupRemove {
+                path: path.to_path_buf(),
+                backup: backup_dest(state_dir, &name),
+            });
+        }
+    }
+    changes.push(Change::Symlink {
+        link: path.to_path_buf(),
+        target: src,
+    });
+    Ok(changes)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionChoice {
+    UseShared,
+    UseLocal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstructionFile {
+    link: Option<PathBuf>,
+    contents: Option<Vec<u8>>,
+}
+
+fn read_instruction_file(path: &Path) -> anyhow::Result<InstructionFile> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(InstructionFile {
+                link: None,
+                contents: None,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() && !metadata.file_type().is_symlink() {
+        anyhow::bail!("{} is not an instruction file", path.display());
+    }
+    let link = if metadata.file_type().is_symlink() {
+        Some(fs::read_link(path)?)
+    } else {
+        None
+    };
+    let contents = match fs::read(path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == ErrorKind::NotFound && link.is_some() => None,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(InstructionFile { link, contents })
+}
+
+#[derive(Debug, Clone)]
+pub struct InstructionResolution {
+    pub source: PathBuf,
+    pub target: PathBuf,
+    pub choice: InstructionChoice,
+    pub diff: Vec<String>,
+    pub changes: Vec<Change>,
+    source_before: InstructionFile,
+    target_before: InstructionFile,
+}
+
+/// Plan one selected file. Previewing never changes either file or creates a backup.
+pub fn plan_instruction_resolution(
+    home: &Path,
+    state_dir: &Path,
+    target: &Path,
+    choice: InstructionChoice,
+) -> anyhow::Result<InstructionResolution> {
+    if !instruction_targets(home)
+        .iter()
+        .any(|(path, _)| path == target)
+    {
+        anyhow::bail!("{} is not a global instruction target", target.display());
+    }
+    let source = instruction_source(home);
+    let source_before = read_instruction_file(&source)?;
+    let target_before = read_instruction_file(target)?;
+    let (before, after) = match choice {
+        InstructionChoice::UseShared => (
+            target_before.contents.as_deref().unwrap_or_default(),
+            source_before.contents.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("shared instructions {} missing", source.display())
+            })?,
+        ),
+        InstructionChoice::UseLocal => (
+            source_before.contents.as_deref().unwrap_or_default(),
+            target_before
+                .contents
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("instructions {} missing", target.display()))?,
+        ),
+    };
+    let diff = instruction_diff(before, after)?;
+    let mut changes = Vec::new();
+    if choice == InstructionChoice::UseLocal && source_before.contents.as_deref() != Some(after) {
+        let mut backup = None;
+        if source_before.link.is_some() {
+            changes.push(Change::BackupRemove {
+                path: source.clone(),
+                backup: backup_dest(state_dir, "AGENTS.md"),
+            });
+        } else if source_before.contents.is_some() {
+            backup = Some(backup_dest(state_dir, "AGENTS.md"));
+        }
+        changes.push(Change::WriteFile {
+            path: source.clone(),
+            contents: after.to_vec(),
+            old: source_before.contents.clone(),
+            backup,
+        });
+    }
+    changes.extend(plan_instruction_link(home, state_dir, target, after, true)?);
+    Ok(InstructionResolution {
+        source,
+        target: target.to_path_buf(),
+        choice,
+        diff,
+        changes,
+        source_before,
+        target_before,
+    })
+}
+
+/// Reject edits made after preview instead of silently replacing newly edited rules.
+pub fn apply_instruction_resolution(
+    home: &Path,
+    resolution: &InstructionResolution,
+) -> anyhow::Result<()> {
+    if instruction_source(home) != resolution.source
+        || !instruction_targets(home)
+            .iter()
+            .any(|(path, _)| path == &resolution.target)
+    {
+        anyhow::bail!("instruction preview belongs to another home");
+    }
+    if read_instruction_file(&resolution.source)? != resolution.source_before
+        || read_instruction_file(&resolution.target)? != resolution.target_before
+    {
+        anyhow::bail!("instruction files changed after preview; compare them again");
+    }
+    crate::apply_changes(&resolution.changes)
+}
+
+// One ordered hunk preserves every change, including repeated or reordered lines.
+fn instruction_diff(before: &[u8], after: &[u8]) -> anyhow::Result<Vec<String>> {
+    let old: Vec<_> = std::str::from_utf8(before)?.split_inclusive('\n').collect();
+    let new: Vec<_> = std::str::from_utf8(after)?.split_inclusive('\n').collect();
+    let prefix = old
+        .iter()
+        .zip(&new)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    if before == after {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut append = |marker: char, line: &str| {
+        out.push(format!(
+            "{marker}{}",
+            line.strip_suffix('\n').unwrap_or(line)
+        ));
+        if !line.ends_with('\n') {
+            out.push("\\ No newline at end of file".into());
+        }
+    };
+    for line in &old[prefix.saturating_sub(3)..prefix] {
+        append(' ', line);
+    }
+    for line in &old[prefix..old.len() - suffix] {
+        append('-', line);
+    }
+    for line in &new[prefix..new.len() - suffix] {
+        append('+', line);
+    }
+    for line in &old[old.len() - suffix..old.len() - suffix + suffix.min(3)] {
+        append(' ', line);
+    }
+    Ok(out)
 }
 
 // ---- MCP -----------------------------------------------------------------
@@ -1380,6 +1562,177 @@ mod tests {
             instructions_status(&fx.home)
                 .iter()
                 .all(|s| matches!(s.state, InstrState::Linked))
+        );
+    }
+
+    fn instruction_resolution_fixture() -> (Fx, PathBuf) {
+        let fx = fixture("instruction-resolution");
+        fs::write(instruction_source(&fx.home), "shared rules\n").unwrap();
+        let target = fx.home.join(".claude/CLAUDE.md");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "local rules\n").unwrap();
+        (fx, target)
+    }
+
+    #[test]
+    fn instruction_resolution_previews_and_replaces_only_the_selected_file() {
+        let (fx, target) = instruction_resolution_fixture();
+        let other = fx.home.join(".codex/AGENTS.md");
+        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        fs::write(&other, "other rules\n").unwrap();
+        let plan = plan_instruction_resolution(
+            &fx.home,
+            &fx.paths.state_dir,
+            &target,
+            InstructionChoice::UseShared,
+        )
+        .unwrap();
+        assert!(plan.diff.iter().any(|line| line == "-local rules"));
+        assert!(plan.diff.iter().any(|line| line == "+shared rules"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "local rules\n");
+        assert!(!fx.paths.backup_dir().exists());
+        apply_instruction_resolution(&fx.home, &plan).unwrap();
+        assert_eq!(
+            fs::read_link(&target).unwrap(),
+            instruction_source(&fx.home)
+        );
+        assert_eq!(fs::read_to_string(&other).unwrap(), "other rules\n");
+        let backup = plan
+            .changes
+            .iter()
+            .find_map(|change| match change {
+                Change::BackupRemove { path, backup } if path == &target => Some(backup),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(fs::read_to_string(backup).unwrap(), "local rules\n");
+    }
+
+    #[test]
+    fn instruction_import_updates_shared_rules_and_preserves_both_backups() {
+        let (fx, target) = instruction_resolution_fixture();
+        let linked = fx.home.join(".codex/AGENTS.md");
+        fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(instruction_source(&fx.home), &linked).unwrap();
+        let plan = plan_instruction_resolution(
+            &fx.home,
+            &fx.paths.state_dir,
+            &target,
+            InstructionChoice::UseLocal,
+        )
+        .unwrap();
+        apply_instruction_resolution(&fx.home, &plan).unwrap();
+        assert_eq!(
+            fs::read_to_string(instruction_source(&fx.home)).unwrap(),
+            "local rules\n"
+        );
+        assert_eq!(fs::read_to_string(&linked).unwrap(), "local rules\n");
+        assert_eq!(
+            fs::read_link(&target).unwrap(),
+            instruction_source(&fx.home)
+        );
+        let backups: Vec<_> = fs::read_dir(fx.paths.backup_dir())
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect();
+        assert_eq!(backups.len(), 2);
+        assert!(backups.contains(&"shared rules\n".to_string()));
+        assert!(backups.contains(&"local rules\n".to_string()));
+    }
+
+    #[test]
+    fn instruction_resolution_rejects_stale_previews_and_foreign_paths() {
+        for edit_source in [true, false] {
+            let (fx, target) = instruction_resolution_fixture();
+            let plan = plan_instruction_resolution(
+                &fx.home,
+                &fx.paths.state_dir,
+                &target,
+                InstructionChoice::UseShared,
+            )
+            .unwrap();
+            let changed = if edit_source {
+                instruction_source(&fx.home)
+            } else {
+                target.clone()
+            };
+            fs::write(&changed, "edited after preview\n").unwrap();
+            assert!(apply_instruction_resolution(&fx.home, &plan).is_err());
+            assert_eq!(
+                fs::read_to_string(&changed).unwrap(),
+                "edited after preview\n"
+            );
+            assert!(!fx.paths.backup_dir().exists());
+            assert!(!target.is_symlink());
+            assert!(
+                plan_instruction_resolution(
+                    &fx.home,
+                    &fx.paths.state_dir,
+                    &fx.home.join("private.md"),
+                    InstructionChoice::UseShared
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn instruction_resolution_handles_missing_source_and_dangling_links() {
+        let (fx, target) = instruction_resolution_fixture();
+        fs::remove_file(instruction_source(&fx.home)).unwrap();
+        let plan = plan_instruction_resolution(
+            &fx.home,
+            &fx.paths.state_dir,
+            &target,
+            InstructionChoice::UseLocal,
+        )
+        .unwrap();
+        apply_instruction_resolution(&fx.home, &plan).unwrap();
+        assert_eq!(
+            fs::read_to_string(instruction_source(&fx.home)).unwrap(),
+            "local rules\n"
+        );
+        fs::remove_file(&target).unwrap();
+        let missing = fx.home.join("missing.md");
+        std::os::unix::fs::symlink(&missing, &target).unwrap();
+        let plan = plan_instruction_resolution(
+            &fx.home,
+            &fx.paths.state_dir,
+            &target,
+            InstructionChoice::UseShared,
+        )
+        .unwrap();
+        apply_instruction_resolution(&fx.home, &plan).unwrap();
+        let backup = plan
+            .changes
+            .iter()
+            .find_map(|change| match change {
+                Change::BackupRemove { backup, .. } => Some(backup),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(fs::read_link(backup).unwrap(), missing);
+        assert_eq!(
+            fs::read_link(&target).unwrap(),
+            instruction_source(&fx.home)
+        );
+    }
+
+    #[test]
+    fn instruction_diff_preserves_order_repeated_lines_and_large_changes() {
+        let diff = instruction_diff(b"A\nB\nA\n", b"A\nA\nB\n").unwrap();
+        assert_eq!(diff, [" A", "-B", "-A", "+A", "+B"]);
+        let before = (0..100).map(|i| format!("old {i}\n")).collect::<String>();
+        let after = (0..100).map(|i| format!("new {i}\n")).collect::<String>();
+        let diff = instruction_diff(before.as_bytes(), after.as_bytes()).unwrap();
+        assert_eq!(diff.len(), 200);
+        assert!(diff.contains(&"-old 99".to_string()));
+        assert!(diff.contains(&"+new 99".to_string()));
+        assert!(
+            instruction_diff(b"line", b"line\n")
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("No newline"))
         );
     }
 

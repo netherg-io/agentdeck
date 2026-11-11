@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agentdeck_core::{Harness, Paths, Registry, claude, codex, sync, t3};
+use agentdeck_core::{Harness, Paths, Registry, claude, codex, shared, sync, t3};
 use i18n_embed_fl::fl;
 use iced::widget::column;
 use iced::{Element, Task};
@@ -92,6 +92,7 @@ pub struct Pending {
     pub preview: Vec<String>,
     /// Fix confirm names this path (resolved to a label in `view`).
     pub confirm_path: Option<String>,
+    pub instruction: Option<shared::InstructionResolution>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -326,10 +327,38 @@ pub fn snapshot(ctx: &Ctx) -> Snapshot {
         harness: "instructions".into(),
         items: sync::instruction_items(&ctx.home)
             .into_iter()
-            .map(|item| Item {
-                key: item.detail.clone(),
-                text: item.detail,
-                ..Default::default()
+            .map(|item| {
+                let Some(path) = item.path else {
+                    return Item {
+                        text: item.detail,
+                        ..Default::default()
+                    };
+                };
+                let key = path.to_string_lossy().into_owned();
+                let mut actions = Vec::new();
+                if shared::instruction_source(&ctx.home).is_file() {
+                    actions.push(Action {
+                        kind: Kind::Apply,
+                        key: key.clone(),
+                        server: None,
+                    });
+                }
+                if path.is_file() {
+                    actions.push(Action {
+                        kind: Kind::Import,
+                        key: key.clone(),
+                        server: None,
+                    });
+                }
+                Item {
+                    key,
+                    text: format!(
+                        "~/{}",
+                        path.strip_prefix(&ctx.home).unwrap_or(&path).display()
+                    ),
+                    actions,
+                    ..Default::default()
+                }
             })
             .collect(),
         ..Default::default()
@@ -369,6 +398,28 @@ fn harness_of(groups: &[Group], id: &str) -> String {
 pub fn preview(ctx: &Ctx, group: &str, key: &str, kind: Kind) -> Result<Pending, String> {
     let harness = harness_of(&snapshot(ctx).groups, group);
     match (harness.as_str(), kind, key) {
+        ("instructions", Kind::Apply | Kind::Import, key) => {
+            let choice = if kind == Kind::Apply {
+                shared::InstructionChoice::UseShared
+            } else {
+                shared::InstructionChoice::UseLocal
+            };
+            let resolution = shared::plan_instruction_resolution(
+                &ctx.home,
+                &ctx.paths.state_dir,
+                Path::new(key),
+                choice,
+            )
+            .map_err(|error| format!("{error:#}"))?;
+            Ok(Pending {
+                group: group.into(),
+                key: key.into(),
+                kind,
+                preview: resolution.diff.clone(),
+                confirm_path: None,
+                instruction: Some(resolution),
+            })
+        }
         ("claude", Kind::Apply, _) => {
             let reg = Registry::load(&ctx.paths).map_err(|e| format!("registry: {e:#}"))?;
             let inst = reg
@@ -387,6 +438,7 @@ pub fn preview(ctx: &Ctx, group: &str, key: &str, kind: Kind) -> Result<Pending,
                 kind,
                 preview: changes.iter().map(claude::describe_change).collect(),
                 confirm_path: None,
+                instruction: None,
             })
         }
         ("claude", Kind::Import, key) => {
@@ -424,6 +476,7 @@ pub fn preview(ctx: &Ctx, group: &str, key: &str, kind: Kind) -> Result<Pending,
                     .into_iter()
                     .collect(),
                 confirm_path: None,
+                instruction: None,
             })
         }
         ("codex", Kind::Apply, _) => {
@@ -443,6 +496,7 @@ pub fn preview(ctx: &Ctx, group: &str, key: &str, kind: Kind) -> Result<Pending,
                 kind,
                 preview: changes.iter().map(|c| c.describe()).collect(),
                 confirm_path: None,
+                instruction: None,
             })
         }
         ("codex", Kind::Fix, key) => {
@@ -468,6 +522,7 @@ pub fn preview(ctx: &Ctx, group: &str, key: &str, kind: Kind) -> Result<Pending,
                 kind,
                 preview,
                 confirm_path: Some(path.to_string()),
+                instruction: None,
             })
         }
         ("t3", Kind::Import, _) => {
@@ -485,6 +540,7 @@ pub fn preview(ctx: &Ctx, group: &str, key: &str, kind: Kind) -> Result<Pending,
                     .map(|f| format!("{} {} {} t3=true", f.id, f.harness.as_str(), f.home))
                     .collect(),
                 confirm_path: None,
+                instruction: None,
             })
         }
         _ => Err("action not applicable here".to_string()),
@@ -494,6 +550,12 @@ pub fn preview(ctx: &Ctx, group: &str, key: &str, kind: Kind) -> Result<Pending,
 /// Run a confirmed preview. Returns the one-line notice for the page.
 pub fn apply(ctx: &Ctx, pending: &Pending) -> String {
     let fail = |e: anyhow::Error| format!("failed: {e:#}");
+    if let Some(resolution) = &pending.instruction {
+        return match shared::apply_instruction_resolution(&ctx.home, resolution) {
+            Ok(()) => fl!(loader(), "drift-instr-resolved"),
+            Err(error) => fail(error),
+        };
+    }
     match (pending.kind, pending.key.as_str()) {
         (Kind::Apply, _) | (Kind::Import, _) | (Kind::Fix, _) => {
             let reg = match Registry::load(&ctx.paths) {
@@ -726,17 +788,23 @@ fn action_buttons<'a>(group: &str, item: &'a Item) -> Vec<Element<'a, Message>> 
     item.actions
         .iter()
         .map(|a| {
+            let label = if group == sync::INSTRUCTIONS_GROUP_ID {
+                match a.kind {
+                    Kind::Apply => fl!(loader(), "drift-instr-use-shared"),
+                    Kind::Import => fl!(loader(), "drift-instr-use-local"),
+                    _ => action_label(a),
+                }
+            } else {
+                action_label(a)
+            };
             // Server names can be long; the label stays a button-sized line.
-            st::btn(
-                st::Btn::Quiet,
-                st::ellipsize(&action_label(a), 40, st::Cut::Middle),
-            )
-            .on_press(Message::Act {
-                group: group.to_string(),
-                key: a.key.clone(),
-                kind: a.kind,
-            })
-            .into()
+            st::btn(st::Btn::Quiet, st::ellipsize(&label, 40, st::Cut::Middle))
+                .on_press(Message::Act {
+                    group: group.to_string(),
+                    key: a.key.clone(),
+                    kind: a.kind,
+                })
+                .into()
         })
         .collect()
 }
@@ -774,6 +842,70 @@ fn confirm_label(pending: &Pending) -> String {
 pub fn modal(state: &State) -> Option<crate::overlay::Modal<'_, Message>> {
     use crate::style as st;
     let pending = state.pending.as_ref()?;
+    if let Some(resolution) = &pending.instruction {
+        let (title, consequence, before, after) = match resolution.choice {
+            shared::InstructionChoice::UseShared => (
+                fl!(loader(), "drift-instr-use-shared"),
+                fl!(
+                    loader(),
+                    "drift-instr-link-consequence",
+                    path = resolution.target.display().to_string()
+                ),
+                &resolution.target,
+                &resolution.source,
+            ),
+            shared::InstructionChoice::UseLocal => (
+                fl!(loader(), "drift-instr-use-local"),
+                fl!(loader(), "drift-instr-import-consequence"),
+                &resolution.source,
+                &resolution.target,
+            ),
+        };
+        let mut body: Vec<Element<'_, Message>> = vec![st::body(consequence).into()];
+        for change in &resolution.changes {
+            let backup = match change {
+                agentdeck_core::Change::BackupRemove { backup, .. } => Some(backup),
+                agentdeck_core::Change::WriteFile { backup, .. } => backup.as_ref(),
+                _ => None,
+            };
+            if let Some(path) = backup {
+                body.push(
+                    st::caption(fl!(
+                        loader(),
+                        "drift-instr-backup",
+                        path = path.display().to_string()
+                    ))
+                    .into(),
+                );
+            }
+        }
+        body.push(st::mono(format!("--- {}", before.display())).into());
+        body.push(st::mono(format!("+++ {}", after.display())).into());
+        body.push(
+            column(
+                resolution
+                    .diff
+                    .iter()
+                    .map(|line| st::mono(line.as_str()).into()),
+            )
+            .spacing(0)
+            .into(),
+        );
+        return Some(crate::overlay::Modal {
+            title: fl!(loader(), "drift-instr-compare"),
+            body,
+            actions: vec![
+                st::btn(st::Btn::Quiet, fl!(loader(), "drift-cancel"))
+                    .on_press(Message::Cancel)
+                    .into(),
+                st::btn(st::Btn::Primary, title)
+                    .on_press_maybe((!resolution.changes.is_empty()).then_some(Message::Confirm))
+                    .into(),
+            ],
+            on_cancel: Message::Cancel,
+            on_submit: None,
+        });
+    }
     let mut preview = pending.preview.clone();
     if preview.is_empty() {
         preview.push(fl!(loader(), "drift-no-drift"));
