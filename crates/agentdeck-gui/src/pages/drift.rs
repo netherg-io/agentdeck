@@ -843,9 +843,9 @@ pub fn modal(state: &State) -> Option<crate::overlay::Modal<'_, Message>> {
     use crate::style as st;
     let pending = state.pending.as_ref()?;
     if let Some(resolution) = &pending.instruction {
-        let (title, consequence, before, after) = match resolution.choice {
+        let (confirmation, consequence, before, after) = match resolution.choice {
             shared::InstructionChoice::UseShared => (
-                fl!(loader(), "drift-instr-use-shared"),
+                fl!(loader(), "drift-instr-confirm-shared"),
                 fl!(
                     loader(),
                     "drift-instr-link-consequence",
@@ -855,7 +855,7 @@ pub fn modal(state: &State) -> Option<crate::overlay::Modal<'_, Message>> {
                 &resolution.source,
             ),
             shared::InstructionChoice::UseLocal => (
-                fl!(loader(), "drift-instr-use-local"),
+                fl!(loader(), "drift-instr-confirm-local"),
                 fl!(loader(), "drift-instr-import-consequence"),
                 &resolution.source,
                 &resolution.target,
@@ -898,7 +898,7 @@ pub fn modal(state: &State) -> Option<crate::overlay::Modal<'_, Message>> {
                 st::btn(st::Btn::Quiet, fl!(loader(), "drift-cancel"))
                     .on_press(Message::Cancel)
                     .into(),
-                st::btn(st::Btn::Primary, title)
+                st::btn(st::Btn::Primary, confirmation)
                     .on_press_maybe((!resolution.changes.is_empty()).then_some(Message::Confirm))
                     .into(),
             ],

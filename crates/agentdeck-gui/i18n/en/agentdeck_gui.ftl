@@ -302,3 +302,5 @@ drift-instr-import-consequence = This version will replace ~/AGENTS.md and updat
 drift-instr-backup = Backup will be saved to { $path }
 drift-instr-resolved = Instruction file resolved.
 drift-instr-compare = Compare instructions
+drift-instr-confirm-shared = Link to shared file
+drift-instr-confirm-local = Replace shared file

@@ -309,3 +309,5 @@ drift-instr-import-consequence = Эта версия заменит ~/AGENTS.md 
 drift-instr-backup = Резервная копия сохранится в { $path }
 drift-instr-resolved = Файл инструкций согласован.
 drift-instr-compare = Сравнение инструкций
+drift-instr-confirm-shared = Связать с общим
+drift-instr-confirm-local = Заменить общий

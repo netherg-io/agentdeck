@@ -1210,9 +1210,9 @@ fn global_instructions_appear_in_drift_without_secondary_accounts() {
 #[test]
 fn instruction_actions_preview_cancel_apply_and_import() {
     let _env = lock_env();
-    for (choice, english, russian) in [
-        (drift::Kind::Apply, "Use shared file", "Использовать общий"),
-        (drift::Kind::Import, "Make shared", "Сделать общим"),
+    for (choice, english) in [
+        (drift::Kind::Apply, "Use shared file"),
+        (drift::Kind::Import, "Make shared"),
     ] {
         let (paths, directory, _guard) = fixture_paths("instruction-actions");
         let home = directory.join("home");
@@ -1253,7 +1253,10 @@ fn instruction_actions_preview_cancel_apply_and_import() {
             &mut state,
             app::Message::Drift(drift::Message::PreviewReady(pending.clone())),
         );
-        for (language, label) in [("en", english), ("ru", russian)] {
+        for (language, label) in [
+            ("en", "Compare instructions"),
+            ("ru", "Сравнение инструкций"),
+        ] {
             agentdeck_gui::i18n::set_language(language);
             for (name, size) in [("wide", (900.0, 620.0)), ("narrow", (520.0, 620.0))] {
                 let mut ui = iced_test::Simulator::with_size(
@@ -1290,7 +1293,13 @@ fn instruction_actions_preview_cancel_apply_and_import() {
             app::Message::Drift(drift::Message::PreviewReady(pending.clone())),
         );
         let mut ui = iced_test::simulator(app::view(&state));
-        ui.click(english).expect("confirm instruction resolution");
+        let confirmation = if choice == drift::Kind::Apply {
+            "Link to shared file"
+        } else {
+            "Replace shared file"
+        };
+        ui.click(confirmation)
+            .expect("confirm instruction resolution");
         assert!(
             ui.into_messages()
                 .any(|message| matches!(message, app::Message::Drift(drift::Message::Confirm)))
