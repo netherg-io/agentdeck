@@ -67,6 +67,14 @@ pub fn scan_once(
             return 0;
         }
     };
+    match sync::restore_blocks(paths, home) {
+        Ok(applied) => {
+            for c in &applied {
+                eprintln!("agentdeck sync: {}", c.describe());
+            }
+        }
+        Err(e) => eprintln!("agentdeck sync: block restore failed: {e:#}"),
+    }
     if sync::auto_apply_enabled(paths) {
         match sync::apply_additive(paths, home, t3_root) {
             Ok(applied) => {
@@ -83,7 +91,7 @@ pub fn scan_once(
     } else {
         let n = items
             .iter()
-            .filter(|i| i.kind == sync::ItemKind::Additive)
+            .filter(|i| i.kind == sync::ItemKind::Additive && i.instance != sync::BLOCKS_GROUP_ID)
             .count();
         if n > 0 {
             eprintln!(

@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use agentdeck_core::{Paths, plugins};
+use agentdeck_core::{Paths, Registry, plugins};
 use clap::Subcommand;
 
 #[derive(Subcommand)]
@@ -99,4 +99,42 @@ pub fn run(paths: &Paths, cmd: PluginCmd) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Disable every enabled plugin, then drop blocks left by plugins that were
+/// disabled by hand. ai-usage goes first: it refuses while the daemon runs,
+/// before anything else is touched.
+pub fn uninstall(paths: &Paths, dry_run: bool) -> anyhow::Result<()> {
+    let home = home_dir()?;
+    let exe = std::env::current_exe()?;
+    let files = plugins::default_instruction_files(&home);
+    let mut reg = Registry::load(paths)?;
+    for name in [
+        plugins::PLUGIN_AI_USAGE,
+        plugins::PLUGIN_ROUTER,
+        plugins::PLUGIN_AGENT_PROCESS,
+    ] {
+        if !plugins::plugin_enabled(&reg, name) {
+            continue;
+        }
+        let changes = plugins::plan_disable(paths, &home, &files, &exe, name)?;
+        for c in &changes {
+            println!("{}", c.describe());
+        }
+        if !dry_run {
+            plugins::apply_all(paths, name, false, &changes)?;
+        }
+    }
+    reg.plugins.clear();
+    let blocks = plugins::plan_managed_blocks(&reg, &home, &exe, &paths.state_dir)?;
+    for c in &blocks {
+        println!("{}", c.describe());
+    }
+    if dry_run {
+        println!("dry-run: nothing changed");
+        return Ok(());
+    }
+    agentdeck_core::apply_changes(&blocks)?;
+    println!("agentdeck integrations removed; delete the binary to finish");
+    Ok(())
 }

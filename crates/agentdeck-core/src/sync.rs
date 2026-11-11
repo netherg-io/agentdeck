@@ -26,6 +26,7 @@ use crate::{Paths, Registry, claude, codex, shared};
 
 // The colon keeps this group distinct from every valid registry instance id.
 pub const INSTRUCTIONS_GROUP_ID: &str = "global:instructions";
+pub const BLOCKS_GROUP_ID: &str = "global:agentdeck-blocks";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -151,6 +152,42 @@ pub fn instruction_items(home: &Path) -> Vec<SyncItem> {
         .collect()
 }
 
+fn plan_blocks(reg: &Registry, paths: &Paths, home: &Path) -> anyhow::Result<Vec<Change>> {
+    let exe = std::env::current_exe()?;
+    crate::plugins::plan_managed_blocks(reg, home, &exe, &paths.state_dir)
+}
+
+/// Agentdeck's own instruction blocks that differ from the generated text.
+/// Restoring them is ADDITIVE: the blocks belong to agentdeck, so hand edits
+/// are reverted. Malformed markers need the owner.
+fn block_items(reg: &Registry, paths: &Paths, home: &Path) -> Vec<SyncItem> {
+    let item = |kind, detail| SyncItem::new(BLOCKS_GROUP_ID, "instructions", kind, detail);
+    match plan_blocks(reg, paths, home) {
+        Ok(changes) => changes
+            .iter()
+            .filter_map(|change| match change {
+                Change::WriteFile { path, .. } => Some(item(
+                    ItemKind::Additive,
+                    format!(
+                        "~/{}: agentdeck block out of date",
+                        path.strip_prefix(home).unwrap_or(path).display()
+                    ),
+                )),
+                _ => None,
+            })
+            .collect(),
+        Err(error) => vec![item(ItemKind::Decision, format!("{error:#}"))],
+    }
+}
+
+/// Rewrite agentdeck's blocks to the generated text. Runs regardless of
+/// `[sync] auto_apply`: it only touches agentdeck-owned lines.
+pub fn restore_blocks(paths: &Paths, home: &Path) -> anyhow::Result<Vec<Change>> {
+    let changes = plan_blocks(&Registry::load(paths)?, paths, home)?;
+    crate::apply_changes(&changes)?;
+    Ok(changes)
+}
+
 /// Gather global instruction drift and registry instance drift (Claude + Codex).
 /// `home` is the real `$HOME` in production, a temp dir in tests;
 /// `t3_root` is accepted and
@@ -160,6 +197,7 @@ pub fn gather(paths: &Paths, home: &Path, t3_root: Option<&Path>) -> anyhow::Res
     let _ = t3_root;
     let reg = Registry::load(paths)?;
     let mut out = instruction_items(home);
+    out.extend(block_items(&reg, paths, home));
     let primary = home.join(".claude");
     let primary_json = home.join(".claude.json");
     for inst in &reg.instances {
@@ -314,7 +352,9 @@ pub fn apply_additive(
     let primary = home.join(".claude");
     let primary_json = home.join(".claude.json");
     let main_default = home.join(".codex");
-    let mut applied = Vec::new();
+    // Broken markers surface as a DECISION item in `gather`; they must not
+    // block the rest of the additive apply.
+    let mut applied = restore_blocks(paths, home).unwrap_or_default();
     let source = shared::instruction_source(home);
     if source.is_file() {
         for status in shared::instructions_status(home) {
@@ -614,6 +654,68 @@ mod tests {
         assert!(!fx.home.join(".config/opencode").exists());
         assert!(!fx.home.join(".gemini").exists());
         assert!(instruction_items(&fx.home).is_empty());
+    }
+
+    #[test]
+    fn agentdeck_blocks_are_restored_and_removed_with_their_plugin() {
+        let fx = fixture();
+        let set = |on: bool| {
+            Registry::update(&fx.paths, |r| {
+                for name in [
+                    crate::plugins::PLUGIN_AGENT_PROCESS,
+                    crate::plugins::PLUGIN_ROUTER,
+                ] {
+                    if on {
+                        r.plugins.insert(name.into(), true);
+                    } else {
+                        r.plugins.remove(name);
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        };
+        let block_items = || {
+            gather(&fx.paths, &fx.home, None)
+                .unwrap()
+                .into_iter()
+                .filter(|i| i.instance == BLOCKS_GROUP_ID)
+                .collect::<Vec<_>>()
+        };
+        let agents = fx.home.join("AGENTS.md");
+        set(true);
+        // CLAUDE.md links to AGENTS.md: one item, one write with both blocks.
+        assert_eq!(block_items().len(), 1);
+        assert_eq!(block_items()[0].kind, ItemKind::Additive);
+        assert_eq!(restore_blocks(&fx.paths, &fx.home).unwrap().len(), 1);
+        let fresh = fs::read_to_string(&agents).unwrap();
+        assert!(fresh.starts_with("me\n<!-- agent-process:begin -->\n"), "{fresh}");
+        assert!(fresh.contains("<!-- model-route:begin -->"), "{fresh}");
+        assert!(block_items().is_empty());
+
+        // A hand edit inside a block is reverted; text outside survives.
+        let edited = fresh
+            .replacen("me\n", "me\nmine\n", 1)
+            .replace("agent-process list", "agent-process ls");
+        fs::write(&agents, &edited).unwrap();
+        assert_eq!(block_items().len(), 1);
+        apply_additive(&fx.paths, &fx.home, None).unwrap();
+        assert_eq!(
+            fs::read_to_string(&agents).unwrap(),
+            fresh.replacen("me\n", "me\nmine\n", 1)
+        );
+
+        // Disabled plugins leave no agentdeck lines behind.
+        set(false);
+        restore_blocks(&fx.paths, &fx.home).unwrap();
+        assert_eq!(fs::read_to_string(&agents).unwrap(), "me\nmine\n");
+
+        // Broken markers are never rewritten blindly.
+        fs::write(&agents, "<!-- agent-process:begin -->\nx\n").unwrap();
+        let items = block_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, ItemKind::Decision);
+        assert!(restore_blocks(&fx.paths, &fx.home).is_err());
     }
 
     #[test]

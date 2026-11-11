@@ -16,12 +16,13 @@ pub const PLUGIN_AI_USAGE: &str = "ai-usage";
 pub const PLUGIN_ROUTER: &str = "router";
 pub const PLUGINS: [&str; 3] = [PLUGIN_AGENT_PROCESS, PLUGIN_AI_USAGE, PLUGIN_ROUTER];
 
-/// Usage lines for the agent-process instruction block. The general
-/// process-ownership policy stays hand-written and is never edited here.
-pub const AGENT_PROCESS_BLOCK: &str = "Start long-running servers only via `agent-process`:\n\
-    `agent-process start --name <n> -- <cmd>` starts a session-owned process,\n\
-    `agent-process list` / `status <id>` inspect it,\n\
-    `agent-process stop <id>` stops it (never stop processes you did not start).";
+/// agent-process instruction block. Every mention of the launcher lives here
+/// so disabling the plugin or uninstalling agentdeck leaves no stale rules;
+/// the general process-ownership policy stays hand-written.
+pub const AGENT_PROCESS_BLOCK: &str = "Start agent-owned long-running processes (dev/preview/watch servers, browser and other daemons) only with `agent-process start --name <name> --cwd <project> -- <command>` (`~/.local/bin/agent-process` on bash/zsh `PATH`). It tags the environment, creates a separate process group and records PID, birth time, command, cwd, log and agent-session owner in `$XDG_RUNTIME_DIR/ai-agent-processes`; that record is the launch proof for the process-ownership rules.\n\
+    - Inspect ownership with `agent-process list` / `agent-process status <id>`.\n\
+    - Stop your own or your delegated child's servers with `agent-process stop <id>`; signal the exact process group only when no record exists.\n\
+    - Other sessions' servers may be reused; stopping them requires explicit user approval, the only permitted use of `--force`.";
 
 pub fn is_known(name: &str) -> bool {
     PLUGINS.contains(&name)
@@ -254,6 +255,57 @@ fn file_name(path: &Path) -> &str {
     path.file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("instructions")
+}
+
+/// Agentdeck owns its marker blocks: an enabled plugin's block must match
+/// the generated text, a disabled plugin's block must be absent. Plans both
+/// blocks per existing file in one write (symlinked duplicates collapse);
+/// missing files are never created here.
+pub fn plan_managed_blocks(
+    reg: &Registry,
+    home: &Path,
+    exe: &Path,
+    state_dir: &Path,
+) -> anyhow::Result<Vec<Change>> {
+    let router = plugin_enabled(reg, PLUGIN_ROUTER).then(|| crate::router::router_block(exe));
+    let blocks = [
+        (
+            PLUGIN_AGENT_PROCESS,
+            plugin_enabled(reg, PLUGIN_AGENT_PROCESS).then_some(AGENT_PROCESS_BLOCK),
+        ),
+        (crate::router::ROUTER_MARKER, router.as_deref()),
+    ];
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut changes = Vec::new();
+    for file in default_instruction_files(home) {
+        let Ok(key) = fs::canonicalize(&file) else {
+            continue;
+        };
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let old = fs::read(&file)?;
+        let old_text = std::str::from_utf8(&old)
+            .map_err(|_| anyhow::anyhow!("{} is not valid UTF-8", file.display()))?;
+        let mut text = old_text.to_string();
+        for (name, body) in blocks {
+            if let Some(new) = apply_marker_block(&text, name, body)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?
+            {
+                text = new;
+            }
+        }
+        if text != old_text {
+            changes.push(Change::WriteFile {
+                path: file.clone(),
+                contents: text.into_bytes(),
+                old: Some(old),
+                backup: Some(backup_dest(state_dir, file_name(&file))),
+            });
+        }
+    }
+    Ok(changes)
 }
 
 /// `~/.local/bin`, or `$AGENTDECK_BIN_DIR` when set (tests inject temp dirs).

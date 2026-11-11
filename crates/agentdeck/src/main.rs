@@ -105,6 +105,13 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Remove everything agentdeck wrote outside its own data: plugin
+    /// hooks, links, the unit and every agentdeck block in instruction files.
+    /// Run before deleting the binary; config and state are kept.
+    Uninstall {
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Enable or disable built-in plugins (agent-process, ai-usage, router).
     Plugin {
         #[command(subcommand)]
@@ -314,6 +321,7 @@ async fn async_main(paths: &Paths, cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Ps(args) => cmd_ps::run(args)?,
         Cmd::Service { cmd } => cmd_service::run(paths, cmd)?,
         Cmd::Plugin { cmd } => cmd_plugin::run(paths, cmd)?,
+        Cmd::Uninstall { dry_run } => cmd_plugin::uninstall(paths, dry_run)?,
         Cmd::Skills { cmd } => cmd_shared::run_skills(paths, cmd)?,
         Cmd::Instructions { cmd } => cmd_shared::run_instructions(paths, cmd)?,
         Cmd::Mcp { cmd } => cmd_shared::run_mcp(paths, cmd)?,
