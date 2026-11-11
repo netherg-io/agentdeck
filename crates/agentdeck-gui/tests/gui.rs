@@ -1251,7 +1251,7 @@ fn instruction_actions_preview_cancel_apply_and_import() {
         assert!(!ctx.paths.backup_dir().exists());
         let _ = app::update(
             &mut state,
-            app::Message::Drift(drift::Message::PreviewReady(pending.clone())),
+            app::Message::Drift(drift::Message::PreviewReady(Box::new(pending.clone()))),
         );
         for (language, label) in [
             ("en", "Compare instructions"),
@@ -1290,7 +1290,7 @@ fn instruction_actions_preview_cancel_apply_and_import() {
         let pending = drift::preview(&ctx, &group, &key, kind).unwrap();
         let _ = app::update(
             &mut state,
-            app::Message::Drift(drift::Message::PreviewReady(pending.clone())),
+            app::Message::Drift(drift::Message::PreviewReady(Box::new(pending.clone()))),
         );
         let mut ui = iced_test::simulator(app::view(&state));
         let confirmation = if choice == drift::Kind::Apply {

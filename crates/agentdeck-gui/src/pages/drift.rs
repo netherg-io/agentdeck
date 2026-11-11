@@ -113,7 +113,7 @@ pub enum Message {
         key: String,
         kind: Kind,
     },
-    PreviewReady(Pending),
+    PreviewReady(Box<Pending>),
     Confirm,
     Cancel,
     Done {
@@ -707,7 +707,7 @@ pub fn update(state: &mut State, ctx: Ctx, message: Message) -> Task<Message> {
             Task::perform(
                 async move {
                     match preview(&ctx, &group, &key, kind) {
-                        Ok(pending) => Message::PreviewReady(pending),
+                        Ok(pending) => Message::PreviewReady(Box::new(pending)),
                         Err(error) => Message::Done {
                             notice: format!("failed: {error}"),
                         },
@@ -717,7 +717,7 @@ pub fn update(state: &mut State, ctx: Ctx, message: Message) -> Task<Message> {
             )
         }
         Message::PreviewReady(pending) => {
-            state.pending = Some(pending);
+            state.pending = Some(*pending);
             state.busy = None;
             Task::none()
         }
