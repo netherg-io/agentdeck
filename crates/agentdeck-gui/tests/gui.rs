@@ -1142,27 +1142,28 @@ fn global_instructions_appear_in_drift_without_secondary_accounts() {
     for (language, title) in [("en", "Instruction files"), ("ru", "Файлы инструкций")]
     {
         agentdeck_gui::i18n::set_language(language);
-        let mut ui = iced_test::Simulator::with_size(
-            iced::Settings::default(),
-            (760.0, 420.0),
-            drift::view(&state),
-        );
-        ui.find(title).expect("localized instruction group");
-        for path in [
-            ".claude/CLAUDE.md",
-            ".codex/AGENTS.md",
-            ".config/opencode/AGENTS.md",
-            ".gemini/GEMINI.md",
-        ] {
-            assert!(
-                drift_group(&state.snapshot, "global-instructions")
-                    .items
-                    .iter()
-                    .any(|item| item.text.contains(path))
+        for (name, size) in [("wide", (760.0, 420.0)), ("narrow", (420.0, 540.0))] {
+            let mut ui = iced_test::Simulator::with_size(
+                iced::Settings::default(),
+                size,
+                drift::view(&state),
             );
+            ui.find(title).expect("localized instruction group");
+            for item in &drift_group(&state.snapshot, "global-instructions").items {
+                ui.find(item.text.as_str()).expect("instruction drift row");
+            }
+            let screenshot = ui
+                .snapshot(&agentdeck_gui::style::theme(true))
+                .expect("headless instruction drift render");
+            if let Some(directory) = std::env::var_os("AGENTDECK_SHOTS").map(PathBuf::from) {
+                let path = directory.join(format!("global_instructions_{name}_{language}.png"));
+                assert!(
+                    screenshot
+                        .matches_image(path)
+                        .expect("save instruction drift render")
+                );
+            }
         }
-        ui.snapshot(&agentdeck_gui::style::theme(true))
-            .expect("headless instruction drift render");
     }
     agentdeck_gui::i18n::set_language("en");
 }

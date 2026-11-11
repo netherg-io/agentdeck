@@ -143,7 +143,8 @@ pub fn instruction_items(home: &Path) -> Vec<SyncItem> {
         .collect()
 }
 
-/// Gather drift for every registry instance (Claude + Codex). `home` is the
+/// Gather global instruction drift and registry instance drift (Claude + Codex).
+/// `home` is the
 /// real `$HOME` in production, a temp dir in tests; `t3_root` is accepted and
 /// ignored: T3 provider-instance envelopes are explicit T3 management
 /// (`t3 sync`), never Drift, so they contribute no badge or notification.
@@ -289,7 +290,8 @@ fn classify_codex(id: &str, drift: &codex::Drift) -> SyncItem {
     }
 }
 
-/// Apply additive drift through the existing planners. Instances with any
+/// Create missing global instruction links exclusively, then apply profile
+/// drift through the existing planners. Profile instances with any
 /// DECISION item are skipped whole (their planners would touch decided
 /// content). Each applied instance is re-checked right before planning, so a
 /// concurrent harness edit cannot slip a decision through. Idempotent: a

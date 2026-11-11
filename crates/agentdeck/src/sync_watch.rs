@@ -15,7 +15,7 @@ pub const DEBOUNCE: Duration = Duration::from_secs(2);
 pub const RESCAN: Duration = Duration::from_secs(10 * 60);
 
 /// Roots whose direct children matter: registry file parent, Claude profile
-/// and `.claude.json` parents, Codex main/shadow homes. Non-recursive: link-
+/// and `.claude.json` parents, global instructions, Codex shadow homes. Non-recursive: link-
 /// level drift lives at the top level; the rescan covers deeper entries
 /// (`.hook-trust` records, sessions churn would otherwise rescan constantly).
 fn watch_roots(paths: &Paths, home: &Path) -> Vec<PathBuf> {
@@ -28,11 +28,6 @@ fn watch_roots(paths: &Paths, home: &Path) -> Vec<PathBuf> {
     let Ok(reg) = Registry::load(paths) else {
         return roots;
     };
-    let primary = home.join(".claude");
-    if primary.is_dir() {
-        roots.push(primary);
-    }
-    roots.push(home.join(".codex"));
     for inst in &reg.instances {
         let dir = sync_expand(&inst.home, home);
         if inst.harness == agentdeck_core::Harness::Claude
