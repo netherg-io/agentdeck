@@ -1135,6 +1135,19 @@ fn global_instructions_appear_in_drift_without_secondary_accounts() {
     assert!(snapshot.error.is_none());
     let group = drift_group(&snapshot, agentdeck_core::sync::INSTRUCTIONS_GROUP_ID);
     assert_eq!(drift::open_items(group), 4);
+    assert!(
+        group.items.iter().all(|item| {
+            item.actions
+                .iter()
+                .any(|action| action.kind == drift::Kind::Apply)
+                && item
+                    .actions
+                    .iter()
+                    .any(|action| action.kind == drift::Kind::Import)
+        }),
+        "every divergent instruction file needs resolution actions"
+    );
+
     let state = drift::State {
         snapshot,
         ..Default::default()
