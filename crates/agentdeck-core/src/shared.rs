@@ -86,6 +86,13 @@ pub fn skill_targets(home: &Path) -> Vec<SkillTarget> {
 /// dir or a list (default `~/.general/skills` then `~/.agents/skills`, the
 /// sync-skills sources in its order; later entries win on a name clash).
 pub fn skills_source(paths: &Paths, home: &Path) -> Vec<PathBuf> {
+    // Plugin-shipped skills come last so they win over stale hand copies.
+    let mut dirs = configured_skills_source(paths, home);
+    dirs.push(crate::plugins::plugin_skills_dir(paths));
+    dirs
+}
+
+fn configured_skills_source(paths: &Paths, home: &Path) -> Vec<PathBuf> {
     if let Ok(reg) = Registry::load(paths)
         && let Some(table) = reg.extra.get("shared").and_then(|v| v.as_table())
         && let Some(value) = table.get("skills_source")
@@ -1349,6 +1356,8 @@ mod tests {
     #[test]
     fn skills_source_single_string_and_list() {
         let fx = fixture("source-cfg");
+        // Shipped plugin skills always come last.
+        let plugin_dir = crate::plugins::plugin_skills_dir(&fx.paths);
         fs::create_dir_all(&fx.paths.config_dir).unwrap();
         // Single string still loads.
         fs::write(
@@ -1358,7 +1367,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             skills_source(&fx.paths, &fx.home),
-            vec![fx.home.join("mys/base")]
+            vec![fx.home.join("mys/base"), plugin_dir.clone()]
         );
         // List form loads in order; empty list falls back to the default.
         fs::write(
@@ -1368,7 +1377,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             skills_source(&fx.paths, &fx.home),
-            vec![fx.home.join("a"), fx.home.join("b")]
+            vec![fx.home.join("a"), fx.home.join("b"), plugin_dir.clone()]
         );
         fs::write(
             fx.paths.registry_file(),
@@ -1379,7 +1388,8 @@ mod tests {
             skills_source(&fx.paths, &fx.home),
             vec![
                 fx.home.join(".general/skills"),
-                fx.home.join(".agents/skills")
+                fx.home.join(".agents/skills"),
+                plugin_dir
             ]
         );
     }

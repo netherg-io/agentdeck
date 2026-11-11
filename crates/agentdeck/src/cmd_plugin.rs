@@ -75,6 +75,7 @@ pub fn run(paths: &Paths, cmd: PluginCmd) -> anyhow::Result<()> {
                 return Ok(());
             }
             plugins::apply_all(paths, &name, true, &changes)?;
+            plugins::sync_plugin_skills(paths, &home)?;
             println!("enabled {name}");
             Ok(())
         }
@@ -95,6 +96,7 @@ pub fn run(paths: &Paths, cmd: PluginCmd) -> anyhow::Result<()> {
                 return Ok(());
             }
             plugins::apply_all(paths, &name, false, &changes)?;
+            plugins::sync_plugin_skills(paths, &home)?;
             println!("disabled {name} (data kept)");
             Ok(())
         }
@@ -135,6 +137,9 @@ pub fn uninstall(paths: &Paths, dry_run: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     agentdeck_core::apply_changes(&blocks)?;
+    for c in plugins::sync_plugin_skills(paths, &home)? {
+        println!("{}", c.describe());
+    }
     println!("agentdeck integrations removed; delete the binary to finish");
     Ok(())
 }

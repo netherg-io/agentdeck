@@ -157,12 +157,13 @@ fn plan_blocks(reg: &Registry, paths: &Paths, home: &Path) -> anyhow::Result<Vec
     crate::plugins::plan_managed_blocks(reg, home, &exe, &paths.state_dir)
 }
 
-/// Agentdeck's own instruction blocks that differ from the generated text.
+/// Agentdeck's own instruction blocks and shipped skills that differ from
+/// the generated content.
 /// Restoring them is ADDITIVE: the blocks belong to agentdeck, so hand edits
 /// are reverted. Malformed markers need the owner.
 fn block_items(reg: &Registry, paths: &Paths, home: &Path) -> Vec<SyncItem> {
     let item = |kind, detail| SyncItem::new(BLOCKS_GROUP_ID, "instructions", kind, detail);
-    match plan_blocks(reg, paths, home) {
+    let mut items = match plan_blocks(reg, paths, home) {
         Ok(changes) => changes
             .iter()
             .filter_map(|change| match change {
@@ -177,14 +178,23 @@ fn block_items(reg: &Registry, paths: &Paths, home: &Path) -> Vec<SyncItem> {
             })
             .collect(),
         Err(error) => vec![item(ItemKind::Decision, format!("{error:#}"))],
+    };
+    if !crate::plugins::plan_plugin_skills(reg, paths).is_empty() {
+        items.push(item(
+            ItemKind::Additive,
+            "agentdeck plugin skills out of date".into(),
+        ));
     }
+    items
 }
 
-/// Rewrite agentdeck's blocks to the generated text. Runs regardless of
-/// `[sync] auto_apply`: it only touches agentdeck-owned lines.
+/// Rewrite agentdeck's blocks and shipped skills to the generated content.
+/// Runs regardless of `[sync] auto_apply`: it only touches agentdeck-owned
+/// lines and files.
 pub fn restore_blocks(paths: &Paths, home: &Path) -> anyhow::Result<Vec<Change>> {
-    let changes = plan_blocks(&Registry::load(paths)?, paths, home)?;
+    let mut changes = plan_blocks(&Registry::load(paths)?, paths, home)?;
     crate::apply_changes(&changes)?;
+    changes.extend(crate::plugins::sync_plugin_skills(paths, home)?);
     Ok(changes)
 }
 
@@ -684,10 +694,14 @@ mod tests {
         };
         let agents = fx.home.join("AGENTS.md");
         set(true);
-        // CLAUDE.md links to AGENTS.md: one item, one write with both blocks.
-        assert_eq!(block_items().len(), 1);
-        assert_eq!(block_items()[0].kind, ItemKind::Additive);
-        assert_eq!(restore_blocks(&fx.paths, &fx.home).unwrap().len(), 1);
+        // CLAUDE.md links to AGENTS.md: one block item plus the shipped skills.
+        assert_eq!(block_items().len(), 2);
+        assert!(block_items().iter().all(|i| i.kind == ItemKind::Additive));
+        restore_blocks(&fx.paths, &fx.home).unwrap();
+        let skill = crate::plugins::plugin_skills_dir(&fx.paths).join("coordinator/SKILL.md");
+        let shipped = fs::read_to_string(&skill).unwrap();
+        let link = fx.home.join(".claude/skills/coordinator");
+        assert_eq!(fs::read_link(&link).unwrap(), skill.parent().unwrap());
         let fresh = fs::read_to_string(&agents).unwrap();
         assert!(
             fresh.starts_with("me\n<!-- agent-process:begin -->\n"),
@@ -695,6 +709,12 @@ mod tests {
         );
         assert!(fresh.contains("<!-- model-route:begin -->"), "{fresh}");
         assert!(block_items().is_empty());
+
+        // Hand edits to shipped skills are reverted.
+        fs::write(&skill, "mine").unwrap();
+        assert_eq!(block_items().len(), 1);
+        restore_blocks(&fx.paths, &fx.home).unwrap();
+        assert_eq!(fs::read_to_string(&skill).unwrap(), shipped);
 
         // A hand edit inside a block is reverted; text outside survives.
         let edited = fresh
@@ -712,6 +732,8 @@ mod tests {
         set(false);
         restore_blocks(&fx.paths, &fx.home).unwrap();
         assert_eq!(fs::read_to_string(&agents).unwrap(), "me\nmine\n");
+        assert!(!skill.exists());
+        assert!(fs::symlink_metadata(&link).is_err());
 
         // Broken markers are never rewritten blindly.
         fs::write(&agents, "<!-- agent-process:begin -->\nx\n").unwrap();

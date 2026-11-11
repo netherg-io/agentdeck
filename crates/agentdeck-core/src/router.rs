@@ -363,6 +363,7 @@ pub fn router_block(exe: &Path) -> String {
         `target` (including `options`) as the `delegate_task` target; append a returned `briefHint` verbatim. \
         `jevConfidence` < 0.4: compare quality and quota penalties of the top two eligible candidates. `target: null`: \
         split the work or do it yourself. A denied target: use the next `eligible` model in `ranking`.\n\
+        - When the user explicitly asks for a specific model, start the task with `[route:user-choice]`: the router then allows any catalog model and only warns.\n\
         - Never set `runtimeMode` unless asked.\n"
     )
 }

@@ -894,6 +894,7 @@ fn apply_plugin(paths: &agentdeck_core::Paths, pending: &Pending) -> Result<Stri
     .map_err(|e| format!("{e:#}"))?;
     agentdeck_core::plugins::apply_all(paths, &pending.name, pending.enable, &planned)
         .map_err(|e| format!("{e:#}"))?;
+    agentdeck_core::plugins::sync_plugin_skills(paths, &home).map_err(|e| format!("{e:#}"))?;
     Ok(if pending.enable {
         format!("enabled {}", pending.name)
     } else {

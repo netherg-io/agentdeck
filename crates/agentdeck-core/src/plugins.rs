@@ -308,6 +308,65 @@ pub fn plan_managed_blocks(
     Ok(changes)
 }
 
+/// Skills shipped with the router plugin, written under the state dir and
+/// linked into every harness by the shared skill sync like any other skill.
+const ROUTER_SKILLS: [(&str, &str); 3] = [
+    (
+        "coordinator/SKILL.md",
+        include_str!("../plugin-skills/coordinator/SKILL.md"),
+    ),
+    (
+        "t3-routed-workflow/SKILL.md",
+        include_str!("../plugin-skills/t3-routed-workflow/SKILL.md"),
+    ),
+    (
+        "t3-routed-workflow/agents/openai.yaml",
+        include_str!("../plugin-skills/t3-routed-workflow/agents/openai.yaml"),
+    ),
+];
+
+pub fn plugin_skills_dir(paths: &Paths) -> PathBuf {
+    paths.state_dir.join("plugin-skills")
+}
+
+/// Shipped skill files match the binary while the router is enabled (hand
+/// edits are reverted) and are gone when it is not.
+pub fn plan_plugin_skills(reg: &Registry, paths: &Paths) -> Vec<Change> {
+    let dir = plugin_skills_dir(paths);
+    if !plugin_enabled(reg, PLUGIN_ROUTER) {
+        return if fs::symlink_metadata(&dir).is_ok() {
+            vec![Change::BackupRemove {
+                path: dir,
+                backup: backup_dest(&paths.state_dir, "plugin-skills"),
+            }]
+        } else {
+            Vec::new()
+        };
+    }
+    ROUTER_SKILLS
+        .iter()
+        .filter_map(|(rel, body)| {
+            let path = dir.join(rel);
+            let old = fs::read(&path).ok();
+            plan_write_file(path, old.as_deref(), body.as_bytes())
+        })
+        .collect()
+}
+
+/// Bring shipped skills in line with the registry, then relink harness skill
+/// dirs so new skills appear and removed ones lose their links.
+pub fn sync_plugin_skills(paths: &Paths, home: &Path) -> anyhow::Result<Vec<Change>> {
+    let mut changes = plan_plugin_skills(&Registry::load(paths)?, paths);
+    if changes.is_empty() {
+        return Ok(changes);
+    }
+    apply_changes(&changes)?;
+    let links = crate::shared::plan_skills_sync(home, paths)?;
+    apply_changes(&links)?;
+    changes.extend(links);
+    Ok(changes)
+}
+
 /// `~/.local/bin`, or `$AGENTDECK_BIN_DIR` when set (tests inject temp dirs).
 pub fn bin_dir(home: &Path) -> PathBuf {
     std::env::var_os("AGENTDECK_BIN_DIR")
