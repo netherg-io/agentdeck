@@ -1113,3 +1113,56 @@ fn quota_module_hides_providers_and_adds_and_removes_sources() {
             .all(|u| u.id != "deepseek-gui")
     );
 }
+
+#[test]
+fn global_instructions_appear_in_drift_without_secondary_accounts() {
+    let _env = lock_env();
+    let (paths, dir, _guard) = fixture_paths("global-instructions");
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    Registry::update(&paths, |_| Ok(())).unwrap();
+    std::fs::write(home.join("AGENTS.md"), "shared rules\n").unwrap();
+    for (path, _) in agentdeck_core::shared::instruction_targets(&home) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "client-specific rules\n").unwrap();
+    }
+    let ctx = drift::Ctx {
+        paths,
+        home,
+        t3_root: None,
+    };
+    let snapshot = drift::snapshot(&ctx);
+    assert!(snapshot.error.is_none());
+    let group = drift_group(&snapshot, "global-instructions");
+    assert_eq!(drift::open_items(group), 4);
+    let state = drift::State {
+        snapshot,
+        ..Default::default()
+    };
+    for (language, title) in [("en", "Instruction files"), ("ru", "Файлы инструкций")]
+    {
+        agentdeck_gui::i18n::set_language(language);
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            (760.0, 420.0),
+            drift::view(&state),
+        );
+        ui.find(title).expect("localized instruction group");
+        for path in [
+            ".claude/CLAUDE.md",
+            ".codex/AGENTS.md",
+            ".config/opencode/AGENTS.md",
+            ".gemini/GEMINI.md",
+        ] {
+            assert!(
+                drift_group(&state.snapshot, "global-instructions")
+                    .items
+                    .iter()
+                    .any(|item| item.text.contains(path))
+            );
+        }
+        ui.snapshot(&agentdeck_gui::style::theme(true))
+            .expect("headless instruction drift render");
+    }
+    agentdeck_gui::i18n::set_language("en");
+}

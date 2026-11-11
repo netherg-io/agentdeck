@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::changes::Change;
-use crate::{Paths, Registry, claude, codex};
+use crate::{Paths, Registry, claude, codex, shared};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -100,6 +100,49 @@ pub fn set_auto_apply(paths: &Paths, on: bool, dry_run: bool) -> anyhow::Result<
     }])
 }
 
+/// Global instruction drift is independent of secondary account registration.
+/// Only installed harness directories participate; a missing shared source is
+/// reported once when existing instruction files would otherwise be hidden.
+pub fn instruction_items(home: &Path) -> Vec<SyncItem> {
+    let statuses: Vec<_> = shared::instructions_status(home)
+        .into_iter()
+        .filter(|status| status.path.parent().is_some_and(Path::is_dir))
+        .collect();
+    let source = shared::instruction_source(home);
+    if !source.is_file() {
+        return if statuses
+            .iter()
+            .any(|status| !matches!(status.state, shared::InstrState::Missing))
+        {
+            vec![SyncItem::new(
+                "global-instructions",
+                "instructions",
+                ItemKind::Decision,
+                "~/AGENTS.md: shared instruction source missing or not a file".into(),
+            )]
+        } else {
+            Vec::new()
+        };
+    }
+    statuses
+        .into_iter()
+        .filter(|status| !matches!(status.state, shared::InstrState::Linked))
+        .map(|status| {
+            let kind = match status.state {
+                shared::InstrState::Missing => ItemKind::Additive,
+                _ => ItemKind::Decision,
+            };
+            let relative = status.path.strip_prefix(home).unwrap_or(&status.path);
+            SyncItem::new(
+                "global-instructions",
+                "instructions",
+                kind,
+                format!("~/{}: {}", relative.display(), status.state.describe()),
+            )
+        })
+        .collect()
+}
+
 /// Gather drift for every registry instance (Claude + Codex). `home` is the
 /// real `$HOME` in production, a temp dir in tests; `t3_root` is accepted and
 /// ignored: T3 provider-instance envelopes are explicit T3 management
@@ -107,7 +150,7 @@ pub fn set_auto_apply(paths: &Paths, on: bool, dry_run: bool) -> anyhow::Result<
 pub fn gather(paths: &Paths, home: &Path, t3_root: Option<&Path>) -> anyhow::Result<Vec<SyncItem>> {
     let _ = t3_root;
     let reg = Registry::load(paths)?;
-    let mut out = Vec::new();
+    let mut out = instruction_items(home);
     let primary = home.join(".claude");
     let primary_json = home.join(".claude.json");
     for inst in &reg.instances {
@@ -262,6 +305,25 @@ pub fn apply_additive(
     let primary_json = home.join(".claude.json");
     let main_default = home.join(".codex");
     let mut applied = Vec::new();
+    let source = shared::instruction_source(home);
+    if source.is_file() {
+        for status in shared::instructions_status(home) {
+            if !matches!(status.state, shared::InstrState::Missing)
+                || !status.path.parent().is_some_and(Path::is_dir)
+            {
+                continue;
+            }
+            // Create exclusively: a concurrent edit must never be replaced.
+            match std::os::unix::fs::symlink(&source, &status.path) {
+                Ok(()) => applied.push(Change::Symlink {
+                    link: status.path,
+                    target: source.clone(),
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
     for inst in &reg.instances {
         let dir = expand_tilde(&inst.home, home);
         match inst.harness {
@@ -404,7 +466,8 @@ mod tests {
         for name in ["skills", "agents", "plugins"] {
             fs::create_dir_all(dot_claude.join(name)).unwrap();
         }
-        fs::write(dot_claude.join("CLAUDE.md"), "me").unwrap();
+        fs::write(home.join("AGENTS.md"), "me").unwrap();
+        std::os::unix::fs::symlink(home.join("AGENTS.md"), dot_claude.join("CLAUDE.md")).unwrap();
         fs::write(dot_claude.join("settings.json"), "{\"theme\":\"dark\"}\n").unwrap();
         fs::write(
             home.join(".claude.json"),
@@ -448,6 +511,99 @@ mod tests {
             .filter(|i| i.instance == instance)
             .map(|i| i.kind)
             .collect()
+    }
+
+    #[test]
+    fn global_instruction_drift_reaches_background_sync() {
+        let fx = fixture();
+        fs::write(fx.home.join("AGENTS.md"), "shared rules\n").unwrap();
+        for (path, _) in crate::shared::instruction_targets(&fx.home) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let _ = fs::remove_file(&path);
+            fs::write(path, "client-specific rules\n").unwrap();
+        }
+        let items = gather(&fx.paths, &fx.home, None).unwrap();
+        for relative in [
+            ".claude/CLAUDE.md",
+            ".codex/AGENTS.md",
+            ".config/opencode/AGENTS.md",
+            ".gemini/GEMINI.md",
+        ] {
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item.kind == ItemKind::Decision && item.detail.contains(relative)),
+                "missing global instruction drift for {relative}: {items:?}"
+            );
+        }
+        assert!(!decision_instances(&items).is_empty());
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.detail.contains("client-specific rules"))
+        );
+    }
+
+    #[test]
+    fn missing_instruction_links_apply_without_replacing_existing_rules() {
+        let fx = fixture();
+        apply_additive(&fx.paths, &fx.home, None).unwrap();
+        let codex = fx.home.join(".codex/AGENTS.md");
+        fs::remove_file(&codex).unwrap();
+        let opencode = fx.home.join(".config/opencode/AGENTS.md");
+        fs::create_dir_all(opencode.parent().unwrap()).unwrap();
+        fs::write(&opencode, "private opencode rules\n").unwrap();
+        let wrong = fx.home.join(".gemini/GEMINI.md");
+        fs::create_dir_all(wrong.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(fx.home.join("missing.md"), &wrong).unwrap();
+        let items = instruction_items(&fx.home);
+        assert_eq!(items.len(), 3, "{items:?}");
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.kind == ItemKind::Additive)
+                .count(),
+            1
+        );
+        apply_additive(&fx.paths, &fx.home, None).unwrap();
+        assert_eq!(fs::read_link(&codex).unwrap(), fx.home.join("AGENTS.md"));
+        assert_eq!(
+            fs::read_to_string(&opencode).unwrap(),
+            "private opencode rules\n"
+        );
+        assert_eq!(fs::read_link(&wrong).unwrap(), fx.home.join("missing.md"));
+        assert_eq!(instruction_items(&fx.home).len(), 2);
+        assert!(
+            apply_additive(&fx.paths, &fx.home, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn instruction_drift_clears_after_linking_and_reports_missing_source() {
+        let fx = fixture();
+        let changes = shared::plan_instructions_link(&fx.home, &fx.paths.state_dir, true).unwrap();
+        apply_changes(&changes).unwrap();
+        assert!(instruction_items(&fx.home).is_empty());
+        fs::remove_file(fx.home.join("AGENTS.md")).unwrap();
+        let items = instruction_items(&fx.home);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, ItemKind::Decision);
+        assert!(
+            items[0]
+                .detail
+                .contains("shared instruction source missing")
+        );
+    }
+
+    #[test]
+    fn instruction_sync_skips_uninstalled_harnesses() {
+        let fx = fixture();
+        apply_additive(&fx.paths, &fx.home, None).unwrap();
+        assert!(!fx.home.join(".config/opencode").exists());
+        assert!(!fx.home.join(".gemini").exists());
+        assert!(instruction_items(&fx.home).is_empty());
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agentdeck_core::{Harness, Paths, Registry, claude, codex, t3};
+use agentdeck_core::{Harness, Paths, Registry, claude, codex, sync, t3};
 use i18n_embed_fl::fl;
 use iced::widget::column;
 use iced::{Element, Task};
@@ -321,7 +321,19 @@ pub fn snapshot(ctx: &Ctx) -> Snapshot {
             };
         }
     };
-    let mut groups = Vec::new();
+    let mut groups = vec![Group {
+        id: "global-instructions".into(),
+        harness: "instructions".into(),
+        items: sync::instruction_items(&ctx.home)
+            .into_iter()
+            .map(|item| Item {
+                key: item.detail.clone(),
+                text: item.detail,
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }];
     for inst in &reg.instances {
         if inst.harness == Harness::Claude {
             groups.push(claude_group(inst, ctx));
@@ -814,14 +826,17 @@ pub fn view(state: &State) -> Element<'_, Message> {
             continue;
         }
         any = true;
-        let title = group
-            .title
-            .clone()
-            .unwrap_or_else(|| fl!(loader(), "drift-group-t3"));
+        let title = group.title.clone().unwrap_or_else(|| {
+            if group.harness == "instructions" {
+                fl!(loader(), "shared-instr")
+            } else {
+                fl!(loader(), "drift-group-t3")
+            }
+        });
         let mut head = row![st::fit(title, st::Role::Heading, st::Cut::End)]
             .spacing(st::SPACE_S)
             .align_y(Alignment::Center);
-        if !group.harness.is_empty() {
+        if !group.harness.is_empty() && group.harness != "instructions" {
             head = head.push(st::pill(group.harness.as_str(), st::Tone::Accent));
         }
         if reenable {

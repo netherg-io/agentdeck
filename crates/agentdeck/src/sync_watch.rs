@@ -20,6 +20,11 @@ pub const RESCAN: Duration = Duration::from_secs(10 * 60);
 /// (`.hook-trust` records, sessions churn would otherwise rescan constantly).
 fn watch_roots(paths: &Paths, home: &Path) -> Vec<PathBuf> {
     let mut roots = vec![paths.config_dir.clone(), home.to_path_buf()];
+    roots.extend(
+        agentdeck_core::shared::instruction_targets(home)
+            .into_iter()
+            .filter_map(|(path, _)| path.parent().map(Path::to_path_buf)),
+    );
     let Ok(reg) = Registry::load(paths) else {
         return roots;
     };
@@ -203,7 +208,8 @@ mod tests {
         for name in ["skills", "agents", "plugins"] {
             fs::create_dir_all(dot.join(name)).unwrap();
         }
-        fs::write(dot.join("CLAUDE.md"), "me").unwrap();
+        fs::write(home.join("AGENTS.md"), "me").unwrap();
+        std::os::unix::fs::symlink(home.join("AGENTS.md"), dot.join("CLAUDE.md")).unwrap();
         fs::write(dot.join("settings.json"), "{\"theme\":\"dark\"}\n").unwrap();
         fs::write(
             home.join(".claude.json"),
@@ -235,6 +241,35 @@ mod tests {
         let inner = log.clone();
         let f = move |t: String, b: String| inner.lock().unwrap().push((t, b));
         (log, f)
+    }
+
+    #[test]
+    fn global_instruction_drift_notifies_and_watches_every_harness() {
+        let (_g, paths, home) = fixture();
+        sync::set_auto_apply(&paths, true, false).unwrap();
+        let (log, notify) = recorder();
+        scan_once(&paths, &home, None, &notify);
+        assert!(log.lock().unwrap().is_empty());
+        for (path, _) in agentdeck_core::shared::instruction_targets(&home) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let _ = fs::remove_file(&path);
+            fs::write(&path, "private client rules\n").unwrap();
+        }
+        let roots = watch_roots(&paths, &home);
+        for (path, _) in agentdeck_core::shared::instruction_targets(&home) {
+            assert!(roots.contains(&path.parent().unwrap().to_path_buf()));
+        }
+        assert!(roots.contains(&home));
+        assert_eq!(scan_once(&paths, &home, None, &notify), 1);
+        assert_eq!(log.lock().unwrap().len(), 1);
+        let body = log.lock().unwrap()[0].1.clone();
+        assert!(body.contains("global-instructions"), "{body}");
+        assert!(!body.contains("private client rules"));
+        scan_once(&paths, &home, None, &notify);
+        assert_eq!(log.lock().unwrap().len(), 1);
+        for (path, _) in agentdeck_core::shared::instruction_targets(&home) {
+            assert_eq!(fs::read_to_string(path).unwrap(), "private client rules\n");
+        }
     }
 
     #[test]
