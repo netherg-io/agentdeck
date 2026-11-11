@@ -689,7 +689,10 @@ mod tests {
         assert_eq!(block_items()[0].kind, ItemKind::Additive);
         assert_eq!(restore_blocks(&fx.paths, &fx.home).unwrap().len(), 1);
         let fresh = fs::read_to_string(&agents).unwrap();
-        assert!(fresh.starts_with("me\n<!-- agent-process:begin -->\n"), "{fresh}");
+        assert!(
+            fresh.starts_with("me\n<!-- agent-process:begin -->\n"),
+            "{fresh}"
+        );
         assert!(fresh.contains("<!-- model-route:begin -->"), "{fresh}");
         assert!(block_items().is_empty());
 
