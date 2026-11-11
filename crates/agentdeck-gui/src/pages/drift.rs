@@ -322,7 +322,7 @@ pub fn snapshot(ctx: &Ctx) -> Snapshot {
         }
     };
     let mut groups = vec![Group {
-        id: "global-instructions".into(),
+        id: sync::INSTRUCTIONS_GROUP_ID.into(),
         harness: "instructions".into(),
         items: sync::instruction_items(&ctx.home)
             .into_iter()

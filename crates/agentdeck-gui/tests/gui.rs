@@ -1133,7 +1133,7 @@ fn global_instructions_appear_in_drift_without_secondary_accounts() {
     };
     let snapshot = drift::snapshot(&ctx);
     assert!(snapshot.error.is_none());
-    let group = drift_group(&snapshot, "global-instructions");
+    let group = drift_group(&snapshot, agentdeck_core::sync::INSTRUCTIONS_GROUP_ID);
     assert_eq!(drift::open_items(group), 4);
     let state = drift::State {
         snapshot,
@@ -1149,7 +1149,9 @@ fn global_instructions_appear_in_drift_without_secondary_accounts() {
                 drift::view(&state),
             );
             ui.find(title).expect("localized instruction group");
-            for item in &drift_group(&state.snapshot, "global-instructions").items {
+            for item in
+                &drift_group(&state.snapshot, agentdeck_core::sync::INSTRUCTIONS_GROUP_ID).items
+            {
                 ui.find(item.text.as_str()).expect("instruction drift row");
             }
             let screenshot = ui
@@ -1165,5 +1167,29 @@ fn global_instructions_appear_in_drift_without_secondary_accounts() {
             }
         }
     }
+    // A valid account id must never shadow the shared instruction group.
+    Registry::update(&ctx.paths, |registry| {
+        registry.add(agentdeck_core::AddSpec {
+            id: "global-instructions".into(),
+            harness: agentdeck_core::Harness::Claude,
+            display_name: None,
+            home: ctx.home.join(".claude").to_string_lossy().into_owned(),
+            binary: None,
+            no_t3: true,
+        })
+    })
+    .unwrap();
+    let snapshot = drift::snapshot(&ctx);
+    assert_eq!(
+        drift_group(&snapshot, "global-instructions").harness,
+        "claude"
+    );
+    assert_eq!(
+        drift::open_items(drift_group(
+            &snapshot,
+            agentdeck_core::sync::INSTRUCTIONS_GROUP_ID
+        )),
+        4
+    );
     agentdeck_gui::i18n::set_language("en");
 }

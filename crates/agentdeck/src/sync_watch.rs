@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(scan_once(&paths, &home, None, &notify), 1);
         assert_eq!(log.lock().unwrap().len(), 1);
         let body = log.lock().unwrap()[0].1.clone();
-        assert!(body.contains("global-instructions"), "{body}");
+        assert!(body.contains(sync::INSTRUCTIONS_GROUP_ID), "{body}");
         assert!(!body.contains("private client rules"));
         scan_once(&paths, &home, None, &notify);
         assert_eq!(log.lock().unwrap().len(), 1);

@@ -24,6 +24,9 @@ use serde::Serialize;
 use crate::changes::Change;
 use crate::{Paths, Registry, claude, codex, shared};
 
+// The colon keeps this group distinct from every valid registry instance id.
+pub const INSTRUCTIONS_GROUP_ID: &str = "global:instructions";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ItemKind {
@@ -33,7 +36,7 @@ pub enum ItemKind {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SyncItem {
-    /// Registry instance id.
+    /// Registry instance id or the global instruction group id.
     pub instance: String,
     pub harness: String,
     pub kind: ItemKind,
@@ -115,7 +118,7 @@ pub fn instruction_items(home: &Path) -> Vec<SyncItem> {
             .any(|status| !matches!(status.state, shared::InstrState::Missing))
         {
             vec![SyncItem::new(
-                "global-instructions",
+                INSTRUCTIONS_GROUP_ID,
                 "instructions",
                 ItemKind::Decision,
                 "~/AGENTS.md: shared instruction source missing or not a file".into(),
@@ -134,7 +137,7 @@ pub fn instruction_items(home: &Path) -> Vec<SyncItem> {
             };
             let relative = status.path.strip_prefix(home).unwrap_or(&status.path);
             SyncItem::new(
-                "global-instructions",
+                INSTRUCTIONS_GROUP_ID,
                 "instructions",
                 kind,
                 format!("~/{}: {}", relative.display(), status.state.describe()),
@@ -144,8 +147,8 @@ pub fn instruction_items(home: &Path) -> Vec<SyncItem> {
 }
 
 /// Gather global instruction drift and registry instance drift (Claude + Codex).
-/// `home` is the
-/// real `$HOME` in production, a temp dir in tests; `t3_root` is accepted and
+/// `home` is the real `$HOME` in production, a temp dir in tests;
+/// `t3_root` is accepted and
 /// ignored: T3 provider-instance envelopes are explicit T3 management
 /// (`t3 sync`), never Drift, so they contribute no badge or notification.
 pub fn gather(paths: &Paths, home: &Path, t3_root: Option<&Path>) -> anyhow::Result<Vec<SyncItem>> {
