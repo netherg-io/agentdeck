@@ -208,6 +208,7 @@ parallel-invalid = Введите целое число от 1 до 4294967295 �
 nav-group-usage = Квоты
 nav-group-router = Роутер
 plugin-imagegen = Генерация изображений
+nav-group-imagegen = Изображения
 nav-imagegen-settings = Настройки
 imagegen-provider = Шлюз
 imagegen-model = Модель

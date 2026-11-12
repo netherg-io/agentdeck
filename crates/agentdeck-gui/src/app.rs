@@ -1065,7 +1065,7 @@ fn sidebar(state: &State) -> Element<'_, Message> {
             ],
         ),
         module(
-            fl!(loader(), "plugin-imagegen"),
+            fl!(loader(), "nav-group-imagegen"),
             agentdeck_core::plugins::PLUGIN_IMAGEGEN,
             &[(Page::ImagegenSettings, st::Icon::Image)],
         ),

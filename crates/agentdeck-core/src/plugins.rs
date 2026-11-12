@@ -863,6 +863,123 @@ mod tests {
         assert!(plan_plugin_skills(&reg, &paths).is_empty());
     }
 
+    /// Every file, link and dir under `root` except agentdeck's own config
+    /// and state (plugin data is kept by design).
+    fn tree(root: &Path, skip: &[PathBuf]) -> BTreeMap<PathBuf, String> {
+        fn walk(dir: &Path, root: &Path, skip: &[PathBuf], out: &mut BTreeMap<PathBuf, String>) {
+            let Ok(rd) = fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if skip.iter().any(|s| p.starts_with(s)) {
+                    continue;
+                }
+                let rel = p.strip_prefix(root).unwrap().to_path_buf();
+                let m = fs::symlink_metadata(&p).unwrap();
+                if m.file_type().is_symlink() {
+                    out.insert(rel, format!("-> {}", fs::read_link(&p).unwrap().display()));
+                } else if m.is_dir() {
+                    out.insert(rel, "dir".into());
+                    walk(&p, root, skip, out);
+                } else {
+                    out.insert(
+                        rel,
+                        String::from_utf8_lossy(&fs::read(&p).unwrap()).into_owned(),
+                    );
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, skip, &mut out);
+        // Parents of agentdeck's own dirs; their other contents still count.
+        for parent in skip.iter().filter_map(|s| s.parent()) {
+            if let Ok(rel) = parent.strip_prefix(root) {
+                out.remove(rel);
+            }
+        }
+        out
+    }
+
+    /// Enable then disable each plugin the way the CLI does (plan, apply,
+    /// plugin-skill sync): everything outside agentdeck's data must be byte
+    /// for byte what it was, as if the plugin had never been there.
+    #[test]
+    fn every_plugin_leaves_no_trace_after_disable() {
+        let _env = test_env_lock();
+        let real_home = env::var_os("HOME");
+        for name in PLUGINS {
+            let (g, home, paths, files, exe) = setup(&format!("trace-{name}"));
+            let t3 = g.0.join("t3");
+            fs::create_dir_all(&t3).unwrap();
+            unsafe {
+                env::set_var("AGENTDECK_T3_DIR", &t3);
+                // XDG dirs sit beside the fake home; only dirs under $HOME
+                // are tracked, and the created-dirs log lives in our state.
+                env::set_var("HOME", &g.0);
+                env::set_var("AGENTDECK_STATE_DIR", &paths.state_dir);
+            }
+            let w = |rel: &str, body: &str| {
+                let p = home.join(rel);
+                fs::create_dir_all(p.parent().unwrap()).unwrap();
+                fs::write(p, body).unwrap();
+            };
+            w("AGENTS.md", "# mine\n\nhand-written rules\n");
+            w(".claude/CLAUDE.md", "claude only\n");
+            w(
+                ".claude/settings.json",
+                "{\n  \"model\": \"opus\",\n  \"hooks\": {\n    \"PostToolUse\": [\n      {\n        \"matcher\": \"Bash\",\n        \"hooks\": [{ \"type\": \"command\", \"command\": \"true\" }]\n      }\n    ]\n  }\n}\n",
+            );
+            w(".claude-second/settings.json", "{\"theme\":\"dark\"}");
+            w(".codex/config.toml", "model = \"gpt\"\n");
+            w(
+                ".gemini/config/config.json",
+                "{\n  \"plugins\": {\n    \"Figma\": {\n      \"enabled\": true\n    }\n  }\n}\n",
+            );
+            w(".config/opencode/opencode.json", "{}\n");
+            for d in [
+                ".claude/skills",
+                ".agents/skills",
+                ".config/opencode/skills",
+                ".gemini/skills",
+                ".local/bin",
+            ] {
+                fs::create_dir_all(home.join(d)).unwrap();
+            }
+            let skip = [
+                paths.config_dir.clone(),
+                paths.state_dir.clone(),
+                g.0.join("calls.log"),
+            ];
+            let before = tree(&g.0, &skip);
+            let on = plan_enable(&paths, &home, &files, &exe, name, false).unwrap();
+            apply_all(&paths, name, true, &on).unwrap();
+            sync_plugin_skills(&paths, &home).unwrap();
+            assert_ne!(tree(&g.0, &skip), before, "{name}: enable changed nothing");
+            let off = plan_disable(&paths, &home, &files, &exe, name).unwrap();
+            apply_all(&paths, name, false, &off).unwrap();
+            sync_plugin_skills(&paths, &home).unwrap();
+            let after = tree(&g.0, &skip);
+            let diff: Vec<String> = before
+                .keys()
+                .chain(after.keys())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .filter(|k| before.get(*k) != after.get(*k))
+                .map(|k| format!("{}: {:?} -> {:?}", k.display(), before.get(k), after.get(k)))
+                .collect();
+            assert!(diff.is_empty(), "{name} left traces:\n{}", diff.join("\n"));
+            unsafe {
+                env::remove_var("AGENTDECK_T3_DIR");
+            }
+        }
+        unsafe {
+            env::remove_var("AGENTDECK_STATE_DIR");
+            match real_home {
+                Some(h) => env::set_var("HOME", h),
+                None => env::remove_var("HOME"),
+            }
+        }
+    }
+
     fn setup(tag: &str) -> (Guard, PathBuf, Paths, Vec<PathBuf>, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "agentdeck-plugins-{tag}-{}-{}",
@@ -1124,17 +1241,16 @@ mod tests {
         // Disable: hooks first (fail closed), then files, then the block.
         let changes = plan_disable(&paths, &home, &files, &exe, PLUGIN_ROUTER).unwrap();
         assert!(!changes.is_empty());
-        let is_settings = |c: &Change| matches!(c, Change::WriteFile { path, .. } if path.ends_with("settings.json"));
+        // settings.json did not exist before enable, so disable removes it.
+        let is_settings = |c: &Change| matches!(c, Change::WriteFile { path, .. } | Change::Remove { path } if path.ends_with("settings.json"));
         let first_hook = changes.iter().position(is_settings).unwrap();
         let first_remove = changes
             .iter()
-            .position(|c| matches!(c, Change::Remove { .. }))
+            .position(|c| matches!(c, Change::Remove { path } if !path.ends_with("settings.json")))
             .unwrap();
         assert!(first_hook < first_remove, "hooks go before files");
         apply_all(&paths, PLUGIN_ROUTER, false, &changes).unwrap();
-        let settings = fs::read_to_string(home.join(".claude/settings.json")).unwrap();
-        assert!(!settings.contains("route hook"));
-        assert!(!settings.contains("hook.mjs"));
+        assert!(!home.join(".claude/settings.json").exists());
         assert!(!home.join(".config/opencode/plugin/model-route.ts").exists());
         assert!(!worker.exists());
         assert!(dir.join("router.json").exists(), "data is kept");
