@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use crate::paths::Paths;
 use crate::registry::Registry;
 use crate::settings::{PROVIDER_OPENROUTER, PROVIDER_VERCEL};
 use crate::usage::UsageKind;
@@ -37,9 +38,15 @@ pub struct ImagegenSettings {
     pub transparent_model: String,
 }
 
-/// `[imagegen] provider / model / transparent_model`; an unknown provider falls back to Vercel,
-/// a missing model to the provider's default.
-pub fn read(reg: &Registry) -> ImagegenSettings {
+/// `[imagegen]` exactly as stored; `None` means the built-in default.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Stored {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub transparent_model: Option<String>,
+}
+
+pub fn stored(reg: &Registry) -> Stored {
     let get = |key: &str| {
         reg.extra
             .get("imagegen")
@@ -48,17 +55,56 @@ pub fn read(reg: &Registry) -> ImagegenSettings {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    let provider = get("provider")
-        .filter(|p| p == PROVIDER_VERCEL || p == PROVIDER_OPENROUTER)
-        .unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
-    let model = get("model").unwrap_or_else(|| default_model(&provider).to_string());
-    let transparent_model =
-        get("transparent_model").unwrap_or_else(|| DEFAULT_TRANSPARENT_MODEL.to_string());
+    Stored {
+        provider: get("provider").filter(|p| p == PROVIDER_VERCEL || p == PROVIDER_OPENROUTER),
+        model: get("model"),
+        transparent_model: get("transparent_model"),
+    }
+}
+
+/// Effective settings: an unknown provider falls back to Vercel, a missing
+/// model to the provider's default.
+pub fn read(reg: &Registry) -> ImagegenSettings {
+    let s = stored(reg);
+    let provider = s.provider.unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
+    let model = s
+        .model
+        .unwrap_or_else(|| default_model(&provider).to_string());
     ImagegenSettings {
         provider,
         model,
-        transparent_model,
+        transparent_model: s
+            .transparent_model
+            .unwrap_or_else(|| DEFAULT_TRANSPARENT_MODEL.to_string()),
     }
+}
+
+/// Validated write of `[imagegen]`; `None` fields drop the key so the
+/// default applies again.
+pub fn write(paths: &Paths, s: &Stored) -> anyhow::Result<()> {
+    if let Some(p) = s.provider.as_deref()
+        && p != PROVIDER_VERCEL
+        && p != PROVIDER_OPENROUTER
+    {
+        anyhow::bail!("provider must be {PROVIDER_VERCEL} or {PROVIDER_OPENROUTER}");
+    }
+    for m in [&s.model, &s.transparent_model].into_iter().flatten() {
+        if m.chars().any(char::is_whitespace) || !m.contains('/') {
+            anyhow::bail!("model ids look like provider/model, without spaces: {m:?}");
+        }
+    }
+    Registry::update(paths, |reg| {
+        let str = |v: &Option<String>| v.clone().map(toml::Value::String);
+        crate::settings::set(reg, "imagegen", "provider", str(&s.provider));
+        crate::settings::set(reg, "imagegen", "model", str(&s.model));
+        crate::settings::set(
+            reg,
+            "imagegen",
+            "transparent_model",
+            str(&s.transparent_model),
+        );
+        Ok(())
+    })
 }
 
 pub fn default_model(provider: &str) -> &'static str {
@@ -209,6 +255,44 @@ mod tests {
         );
         assert_eq!(read(&reg).provider, "vercel");
         assert_eq!(read(&reg).model, "x/y");
+    }
+
+    #[test]
+    fn write_validates_and_blank_restores_defaults() {
+        let dir = std::env::temp_dir().join(format!("agentdeck-imagegen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = Paths::new(dir.join("config"), dir.join("state"));
+        let s = Stored {
+            provider: Some("openrouter".into()),
+            model: Some("google/gemini-3-pro-image".into()),
+            transparent_model: None,
+        };
+        write(&paths, &s).unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        assert_eq!(stored(&reg), s);
+        assert_eq!(read(&reg).transparent_model, DEFAULT_TRANSPARENT_MODEL);
+        for bad in ["no slash", "a/b c"] {
+            let s = Stored {
+                model: Some(bad.into()),
+                ..Default::default()
+            };
+            assert!(write(&paths, &s).is_err(), "{bad}");
+        }
+        assert!(
+            write(
+                &paths,
+                &Stored {
+                    provider: Some("x".into()),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+        write(&paths, &Stored::default()).unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        assert!(!reg.extra.contains_key("imagegen"));
+        assert_eq!(read(&reg).model, DEFAULT_VERCEL_MODEL);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

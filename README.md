@@ -145,6 +145,8 @@ Built-in, enabled per machine with `agentdeck plugin enable <name>`:
   tool or other image skill works, because every call is billed. Image-only
   gateway models go through the Images API (`/images/generations`,
   `/images/edits`); Gemini/GPT image models go through chat completions.
+  Gateway, models and key are set in the GUI under Image generation → Settings;
+  **Check** verifies both models on the gateway's public model list for free.
 
 Enable lays out exactly the plugin's files, hooks and instruction block;
 disable removes them. Plugin data is kept.

@@ -16,6 +16,7 @@ dirs = "6.0"
 iced = { version = "0.14", features = ["tokio", "svg"] }
 i18n-embed = { version = "0.16", features = ["fluent-system", "desktop-requester"] }
 i18n-embed-fl = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rust-embed = "8"
 serde_json = "1.0"
 tokio = { version = "1.47", features = ["rt", "net"] }

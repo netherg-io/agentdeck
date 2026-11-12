@@ -600,11 +600,15 @@ pub enum Icon {
     Download,
     ArrowLeft,
     CircleCheck,
+    Image,
 }
 
 impl Icon {
     fn markup(self) -> &'static str {
         match self {
+            Icon::Image => {
+                r#"<rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>"#
+            }
             Icon::Pencil => r#"<path d="m16 3 5 5L8 21H3v-5L16 3Z"/><path d="m14 5 5 5"/>"#,
             Icon::Users => {
                 r#"<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><path d="M16 3.128a4 4 0 0 1 0 7.744"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><circle cx="9" cy="7" r="4"/>"#

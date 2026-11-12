@@ -175,6 +175,7 @@ dependencies = [
  "iced 0.14.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "iced_test",
  "raw-window-handle",
+ "reqwest",
  "rust-embed",
  "serde_json",
  "tokio",

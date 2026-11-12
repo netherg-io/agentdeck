@@ -832,6 +832,7 @@ mod tests {
     /// whole test body. Returns (guard, home, paths, files, exe).
     #[test]
     fn plugin_skills_follow_their_own_plugin() {
+        let _env = test_env_lock();
         let (_g, _home, paths, _files, _exe) = setup("plugin-skills");
         let dir = plugin_skills_dir(&paths);
         let set = |name: &str, on: bool| {
