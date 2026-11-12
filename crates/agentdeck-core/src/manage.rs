@@ -725,7 +725,19 @@ enum Shape {
 
 fn json_targets(paths: &Paths, home: &Path) -> Vec<(PathBuf, Shape)> {
     let mut out = vec![(home.join(".claude.json"), Shape::Claude)];
-    for dir in crate::shared::claude_secondaries(paths, home).unwrap_or_default() {
+    // Registered secondaries plus any other `~/.claude-*` profile, like the
+    // skill and hook targets.
+    let mut dirs = crate::shared::claude_secondaries(paths, home).unwrap_or_default();
+    if let Ok(rd) = fs::read_dir(home) {
+        dirs.extend(
+            rd.flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(".claude-"))
+                .map(|e| e.path()),
+        );
+    }
+    dirs.sort();
+    dirs.dedup();
+    for dir in dirs {
         out.push((dir.join(".claude.json"), Shape::Claude));
     }
     out.push((home.join(".gemini/config/mcp_config.json"), Shape::Agy));
@@ -803,9 +815,16 @@ pub fn plan_register(
             None => Value::Object(Map::new()),
             Some(b) => match serde_json::from_slice(b) {
                 Ok(v) => v,
+                Err(_) if shape == Shape::OpenCode => {
+                    match plan_jsonc(&path, b, exe, on) {
+                        Ok(c) => changes.extend(c),
+                        Err(e) => notes.push(format!("{}: {e:#}", path.display())),
+                    }
+                    continue;
+                }
                 Err(_) => {
                     notes.push(format!(
-                        "{}: not plain JSON (comments?), add `{SERVER_NAME}` by hand",
+                        "{}: not valid JSON, add `{SERVER_NAME}` by hand",
                         path.display()
                     ));
                     continue;
@@ -911,6 +930,129 @@ fn file_label(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "config".into())
+}
+
+/// JSONC with comments blanked to spaces (same byte offsets), so it parses
+/// as JSON and positions found in it apply to the original text.
+fn blank_comments(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = b.to_vec();
+    let (mut i, mut in_str) = (0, false);
+    while i < b.len() {
+        if in_str {
+            if b[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            in_str = b[i] != b'"';
+            i += 1;
+        } else if b[i] == b'"' {
+            in_str = true;
+            i += 1;
+        } else if b[i..].starts_with(b"//") {
+            while i < b.len() && b[i] != b'\n' {
+                out[i] = b' ';
+                i += 1;
+            }
+        } else if b[i..].starts_with(b"/*") {
+            while i < b.len() && !b[i..].starts_with(b"*/") {
+                if b[i] != b'\n' {
+                    out[i] = b' ';
+                }
+                i += 1;
+            }
+            let end = (i + 2).min(b.len());
+            out[i..end].fill(b' ');
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// Byte offset just after the `{` of top-level key `key`'s object value.
+fn top_level_object(clean: &str, key: &str) -> Option<usize> {
+    let b = clean.as_bytes();
+    let (mut depth, mut i) = (0usize, 0);
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                let start = i;
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                if depth == 1 && &clean[start + 1..i.min(b.len())] == key {
+                    let rest = &clean[i + 1..];
+                    let after = rest.trim_start();
+                    if let Some(val) = after.strip_prefix(':') {
+                        let val = val.trim_start();
+                        if val.starts_with('{') {
+                            return Some(clean.len() - val.len() + 1);
+                        }
+                    }
+                }
+            }
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn jsonc_entry(exe: &Path) -> String {
+    format!(
+        "\n    \"{SERVER_NAME}\": {{ \"type\": \"local\", \"command\": {}, \"enabled\": true }},",
+        serde_json::to_string(&json!([exe, "mcp-server"])).unwrap_or_default()
+    )
+}
+
+/// OpenCode JSONC (comments kept): insert our entry as the first line of the
+/// top-level `mcp` object, and on disable cut exactly that text again.
+fn plan_jsonc(path: &Path, old: &[u8], exe: &Path, on: bool) -> anyhow::Result<Vec<Change>> {
+    let text = std::str::from_utf8(old)?;
+    let clean = blank_comments(text);
+    let v: Value = serde_json::from_str(&clean)
+        .map_err(|e| anyhow::anyhow!("not valid JSONC ({e}), add `{SERVER_NAME}` by hand"))?;
+    let entry = jsonc_entry(exe);
+    let present = v.pointer(&format!("/mcp/{SERVER_NAME}")).is_some();
+    let new = if on {
+        if present {
+            return Ok(Vec::new());
+        }
+        let at = top_level_object(&clean, "mcp").ok_or_else(|| {
+            anyhow::anyhow!("no top-level \"mcp\" object, add `{SERVER_NAME}` by hand")
+        })?;
+        let empty = v
+            .get("mcp")
+            .and_then(Value::as_object)
+            .is_some_and(Map::is_empty);
+        let snippet = if empty {
+            entry.trim_end_matches(',').to_string()
+        } else {
+            entry
+        };
+        format!("{}{snippet}{}", &text[..at], &text[at..])
+    } else {
+        let snippet = [entry.clone(), entry.trim_end_matches(',').to_string()]
+            .into_iter()
+            .find(|s| text.contains(s.as_str()));
+        match snippet {
+            Some(s) => text.replacen(&s, "", 1),
+            None if present => {
+                anyhow::bail!("`{SERVER_NAME}` was edited by hand; remove it by hand")
+            }
+            None => return Ok(Vec::new()),
+        }
+    };
+    Ok(
+        plan_write_file(path.to_path_buf(), Some(old), new.as_bytes())
+            .into_iter()
+            .collect(),
+    )
 }
 
 /// Codex `config.toml`: `[mcp_servers.agentdeck]`, edited with toml_edit so
@@ -1128,6 +1270,30 @@ mod tests {
             fs::read_to_string(s.join("x/agents/openai.yaml")).unwrap(),
             "interface:\n  display_name: \"X\"\n"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn jsonc_insert_and_remove_keep_comments_byte_exact() {
+        let (dir, _paths, home) = fx("jsonc");
+        let path = home.join("opencode.jsonc");
+        let orig = "{\n  // keep me\n  \"mcp\": {\n    \"x\": { \"type\": \"local\" } // and me\n  },\n  \"a\": \"// not a comment\"\n}\n";
+        fs::write(&path, orig).unwrap();
+        let exe = Path::new("/bin/agentdeck");
+        let on = plan_jsonc(&path, orig.as_bytes(), exe, true).unwrap();
+        apply_changes(&on).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("// keep me") && text.contains("// and me"));
+        let v: Value = serde_json::from_str(&blank_comments(&text)).unwrap();
+        assert_eq!(v["mcp"]["agentdeck"]["command"][1], "mcp-server");
+        assert_eq!(v["a"], "// not a comment");
+        assert!(
+            plan_jsonc(&path, text.as_bytes(), exe, true)
+                .unwrap()
+                .is_empty()
+        );
+        apply_changes(&plan_jsonc(&path, text.as_bytes(), exe, false).unwrap()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), orig);
         let _ = fs::remove_dir_all(dir);
     }
 
