@@ -207,6 +207,7 @@ parallel-unlimited = Без ограничений
 parallel-invalid = Введите целое число от 1 до 4294967295 или оставьте поле пустым для снятия ограничения.
 nav-group-usage = Квоты
 nav-group-router = Роутер
+plugin-imagegen = Генерация изображений
 nav-group-agents = Агенты
 nav-usage-sources = Источники
 nav-usage-widget = Панель

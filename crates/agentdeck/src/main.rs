@@ -5,6 +5,7 @@ mod cmd_claude;
 mod cmd_codex;
 mod cmd_daemon;
 mod cmd_harness;
+mod cmd_imagegen;
 mod cmd_login;
 mod cmd_migrate;
 mod cmd_opencode;
@@ -112,11 +113,14 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Enable or disable built-in plugins (agent-process, ai-usage, router).
+    /// Enable or disable built-in plugins (agent-process, ai-usage, router, imagegen).
     Plugin {
         #[command(subcommand)]
         cmd: cmd_plugin::PluginCmd,
     },
+    /// Generate or edit one image through Vercel AI Gateway or OpenRouter
+    /// (plugin imagegen). Prints one JSON line.
+    Imagegen(cmd_imagegen::ImagegenArgs),
     /// Sync shared skills into every harness skill dir.
     Skills {
         #[command(subcommand)]
@@ -322,6 +326,7 @@ async fn async_main(paths: &Paths, cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Service { cmd } => cmd_service::run(paths, cmd)?,
         Cmd::Plugin { cmd } => cmd_plugin::run(paths, cmd)?,
         Cmd::Uninstall { dry_run } => cmd_plugin::uninstall(paths, dry_run)?,
+        Cmd::Imagegen(args) => std::process::exit(cmd_imagegen::run(paths, args).await),
         Cmd::Skills { cmd } => cmd_shared::run_skills(paths, cmd)?,
         Cmd::Instructions { cmd } => cmd_shared::run_instructions(paths, cmd)?,
         Cmd::Mcp { cmd } => cmd_shared::run_mcp(paths, cmd)?,

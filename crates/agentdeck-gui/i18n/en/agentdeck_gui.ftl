@@ -202,6 +202,7 @@ parallel-unlimited = Unlimited
 parallel-invalid = Enter a whole number from 1 to 4294967295, or leave blank for unlimited.
 nav-group-usage = Quotas
 nav-group-router = Router
+plugin-imagegen = Image generation
 nav-group-agents = Agents
 nav-usage-sources = Sources
 nav-usage-widget = Panel

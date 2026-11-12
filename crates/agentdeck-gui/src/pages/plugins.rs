@@ -117,6 +117,7 @@ fn status_card<'a>(plugin: &'a PluginRow, open: &'a HashSet<String>) -> Element<
         agentdeck_core::plugins::PLUGIN_AI_USAGE => fl!(loader(), "nav-group-usage"),
         agentdeck_core::plugins::PLUGIN_ROUTER => fl!(loader(), "nav-group-router"),
         agentdeck_core::plugins::PLUGIN_AGENT_PROCESS => fl!(loader(), "nav-group-agents"),
+        agentdeck_core::plugins::PLUGIN_IMAGEGEN => fl!(loader(), "plugin-imagegen"),
         other => other.to_string(),
     };
     let head = row![

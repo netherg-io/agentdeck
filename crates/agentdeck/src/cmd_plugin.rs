@@ -1,5 +1,5 @@
 //! `agentdeck plugin list|enable|disable`: built-in plugins (agent-process,
-//! ai-usage, router). The router needs T3 present. Every write goes
+//! ai-usage, router, imagegen). The router needs T3 present. Every write goes
 //! through injectable paths and supports --dry-run; previews print first.
 
 use std::path::PathBuf;
@@ -13,7 +13,7 @@ pub enum PluginCmd {
     List,
     /// Enable a plugin (files + unit + registry flag).
     Enable {
-        /// Plugin name (agent-process, ai-usage).
+        /// Plugin name (agent-process, ai-usage, router, imagegen).
         name: String,
         /// Back up a foreign file at the launcher path instead of refusing.
         #[arg(long)]
@@ -23,7 +23,7 @@ pub enum PluginCmd {
     },
     /// Disable a plugin (removes its files; data is kept).
     Disable {
-        /// Plugin name (agent-process, ai-usage).
+        /// Plugin name (agent-process, ai-usage, router, imagegen).
         name: String,
         #[arg(long)]
         dry_run: bool,
@@ -114,6 +114,7 @@ pub fn uninstall(paths: &Paths, dry_run: bool) -> anyhow::Result<()> {
     for name in [
         plugins::PLUGIN_AI_USAGE,
         plugins::PLUGIN_ROUTER,
+        plugins::PLUGIN_IMAGEGEN,
         plugins::PLUGIN_AGENT_PROCESS,
     ] {
         if !plugins::plugin_enabled(&reg, name) {

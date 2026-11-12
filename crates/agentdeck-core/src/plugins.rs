@@ -1,5 +1,5 @@
-//! Built-in plugins: the `agent-process` launcher, the `ai-usage` daemon unit
-//! and the `router` (model-route copy). Plugin state lives in `instances.toml`
+//! Built-in plugins: the `agent-process` launcher, the `ai-usage` daemon unit,
+//! the `router` (model-route copy) and `imagegen` (gateway image skill). Plugin state lives in `instances.toml`
 //! under `[plugins]` (absent table = nothing enabled, so old files stay
 //! valid). Enabling a plugin lays out its files and instruction block;
 //! disabling removes them; plugin data is kept.
@@ -14,7 +14,13 @@ use crate::registry::Registry;
 pub const PLUGIN_AGENT_PROCESS: &str = "agent-process";
 pub const PLUGIN_AI_USAGE: &str = "ai-usage";
 pub const PLUGIN_ROUTER: &str = "router";
-pub const PLUGINS: [&str; 3] = [PLUGIN_AGENT_PROCESS, PLUGIN_AI_USAGE, PLUGIN_ROUTER];
+pub const PLUGIN_IMAGEGEN: &str = "imagegen";
+pub const PLUGINS: [&str; 4] = [
+    PLUGIN_AGENT_PROCESS,
+    PLUGIN_AI_USAGE,
+    PLUGIN_ROUTER,
+    PLUGIN_IMAGEGEN,
+];
 
 /// agent-process instruction block. Every mention of the launcher lives here
 /// so disabling the plugin or uninstalling agentdeck leaves no stale rules;
@@ -30,7 +36,9 @@ pub fn is_known(name: &str) -> bool {
 
 fn check_name(name: &str) -> anyhow::Result<()> {
     if !is_known(name) {
-        anyhow::bail!("unknown plugin {name:?}: expected agent-process, ai-usage or router");
+        anyhow::bail!(
+            "unknown plugin {name:?}: expected agent-process, ai-usage, router or imagegen"
+        );
     }
     Ok(())
 }
@@ -308,9 +316,9 @@ pub fn plan_managed_blocks(
     Ok(changes)
 }
 
-/// Skills shipped with the router plugin, written under the state dir and
-/// linked into every harness by the shared skill sync like any other skill.
-const ROUTER_SKILLS: [(&str, &str); 3] = [
+/// Skills shipped with plugins, written under the state dir and linked into
+/// every harness by the shared skill sync like any other skill.
+const ROUTER_SKILLS: &[(&str, &str)] = &[
     (
         "coordinator/SKILL.md",
         include_str!("../plugin-skills/coordinator/SKILL.md"),
@@ -325,15 +333,31 @@ const ROUTER_SKILLS: [(&str, &str); 3] = [
     ),
 ];
 
+// Not named `imagegen`: Codex ships a system skill by that name, and a shared
+// one would shadow its native image tool.
+const IMAGEGEN_SKILLS: &[(&str, &str)] = &[(
+    "imagegen-gateway/SKILL.md",
+    include_str!("../plugin-skills/imagegen-gateway/SKILL.md"),
+)];
+
+const PLUGIN_SKILLS: [(&str, &[(&str, &str)]); 2] = [
+    (PLUGIN_ROUTER, ROUTER_SKILLS),
+    (PLUGIN_IMAGEGEN, IMAGEGEN_SKILLS),
+];
+
 pub fn plugin_skills_dir(paths: &Paths) -> PathBuf {
     paths.state_dir.join("plugin-skills")
 }
 
-/// Shipped skill files match the binary while the router is enabled (hand
-/// edits are reverted) and are gone when it is not.
+/// Shipped skill files match the binary while their plugin is enabled (hand
+/// edits are reverted); a disabled plugin's skills are removed, and the dir
+/// goes once no plugin ships anything.
 pub fn plan_plugin_skills(reg: &Registry, paths: &Paths) -> Vec<Change> {
     let dir = plugin_skills_dir(paths);
-    if !plugin_enabled(reg, PLUGIN_ROUTER) {
+    let (on, off): (Vec<_>, Vec<_>) = PLUGIN_SKILLS
+        .iter()
+        .partition(|(plugin, _)| plugin_enabled(reg, plugin));
+    if on.is_empty() {
         return if fs::symlink_metadata(&dir).is_ok() {
             vec![Change::BackupRemove {
                 path: dir,
@@ -343,14 +367,31 @@ pub fn plan_plugin_skills(reg: &Registry, paths: &Paths) -> Vec<Change> {
             Vec::new()
         };
     }
-    ROUTER_SKILLS
+    let mut changes: Vec<Change> = on
         .iter()
+        .flat_map(|(_, files)| files.iter())
         .filter_map(|(rel, body)| {
             let path = dir.join(rel);
             let old = fs::read(&path).ok();
             plan_write_file(path, old.as_deref(), body.as_bytes())
         })
-        .collect()
+        .collect();
+    let mut gone: Vec<&str> = off
+        .iter()
+        .flat_map(|(_, files)| files.iter())
+        .filter_map(|(rel, _)| rel.split('/').next())
+        .collect();
+    gone.dedup();
+    for skill in gone {
+        let path = dir.join(skill);
+        if fs::symlink_metadata(&path).is_ok() {
+            changes.push(Change::BackupRemove {
+                path,
+                backup: backup_dest(&paths.state_dir, skill),
+            });
+        }
+    }
+    changes
 }
 
 /// Bring shipped skills in line with the registry, then relink harness skill
@@ -513,6 +554,18 @@ pub fn status(paths: &Paths, home: &Path, exe: &Path) -> Vec<PluginStatus> {
         available: router_available(),
         detail: router_detail(paths, home, exe),
     });
+    let ig = crate::imagegen::read(&reg);
+    let key = crate::imagegen::gateway_key(&reg, home, &ig.provider).is_some();
+    out.push(PluginStatus {
+        name: PLUGIN_IMAGEGEN,
+        enabled: plugin_enabled(&reg, PLUGIN_IMAGEGEN),
+        available: true,
+        detail: vec![
+            format!("provider: {}", ig.provider),
+            format!("model: {}", ig.model),
+            format!("key: {}", if key { "found" } else { "missing" }),
+        ],
+    });
     out
 }
 
@@ -668,6 +721,8 @@ pub fn plan_enable(
         }
         PLUGIN_AI_USAGE => plan_enable_ai_usage(paths)?,
         PLUGIN_ROUTER => plan_enable_router(paths, home, files, exe, replace)?,
+        // Only the flag and its skill (synced after apply).
+        PLUGIN_IMAGEGEN => Vec::new(),
         _ => unreachable!(),
     };
     let old = fs::read(paths.registry_file()).ok();
@@ -702,6 +757,7 @@ pub fn plan_disable(
         PLUGIN_AGENT_PROCESS => plan_disable_agent_process(home, files, exe, &paths.state_dir)?,
         PLUGIN_AI_USAGE => plan_disable_ai_usage()?,
         PLUGIN_ROUTER => plan_disable_router(paths, home, files, exe)?,
+        PLUGIN_IMAGEGEN => Vec::new(),
         _ => unreachable!(),
     };
     let old = fs::read(paths.registry_file()).ok();
@@ -773,6 +829,38 @@ mod tests {
     /// Temp HOME with `AGENTDECK_BIN_DIR` pointed inside it and a fake
     /// systemctl on PATH-vars. Callers hold [`test_env_lock`] across the
     /// whole test body. Returns (guard, home, paths, files, exe).
+    #[test]
+    fn plugin_skills_follow_their_own_plugin() {
+        let (_g, _home, paths, _files, _exe) = setup("plugin-skills");
+        let dir = plugin_skills_dir(&paths);
+        let set = |name: &str, on: bool| {
+            Registry::update(&paths, |r| {
+                if on {
+                    r.plugins.insert(name.into(), true);
+                } else {
+                    r.plugins.remove(name);
+                }
+                Ok(())
+            })
+            .unwrap();
+            let reg = Registry::load(&paths).unwrap();
+            apply_changes(&plan_plugin_skills(&reg, &paths)).unwrap();
+        };
+        set(PLUGIN_IMAGEGEN, true);
+        assert!(dir.join("imagegen-gateway/SKILL.md").is_file());
+        assert!(!dir.join("coordinator").exists());
+        set(PLUGIN_ROUTER, true);
+        assert!(dir.join("coordinator/SKILL.md").is_file());
+        // Disabling one plugin removes only its skills.
+        set(PLUGIN_IMAGEGEN, false);
+        assert!(!dir.join("imagegen-gateway").exists());
+        assert!(dir.join("coordinator/SKILL.md").is_file());
+        set(PLUGIN_ROUTER, false);
+        assert!(!dir.exists());
+        let reg = Registry::load(&paths).unwrap();
+        assert!(plan_plugin_skills(&reg, &paths).is_empty());
+    }
+
     fn setup(tag: &str) -> (Guard, PathBuf, Paths, Vec<PathBuf>, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "agentdeck-plugins-{tag}-{}-{}",
