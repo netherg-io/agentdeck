@@ -203,6 +203,7 @@ parallel-invalid = Enter a whole number from 1 to 4294967295, or leave blank for
 nav-group-usage = Quotas
 nav-group-router = Router
 plugin-imagegen = Image generation
+plugin-mcp-server = agentdeck MCP
 nav-group-imagegen = Images
 nav-imagegen-settings = Settings
 imagegen-provider = Gateway

@@ -115,6 +115,7 @@ pub fn uninstall(paths: &Paths, dry_run: bool) -> anyhow::Result<()> {
         plugins::PLUGIN_AI_USAGE,
         plugins::PLUGIN_ROUTER,
         plugins::PLUGIN_IMAGEGEN,
+        plugins::PLUGIN_MCP_SERVER,
         plugins::PLUGIN_AGENT_PROCESS,
     ] {
         if !plugins::plugin_enabled(&reg, name) {

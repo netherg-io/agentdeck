@@ -15,11 +15,13 @@ pub const PLUGIN_AGENT_PROCESS: &str = "agent-process";
 pub const PLUGIN_AI_USAGE: &str = "ai-usage";
 pub const PLUGIN_ROUTER: &str = "router";
 pub const PLUGIN_IMAGEGEN: &str = "imagegen";
-pub const PLUGINS: [&str; 4] = [
+pub const PLUGIN_MCP_SERVER: &str = "mcp-server";
+pub const PLUGINS: [&str; 5] = [
     PLUGIN_AGENT_PROCESS,
     PLUGIN_AI_USAGE,
     PLUGIN_ROUTER,
     PLUGIN_IMAGEGEN,
+    PLUGIN_MCP_SERVER,
 ];
 
 /// agent-process instruction block. Every mention of the launcher lives here
@@ -37,7 +39,7 @@ pub fn is_known(name: &str) -> bool {
 fn check_name(name: &str) -> anyhow::Result<()> {
     if !is_known(name) {
         anyhow::bail!(
-            "unknown plugin {name:?}: expected agent-process, ai-usage, router or imagegen"
+            "unknown plugin {name:?}: expected agent-process, ai-usage, router, imagegen or mcp-server"
         );
     }
     Ok(())
@@ -282,6 +284,10 @@ pub fn plan_managed_blocks(
             plugin_enabled(reg, PLUGIN_AGENT_PROCESS).then_some(AGENT_PROCESS_BLOCK),
         ),
         (crate::router::ROUTER_MARKER, router.as_deref()),
+        (
+            PLUGIN_MCP_SERVER,
+            plugin_enabled(reg, PLUGIN_MCP_SERVER).then_some(crate::manage::MCP_BLOCK),
+        ),
     ];
     let mut seen: Vec<PathBuf> = Vec::new();
     let mut changes = Vec::new();
@@ -567,6 +573,26 @@ pub fn status(paths: &Paths, home: &Path, exe: &Path) -> Vec<PluginStatus> {
             format!("key: {}", if key { "found" } else { "missing" }),
         ],
     });
+    out.push(PluginStatus {
+        name: PLUGIN_MCP_SERVER,
+        enabled: plugin_enabled(&reg, PLUGIN_MCP_SERVER),
+        available: true,
+        detail: match crate::manage::plan_register(paths, home, exe, true) {
+            Ok((changes, notes)) => {
+                let mut d = vec![format!(
+                    "registration: {}",
+                    if changes.is_empty() {
+                        "in every harness"
+                    } else {
+                        "incomplete"
+                    }
+                )];
+                d.extend(notes);
+                d
+            }
+            Err(e) => vec![format!("registration: {e:#}")],
+        },
+    });
     out
 }
 
@@ -724,6 +750,16 @@ pub fn plan_enable(
         PLUGIN_ROUTER => plan_enable_router(paths, home, files, exe, replace)?,
         // Only the flag and its skill (synced after apply).
         PLUGIN_IMAGEGEN => Vec::new(),
+        PLUGIN_MCP_SERVER => {
+            let mut c = crate::manage::plan_register(paths, home, exe, true)?.0;
+            c.extend(plan_marker_files(
+                files,
+                PLUGIN_MCP_SERVER,
+                Some(crate::manage::MCP_BLOCK),
+                &paths.state_dir,
+            )?);
+            c
+        }
         _ => unreachable!(),
     };
     let old = fs::read(paths.registry_file()).ok();
@@ -759,6 +795,16 @@ pub fn plan_disable(
         PLUGIN_AI_USAGE => plan_disable_ai_usage()?,
         PLUGIN_ROUTER => plan_disable_router(paths, home, files, exe)?,
         PLUGIN_IMAGEGEN => Vec::new(),
+        PLUGIN_MCP_SERVER => {
+            let mut c = crate::manage::plan_register(paths, home, exe, false)?.0;
+            c.extend(plan_marker_files(
+                files,
+                PLUGIN_MCP_SERVER,
+                None,
+                &paths.state_dir,
+            )?);
+            c
+        }
         _ => unreachable!(),
     };
     let old = fs::read(paths.registry_file()).ok();
@@ -934,7 +980,18 @@ mod tests {
                 ".gemini/config/config.json",
                 "{\n  \"plugins\": {\n    \"Figma\": {\n      \"enabled\": true\n    }\n  }\n}\n",
             );
-            w(".config/opencode/opencode.json", "{}\n");
+            w(
+                ".config/opencode/opencode.json",
+                "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"plugin\": [\"x\"]\n}\n",
+            );
+            w(
+                ".claude.json",
+                "{\n  \"numStartups\": 3,\n  \"mcpServers\": {\n    \"shared\": {\n      \"type\": \"http\",\n      \"url\": \"http://127.0.0.1:8080/mcp\"\n    }\n  }\n}\n",
+            );
+            w(
+                ".gemini/config/mcp_config.json",
+                "{\"mcpServers\":{\"shared\":{\"url\":\"http://x\"}}}",
+            );
             for d in [
                 ".claude/skills",
                 ".agents/skills",

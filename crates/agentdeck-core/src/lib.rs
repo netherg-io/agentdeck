@@ -8,6 +8,7 @@ pub mod harness;
 pub mod imagegen;
 pub mod launch;
 pub mod login;
+pub mod manage;
 pub mod opencode;
 pub mod paths;
 pub mod plugins;

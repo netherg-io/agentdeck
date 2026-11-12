@@ -57,6 +57,7 @@ agentdeck wrapper       terminal wrappers and legacy launcher cleanup
 agentdeck service       install/remove/inspect the systemd user unit (never starts it)
 agentdeck plugin        enable/disable built-in plugins (agent-process, ai-usage, router, imagegen)
 agentdeck imagegen      generate or edit one image through Vercel AI Gateway or OpenRouter
+agentdeck mcp-server    stdio MCP server for skills, shared instructions and drift (plugin mcp-server)
 agentdeck route         route a task through the router (`agentdeck route`, hook, workflow, shell bridge)
 agentdeck router        refresh the generated router.json
 agentdeck ps            live agent-process tree (read-only)
@@ -147,6 +148,16 @@ Built-in, enabled per machine with `agentdeck plugin enable <name>`:
   `/images/edits`); Gemini/GPT image models go through chat completions.
   Gateway, models and key are set in the GUI under Image generation → Settings;
   **Check** verifies both models on the gateway's public model list for free.
+- `mcp-server` — registers `agentdeck mcp-server` (stdio MCP) in every harness
+  (Claude profiles, Codex, Antigravity, OpenCode) and adds an instruction block
+  telling models to use it. Tools: `skills_list` (origins, invocation and
+  conflicts such as a shared skill shadowing a Codex system skill),
+  `skill_install` / `skill_remove` (local dir or GitHub, global or one
+  project), `skill_invocation`, `instructions_read` / `instructions_edit`
+  (agentdeck blocks stay protected), `drift_list` / `drift_apply` /
+  `drift_resolve`. One call updates every harness instead of only the
+  caller's own. Disable removes the registrations and restores each harness
+  file byte for byte.
 
 Enable lays out exactly the plugin's files, hooks and instruction block;
 disable removes them. Plugin data is kept.

@@ -87,12 +87,13 @@ pub fn skill_targets(home: &Path) -> Vec<SkillTarget> {
 /// sync-skills sources in its order; later entries win on a name clash).
 pub fn skills_source(paths: &Paths, home: &Path) -> Vec<PathBuf> {
     // Plugin-shipped skills come last so they win over stale hand copies.
-    let mut dirs = configured_skills_source(paths, home);
+    let mut dirs = configured_sources(paths, home);
     dirs.push(crate::plugins::plugin_skills_dir(paths));
     dirs
 }
 
-fn configured_skills_source(paths: &Paths, home: &Path) -> Vec<PathBuf> {
+/// The configured (non-plugin) skill sources, in sync order.
+pub fn configured_sources(paths: &Paths, home: &Path) -> Vec<PathBuf> {
     if let Ok(reg) = Registry::load(paths)
         && let Some(table) = reg.extra.get("shared").and_then(|v| v.as_table())
         && let Some(value) = table.get("skills_source")
