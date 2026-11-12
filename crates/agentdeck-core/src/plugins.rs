@@ -563,6 +563,7 @@ pub fn status(paths: &Paths, home: &Path, exe: &Path) -> Vec<PluginStatus> {
         detail: vec![
             format!("provider: {}", ig.provider),
             format!("model: {}", ig.model),
+            format!("transparent model: {}", ig.transparent_model),
             format!("key: {}", if key { "found" } else { "missing" }),
         ],
     });

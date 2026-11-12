@@ -1,6 +1,6 @@
 ---
 name: imagegen-gateway
-description: "Last-resort raster image generation and editing through a paid API gateway (agentdeck imagegen: Vercel AI Gateway or OpenRouter). Use ONLY when it is the only working way to produce an image in this harness: no built-in image tool (such as Codex image_gen) and no other image-generation skill is available or they failed. Covers photos, illustrations, textures, sprites, product shots, UI mockups, backgrounds, and edits of an existing image. Not for charts, diagrams, or icons/logos better built as SVG/HTML/CSS."
+description: "Last-resort raster image generation and editing through a paid API gateway (agentdeck imagegen: Vercel AI Gateway or OpenRouter). Use ONLY when it is the only working way to produce an image in this harness: no built-in image tool (such as Codex image_gen) and no other image-generation skill is available or they failed. Covers photos, illustrations, textures, sprites, product shots, UI mockups, backgrounds, transparent cutouts, background removal, and edits of an existing image. Not for charts, diagrams, or icons/logos better built as SVG/HTML/CSS."
 ---
 
 # Image generation through the gateway
@@ -10,7 +10,7 @@ or another image skill always wins. Every call is billed to the owner's gateway 
 (Seedream 5.0 Pro: about $0.035 per image), so generate what the task needs, not extra variants.
 
 ```bash
-agentdeck imagegen -o OUT.png [-a 16:9] [-e EDIT_TARGET] [-r REF]... "PROMPT"   # '-' reads stdin
+agentdeck imagegen -o OUT.png [-a 16:9] [-t] [-q low|medium|high] [-e EDIT_TARGET] [-r REF]... "PROMPT"   # '-' reads stdin
 ```
 
 - One call = one image, 30-120 s; run it with a timeout of at least 300 s. It prints one JSON
@@ -22,7 +22,11 @@ agentdeck imagegen -o OUT.png [-a 16:9] [-e EDIT_TARGET] [-r REF]... "PROMPT"   
   `-r FILE`: style/composition/subject reference, repeatable (Image 2...).
 - `--model provider/model` overrides the configured model for one call; `--provider
   vercel|openrouter` switches gateway. Defaults come from `[imagegen]` in agentdeck's config.
-- No transparency: ask for a plain flat background and cut it out afterwards if needed.
+- `-t`: transparent PNG through `openai/gpt-image-1-mini` (Vercel; about $0.002 at `-q low`,
+  $0.01 at `medium`, 15-30 s; sizes snap to 1024x1024, 1536x1024 or 1024x1536). Use it for
+  cutouts, sprites, icons and stickers. To remove the background from an existing image:
+  `-t -e photo.png "Remove the background completely; keep the subject exactly as it is."`
+  Without `-t` the default model always returns an opaque JPEG.
 
 ## Workflow
 

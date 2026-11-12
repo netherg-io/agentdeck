@@ -40,6 +40,13 @@ pub struct ImagegenArgs {
     /// Gateway override: vercel or openrouter.
     #[arg(long, value_parser = ["vercel", "openrouter"])]
     provider: Option<String>,
+    /// Transparent PNG (Vercel transparent_model, default gpt-image-1-mini).
+    /// With --edit it cuts the subject out of an existing image.
+    #[arg(short, long)]
+    transparent: bool,
+    /// Quality for models that take one (gpt-image: low, medium, high).
+    #[arg(short, long, value_parser = ["low", "medium", "high"])]
+    quality: Option<String>,
     #[arg(long)]
     force: bool,
 }
@@ -106,9 +113,20 @@ async fn generate(paths: &Paths, mut a: ImagegenArgs) -> Result<Value, Failure> 
         })
         .unwrap_or_else(|| "1:1".into());
     let settings = ig::read(&reg);
-    let provider = a.provider.clone().unwrap_or(settings.provider.clone());
+    if a.transparent && a.provider.as_deref() == Some(PROVIDER_OPENROUTER) {
+        return Err(input(anyhow::anyhow!(
+            "--transparent needs Vercel: no OpenRouter image model returns alpha"
+        )));
+    }
+    let provider = if a.transparent {
+        agentdeck_core::settings::PROVIDER_VERCEL.to_string()
+    } else {
+        a.provider.clone().unwrap_or(settings.provider.clone())
+    };
     let model = a.model.clone().unwrap_or_else(|| {
-        if provider == settings.provider {
+        if a.transparent {
+            settings.transparent_model.clone()
+        } else if provider == settings.provider {
             settings.model.clone()
         } else {
             ig::default_model(&provider).to_string()
@@ -139,12 +157,24 @@ async fn generate(paths: &Paths, mut a: ImagegenArgs) -> Result<Value, Failure> 
         .build()
         .map_err(remote)?;
     let image_api = provider != PROVIDER_OPENROUTER && is_image_model(&client, &model).await?;
+    if a.transparent && !image_api {
+        return Err(input(anyhow::anyhow!(
+            "--transparent needs an image-only model with alpha output; {model} is not one"
+        )));
+    }
     let (url, body) = if image_api {
-        let (w, h) = ig::size_for(&ratio).unwrap_or((2048, 2048));
+        let (w, h) = ig::size_for(&model, &ratio).unwrap_or((1024, 1024));
         let mut body = json!({
             "model": model, "prompt": full_prompt, "n": 1,
             "size": format!("{w}x{h}"), "response_format": "b64_json",
         });
+        if a.transparent {
+            body["background"] = json!("transparent");
+            body["output_format"] = json!("png");
+        }
+        if let Some(q) = &a.quality {
+            body["quality"] = json!(q);
+        }
         if model.starts_with("bytedance/") {
             // Seedream stamps "AI generated" on edits unless told not to.
             body["providerOptions"] = json!({ "bytedance": { "watermark": false } });

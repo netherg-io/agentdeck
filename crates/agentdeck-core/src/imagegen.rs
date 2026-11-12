@@ -12,6 +12,9 @@ use crate::usage::UsageKind;
 pub const DEFAULT_PROVIDER: &str = PROVIDER_VERCEL;
 pub const DEFAULT_VERCEL_MODEL: &str = "bytedance/seedream-5.0-pro";
 pub const DEFAULT_OPENROUTER_MODEL: &str = "google/gemini-3.1-flash-image";
+/// Vercel image model with a native `background: "transparent"` (Seedream,
+/// Recraft and Gemini have none); open on the gateway's free tier.
+pub const DEFAULT_TRANSPARENT_MODEL: &str = "openai/gpt-image-1-mini";
 
 /// (ratio, width, height): about 3.7-4.2 MP, multiples of 16. Seedream
 /// rejects small sizes and ignores `aspect_ratio`, so the size carries it.
@@ -30,9 +33,11 @@ pub const SIZES: [(&str, u32, u32); 8] = [
 pub struct ImagegenSettings {
     pub provider: String,
     pub model: String,
+    /// Used on Vercel for `--transparent`.
+    pub transparent_model: String,
 }
 
-/// `[imagegen] provider / model`; an unknown provider falls back to Vercel,
+/// `[imagegen] provider / model / transparent_model`; an unknown provider falls back to Vercel,
 /// a missing model to the provider's default.
 pub fn read(reg: &Registry) -> ImagegenSettings {
     let get = |key: &str| {
@@ -47,7 +52,13 @@ pub fn read(reg: &Registry) -> ImagegenSettings {
         .filter(|p| p == PROVIDER_VERCEL || p == PROVIDER_OPENROUTER)
         .unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
     let model = get("model").unwrap_or_else(|| default_model(&provider).to_string());
-    ImagegenSettings { provider, model }
+    let transparent_model =
+        get("transparent_model").unwrap_or_else(|| DEFAULT_TRANSPARENT_MODEL.to_string());
+    ImagegenSettings {
+        provider,
+        model,
+        transparent_model,
+    }
 }
 
 pub fn default_model(provider: &str) -> &'static str {
@@ -88,11 +99,18 @@ pub fn gateway_key(reg: &Registry, home: &Path, provider: &str) -> Option<String
         })
 }
 
-pub fn size_for(ratio: &str) -> Option<(u32, u32)> {
-    SIZES
-        .iter()
-        .find(|(r, ..)| *r == ratio)
-        .map(|(_, w, h)| (*w, *h))
+/// Request size for `ratio`. GPT Image 1.x only takes 1024x1024, 1536x1024
+/// and 1024x1536, so it gets the closest of those.
+pub fn size_for(model: &str, ratio: &str) -> Option<(u32, u32)> {
+    let (_, w, h) = SIZES.iter().find(|(r, ..)| *r == ratio)?;
+    if model.starts_with("openai/gpt-image-1") {
+        return Some(match w.cmp(h) {
+            std::cmp::Ordering::Greater => (1536, 1024),
+            std::cmp::Ordering::Less => (1024, 1536),
+            std::cmp::Ordering::Equal => (1024, 1024),
+        });
+    }
+    Some((*w, *h))
 }
 
 /// The table ratio closest to `w:h` (edits keep the source's shape).
@@ -157,7 +175,8 @@ mod tests {
             read(&reg),
             ImagegenSettings {
                 provider: "vercel".into(),
-                model: DEFAULT_VERCEL_MODEL.into()
+                model: DEFAULT_VERCEL_MODEL.into(),
+                transparent_model: DEFAULT_TRANSPARENT_MODEL.into(),
             }
         );
         reg.extra.insert(
@@ -177,8 +196,17 @@ mod tests {
 
     #[test]
     fn sizes_and_ratios() {
-        assert_eq!(size_for("16:9"), Some((2560, 1440)));
-        assert_eq!(size_for("5:1"), None);
+        assert_eq!(size_for("x/y", "16:9"), Some((2560, 1440)));
+        assert_eq!(size_for("x/y", "5:1"), None);
+        assert_eq!(
+            size_for("openai/gpt-image-1-mini", "21:9"),
+            Some((1536, 1024))
+        );
+        assert_eq!(size_for("openai/gpt-image-1.5", "9:16"), Some((1024, 1536)));
+        assert_eq!(
+            size_for("openai/gpt-image-1-mini", "1:1"),
+            Some((1024, 1024))
+        );
         assert_eq!(nearest_ratio(1664, 2496), "2:3");
         assert_eq!(nearest_ratio(1376, 768), "16:9");
         assert_eq!(nearest_ratio(1000, 1010), "1:1");

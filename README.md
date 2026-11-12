@@ -103,6 +103,7 @@ decision_model = "~typesafe/jev-latest"   # default for OpenRouter; required for
 [imagegen]
 provider = "vercel"                       # or "openrouter"
 model = "bytedance/seedream-5.0-pro"      # default; OpenRouter default: google/gemini-3.1-flash-image
+transparent_model = "openai/gpt-image-1-mini"  # --transparent, always on Vercel
 
 [usage_poll]
 refresh_seconds = 120   # minimum 15
