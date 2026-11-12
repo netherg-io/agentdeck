@@ -23,7 +23,8 @@ use crate::registry::Registry;
 /// agree on which copies are managed.
 pub const SKILL_MARKER: &str = ".sync-skills-source";
 /// Skills that live per-harness and are never synced (sync-skills rule).
-const SKIP_SKILLS: [&str; 2] = ["impeccable", "synced"];
+/// Per-harness variants kept by their own installers, never synced.
+pub const SKIP_SKILLS: [&str; 2] = ["impeccable", "synced"];
 /// Owned-entry manifest in the state dir.
 const MANIFEST: &str = "shared-skills.json";
 

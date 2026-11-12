@@ -190,7 +190,15 @@ pub fn list_skills(
             S::Ok | S::NoDir => {}
             S::Foreign => {
                 let path = st.target.join(&st.skill);
-                if by_name.contains_key(&st.skill) {
+                // Installer-managed per-harness variants are intended, and a
+                // source dir's own entry is not a copy.
+                let intended = crate::shared::SKIP_SKILLS.contains(&st.skill.as_str())
+                    || configured.contains(&st.target);
+                if intended {
+                    if !by_name.contains_key(&st.skill) {
+                        harness_only.entry(st.skill.clone()).or_insert(path);
+                    }
+                } else if by_name.contains_key(&st.skill) {
                     conflicts.push(Conflict {
                         skill: st.skill.clone(),
                         kind: "harness-copy".into(),
