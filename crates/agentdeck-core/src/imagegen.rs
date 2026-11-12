@@ -139,6 +139,23 @@ pub fn sniff(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// Whether a PNG/WebP can carry transparency (PNG colour type with alpha or a
+/// `tRNS` chunk; WebP `VP8X` alpha flag or lossless `VP8L` alpha hint). JPEG never does.
+pub fn has_alpha(bytes: &[u8]) -> bool {
+    match sniff(bytes).map(|s| s.0) {
+        Some("png") => {
+            matches!(bytes.get(25), Some(4 | 6))
+                || bytes.windows(4).take(4096).any(|w| w == b"tRNS")
+        }
+        Some("webp") => match bytes.get(12..16) {
+            Some(b"VP8X") => bytes.get(20).is_some_and(|f| f & 0x10 != 0),
+            Some(b"VP8L") => bytes.get(24).is_some_and(|b| b & 0x10 != 0),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Pixel size of a PNG or baseline/progressive JPEG; `None` for anything else.
 pub fn dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     let be16 = |i: usize| Some(u16::from_be_bytes([*bytes.get(i)?, *bytes.get(i + 1)?]) as u32);
@@ -230,5 +247,17 @@ mod tests {
         assert_eq!(dimensions(&jpg), Some((200, 300)));
         assert_eq!(sniff(b"RIFF\0\0\0\0WEBPVP8 "), Some(("webp", "image/webp")));
         assert_eq!(sniff(b"GIF89a"), None);
+        assert!(!has_alpha(&png)); // IHDR ends before the colour type byte
+        let mut rgba = png.clone();
+        rgba.extend_from_slice(&[8, 6]);
+        assert!(has_alpha(&rgba));
+        rgba[25] = 2;
+        assert!(!has_alpha(&rgba));
+        assert!(!has_alpha(&jpg));
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8X\0\0\0\0".to_vec();
+        webp.push(0x10);
+        assert!(has_alpha(&webp));
+        webp[20] = 0;
+        assert!(!has_alpha(&webp));
     }
 }

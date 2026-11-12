@@ -26,7 +26,8 @@ agentdeck imagegen -o OUT.png [-a 16:9] [-t] [-q low|medium|high] [-e EDIT_TARGE
   $0.01 at `medium`, 15-30 s; sizes snap to 1024x1024, 1536x1024 or 1024x1536). Use it for
   cutouts, sprites, icons and stickers. To remove the background from an existing image:
   `-t -e photo.png "Remove the background completely; keep the subject exactly as it is."`
-  Without `-t` the default model always returns an opaque JPEG.
+  Without `-t` the default model always returns an opaque JPEG. Keep `-t` on its default
+  model: others ignore the request and the call fails as opaque.
 
 ## Workflow
 

@@ -214,6 +214,12 @@ async fn generate(paths: &Paths, mut a: ImagegenArgs) -> Result<Value, Failure> 
     let bytes = extract_image(&client, &resp).await?;
     let (ext, _) = ig::sniff(&bytes)
         .ok_or_else(|| remote(anyhow::anyhow!("gateway returned an unknown image format")))?;
+    // shortcut: checks for an alpha channel, not that any pixel is transparent; decode if a model starts sending opaque RGBA.
+    if a.transparent && !ig::has_alpha(&bytes) {
+        return Err(remote(anyhow::anyhow!(
+            "{model} returned an opaque {ext}: it ignores background=transparent; use the default transparent_model"
+        )));
+    }
     let out = with_format(&a.out, ext);
     if out != a.out && out.exists() && !a.force {
         return Err(input(anyhow::anyhow!(
