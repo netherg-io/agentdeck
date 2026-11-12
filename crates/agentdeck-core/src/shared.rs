@@ -319,8 +319,15 @@ pub fn plan_skills_sync(home: &Path, paths: &Paths) -> anyhow::Result<Vec<Change
     let owned = read_manifest(&manifest);
     let mut owned: BTreeSet<PathBuf> = owned.into_iter().collect();
     let mut changes = Vec::new();
+    let mut seen = BTreeSet::new();
     for target in skill_targets(home) {
         if !target.dir.is_dir() {
+            continue;
+        }
+        // Profile skill dirs are often links to one shared dir; planning it twice
+        // would queue the same removal again and fail on the missing entry.
+        if !seen.insert(fs::canonicalize(&target.dir).unwrap_or_else(|_| target.dir.clone())) {
+            owned.retain(|p| !p.starts_with(&target.dir));
             continue;
         }
         let sources = skill_sources(&source_dirs, home, target.plugin);
@@ -1313,6 +1320,29 @@ mod tests {
     fn sync(fx: &Fx) {
         let changes = plan_skills_sync(&fx.home, &fx.paths).unwrap();
         apply_changes(&changes).unwrap();
+    }
+
+    #[test]
+    fn aliased_skill_dirs_are_synced_once() {
+        let fx = skills_fixture();
+        fs::create_dir_all(fx.home.join(".claude-second")).unwrap();
+        std::os::unix::fs::symlink(
+            fx.home.join(".claude/skills"),
+            fx.home.join(".claude-second/skills"),
+        )
+        .unwrap();
+        sync(&fx);
+        // Removing a source must not queue the same removal once per alias.
+        fs::remove_dir_all(fx.home.join(".general/skills/beta")).unwrap();
+        sync(&fx);
+        assert!(fs::symlink_metadata(fx.home.join(".claude/skills/beta")).is_err());
+        assert!(fs::read_link(fx.home.join(".claude/skills/alpha")).is_ok());
+        assert!(
+            plan_skills_sync(&fx.home, &fx.paths)
+                .unwrap()
+                .iter()
+                .all(|c| !matches!(c, Change::BackupRemove { .. }))
+        );
     }
 
     #[test]
