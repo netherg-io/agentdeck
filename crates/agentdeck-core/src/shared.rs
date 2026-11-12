@@ -478,14 +478,16 @@ fn plan_copy(src: &Path, dst: &Path) -> anyhow::Result<Vec<Change>> {
         path: dst.to_path_buf(),
     }];
     files.sort_by(|a, b| a.0.cmp(&b.0));
+    // The old dir is removed before these writes, so every file is new:
+    // diffing against it would skip unchanged files and leave them missing.
     for (rel, bytes) in files {
-        let path = dst.join(rel);
-        let old = fs::read(&path).ok();
-        changes.extend(plan_write_file(path, old.as_deref(), &bytes));
+        changes.extend(plan_write_file(dst.join(rel), None, &bytes));
     }
-    let marker = dst.join(SKILL_MARKER);
-    let old = fs::read(&marker).ok();
-    changes.extend(plan_write_file(marker, old.as_deref(), &marker_bytes(src)));
+    changes.extend(plan_write_file(
+        dst.join(SKILL_MARKER),
+        None,
+        &marker_bytes(src),
+    ));
     Ok(changes)
 }
 
@@ -1492,6 +1494,15 @@ mod tests {
             b"# alpha\n"
         );
         assert!(fs::read(fx.home.join(".gemini/skills/mine/SKILL.md")).is_ok());
+        // A stray file makes the copy stale while SKILL.md is unchanged; the
+        // refresh must still rewrite SKILL.md into the replaced dir.
+        fs::write(fx.home.join(".gemini/skills/alpha/stray.md"), "x\n").unwrap();
+        sync(&fx);
+        assert_eq!(
+            fs::read(fx.home.join(".gemini/skills/alpha/SKILL.md")).unwrap(),
+            b"# alpha\n"
+        );
+        assert!(!fx.home.join(".gemini/skills/alpha/stray.md").exists());
         // Unchanged copies are skipped (marker mtime untouched).
         let before = fs::metadata(fx.home.join(".gemini/skills/beta/SKILL.md"))
             .unwrap()
