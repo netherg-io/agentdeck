@@ -150,6 +150,10 @@ impl Change {
                 Ok(())
             }
             Change::BackupRemove { path, backup } => {
+                // Already gone (an earlier change pruned it): nothing to back up.
+                if fs::symlink_metadata(path).is_err() {
+                    return Ok(());
+                }
                 if let Some(parent) = backup.parent() {
                     fs::create_dir_all(parent)?;
                 }

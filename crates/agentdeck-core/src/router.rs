@@ -991,8 +991,12 @@ fn restore_originals(home: &Path, paths: &Paths, exe: &Path, changes: Vec<Change
                         };
                     }
                 }
-                // Only a file enable created goes away; an unrecorded one stays.
+                // Only a file enable created goes away; an unrecorded one stays,
+                // except in the agy plugin dir, which is entirely ours.
                 Some(Value::Null) if now.as_object().is_some_and(Map::is_empty) => {
+                    return Change::Remove { path };
+                }
+                _ if path == agy_hooks(home) && now.as_object().is_some_and(Map::is_empty) => {
                     return Change::Remove { path };
                 }
                 _ => {}
@@ -1017,6 +1021,25 @@ fn restore_originals(home: &Path, paths: &Paths, exe: &Path, changes: Vec<Change
     ) {
         map.remove(&manifest.display().to_string());
         out.push(Change::Remove { path: manifest });
+    }
+    // The plugin dir itself, once nothing but our two files was in it.
+    let dir = agy_hooks(home).parent().map(Path::to_path_buf);
+    if let Some(dir) = dir {
+        let ours = [agy_hooks(home), agy_plugin_manifest(home)];
+        let gone = |p: &PathBuf| {
+            out.iter()
+                .any(|c| matches!(c, Change::Remove { path } if path == p))
+        };
+        let only_ours = std::fs::read_dir(&dir).is_ok_and(|rd| {
+            rd.flatten()
+                .all(|e| ours.contains(&e.path()) && gone(&e.path()))
+        });
+        if only_ours {
+            out.push(Change::BackupRemove {
+                backup: crate::changes::backup_dest(&paths.state_dir, "model-route-agy-plugin"),
+                path: dir,
+            });
+        }
     }
     if map != before {
         out.extend(originals_change(paths, &map));
@@ -1363,6 +1386,27 @@ mod tests {
         let changes = plan_router_files(&paths, &reg).unwrap();
         assert!(!changes.is_empty());
         assert!(!router_json_path(&paths).exists());
+    }
+
+    #[test]
+    fn legacy_agy_plugin_dir_goes_with_disable() {
+        // Installed by an older agentdeck: no originals were recorded.
+        let (paths, home) = test_paths("agy-legacy");
+        let exe = home.join("agentdeck");
+        let hooks = agy_hooks(&home);
+        std::fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        let v = serde_json::json!({"model-route": {"PreToolUse": [
+            {"matcher": AGY_MATCHER, "hooks": [{"type": "command", "command": hook_command(&exe, "agy")}]}
+        ]}});
+        std::fs::write(&hooks, v.to_string()).unwrap();
+        std::fs::write(agy_plugin_manifest(&home), "{ \"name\": \"model-route\" }").unwrap();
+        let changes = plan_hooks_disable(&home, &paths, &exe, &paths.state_dir).unwrap();
+        crate::changes::apply_changes(&changes).unwrap();
+        assert!(!hooks.parent().unwrap().exists());
+        assert!(
+            home.join(".gemini/config/plugins").exists(),
+            "only our dir goes"
+        );
     }
 
     #[test]
