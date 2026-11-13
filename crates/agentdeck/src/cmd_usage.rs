@@ -180,6 +180,11 @@ pub async fn run(paths: &Paths, cmd: UsageCmd) -> anyhow::Result<()> {
 
 fn print_doctor(report: &daemon::DoctorReport) {
     println!("agentdeck usage doctor\n");
+    if report.t3_health_refresh_interval_ms == Some(0) {
+        println!(
+            "T3 background refresh is off (providerHealthRefreshInterval=0; Settings -> Providers -> Health check interval); quotas update only on manual refresh and go stale."
+        );
+    }
     println!("sources: {}", report.sources.len());
     for s in &report.sources {
         let inst = s

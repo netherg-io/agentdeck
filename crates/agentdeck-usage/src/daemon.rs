@@ -397,6 +397,7 @@ pub struct DoctorStateFile {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DoctorReport {
     pub sources: Vec<DoctorSource>,
+    pub t3_health_refresh_interval_ms: Option<u64>,
     pub canonical: DoctorStateFile,
     pub runtime: DoctorStateFile,
     pub compat_canonical: Vec<DoctorStateFile>,
@@ -422,8 +423,21 @@ pub fn doctor(
     accounts: &[AccountConfig],
     old_service_active: fn() -> bool,
 ) -> DoctorReport {
-    let now = util::unix_now();
     let t3_root = agentdeck_core::t3::t3_root().ok();
+    doctor_from_root(paths, accounts, old_service_active, t3_root.as_deref())
+}
+
+fn doctor_from_root(
+    paths: &DaemonPaths,
+    accounts: &[AccountConfig],
+    old_service_active: fn() -> bool,
+    t3_root: Option<&Path>,
+) -> DoctorReport {
+    let now = util::unix_now();
+    let t3_health_refresh_interval_ms = t3_root
+        .and_then(|root| fs::read(root.join("userdata/settings.json")).ok())
+        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+        .and_then(|settings| settings.get("providerHealthRefreshInterval")?.as_u64());
     let t3_source = |kind: &str, instance: Option<&str>| -> (Option<String>, String) {
         let resolved = providers::t3::resolve_instance_slug(kind, instance);
         let source = match (&resolved, &t3_root) {
@@ -474,6 +488,7 @@ pub fn doctor(
         .collect::<Vec<_>>();
     DoctorReport {
         sources,
+        t3_health_refresh_interval_ms,
         canonical: state_file_info(&paths.canonical, now),
         runtime: state_file_info(&paths.runtime, now),
         compat_canonical: paths
@@ -703,6 +718,36 @@ mod tests {
 
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("agy-main"));
+    }
+
+    #[test]
+    fn doctor_reports_t3_background_refresh_without_changing_settings() {
+        let (paths, _g) = temp_paths("doctor-refresh");
+        let t3 = paths.canonical.parent().unwrap().join("t3");
+        fs::create_dir_all(t3.join("userdata")).unwrap();
+        let settings = t3.join("userdata/settings.json");
+        for (raw, expected) in [
+            (r#"{"providerHealthRefreshInterval":0}"#, Some(0)),
+            (r#"{"providerHealthRefreshInterval":300000}"#, Some(300_000)),
+            (r#"{}"#, None),
+            (r#"{"providerHealthRefreshInterval":"0"}"#, None),
+            ("{", None),
+        ] {
+            fs::write(&settings, raw).unwrap();
+            let report = doctor_from_root(&paths, &[], || false, Some(&t3));
+            assert_eq!(report.t3_health_refresh_interval_ms, expected);
+            assert_eq!(fs::read_to_string(&settings).unwrap(), raw);
+            assert!(!paths.lock.exists());
+        }
+        fs::remove_file(&settings).unwrap();
+        assert_eq!(
+            doctor_from_root(&paths, &[], || false, Some(&t3)).t3_health_refresh_interval_ms,
+            None
+        );
+        assert_eq!(
+            doctor_from_root(&paths, &[], || false, None).t3_health_refresh_interval_ms,
+            None
+        );
     }
 
     #[tokio::test]
