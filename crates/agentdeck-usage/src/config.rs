@@ -134,6 +134,17 @@ impl AccountConfig {
         }
     }
 
+    pub fn t3_instance(&self) -> Option<String> {
+        let instance = match self {
+            Self::Claude { instance, .. }
+            | Self::Codex { instance, .. }
+            | Self::Antigravity { instance, .. }
+            | Self::OpencodeGo { instance, .. } => instance.as_deref(),
+            Self::Deepseek { .. } | Self::Openrouter { .. } | Self::Vercel { .. } => return None,
+        };
+        crate::providers::t3::resolve_instance_slug(self.provider(), instance)
+    }
+
     /// Каталог, которым аккаунт владеет монопольно. Два аккаунта одного
     /// провайдера не могут его делить: для Claude это привело бы к драке за
     /// один `statusLine`, для Codex — к перепутанным лимитам.
@@ -194,10 +205,10 @@ pub fn parse_str(raw: &str, what: &Path) -> Result<Config> {
 }
 
 /// Проверяет инварианты, которые нельзя выразить типами: уникальность ID и
-/// монопольность каталогов провайдеров.
+/// уникальность привязки к инстансам T3.
 pub fn validate(config: &Config) -> Result<()> {
     let mut seen_ids: HashMap<&str, ()> = HashMap::new();
-    let mut seen_dirs: HashMap<(&'static str, PathBuf), &str> = HashMap::new();
+    let mut seen_instances: HashMap<String, &str> = HashMap::new();
 
     for account in &config.accounts {
         crate::util::validate_id(account.id())
@@ -207,19 +218,15 @@ pub fn validate(config: &Config) -> Result<()> {
             bail!("Дублирующийся ID аккаунта: '{}'", account.id());
         }
 
-        if let Some(dir) = account.exclusive_dir() {
-            // Сравниваем развёрнутые пути: '~/.codex' и '/home/user/.codex'
-            // указывают на один каталог.
-            let key = (account.provider(), crate::util::expand_home(dir));
-            if let Some(previous) = seen_dirs.insert(key, account.id()) {
-                bail!(
-                    "Аккаунты '{}' и '{}' используют один каталог {}; для {} нужны отдельные каталоги",
-                    previous,
-                    account.id(),
-                    dir.display(),
-                    account.provider()
-                );
-            }
+        if let Some(instance) = account.t3_instance()
+            && let Some(previous) = seen_instances.insert(instance.clone(), account.id())
+        {
+            bail!(
+                "Источники '{}' и '{}' указывают на один инстанс T3 '{}'",
+                previous,
+                account.id(),
+                instance
+            );
         }
     }
 
@@ -231,7 +238,7 @@ pub fn validate(config: &Config) -> Result<()> {
 }
 
 /// Build the provider account list from validated `[[usage]]` registry entries.
-/// Reuses [`validate`] so the exclusive-dir invariants match the old parser.
+/// Reuses [`validate`] so duplicate ids and duplicate T3 instances are rejected.
 pub fn accounts_from_registry(entries: &[UsageEntry]) -> Result<Vec<AccountConfig>> {
     let mut accounts = Vec::with_capacity(entries.len());
     for e in entries {
@@ -435,23 +442,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_two_claude_accounts_sharing_a_config_dir() {
-        // Это ломало бы восстановление statusLine при удалении.
+    fn allows_two_claude_accounts_sharing_a_legacy_config_dir() {
         let config = Config {
             accounts: vec![claude("one", "~/.claude"), claude("two", "~/.claude")],
             ..Config::default()
         };
-        let error = validate(&config).unwrap_err().to_string();
-        assert!(error.contains("один каталог"), "{error}");
+        validate(&config).unwrap();
     }
 
     #[test]
-    fn rejects_two_codex_accounts_sharing_codex_home() {
+    fn allows_two_codex_accounts_sharing_legacy_codex_home() {
         let config = Config {
             accounts: vec![codex("one", "~/.codex"), codex("two", "~/.codex")],
             ..Config::default()
         };
-        assert!(validate(&config).is_err());
+        validate(&config).unwrap();
     }
 
     #[test]
@@ -618,14 +623,16 @@ db_file = "/data/opencode.db"
     }
 
     #[test]
-    fn registry_adapter_rejects_shared_claude_dirs() {
+    fn registry_adapter_allows_shared_legacy_claude_dirs() {
         let reg = agentdeck_core::Registry::from_toml(
             "version = 1\n\
-             [[usage]]\nid = \"one\"\nkind = \"claude\"\nconfig_dir = \"~/.claude\"\n\
-             [[usage]]\nid = \"two\"\nkind = \"claude\"\nconfig_dir = \"~/.claude\"\n",
+             [[instance]]\nid = \"claude-1\"\nharness = \"claude\"\nhome = \"~/.claude\"\n\
+             [[instance]]\nid = \"claude-2\"\nharness = \"claude\"\nhome = \"~/.claude\"\n\
+             [[usage]]\nid = \"one\"\nkind = \"claude\"\ninstance = \"claude-1\"\nconfig_dir = \"~/.claude\"\n\
+             [[usage]]\nid = \"two\"\nkind = \"claude\"\ninstance = \"claude-2\"\nconfig_dir = \"~/.claude\"\n",
         )
         .unwrap();
-        assert!(accounts_from_registry(&reg.usage).is_err());
+        assert_eq!(accounts_from_registry(&reg.usage).unwrap().len(), 2);
     }
 
     #[test]
@@ -646,5 +653,36 @@ db_file = "/data/opencode.db"
             &accounts[1],
             AccountConfig::OpencodeGo { instance: None, .. }
         ));
+    }
+
+    #[test]
+    fn rejects_two_usage_sources_pointing_at_same_t3_instance() {
+        let reg = agentdeck_core::Registry::from_toml(
+            "version = 1\n\
+             [[instance]]\nid = \"claude-main\"\nharness = \"claude\"\nhome = \"~/.claude\"\n\
+             [[usage]]\nid = \"one\"\nkind = \"claude\"\ninstance = \"claude-main\"\nconfig_dir = \"~/.claude-1\"\n\
+             [[usage]]\nid = \"two\"\nkind = \"claude\"\ninstance = \"claude-main\"\nconfig_dir = \"~/.claude-2\"\n",
+        )
+        .unwrap();
+        let err = accounts_from_registry(&reg.usage).unwrap_err().to_string();
+        assert!(
+            err.contains("one") && err.contains("two") && err.contains("claude-main"),
+            "{err}"
+        );
+
+        let go_reg = agentdeck_core::Registry::from_toml(
+            "version = 1\n\
+             [[instance]]\nid = \"opencode\"\nharness = \"opencode\"\nhome = \"~\"\n\
+             [[usage]]\nid = \"go-a\"\nkind = \"opencode-go\"\n\
+             [[usage]]\nid = \"go-b\"\nkind = \"opencode-go\"\ninstance = \"opencode\"\n",
+        )
+        .unwrap();
+        let err = accounts_from_registry(&go_reg.usage)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("go-a") && err.contains("go-b") && err.contains("opencode"),
+            "{err}"
+        );
     }
 }
