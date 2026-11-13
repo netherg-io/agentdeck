@@ -935,7 +935,7 @@ fn t3_reader_output_drives_router_quota_gates() {
         std::fs::write(
             fx.dir.join(".local/state/model-route/catalog.json"),
             json!({
-                "providers":[{"providerInstanceId":instance, "models":[{"id":model}]}]
+                "providers":[{"providerInstanceId":instance, "driverKind":driver, "models":[{"id":model, "options":[]}]}]
             })
             .to_string(),
         )
