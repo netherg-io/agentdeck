@@ -1083,6 +1083,6 @@ fn repeated_provider_errors_lower_rank_without_exclusion() {
         .find(|r| r["provider"] == SOL.0)
         .unwrap();
     assert_eq!(failed["eligible"], true);
-    assert_eq!(failed["failurePenalty"], 0.05);
+    assert_eq!(failed["failurePenalty"], 0.1);
     assert!(failed.get("policyBan").is_none());
 }
