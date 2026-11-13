@@ -1017,11 +1017,12 @@ mod tests {
         let (paths, dir) = test_paths("legacy-cleanup");
         let router = router_dir(&paths);
         std::fs::create_dir_all(&router).unwrap();
-        // roster.json stays in the repo: a pristine copy is removed, a
-        // modified one (and unknown files) are kept.
+        // A pristine copy of the last extracted roster.json is removed, a
+        // modified one (and unknown files) are kept. The fixture is that
+        // extracted version, so later roster edits do not break this test.
         let pristine = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/assets/router/roster.json"
+            "/testdata/legacy-roster.json"
         ))
         .unwrap();
         std::fs::write(router.join("roster.json"), &pristine).unwrap();

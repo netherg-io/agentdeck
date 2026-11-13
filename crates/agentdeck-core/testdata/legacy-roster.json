@@ -1,0 +1,121 @@
+{
+  "briefHint": "Delegated-agent rule: do this task yourself; never spawn, delegate to or launch other agents, subagents, workflows or threads (Agent, Workflow, spawn_agent, delegate_task, t3_thread_launch, create_threads or equivalents), even for parallel work. Stay within the brief: no unrequested changes outside its scope. Before finishing, run the verification the brief names, or the smallest relevant check. For PR work, after pushing or rerunning failed jobs, return control to the coordinator. Do not wait for or poll CI, review bots or PR merges, and do not watch PRs. The coordinator waits for PRs. End the final response with `PR <url>, head <sha>, checks and reviews <state>`, using actual values and the observed state. Pending PR checks, reviews or merges are a normal handoff, not BLOCKED. Waiting for local commands (such as Gradle or test stands) within your turn is allowed. Final response: the result first, then files changed, checks run with outcomes, and anything unverified or left undone; cite file paths and line numbers instead of pasting large content. Never ask questions, request user input or approvals, or wait for an answer. Work only within existing authorization; never bypass required consent or substitute credentials. If completion needs unavailable input, access or authorization, finish useful independent work within your assigned scope, preserve changes and evidence, clean up only your own task resources, and end with a final response whose first line starts exactly BLOCKED: (no preamble or code fence). State the blocker, what you completed, and what the coordinator must provide; describe secret types or paths, never secret values. Do not report success or leave an input request pending.",
+  "routing": {
+    "sharedQuotaPenalty": 0.05,
+    "paidCreditPenalty": 0,
+    "cheapModelBonus": 0.15,
+    "weeklyReservePercent": 0
+  },
+  "plans": {
+    "_doc": "Per ai-usage provider and plan label: percent of the account's weekly window one task of size 0..3 takes for a burn-1 model. Codex models with 10+ clean sessions on the account plan are measured from weekly-window log deltas instead. Codex fallbacks are 2x the gpt-6.1-sol measurements of 2026-10-10 (Plus 39 sessions: 0.24/0.43/2.35/5.7; Pro 5x 445 sessions: 0.06/0.17/0.71/2.19); Pro 20x assumes 4x Pro 5x. Google AI Pro is 2x the gemini-3.8-flash measurements of 2026-10-11 (22 coding runs, 0.1-0.6% weekly each). OpenCode Go is policy USD_COST ($0.05/0.3/1/3 per burn-1 task) over the plan's $30 weekly cap. Muse Spark burn 0.1 measured 2026-10-11 from OpenCode message costs: 234 OpenRouter sessions p50/p75/p90/max $0.002/0.019/0.048/0.86, 12 Go sessions max $0.021; the Go 5-hour meter agreed ($0.17 = 1% of $12). Kimi burn 5: those Muse sessions repriced at K3 rates ($3/$15/$0.3 cache read per 1M) cost about 59x, p75/p90 $1.2/$3.2 per session. Calibrated 2026-10-11 with one focused read-only task (size 1, variant max, about 5 minutes, 35k input/4.3k output/401k cache-read tokens): OpenCode billed $0.32, while the Go weekly meter rose from 1% to 5% and the monthly meter from 0% to 2% with only about $0.05 of concurrent Muse work, so about 3.5-4% weekly for size 1 against the 5% this burn predicts. Kept at 5 until more samples; OpenCode's dollar figure understates Go meter use for Kimi. Gemini Argon burn 12 is measured (2026-10-16, one run): Argon has its own Google AI Pro weekly bucket (gemini-argon-wtu-weekly) and leaves the shared Gemini windows untouched; task B (spec evaluator, size 1, 8 min, 34k output + 26k thinking tokens) took 7.2% of it, so 0.6 x 12. About 14 such tasks per week; recheck after a few more runs. Claude rows were divided by 5 on 2026-10-16: the old values matched the 5-hour window, not the weekly one, and the 5-hour check multiplies weekly by windowFactor 5 again. Measured on claude-main Max 5x from ai-usage history: two size-2 Opus reviews took +7% and +8% of the 5-hour window and about +1% weekly each; 09:50-12:01 UTC overall +28% 5-hour vs +3% weekly. Pro and Max 20x were scaled the same way, unmeasured.",
+    "claude": {
+      "Pro": [0.4, 1.6, 5, 12],
+      "Max 5x": [0.1, 0.4, 1.2, 3],
+      "Max 20x": [0.03, 0.1, 0.3, 0.8]
+    },
+    "codex": {
+      "Plus": [0.5, 1, 5, 12],
+      "Pro 5x": [0.15, 0.4, 1.5, 4.5],
+      "Pro 20x": [0.05, 0.1, 0.4, 1.2]
+    },
+    "antigravity": {
+      "Google AI Pro": [0.2, 0.6, 1.5, 4]
+    },
+    "opencode-go": {
+      "Go": [0.17, 1, 3.3, 10]
+    },
+    "*": [2, 8, 25, 60]
+  },
+  "codexPlanTypes": {
+    "_doc": "ai-usage Codex plan label -> raw plan_type in Codex session logs, used to pick measured costs.",
+    "Free": "free",
+    "Plus": "plus",
+    "Pro 5x": "prolite",
+    "Pro 20x": "pro"
+  },
+  "families": [
+    {
+      "match": "claude-opus",
+      "burn": 1,
+      "profile": "Anthropic flagship class. Durable leader in agentic coding across generations: long autonomous sessions, large refactors, architecture and system design, security work, careful code review, knowledge-work agents, technical writing. Text and image input only, no video or audio. Verbose: spends many tokens per task."
+    },
+    {
+      "match": "claude-sonnet",
+      "burn": 0.6,
+      "minEffort": "medium",
+      "profile": "Anthropic mid tier, close to Opus on analysis. Best at codebase analysis, audits and code review: in Theo's (t3.gg) large-codebase PR audit Sonnet 5.5 scored slightly above Opus at about half the cost and twice the speed. Also good for everyday features, refactors, tests, multi-file edits, long-horizon tasks, screenshot and image understanding, clear writing; picks the sensible reading of an ambiguous request. Weaker at planning and executing large changes than Opus, and clearly behind Opus and Fable at frontend and visual design. Verbose: many tokens per task; max effort burns about 15x more tokens than xhigh without better results, and low effort is poor. Text and image input only."
+    },
+    {
+      "match": "claude-haiku",
+      "burn": 0.1,
+      "profile": "Anthropic small tier, very cheap and fast (about 180 tokens/s). Haiku 5.5 roughly doubled Haiku 4.5 on most benchmarks, about 40% Terminal Bench and strong computer use for its size (far above GPT-6 Luna). Good for focused subagent work: file and codebase search, lookups, categorisation, verifying another model's claims or output, summaries, mechanical edits, simple scripts and shell tasks, and many cheap parallel attempts with verification. Weak on non-trivial coding, design and judgement-heavy work: failed attempts waste tokens, and long tool flows are brittle (Theo, t3.gg: stopped on a GitHub rate limit instead of waiting). Prices and quota use rise sharply above 100k context, so keep tasks narrow."
+    },
+    {
+      "match": "claude-fable",
+      "burn": 3,
+      "profile": "Anthropic top tier above Opus: the best results on the hardest problems and the best visual and frontend design (landing pages, art direction, typography, polished UI). These specialties matter for demanding work; routine edits, tests and experiments alone do not imply a substantial quality advantage."
+    },
+    {
+      "match": "^gpt-",
+      "burn": 1,
+      "profile": "OpenAI. Durable leader in hard math, algorithms and science reasoning, and the most token-efficient frontier family. The best at computer use (driving GUIs, browsers, desktop apps) and at debugging: reproducing bugs, tracing failures, race conditions, crashes. Strong at shell, terminal and DevOps work and as an independent second opinion from another vendor. Weak on factual recall: verify facts it states."
+    },
+    {
+      "match": "gemini-.*flash",
+      "burn": 1,
+      "profile": "Google fast tier. Durable leader in multimodal input: takes almost anything natively (images, screenshots, video, audio, PDFs, scans, spreadsheets, huge files, mixed media). Strong at high-volume work, web research, summarisation and broad read-only exploration. On hard, well-specified coding (concurrency debugging, spec-exact parsers, Rust fixes, optimisation, log-driven incident analysis, features in a real library) it matched GPT-6.1 Sol on hidden tests, but took about twice as long and used far more tokens. Weakest of five families at original web design from a brief (stock templates, mobile overflow) despite browser self-checks. Ambiguous architecture and long autonomous implementation are unproven."
+    },
+    {
+      "match": "gemini-.*pro",
+      "burn": 1,
+      "profile": "Google frontier tier: the strongest multimodal reasoning over any input (images, video, audio, PDFs, mixed media), planning and deep analysis of rich inputs. Suitable for routine source exploration and bounded code implementation. Behind Claude and GPT on hard debugging and long autonomous agentic coding."
+    },
+    {
+      "match": "gemini-.*argon",
+      "burn": 12,
+      "noReview": true,
+      "profile": "Google top tier above Pro (October 2026). Good: video, image, PDF and visual/spatial understanding; YouTube data; frontend and landing first passes when a design skill is loaded; small well-specified coding tasks with tests (user run: 59/59 hidden tests on a spec-exact evaluator). Never for audits or reviews of any kind, including design and UI/UX audits (user rule 2026-10-17 after a design audit with several false claims; `noReview` enforces it unless the user explicitly asks for Argon). Not for code review, codebase audits, root-cause diagnosis or non-trivial changes in large real codebases: hands-on reports (Theo, t3.gg, 2026-10-14) found 24/36, 56/78 and 47/92 false claims in code audits, a 1,200-line PR with failing CI for a 21-line fix, no use of existing PRs, and occasional reasoning loops. Any Argon finding or patch must be verified by a stronger model before acting on it. Slow to finish despite fast tokens, very verbose, unstable API/ACP runs can drop mid-task."
+    },
+    {
+      "match": "deepseek-.*pro",
+      "burn": 1,
+      "profile": "DeepSeek: lowest price per capability, open weights, 1M context; bulk implementation, data scripts and algorithmic work where cost matters more than polish. Behind the frontier on hard agentic tasks."
+    },
+    {
+      "match": "deepseek-.*flash",
+      "burn": 0.2,
+      "profile": "DeepSeek small tier: the cheapest option; mechanical edits, renames, boilerplate, simple scripts, log or text triage."
+    },
+    {
+      "match": "glm-",
+      "burn": 0.3,
+      "profile": "Z.ai GLM: cheap, good at tool calling and routine coding; quick lookups, small edits, translation, formatting. Behind the frontier on terminal and long agentic tasks."
+    },
+    {"match": "muse-spark", "burn": 0.1, "minEffort": "high", "spendToZero": true, "profile": "Meta: very cheap and fast, 1M context with accurate multi-file tracing. On hard, well-specified engineering work (concurrency bugs, spec-exact parsers, Rust fixes, algorithmic optimisation, log-driven incident analysis, a feature in a 6k-line library) it matched GPT-6.1 Sol on hidden tests; it self-tests thoroughly and reports ambiguities honestly, but misses subtle contract clauses slightly more often. Strong domain-specific writing. Does not load user skills on its own: without the design skill its web pages are generic and repeat across runs; with it they are competitive. Long autonomous sessions are unproven.", "briefHint": "Long commands: bounded waits apply only to local commands (such as Gradle or test stands), never to PRs, CI, review bots or merges. Your shell tool stops a single call after about 10 minutes, so start a longer local command in the background with its output in a log file and its PID saved, then keep waiting INSIDE THIS SAME TURN with repeated bounded waits (for example `timeout 540 tail --pid=$PID -f /dev/null`, then read the log tail) until it exits or your stop rule expires. Your final message ends the task: the coordinator never sees anything you would do later, so never write that you will report or resume when a local command finishes. If the stop rule forces you to stop while a local command still runs, start the final response with PARTIAL: and name that command, its PID and its log path."},
+    {
+      "match": "grok",
+      "burn": 1,
+      "profile": "xAI Grok: agentic knowledge work and research with live web context; spends many tokens per task."
+    },
+    {
+      "match": "kimi",
+      "burn": 5,
+      "profile": "Moonshot Kimi: open-weights flagship near the frontier. Leads frontend and visual web coding (Arena Frontend Code #1 above Claude Fable at K3 release), strong long agentic coding (Opus-class on an independent production codebase test) and creative writing. Slower than peers, about twice the time per ticket. Vendor coding tables mix harnesses; treat them as optimistic."
+    },
+    {
+      "match": "qwen",
+      "burn": 0.5,
+      "profile": "Alibaba Qwen: broad open-weights lineup, good instruction following and GUI agents at low cost."
+    },
+    {
+      "match": "minimax",
+      "burn": 0.5,
+      "profile": "MiniMax: cheap agentic and document-processing work."
+    },
+    {
+      "match": "mistral",
+      "burn": 0.5,
+      "profile": "Mistral: EU-hosted, open-weights, solid tool use; below the frontier."
+    }
+  ]
+}
