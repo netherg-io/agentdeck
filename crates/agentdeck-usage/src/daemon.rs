@@ -470,8 +470,14 @@ fn doctor_from_root(
                     let (inst, src) = t3_source("antigravity", instance.as_deref());
                     ("antigravity", inst, src)
                 }
-                AccountConfig::OpencodeGo { instance, .. } => {
+                AccountConfig::OpencodeGo {
+                    instance, db_file, ..
+                } => {
                     let (inst, src) = t3_source("opencode-go", instance.as_deref());
+                    let db = db_file
+                        .clone()
+                        .unwrap_or_else(providers::opencode_go::default_db_file);
+                    let src = format!("{} (fallback {src})", db.display());
                     ("opencode-go", inst, src)
                 }
             };
