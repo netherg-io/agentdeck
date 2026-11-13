@@ -1280,20 +1280,15 @@ mod tests {
             kind,
             instance: instance.map(str::to_string),
             display: String::new(),
-            config_dir: None,
-            codex_home: None,
-            token_file: None,
             api_key_env: None,
             db_file: None,
             extra: Default::default(),
         };
-        match kind {
-            UsageKind::Claude => e.config_dir = Some("~/.claude".into()),
-            UsageKind::Codex => e.codex_home = Some("~/.codex".into()),
-            UsageKind::Deepseek | UsageKind::Openrouter | UsageKind::Vercel => {
-                e.api_key_env = Some("AGENTDECK_TEST_KEY".into());
-            }
-            UsageKind::Antigravity | UsageKind::OpencodeGo => {}
+        if matches!(
+            kind,
+            UsageKind::Deepseek | UsageKind::Openrouter | UsageKind::Vercel
+        ) {
+            e.api_key_env = Some("AGENTDECK_TEST_KEY".into());
         }
         e
     }

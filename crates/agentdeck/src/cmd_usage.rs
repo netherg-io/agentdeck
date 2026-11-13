@@ -21,12 +21,6 @@ pub enum UsageCmd {
         #[arg(long)]
         display: Option<String>,
         #[arg(long)]
-        config_dir: Option<String>,
-        #[arg(long)]
-        codex_home: Option<String>,
-        #[arg(long)]
-        token_file: Option<String>,
-        #[arg(long)]
         api_key_env: Option<String>,
         #[arg(long)]
         db_file: Option<String>,
@@ -109,9 +103,6 @@ pub async fn run(paths: &Paths, cmd: UsageCmd) -> anyhow::Result<()> {
             kind,
             instance,
             display,
-            config_dir,
-            codex_home,
-            token_file,
             api_key_env,
             db_file,
             dry_run,
@@ -121,9 +112,6 @@ pub async fn run(paths: &Paths, cmd: UsageCmd) -> anyhow::Result<()> {
                 kind: kind.as_core(),
                 instance: opt(instance),
                 display: display.unwrap_or_default(),
-                config_dir: opt(config_dir),
-                codex_home: opt(codex_home),
-                token_file: opt(token_file),
                 api_key_env: opt(api_key_env),
                 db_file: opt(db_file),
                 extra: Default::default(),

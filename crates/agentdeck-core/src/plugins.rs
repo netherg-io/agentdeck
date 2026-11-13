@@ -643,7 +643,7 @@ fn claude_settings_candidates(home: &Path, reg: &Registry) -> Vec<PathBuf> {
     }
     for u in &reg.usage {
         if u.kind == crate::usage::UsageKind::Claude
-            && let Some(dir) = &u.config_dir
+            && let Some(dir) = u.extra.get("config_dir").and_then(|v| v.as_str())
         {
             let dir = crate::sync::expand_tilde(dir, home);
             push_unique_path(&mut out, &mut seen, dir.join("settings.json"));

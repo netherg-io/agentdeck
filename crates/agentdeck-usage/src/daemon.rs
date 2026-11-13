@@ -695,7 +695,6 @@ mod tests {
                 id: "agy-main".to_owned(),
                 name: "Agy".to_owned(),
                 instance: Some("antigravity".to_owned()),
-                token_file: None,
             },
             AccountConfig::OpencodeGo {
                 id: "opencode-go".to_owned(),
@@ -754,7 +753,6 @@ mod tests {
             name: "Claude".to_owned(),
             plan: None,
             instance: None,
-            config_dir: PathBuf::new(),
         }];
         let state = refresh_cycle(&accounts, 900, Some(prev)).await;
         assert_eq!(state.accounts.len(), 1);
