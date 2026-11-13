@@ -1,5 +1,5 @@
-//! Built-in plugins: the `agent-process` launcher, the `ai-usage` daemon unit
-//! and the `router` (model-route copy). Plugin state lives in `instances.toml`
+//! Built-in plugins: the `agent-process` launcher, the `ai-usage` daemon unit,
+//! the `router` (model-route copy) and `imagegen` (gateway image skill). Plugin state lives in `instances.toml`
 //! under `[plugins]` (absent table = nothing enabled, so old files stay
 //! valid). Enabling a plugin lays out its files and instruction block;
 //! disabling removes them; plugin data is kept.
@@ -14,14 +14,23 @@ use crate::registry::Registry;
 pub const PLUGIN_AGENT_PROCESS: &str = "agent-process";
 pub const PLUGIN_AI_USAGE: &str = "ai-usage";
 pub const PLUGIN_ROUTER: &str = "router";
-pub const PLUGINS: [&str; 3] = [PLUGIN_AGENT_PROCESS, PLUGIN_AI_USAGE, PLUGIN_ROUTER];
+pub const PLUGIN_IMAGEGEN: &str = "imagegen";
+pub const PLUGIN_MCP_SERVER: &str = "mcp-server";
+pub const PLUGINS: [&str; 5] = [
+    PLUGIN_AGENT_PROCESS,
+    PLUGIN_AI_USAGE,
+    PLUGIN_ROUTER,
+    PLUGIN_IMAGEGEN,
+    PLUGIN_MCP_SERVER,
+];
 
-/// Usage lines for the agent-process instruction block. The general
-/// process-ownership policy stays hand-written and is never edited here.
-pub const AGENT_PROCESS_BLOCK: &str = "Start long-running servers only via `agent-process`:\n\
-    `agent-process start --name <n> -- <cmd>` starts a session-owned process,\n\
-    `agent-process list` / `status <id>` inspect it,\n\
-    `agent-process stop <id>` stops it (never stop processes you did not start).";
+/// agent-process instruction block. Every mention of the launcher lives here
+/// so disabling the plugin or uninstalling agentdeck leaves no stale rules;
+/// the general process-ownership policy stays hand-written.
+pub const AGENT_PROCESS_BLOCK: &str = "Start agent-owned long-running processes (dev/preview/watch servers, browser and other daemons) only with `agent-process start --name <name> --cwd <project> -- <command>` (`~/.local/bin/agent-process` on bash/zsh `PATH`). It tags the environment, creates a separate process group and records PID, birth time, command, cwd, log and agent-session owner in `$XDG_RUNTIME_DIR/ai-agent-processes`; that record is the launch proof for the process-ownership rules.\n\
+    - Inspect ownership with `agent-process list` / `agent-process status <id>`.\n\
+    - Stop your own or your delegated child's servers with `agent-process stop <id>`; signal the exact process group only when no record exists.\n\
+    - Other sessions' servers may be reused; stopping them requires explicit user approval, the only permitted use of `--force`.";
 
 pub fn is_known(name: &str) -> bool {
     PLUGINS.contains(&name)
@@ -29,7 +38,9 @@ pub fn is_known(name: &str) -> bool {
 
 fn check_name(name: &str) -> anyhow::Result<()> {
     if !is_known(name) {
-        anyhow::bail!("unknown plugin {name:?}: expected agent-process, ai-usage or router");
+        anyhow::bail!(
+            "unknown plugin {name:?}: expected agent-process, ai-usage, router, imagegen or mcp-server"
+        );
     }
     Ok(())
 }
@@ -256,6 +267,153 @@ fn file_name(path: &Path) -> &str {
         .unwrap_or("instructions")
 }
 
+/// Agentdeck owns its marker blocks: an enabled plugin's block must match
+/// the generated text, a disabled plugin's block must be absent. Plans both
+/// blocks per existing file in one write (symlinked duplicates collapse);
+/// missing files are never created here.
+pub fn plan_managed_blocks(
+    reg: &Registry,
+    home: &Path,
+    exe: &Path,
+    state_dir: &Path,
+) -> anyhow::Result<Vec<Change>> {
+    let router = plugin_enabled(reg, PLUGIN_ROUTER).then(|| crate::router::router_block(exe));
+    let blocks = [
+        (
+            PLUGIN_AGENT_PROCESS,
+            plugin_enabled(reg, PLUGIN_AGENT_PROCESS).then_some(AGENT_PROCESS_BLOCK),
+        ),
+        (crate::router::ROUTER_MARKER, router.as_deref()),
+        (
+            PLUGIN_MCP_SERVER,
+            plugin_enabled(reg, PLUGIN_MCP_SERVER).then_some(crate::manage::MCP_BLOCK),
+        ),
+    ];
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut changes = Vec::new();
+    for file in default_instruction_files(home) {
+        let Ok(key) = fs::canonicalize(&file) else {
+            continue;
+        };
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let old = fs::read(&file)?;
+        let old_text = std::str::from_utf8(&old)
+            .map_err(|_| anyhow::anyhow!("{} is not valid UTF-8", file.display()))?;
+        let mut text = old_text.to_string();
+        for (name, body) in blocks {
+            if let Some(new) = apply_marker_block(&text, name, body)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?
+            {
+                text = new;
+            }
+        }
+        if text != old_text {
+            changes.push(Change::WriteFile {
+                path: file.clone(),
+                contents: text.into_bytes(),
+                old: Some(old),
+                backup: Some(backup_dest(state_dir, file_name(&file))),
+            });
+        }
+    }
+    Ok(changes)
+}
+
+/// Skills shipped with plugins, written under the state dir and linked into
+/// every harness by the shared skill sync like any other skill.
+const ROUTER_SKILLS: &[(&str, &str)] = &[
+    (
+        "coordinator/SKILL.md",
+        include_str!("../plugin-skills/coordinator/SKILL.md"),
+    ),
+    (
+        "t3-routed-workflow/SKILL.md",
+        include_str!("../plugin-skills/t3-routed-workflow/SKILL.md"),
+    ),
+    (
+        "t3-routed-workflow/agents/openai.yaml",
+        include_str!("../plugin-skills/t3-routed-workflow/agents/openai.yaml"),
+    ),
+];
+
+// Not named `imagegen`: Codex ships a system skill by that name, and a shared
+// one would shadow its native image tool.
+const IMAGEGEN_SKILLS: &[(&str, &str)] = &[(
+    "imagegen-gateway/SKILL.md",
+    include_str!("../plugin-skills/imagegen-gateway/SKILL.md"),
+)];
+
+const PLUGIN_SKILLS: [(&str, &[(&str, &str)]); 2] = [
+    (PLUGIN_ROUTER, ROUTER_SKILLS),
+    (PLUGIN_IMAGEGEN, IMAGEGEN_SKILLS),
+];
+
+pub fn plugin_skills_dir(paths: &Paths) -> PathBuf {
+    paths.state_dir.join("plugin-skills")
+}
+
+/// Shipped skill files match the binary while their plugin is enabled (hand
+/// edits are reverted); a disabled plugin's skills are removed, and the dir
+/// goes once no plugin ships anything.
+pub fn plan_plugin_skills(reg: &Registry, paths: &Paths) -> Vec<Change> {
+    let dir = plugin_skills_dir(paths);
+    let (on, off): (Vec<_>, Vec<_>) = PLUGIN_SKILLS
+        .iter()
+        .partition(|(plugin, _)| plugin_enabled(reg, plugin));
+    if on.is_empty() {
+        return if fs::symlink_metadata(&dir).is_ok() {
+            vec![Change::BackupRemove {
+                path: dir,
+                backup: backup_dest(&paths.state_dir, "plugin-skills"),
+            }]
+        } else {
+            Vec::new()
+        };
+    }
+    let mut changes: Vec<Change> = on
+        .iter()
+        .flat_map(|(_, files)| files.iter())
+        .filter_map(|(rel, body)| {
+            let path = dir.join(rel);
+            let old = fs::read(&path).ok();
+            plan_write_file(path, old.as_deref(), body.as_bytes())
+        })
+        .collect();
+    let mut gone: Vec<&str> = off
+        .iter()
+        .flat_map(|(_, files)| files.iter())
+        .filter_map(|(rel, _)| rel.split('/').next())
+        .collect();
+    gone.dedup();
+    for skill in gone {
+        let path = dir.join(skill);
+        if fs::symlink_metadata(&path).is_ok() {
+            changes.push(Change::BackupRemove {
+                path,
+                backup: backup_dest(&paths.state_dir, skill),
+            });
+        }
+    }
+    changes
+}
+
+/// Bring shipped skills in line with the registry, then relink harness skill
+/// dirs so new skills appear and removed ones lose their links.
+pub fn sync_plugin_skills(paths: &Paths, home: &Path) -> anyhow::Result<Vec<Change>> {
+    let mut changes = plan_plugin_skills(&Registry::load(paths)?, paths);
+    if changes.is_empty() {
+        return Ok(changes);
+    }
+    apply_changes(&changes)?;
+    let links = crate::shared::plan_skills_sync(home, paths)?;
+    apply_changes(&links)?;
+    changes.extend(links);
+    Ok(changes)
+}
+
 /// `~/.local/bin`, or `$AGENTDECK_BIN_DIR` when set (tests inject temp dirs).
 pub fn bin_dir(home: &Path) -> PathBuf {
     std::env::var_os("AGENTDECK_BIN_DIR")
@@ -401,6 +559,39 @@ pub fn status(paths: &Paths, home: &Path, exe: &Path) -> Vec<PluginStatus> {
         enabled: plugin_enabled(&reg, PLUGIN_ROUTER),
         available: router_available(),
         detail: router_detail(paths, home, exe),
+    });
+    let ig = crate::imagegen::read(&reg);
+    let key = crate::imagegen::gateway_key(&reg, home, &ig.provider).is_some();
+    out.push(PluginStatus {
+        name: PLUGIN_IMAGEGEN,
+        enabled: plugin_enabled(&reg, PLUGIN_IMAGEGEN),
+        available: true,
+        detail: vec![
+            format!("provider: {}", ig.provider),
+            format!("model: {}", ig.model),
+            format!("transparent model: {}", ig.transparent_model),
+            format!("key: {}", if key { "found" } else { "missing" }),
+        ],
+    });
+    out.push(PluginStatus {
+        name: PLUGIN_MCP_SERVER,
+        enabled: plugin_enabled(&reg, PLUGIN_MCP_SERVER),
+        available: true,
+        detail: match crate::manage::plan_register(paths, home, exe, true) {
+            Ok((changes, notes)) => {
+                let mut d = vec![format!(
+                    "registration: {}",
+                    if changes.is_empty() {
+                        "in every harness"
+                    } else {
+                        "incomplete"
+                    }
+                )];
+                d.extend(notes);
+                d
+            }
+            Err(e) => vec![format!("registration: {e:#}")],
+        },
     });
     out
 }
@@ -557,6 +748,18 @@ pub fn plan_enable(
         }
         PLUGIN_AI_USAGE => plan_enable_ai_usage(paths)?,
         PLUGIN_ROUTER => plan_enable_router(paths, home, files, exe, replace)?,
+        // Only the flag and its skill (synced after apply).
+        PLUGIN_IMAGEGEN => Vec::new(),
+        PLUGIN_MCP_SERVER => {
+            let mut c = crate::manage::plan_register(paths, home, exe, true)?.0;
+            c.extend(plan_marker_files(
+                files,
+                PLUGIN_MCP_SERVER,
+                Some(crate::manage::MCP_BLOCK),
+                &paths.state_dir,
+            )?);
+            c
+        }
         _ => unreachable!(),
     };
     let old = fs::read(paths.registry_file()).ok();
@@ -591,6 +794,17 @@ pub fn plan_disable(
         PLUGIN_AGENT_PROCESS => plan_disable_agent_process(home, files, exe, &paths.state_dir)?,
         PLUGIN_AI_USAGE => plan_disable_ai_usage()?,
         PLUGIN_ROUTER => plan_disable_router(paths, home, files, exe)?,
+        PLUGIN_IMAGEGEN => Vec::new(),
+        PLUGIN_MCP_SERVER => {
+            let mut c = crate::manage::plan_register(paths, home, exe, false)?.0;
+            c.extend(plan_marker_files(
+                files,
+                PLUGIN_MCP_SERVER,
+                None,
+                &paths.state_dir,
+            )?);
+            c
+        }
         _ => unreachable!(),
     };
     let old = fs::read(paths.registry_file()).ok();
@@ -662,6 +876,167 @@ mod tests {
     /// Temp HOME with `AGENTDECK_BIN_DIR` pointed inside it and a fake
     /// systemctl on PATH-vars. Callers hold [`test_env_lock`] across the
     /// whole test body. Returns (guard, home, paths, files, exe).
+    #[test]
+    fn plugin_skills_follow_their_own_plugin() {
+        let _env = test_env_lock();
+        let (_g, _home, paths, _files, _exe) = setup("plugin-skills");
+        let dir = plugin_skills_dir(&paths);
+        let set = |name: &str, on: bool| {
+            Registry::update(&paths, |r| {
+                if on {
+                    r.plugins.insert(name.into(), true);
+                } else {
+                    r.plugins.remove(name);
+                }
+                Ok(())
+            })
+            .unwrap();
+            let reg = Registry::load(&paths).unwrap();
+            apply_changes(&plan_plugin_skills(&reg, &paths)).unwrap();
+        };
+        set(PLUGIN_IMAGEGEN, true);
+        assert!(dir.join("imagegen-gateway/SKILL.md").is_file());
+        assert!(!dir.join("coordinator").exists());
+        set(PLUGIN_ROUTER, true);
+        assert!(dir.join("coordinator/SKILL.md").is_file());
+        // Disabling one plugin removes only its skills.
+        set(PLUGIN_IMAGEGEN, false);
+        assert!(!dir.join("imagegen-gateway").exists());
+        assert!(dir.join("coordinator/SKILL.md").is_file());
+        set(PLUGIN_ROUTER, false);
+        assert!(!dir.exists());
+        let reg = Registry::load(&paths).unwrap();
+        assert!(plan_plugin_skills(&reg, &paths).is_empty());
+    }
+
+    /// Every file, link and dir under `root` except agentdeck's own config
+    /// and state (plugin data is kept by design).
+    fn tree(root: &Path, skip: &[PathBuf]) -> BTreeMap<PathBuf, String> {
+        fn walk(dir: &Path, root: &Path, skip: &[PathBuf], out: &mut BTreeMap<PathBuf, String>) {
+            let Ok(rd) = fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if skip.iter().any(|s| p.starts_with(s)) {
+                    continue;
+                }
+                let rel = p.strip_prefix(root).unwrap().to_path_buf();
+                let m = fs::symlink_metadata(&p).unwrap();
+                if m.file_type().is_symlink() {
+                    out.insert(rel, format!("-> {}", fs::read_link(&p).unwrap().display()));
+                } else if m.is_dir() {
+                    out.insert(rel, "dir".into());
+                    walk(&p, root, skip, out);
+                } else {
+                    out.insert(
+                        rel,
+                        String::from_utf8_lossy(&fs::read(&p).unwrap()).into_owned(),
+                    );
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, skip, &mut out);
+        // Parents of agentdeck's own dirs; their other contents still count.
+        for parent in skip.iter().filter_map(|s| s.parent()) {
+            if let Ok(rel) = parent.strip_prefix(root) {
+                out.remove(rel);
+            }
+        }
+        out
+    }
+
+    /// Enable then disable each plugin the way the CLI does (plan, apply,
+    /// plugin-skill sync): everything outside agentdeck's data must be byte
+    /// for byte what it was, as if the plugin had never been there.
+    #[test]
+    fn every_plugin_leaves_no_trace_after_disable() {
+        let _env = test_env_lock();
+        let real_home = env::var_os("HOME");
+        for name in PLUGINS {
+            let (g, home, paths, files, exe) = setup(&format!("trace-{name}"));
+            let t3 = g.0.join("t3");
+            fs::create_dir_all(&t3).unwrap();
+            unsafe {
+                env::set_var("AGENTDECK_T3_DIR", &t3);
+                // XDG dirs sit beside the fake home; only dirs under $HOME
+                // are tracked, and the created-dirs log lives in our state.
+                env::set_var("HOME", &g.0);
+                env::set_var("AGENTDECK_STATE_DIR", &paths.state_dir);
+            }
+            let w = |rel: &str, body: &str| {
+                let p = home.join(rel);
+                fs::create_dir_all(p.parent().unwrap()).unwrap();
+                fs::write(p, body).unwrap();
+            };
+            w("AGENTS.md", "# mine\n\nhand-written rules\n");
+            w(".claude/CLAUDE.md", "claude only\n");
+            w(
+                ".claude/settings.json",
+                "{\n  \"model\": \"opus\",\n  \"hooks\": {\n    \"PostToolUse\": [\n      {\n        \"matcher\": \"Bash\",\n        \"hooks\": [{ \"type\": \"command\", \"command\": \"true\" }]\n      }\n    ]\n  }\n}\n",
+            );
+            w(".claude-second/settings.json", "{\"theme\":\"dark\"}");
+            w(".codex/config.toml", "model = \"gpt\"\n");
+            w(
+                ".gemini/config/config.json",
+                "{\n  \"plugins\": {\n    \"Figma\": {\n      \"enabled\": true\n    }\n  }\n}\n",
+            );
+            w(
+                ".config/opencode/opencode.json",
+                "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"plugin\": [\"x\"]\n}\n",
+            );
+            w(
+                ".claude.json",
+                "{\n  \"numStartups\": 3,\n  \"mcpServers\": {\n    \"shared\": {\n      \"type\": \"http\",\n      \"url\": \"http://127.0.0.1:8080/mcp\"\n    }\n  }\n}\n",
+            );
+            w(
+                ".gemini/config/mcp_config.json",
+                "{\"mcpServers\":{\"shared\":{\"url\":\"http://x\"}}}",
+            );
+            for d in [
+                ".claude/skills",
+                ".agents/skills",
+                ".config/opencode/skills",
+                ".gemini/skills",
+                ".local/bin",
+            ] {
+                fs::create_dir_all(home.join(d)).unwrap();
+            }
+            let skip = [
+                paths.config_dir.clone(),
+                paths.state_dir.clone(),
+                g.0.join("calls.log"),
+            ];
+            let before = tree(&g.0, &skip);
+            let on = plan_enable(&paths, &home, &files, &exe, name, false).unwrap();
+            apply_all(&paths, name, true, &on).unwrap();
+            sync_plugin_skills(&paths, &home).unwrap();
+            assert_ne!(tree(&g.0, &skip), before, "{name}: enable changed nothing");
+            let off = plan_disable(&paths, &home, &files, &exe, name).unwrap();
+            apply_all(&paths, name, false, &off).unwrap();
+            sync_plugin_skills(&paths, &home).unwrap();
+            let after = tree(&g.0, &skip);
+            let diff: Vec<String> = before
+                .keys()
+                .chain(after.keys())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .filter(|k| before.get(*k) != after.get(*k))
+                .map(|k| format!("{}: {:?} -> {:?}", k.display(), before.get(k), after.get(k)))
+                .collect();
+            assert!(diff.is_empty(), "{name} left traces:\n{}", diff.join("\n"));
+            unsafe {
+                env::remove_var("AGENTDECK_T3_DIR");
+            }
+        }
+        unsafe {
+            env::remove_var("AGENTDECK_STATE_DIR");
+            match real_home {
+                Some(h) => env::set_var("HOME", h),
+                None => env::remove_var("HOME"),
+            }
+        }
+    }
+
     fn setup(tag: &str) -> (Guard, PathBuf, Paths, Vec<PathBuf>, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "agentdeck-plugins-{tag}-{}-{}",
@@ -923,17 +1298,16 @@ mod tests {
         // Disable: hooks first (fail closed), then files, then the block.
         let changes = plan_disable(&paths, &home, &files, &exe, PLUGIN_ROUTER).unwrap();
         assert!(!changes.is_empty());
-        let is_settings = |c: &Change| matches!(c, Change::WriteFile { path, .. } if path.ends_with("settings.json"));
+        // settings.json did not exist before enable, so disable removes it.
+        let is_settings = |c: &Change| matches!(c, Change::WriteFile { path, .. } | Change::Remove { path } if path.ends_with("settings.json"));
         let first_hook = changes.iter().position(is_settings).unwrap();
         let first_remove = changes
             .iter()
-            .position(|c| matches!(c, Change::Remove { .. }))
+            .position(|c| matches!(c, Change::Remove { path } if !path.ends_with("settings.json")))
             .unwrap();
         assert!(first_hook < first_remove, "hooks go before files");
         apply_all(&paths, PLUGIN_ROUTER, false, &changes).unwrap();
-        let settings = fs::read_to_string(home.join(".claude/settings.json")).unwrap();
-        assert!(!settings.contains("route hook"));
-        assert!(!settings.contains("hook.mjs"));
+        assert!(!home.join(".claude/settings.json").exists());
         assert!(!home.join(".config/opencode/plugin/model-route.ts").exists());
         assert!(!worker.exists());
         assert!(dir.join("router.json").exists(), "data is kept");

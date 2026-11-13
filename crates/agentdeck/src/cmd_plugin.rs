@@ -1,10 +1,10 @@
 //! `agentdeck plugin list|enable|disable`: built-in plugins (agent-process,
-//! ai-usage, router). The router needs T3 present. Every write goes
+//! ai-usage, router, imagegen). The router needs T3 present. Every write goes
 //! through injectable paths and supports --dry-run; previews print first.
 
 use std::path::PathBuf;
 
-use agentdeck_core::{Paths, plugins};
+use agentdeck_core::{Paths, Registry, plugins};
 use clap::Subcommand;
 
 #[derive(Subcommand)]
@@ -13,7 +13,7 @@ pub enum PluginCmd {
     List,
     /// Enable a plugin (files + unit + registry flag).
     Enable {
-        /// Plugin name (agent-process, ai-usage).
+        /// Plugin name (agent-process, ai-usage, router, imagegen).
         name: String,
         /// Back up a foreign file at the launcher path instead of refusing.
         #[arg(long)]
@@ -23,7 +23,7 @@ pub enum PluginCmd {
     },
     /// Disable a plugin (removes its files; data is kept).
     Disable {
-        /// Plugin name (agent-process, ai-usage).
+        /// Plugin name (agent-process, ai-usage, router, imagegen).
         name: String,
         #[arg(long)]
         dry_run: bool,
@@ -75,6 +75,7 @@ pub fn run(paths: &Paths, cmd: PluginCmd) -> anyhow::Result<()> {
                 return Ok(());
             }
             plugins::apply_all(paths, &name, true, &changes)?;
+            plugins::sync_plugin_skills(paths, &home)?;
             println!("enabled {name}");
             Ok(())
         }
@@ -95,8 +96,52 @@ pub fn run(paths: &Paths, cmd: PluginCmd) -> anyhow::Result<()> {
                 return Ok(());
             }
             plugins::apply_all(paths, &name, false, &changes)?;
+            plugins::sync_plugin_skills(paths, &home)?;
             println!("disabled {name} (data kept)");
             Ok(())
         }
     }
+}
+
+/// Disable every enabled plugin, then drop blocks left by plugins that were
+/// disabled by hand. ai-usage goes first: it refuses while the daemon runs,
+/// before anything else is touched.
+pub fn uninstall(paths: &Paths, dry_run: bool) -> anyhow::Result<()> {
+    let home = home_dir()?;
+    let exe = std::env::current_exe()?;
+    let files = plugins::default_instruction_files(&home);
+    let mut reg = Registry::load(paths)?;
+    for name in [
+        plugins::PLUGIN_AI_USAGE,
+        plugins::PLUGIN_ROUTER,
+        plugins::PLUGIN_IMAGEGEN,
+        plugins::PLUGIN_MCP_SERVER,
+        plugins::PLUGIN_AGENT_PROCESS,
+    ] {
+        if !plugins::plugin_enabled(&reg, name) {
+            continue;
+        }
+        let changes = plugins::plan_disable(paths, &home, &files, &exe, name)?;
+        for c in &changes {
+            println!("{}", c.describe());
+        }
+        if !dry_run {
+            plugins::apply_all(paths, name, false, &changes)?;
+        }
+    }
+    reg.plugins.clear();
+    let blocks = plugins::plan_managed_blocks(&reg, &home, &exe, &paths.state_dir)?;
+    for c in &blocks {
+        println!("{}", c.describe());
+    }
+    if dry_run {
+        println!("dry-run: nothing changed");
+        return Ok(());
+    }
+    agentdeck_core::apply_changes(&blocks)?;
+    for c in plugins::sync_plugin_skills(paths, &home)? {
+        println!("{}", c.describe());
+    }
+    println!("agentdeck integrations removed; delete the binary to finish");
+    Ok(())
 }

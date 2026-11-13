@@ -363,6 +363,7 @@ pub fn router_block(exe: &Path) -> String {
         `target` (including `options`) as the `delegate_task` target; append a returned `briefHint` verbatim. \
         `jevConfidence` < 0.4: compare quality and quota penalties of the top two eligible candidates. `target: null`: \
         split the work or do it yourself. A denied target: use the next `eligible` model in `ranking`.\n\
+        - When the user explicitly asks for a specific model, start the task with `[route:user-choice]`: the router then allows any catalog model and only warns.\n\
         - Never set `runtimeMode` unless asked.\n"
     )
 }
@@ -836,7 +837,214 @@ pub fn plan_hooks_enable(
             });
         }
     }
+    // agy loads a plugin dir only with its manifest.
+    {
+        let path = agy_plugin_manifest(home);
+        if std::fs::symlink_metadata(&path).is_err() {
+            changes.push(Change::WriteFile {
+                path,
+                contents: AGY_PLUGIN_MANIFEST.as_bytes().to_vec(),
+                old: None,
+                backup: None,
+            });
+        }
+    }
+    changes.extend(record_originals(home, paths, exe, &changes));
     Ok(changes)
+}
+
+pub const AGY_PLUGIN_MANIFEST: &str = "{ \"name\": \"model-route\" }\n";
+
+pub fn agy_plugin_manifest(home: &Path) -> PathBuf {
+    home.join(".gemini/config/plugins/model-route/plugin.json")
+}
+
+/// Harness JSON files the router edits (not the files it owns outright).
+fn hook_json_files(home: &Path, paths: &Paths, exe: &Path) -> Vec<PathBuf> {
+    let mut files = claude_hook_targets(home, paths, exe);
+    files.extend([codex_hooks(home), agy_hooks(home), agy_config(home)]);
+    files.push(agy_plugin_manifest(home));
+    files
+}
+
+/// Pre-enable bytes of every harness file the router edits (`null` = the
+/// file did not exist), so disable can restore them byte for byte.
+fn originals_path(paths: &Paths) -> PathBuf {
+    router_dir(paths).join("hook-originals.json")
+}
+
+fn read_originals(paths: &Paths) -> Map<String, Value> {
+    std::fs::read(originals_path(paths))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn originals_change(paths: &Paths, map: &Map<String, Value>) -> Option<Change> {
+    let path = originals_path(paths);
+    let old = std::fs::read(&path).ok();
+    if map.is_empty() {
+        return old.map(|_| Change::Remove { path });
+    }
+    let new = serde_json::to_string_pretty(map).unwrap_or_default() + "\n";
+    crate::changes::plan_write_file(path, old.as_deref(), new.as_bytes())
+}
+
+fn record_originals(home: &Path, paths: &Paths, exe: &Path, changes: &[Change]) -> Option<Change> {
+    let files = hook_json_files(home, paths, exe);
+    let mut map = read_originals(paths);
+    let before = map.clone();
+    for c in changes {
+        let Change::WriteFile { path, old, .. } = c else {
+            continue;
+        };
+        let key = path.display().to_string();
+        if !files.contains(path) || map.contains_key(&key) {
+            continue;
+        }
+        // A file already carrying a router hook (older install) has no clean
+        // original to go back to.
+        let text = old
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        if text
+            .as_deref()
+            .is_some_and(|t| t.contains("route hook") || t.contains("model-route/hook"))
+        {
+            continue;
+        }
+        map.insert(key, text.map(Value::String).unwrap_or(Value::Null));
+    }
+    (map != before)
+        .then(|| originals_change(paths, &map))
+        .flatten()
+}
+
+/// Drop the empty containers enable may have added, so a file with only our
+/// hook removed compares equal to its original.
+fn prune_empty(v: &mut Value) {
+    let Some(root) = v.as_object_mut() else {
+        return;
+    };
+    for key in ["hooks", "model-route"] {
+        if let Some(Value::Object(o)) = root.get_mut(key) {
+            if o.get("PreToolUse")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+            {
+                o.remove("PreToolUse");
+            }
+            if o.is_empty() {
+                root.remove(key);
+            }
+        }
+    }
+    if root
+        .get("plugins")
+        .and_then(Value::as_object)
+        .is_some_and(Map::is_empty)
+    {
+        root.remove("plugins");
+    }
+}
+
+/// Rewrite disable's JSON edits: back to the recorded original bytes when
+/// only our hook differed, removed when nothing but our scaffolding is left.
+fn restore_originals(home: &Path, paths: &Paths, exe: &Path, changes: Vec<Change>) -> Vec<Change> {
+    let files = hook_json_files(home, paths, exe);
+    let mut map = read_originals(paths);
+    let before = map.clone();
+    let mut out: Vec<Change> = changes
+        .into_iter()
+        .map(|c| {
+            let Change::WriteFile {
+                path,
+                contents,
+                old,
+                backup,
+            } = c
+            else {
+                return c;
+            };
+            if !files.contains(&path) {
+                return Change::WriteFile {
+                    path,
+                    contents,
+                    old,
+                    backup,
+                };
+            }
+            let orig = map.remove(&path.display().to_string());
+            let mut now: Value = serde_json::from_slice(&contents).unwrap_or(Value::Null);
+            prune_empty(&mut now);
+            match orig {
+                Some(Value::String(text)) => {
+                    let mut was: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                    prune_empty(&mut was);
+                    if was == now {
+                        return Change::WriteFile {
+                            path,
+                            contents: text.into_bytes(),
+                            old,
+                            backup,
+                        };
+                    }
+                }
+                // Only a file enable created goes away; an unrecorded one stays,
+                // except in the agy plugin dir, which is entirely ours.
+                Some(Value::Null) if now.as_object().is_some_and(Map::is_empty) => {
+                    return Change::Remove { path };
+                }
+                _ if path == agy_hooks(home) && now.as_object().is_some_and(Map::is_empty) => {
+                    return Change::Remove { path };
+                }
+                _ => {}
+            }
+            let contents =
+                (serde_json::to_string_pretty(&now).unwrap_or_default() + "\n").into_bytes();
+            Change::WriteFile {
+                path,
+                contents,
+                old,
+                backup,
+            }
+        })
+        .collect();
+    // Our agy manifest goes with the plugin it names.
+    let manifest = agy_plugin_manifest(home);
+    if std::fs::read(&manifest).is_ok_and(|b| {
+        serde_json::from_slice::<Value>(&b).ok() == serde_json::from_str(AGY_PLUGIN_MANIFEST).ok()
+    }) && !matches!(
+        map.get(&manifest.display().to_string()),
+        Some(Value::String(_))
+    ) {
+        map.remove(&manifest.display().to_string());
+        out.push(Change::Remove { path: manifest });
+    }
+    // The plugin dir itself, once nothing but our two files was in it.
+    let dir = agy_hooks(home).parent().map(Path::to_path_buf);
+    if let Some(dir) = dir {
+        let ours = [agy_hooks(home), agy_plugin_manifest(home)];
+        let gone = |p: &PathBuf| {
+            out.iter()
+                .any(|c| matches!(c, Change::Remove { path } if path == p))
+        };
+        let only_ours = std::fs::read_dir(&dir).is_ok_and(|rd| {
+            rd.flatten()
+                .all(|e| ours.contains(&e.path()) && gone(&e.path()))
+        });
+        if only_ours {
+            out.push(Change::BackupRemove {
+                backup: crate::changes::backup_dest(&paths.state_dir, "model-route-agy-plugin"),
+                path: dir,
+            });
+        }
+    }
+    if map != before {
+        out.extend(originals_change(paths, &map));
+    }
+    out
 }
 
 /// Plan hook removal, in the disable order (hooks first: they fail closed).
@@ -907,7 +1115,7 @@ pub fn plan_hooks_disable(
             changes.push(Change::Remove { path });
         }
     }
-    Ok(changes)
+    Ok(restore_originals(home, paths, exe, changes))
 }
 
 /// Read-only hook presence for status output.
@@ -1179,6 +1387,27 @@ mod tests {
         let changes = plan_router_files(&paths, &reg).unwrap();
         assert!(!changes.is_empty());
         assert!(!router_json_path(&paths).exists());
+    }
+
+    #[test]
+    fn legacy_agy_plugin_dir_goes_with_disable() {
+        // Installed by an older agentdeck: no originals were recorded.
+        let (paths, home) = test_paths("agy-legacy");
+        let exe = home.join("agentdeck");
+        let hooks = agy_hooks(&home);
+        std::fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        let v = serde_json::json!({"model-route": {"PreToolUse": [
+            {"matcher": AGY_MATCHER, "hooks": [{"type": "command", "command": hook_command(&exe, "agy")}]}
+        ]}});
+        std::fs::write(&hooks, v.to_string()).unwrap();
+        std::fs::write(agy_plugin_manifest(&home), "{ \"name\": \"model-route\" }").unwrap();
+        let changes = plan_hooks_disable(&home, &paths, &exe, &paths.state_dir).unwrap();
+        crate::changes::apply_changes(&changes).unwrap();
+        assert!(!hooks.parent().unwrap().exists());
+        assert!(
+            home.join(".gemini/config/plugins").exists(),
+            "only our dir goes"
+        );
     }
 
     #[test]

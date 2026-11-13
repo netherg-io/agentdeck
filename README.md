@@ -15,7 +15,7 @@ What it does:
 - Syncs shared state across instances: secondary accounts, Codex shadow
   homes, skills, instruction files, MCP lists, terminal wrappers.
 - Ships built-in plugins with no standalone copies: usage polling, the model
-  router and the agent-process supervisor.
+  router, the agent-process supervisor and gateway image generation.
 
 ## Install
 
@@ -55,7 +55,9 @@ agentdeck sync          background sync drift status and manual runs
 agentdeck skills | instructions | mcp   shared skills, AGENTS.md links, MCP lists
 agentdeck wrapper       terminal wrappers and legacy launcher cleanup
 agentdeck service       install/remove/inspect the systemd user unit (never starts it)
-agentdeck plugin        enable/disable built-in plugins (agent-process, ai-usage, router)
+agentdeck plugin        enable/disable built-in plugins (agent-process, ai-usage, router, imagegen)
+agentdeck imagegen      generate or edit one image through Vercel AI Gateway or OpenRouter
+agentdeck mcp-server    stdio MCP server for skills, shared instructions and drift (plugin mcp-server)
 agentdeck route         route a task through the router (`agentdeck route`, hook, workflow, shell bridge)
 agentdeck router        refresh the generated router.json
 agentdeck ps            live agent-process tree (read-only)
@@ -99,6 +101,11 @@ Module settings live in `instances.toml`; absent keys use the defaults:
 decision_provider = "openrouter"          # or "vercel" (Vercel AI Gateway)
 decision_model = "~typesafe/jev-latest"   # default for OpenRouter; required for vercel
 
+[imagegen]
+provider = "vercel"                       # or "openrouter"
+model = "bytedance/seedream-5.0-pro"      # default; OpenRouter default: google/gemini-3.1-flash-image
+transparent_model = "openai/gpt-image-1-mini"  # --transparent, always on Vercel
+
 [usage_poll]
 refresh_seconds = 120   # minimum 15
 stale_seconds = 900     # cached quota data older than this is stale
@@ -107,7 +114,9 @@ stale_seconds = 900     # cached quota data older than this is stale
 Decision keys: OpenRouter reads `JEV_OPENROUTER_API_KEY` or
 `~/.config/model-route/openrouter.key`; Vercel AI Gateway reads
 `AI_GATEWAY_API_KEY` or `~/.config/model-route/vercel.key`. Quota sources of
-kind `vercel` show the gateway's credit balance.
+kind `vercel` show the gateway's credit balance. Image keys: `AI_GATEWAY_API_KEY` /
+`OPENROUTER_API_KEY`, then the `api_key_env` of the matching `[[usage]]` source,
+then the same `model-route` key files.
 
 **Parallel tasks** on each instance sets its router limit; a blank value means
 unlimited. The limit covers active T3 threads and subagents across every
@@ -132,6 +141,23 @@ Built-in, enabled per machine with `agentdeck plugin enable <name>`:
 - `router` — model pool JSON and the delegation router.
 - `agent-process` — supervised background processes with the same CLI and
   registry as the standalone script it replaces.
+- `imagegen` — `agentdeck imagegen` plus the `imagegen-gateway` skill, synced to
+  every harness. The skill tells agents to use it only when no built-in image
+  tool or other image skill works, because every call is billed. Image-only
+  gateway models go through the Images API (`/images/generations`,
+  `/images/edits`); Gemini/GPT image models go through chat completions.
+  Gateway, models and key are set in the GUI under Image generation → Settings;
+  **Check** verifies both models on the gateway's public model list for free.
+- `mcp-server` — registers `agentdeck mcp-server` (stdio MCP) in every harness
+  (Claude profiles, Codex, Antigravity, OpenCode) and adds an instruction block
+  telling models to use it. Tools: `skills_list` (origins, invocation and
+  conflicts such as a shared skill shadowing a Codex system skill),
+  `skill_install` / `skill_remove` (local dir or GitHub, global or one
+  project), `skill_invocation`, `instructions_read` / `instructions_edit`
+  (agentdeck blocks stay protected), `drift_list` / `drift_apply` /
+  `drift_resolve`. One call updates every harness instead of only the
+  caller's own. Disable removes the registrations and restores each harness
+  file byte for byte.
 
 Enable lays out exactly the plugin's files, hooks and instruction block;
 disable removes them. Plugin data is kept.

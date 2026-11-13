@@ -91,7 +91,7 @@ impl Provider {
         }
     }
 
-    fn key_file(self) -> PathBuf {
+    pub(crate) fn key_file(self) -> PathBuf {
         let name = match self {
             Self::OpenRouter => "openrouter.key",
             Self::Vercel => "vercel.key",

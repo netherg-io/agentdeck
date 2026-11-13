@@ -1,0 +1,4 @@
+interface:
+  display_name: "T3 Routed Workflow"
+  short_description: "Run dependent T3 tasks with per-step model routing"
+  default_prompt: "Use $t3-routed-workflow to run this task as routed parallel steps with saved progress."

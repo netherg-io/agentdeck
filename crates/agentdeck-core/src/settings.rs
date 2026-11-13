@@ -334,7 +334,7 @@ pub fn write_user_rules(paths: &Paths, rules: &UserRules) -> anyhow::Result<()> 
     })
 }
 
-fn set(reg: &mut Registry, table: &str, key: &str, value: Option<toml::Value>) {
+pub(crate) fn set(reg: &mut Registry, table: &str, key: &str, value: Option<toml::Value>) {
     let entry = reg
         .extra
         .entry(table.to_string())

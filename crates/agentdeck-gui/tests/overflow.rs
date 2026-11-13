@@ -12,7 +12,7 @@ use agentdeck_core::{Paths, PoolEntry};
 use agentdeck_gui::app::{self, Message, Page};
 use agentdeck_gui::data::{Data, InstanceRow, PluginRow, QuotaBar, T3Info, UsageQuotas};
 use agentdeck_gui::pages::add_instance::AddMsg;
-use agentdeck_gui::pages::{drift, harnesses, pool, shared, usage};
+use agentdeck_gui::pages::{drift, harnesses, imagegen, pool, shared, usage};
 
 const LONG_ID: &str = "claude-d756536e-very-long-instance-identifier-for-overflow-checks";
 const LONG_NAME: &str =
@@ -364,6 +364,26 @@ fn every_page_fits_at_min_size_with_long_names() {
         shot(&state, lang, "usage_poll");
         update(&mut state, Message::SelectPage(Page::RouterSettings));
         shot(&state, lang, "router_settings");
+        update(&mut state, Message::SelectPage(Page::ImagegenSettings));
+        update(
+            &mut state,
+            Message::Imagegen(imagegen::Msg::Loaded(imagegen::Loaded {
+                stored: agentdeck_core::imagegen::Stored {
+                    provider: None,
+                    model: Some(format!("bytedance/{LONG_ID}")),
+                    transparent_model: None,
+                },
+                key_set: (false, true),
+                error: None,
+            })),
+        );
+        update(
+            &mut state,
+            Message::Imagegen(imagegen::Msg::Checked(Err(format!(
+                "bytedance/{LONG_ID} is not on this gateway"
+            )))),
+        );
+        shot(&state, lang, "imagegen_settings");
         update(&mut state, Message::SelectPage(Page::Modules));
         update(&mut state, Message::PluginDetail("agent-process".into()));
         shot(&state, lang, "modules");

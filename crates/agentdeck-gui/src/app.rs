@@ -12,7 +12,7 @@ use crate::overlay::{self, Modal, Toast};
 use crate::pages::add_instance::{self, AddMsg};
 use crate::pages::drift::{self, Ctx as DriftCtx};
 use crate::pages::plugins::Pending;
-use crate::pages::{self, harnesses, pool, settings, shared, usage};
+use crate::pages::{self, harnesses, imagegen, pool, settings, shared, usage};
 use crate::style as st;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -26,6 +26,7 @@ pub enum Page {
     UsagePoll,
     Limits,
     RouterSettings,
+    ImagegenSettings,
     Modules,
     Processes,
     Pool,
@@ -44,6 +45,7 @@ impl Page {
             Self::Limits => fl!(loader(), "nav-limits"),
             Self::UsagePoll => fl!(loader(), "nav-usage-poll"),
             Self::RouterSettings => fl!(loader(), "nav-router-settings"),
+            Self::ImagegenSettings => fl!(loader(), "nav-imagegen-settings"),
             Self::Modules => fl!(loader(), "nav-modules"),
             Self::Processes => fl!(loader(), "nav-processes"),
             Self::Pool => fl!(loader(), "nav-pool"),
@@ -105,6 +107,7 @@ pub enum Message {
     Harnesses(pages::harnesses::Msg),
     Usage(usage::Msg),
     Settings(settings::Msg),
+    Imagegen(imagegen::Msg),
     AutoApply(bool),
     AutoApplyDone(Result<(), String>),
 }
@@ -173,6 +176,7 @@ pub struct State {
     harnesses: harnesses::State,
     usage: usage::State,
     settings: settings::State,
+    imagegen: imagegen::State,
     toasts: Vec<Toast>,
     next_toast: u64,
     dark: bool,
@@ -222,6 +226,7 @@ impl State {
                 harnesses: harnesses::State::default(),
                 usage: usage::State::default(),
                 settings: settings::State::default(),
+                imagegen: imagegen::State::default(),
                 toasts: Vec::new(),
                 next_toast: 0,
                 dark: true,
@@ -257,6 +262,7 @@ impl State {
             harnesses: harnesses::State::default(),
             usage: usage::State::default(),
             settings: settings::State::default(),
+            imagegen: imagegen::State::default(),
             toasts: Vec::new(),
             next_toast: 0,
             dark: true,
@@ -313,6 +319,9 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
                 (Page::UsagePoll | Page::RouterSettings, Some(paths)) => {
                     Task::perform(async move { settings::load(&paths) }, Message::Settings)
+                }
+                (Page::ImagegenSettings, Some(paths)) => {
+                    Task::perform(async move { imagegen::load(&paths) }, Message::Imagegen)
                 }
                 _ => Task::none(),
             }
@@ -722,6 +731,18 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             task
         }
+        Message::Imagegen(msg) => {
+            let task = match state.paths.clone() {
+                Some(paths) => {
+                    imagegen::update(&mut state.imagegen, paths, msg).map(Message::Imagegen)
+                }
+                None => Task::none(),
+            };
+            if let Some((text, error)) = state.imagegen.result.take() {
+                state.toast(text, error);
+            }
+            task
+        }
         Message::Settings(msg) => {
             let task = match state.paths.clone() {
                 Some(paths) => {
@@ -894,6 +915,7 @@ fn apply_plugin(paths: &agentdeck_core::Paths, pending: &Pending) -> Result<Stri
     .map_err(|e| format!("{e:#}"))?;
     agentdeck_core::plugins::apply_all(paths, &pending.name, pending.enable, &planned)
         .map_err(|e| format!("{e:#}"))?;
+    agentdeck_core::plugins::sync_plugin_skills(paths, &home).map_err(|e| format!("{e:#}"))?;
     Ok(if pending.enable {
         format!("enabled {}", pending.name)
     } else {
@@ -950,6 +972,7 @@ fn modal(state: &State) -> Option<Modal<'_, Message>> {
         | Page::Limits
         | Page::UsagePoll
         | Page::RouterSettings
+        | Page::ImagegenSettings
         | Page::Modules => None,
     }
 }
@@ -1042,6 +1065,11 @@ fn sidebar(state: &State) -> Element<'_, Message> {
             ],
         ),
         module(
+            fl!(loader(), "nav-group-imagegen"),
+            agentdeck_core::plugins::PLUGIN_IMAGEGEN,
+            &[(Page::ImagegenSettings, st::Icon::Image)],
+        ),
+        module(
             fl!(loader(), "nav-group-agents"),
             agentdeck_core::plugins::PLUGIN_AGENT_PROCESS,
             &[(Page::Processes, st::Icon::Terminal)],
@@ -1127,6 +1155,7 @@ fn header(state: &State) -> Element<'_, Message> {
         Page::Limits => (t("limits-title"), None),
         Page::UsagePoll => (t("usage-poll-title"), None),
         Page::RouterSettings => (t("router-settings-title"), None),
+        Page::ImagegenSettings => (t("plugin-imagegen"), None),
         Page::Modules => (t("modules-title"), None),
         Page::Pool => (
             t("pool-title"),
@@ -1153,6 +1182,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
         Page::UsagePoll => settings::poll_view(&state.settings).map(Message::Settings),
         Page::Limits => pages::instances::limits_view(&state.data, state.parallel.as_ref()),
         Page::RouterSettings => settings::router_view(&state.settings).map(Message::Settings),
+        Page::ImagegenSettings => imagegen::view(&state.imagegen).map(Message::Imagegen),
         Page::Modules => pages::plugins::view(&state.data, &state.plugin_open),
         Page::Processes => pages::processes::view(&state.data, &state.proc_ui),
         Page::Pool => pool::view(&state.pool).map(Message::Pool),

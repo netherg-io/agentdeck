@@ -652,7 +652,24 @@ pub fn run(argv: &[String]) -> i32 {
     0
 }
 
+/// A hook left in a harness file after the router plugin was disabled (an
+/// unsynced profile, a copied settings.json) must not keep routing. An
+/// unreadable registry keeps routing: hooks fail closed.
+fn router_disabled() -> bool {
+    let Ok(paths) = agentdeck_core::Paths::from_env() else {
+        return false;
+    };
+    paths.registry_file().exists()
+        && agentdeck_core::Registry::load(&paths).is_ok_and(|reg| {
+            !agentdeck_core::plugins::plugin_enabled(&reg, agentdeck_core::plugins::PLUGIN_ROUTER)
+        })
+}
+
 fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
+    if router_disabled() {
+        ctx.emit(true, "");
+        return Ok(());
+    }
     let home = crate::home_dir()?;
     let raw = {
         use std::io::Read;

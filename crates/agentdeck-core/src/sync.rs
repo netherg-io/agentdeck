@@ -22,7 +22,11 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::changes::Change;
-use crate::{Paths, Registry, claude, codex};
+use crate::{Paths, Registry, claude, codex, shared};
+
+// The colon keeps this group distinct from every valid registry instance id.
+pub const INSTRUCTIONS_GROUP_ID: &str = "global:instructions";
+pub const BLOCKS_GROUP_ID: &str = "global:agentdeck-blocks";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -33,12 +37,14 @@ pub enum ItemKind {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SyncItem {
-    /// Registry instance id.
+    /// Registry instance id or the global instruction group id.
     pub instance: String,
     pub harness: String,
     pub kind: ItemKind,
     /// Value-free summary (key/path names only, never secret values).
     pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
 }
 
 impl SyncItem {
@@ -48,6 +54,7 @@ impl SyncItem {
             harness: harness.to_string(),
             kind,
             detail,
+            path: None,
         }
     }
 }
@@ -100,14 +107,107 @@ pub fn set_auto_apply(paths: &Paths, on: bool, dry_run: bool) -> anyhow::Result<
     }])
 }
 
-/// Gather drift for every registry instance (Claude + Codex). `home` is the
-/// real `$HOME` in production, a temp dir in tests; `t3_root` is accepted and
+/// Global instruction drift is independent of secondary account registration.
+/// Only installed harness directories participate; a missing shared source is
+/// reported once when existing instruction files would otherwise be hidden.
+pub fn instruction_items(home: &Path) -> Vec<SyncItem> {
+    let statuses: Vec<_> = shared::instructions_status(home)
+        .into_iter()
+        .filter(|status| status.path.parent().is_some_and(Path::is_dir))
+        .collect();
+    let source = shared::instruction_source(home);
+    if !source.is_file() {
+        return if statuses
+            .iter()
+            .any(|status| !matches!(status.state, shared::InstrState::Missing))
+        {
+            vec![SyncItem::new(
+                INSTRUCTIONS_GROUP_ID,
+                "instructions",
+                ItemKind::Decision,
+                "~/AGENTS.md: shared instruction source missing or not a file".into(),
+            )]
+        } else {
+            Vec::new()
+        };
+    }
+    statuses
+        .into_iter()
+        .filter(|status| !matches!(status.state, shared::InstrState::Linked))
+        .map(|status| {
+            let kind = match status.state {
+                shared::InstrState::Missing => ItemKind::Additive,
+                _ => ItemKind::Decision,
+            };
+            let relative = status.path.strip_prefix(home).unwrap_or(&status.path);
+            let mut item = SyncItem::new(
+                INSTRUCTIONS_GROUP_ID,
+                "instructions",
+                kind,
+                format!("~/{}: {}", relative.display(), status.state.describe()),
+            );
+            item.path = Some(status.path);
+            item
+        })
+        .collect()
+}
+
+fn plan_blocks(reg: &Registry, paths: &Paths, home: &Path) -> anyhow::Result<Vec<Change>> {
+    let exe = std::env::current_exe()?;
+    crate::plugins::plan_managed_blocks(reg, home, &exe, &paths.state_dir)
+}
+
+/// Agentdeck's own instruction blocks and shipped skills that differ from
+/// the generated content.
+/// Restoring them is ADDITIVE: the blocks belong to agentdeck, so hand edits
+/// are reverted. Malformed markers need the owner.
+fn block_items(reg: &Registry, paths: &Paths, home: &Path) -> Vec<SyncItem> {
+    let item = |kind, detail| SyncItem::new(BLOCKS_GROUP_ID, "instructions", kind, detail);
+    let mut items = match plan_blocks(reg, paths, home) {
+        Ok(changes) => changes
+            .iter()
+            .filter_map(|change| match change {
+                Change::WriteFile { path, .. } => Some(item(
+                    ItemKind::Additive,
+                    format!(
+                        "~/{}: agentdeck block out of date",
+                        path.strip_prefix(home).unwrap_or(path).display()
+                    ),
+                )),
+                _ => None,
+            })
+            .collect(),
+        Err(error) => vec![item(ItemKind::Decision, format!("{error:#}"))],
+    };
+    if !crate::plugins::plan_plugin_skills(reg, paths).is_empty() {
+        items.push(item(
+            ItemKind::Additive,
+            "agentdeck plugin skills out of date".into(),
+        ));
+    }
+    items
+}
+
+/// Rewrite agentdeck's blocks and shipped skills to the generated content.
+/// Runs regardless of `[sync] auto_apply`: it only touches agentdeck-owned
+/// lines and files.
+pub fn restore_blocks(paths: &Paths, home: &Path) -> anyhow::Result<Vec<Change>> {
+    let mut changes = plan_blocks(&Registry::load(paths)?, paths, home)?;
+    crate::apply_changes(&changes)?;
+    changes.extend(crate::plugins::sync_plugin_skills(paths, home)?);
+    Ok(changes)
+}
+
+/// Gather global instruction drift and registry instance drift (Claude + Codex).
+/// `home` is the real `$HOME` in production, a temp dir in tests;
+/// `t3_root` is accepted and
 /// ignored: T3 provider-instance envelopes are explicit T3 management
 /// (`t3 sync`), never Drift, so they contribute no badge or notification.
 pub fn gather(paths: &Paths, home: &Path, t3_root: Option<&Path>) -> anyhow::Result<Vec<SyncItem>> {
     let _ = t3_root;
     let reg = Registry::load(paths)?;
-    let mut out = Vec::new();
+    let mut out = instruction_items(home);
+    out.extend(block_items(&reg, paths, home));
     let primary = home.join(".claude");
     let primary_json = home.join(".claude.json");
     for inst in &reg.instances {
@@ -246,7 +346,8 @@ fn classify_codex(id: &str, drift: &codex::Drift) -> SyncItem {
     }
 }
 
-/// Apply additive drift through the existing planners. Instances with any
+/// Create missing global instruction links exclusively, then apply profile
+/// drift through the existing planners. Profile instances with any
 /// DECISION item are skipped whole (their planners would touch decided
 /// content). Each applied instance is re-checked right before planning, so a
 /// concurrent harness edit cannot slip a decision through. Idempotent: a
@@ -261,7 +362,28 @@ pub fn apply_additive(
     let primary = home.join(".claude");
     let primary_json = home.join(".claude.json");
     let main_default = home.join(".codex");
-    let mut applied = Vec::new();
+    // Broken markers surface as a DECISION item in `gather`; they must not
+    // block the rest of the additive apply.
+    let mut applied = restore_blocks(paths, home).unwrap_or_default();
+    let source = shared::instruction_source(home);
+    if source.is_file() {
+        for status in shared::instructions_status(home) {
+            if !matches!(status.state, shared::InstrState::Missing)
+                || !status.path.parent().is_some_and(Path::is_dir)
+            {
+                continue;
+            }
+            // Create exclusively: a concurrent edit must never be replaced.
+            match std::os::unix::fs::symlink(&source, &status.path) {
+                Ok(()) => applied.push(Change::Symlink {
+                    link: status.path,
+                    target: source.clone(),
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
     for inst in &reg.instances {
         let dir = expand_tilde(&inst.home, home);
         match inst.harness {
@@ -404,7 +526,8 @@ mod tests {
         for name in ["skills", "agents", "plugins"] {
             fs::create_dir_all(dot_claude.join(name)).unwrap();
         }
-        fs::write(dot_claude.join("CLAUDE.md"), "me").unwrap();
+        fs::write(home.join("AGENTS.md"), "me").unwrap();
+        std::os::unix::fs::symlink(home.join("AGENTS.md"), dot_claude.join("CLAUDE.md")).unwrap();
         fs::write(dot_claude.join("settings.json"), "{\"theme\":\"dark\"}\n").unwrap();
         fs::write(
             home.join(".claude.json"),
@@ -448,6 +571,176 @@ mod tests {
             .filter(|i| i.instance == instance)
             .map(|i| i.kind)
             .collect()
+    }
+
+    #[test]
+    fn global_instruction_drift_reaches_background_sync() {
+        let fx = fixture();
+        fs::write(fx.home.join("AGENTS.md"), "shared rules\n").unwrap();
+        for (path, _) in crate::shared::instruction_targets(&fx.home) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let _ = fs::remove_file(&path);
+            fs::write(path, "client-specific rules\n").unwrap();
+        }
+        let items = gather(&fx.paths, &fx.home, None).unwrap();
+        for relative in [
+            ".claude/CLAUDE.md",
+            ".codex/AGENTS.md",
+            ".config/opencode/AGENTS.md",
+            ".gemini/GEMINI.md",
+        ] {
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item.kind == ItemKind::Decision && item.detail.contains(relative)),
+                "missing global instruction drift for {relative}: {items:?}"
+            );
+        }
+        assert!(!decision_instances(&items).is_empty());
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.detail.contains("client-specific rules"))
+        );
+    }
+
+    #[test]
+    fn missing_instruction_links_apply_without_replacing_existing_rules() {
+        let fx = fixture();
+        apply_additive(&fx.paths, &fx.home, None).unwrap();
+        let codex = fx.home.join(".codex/AGENTS.md");
+        fs::remove_file(&codex).unwrap();
+        let opencode = fx.home.join(".config/opencode/AGENTS.md");
+        fs::create_dir_all(opencode.parent().unwrap()).unwrap();
+        fs::write(&opencode, "private opencode rules\n").unwrap();
+        let wrong = fx.home.join(".gemini/GEMINI.md");
+        fs::create_dir_all(wrong.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(fx.home.join("missing.md"), &wrong).unwrap();
+        let items = instruction_items(&fx.home);
+        assert_eq!(items.len(), 3, "{items:?}");
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.kind == ItemKind::Additive)
+                .count(),
+            1
+        );
+        apply_additive(&fx.paths, &fx.home, None).unwrap();
+        assert_eq!(fs::read_link(&codex).unwrap(), fx.home.join("AGENTS.md"));
+        assert_eq!(
+            fs::read_to_string(&opencode).unwrap(),
+            "private opencode rules\n"
+        );
+        assert_eq!(fs::read_link(&wrong).unwrap(), fx.home.join("missing.md"));
+        assert_eq!(instruction_items(&fx.home).len(), 2);
+        assert!(
+            apply_additive(&fx.paths, &fx.home, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn instruction_drift_clears_after_linking_and_reports_missing_source() {
+        let fx = fixture();
+        let changes = shared::plan_instructions_link(&fx.home, &fx.paths.state_dir, true).unwrap();
+        apply_changes(&changes).unwrap();
+        assert!(instruction_items(&fx.home).is_empty());
+        fs::remove_file(fx.home.join("AGENTS.md")).unwrap();
+        let items = instruction_items(&fx.home);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, ItemKind::Decision);
+        assert!(
+            items[0]
+                .detail
+                .contains("shared instruction source missing")
+        );
+    }
+
+    #[test]
+    fn instruction_sync_skips_uninstalled_harnesses() {
+        let fx = fixture();
+        apply_additive(&fx.paths, &fx.home, None).unwrap();
+        assert!(!fx.home.join(".config/opencode").exists());
+        assert!(!fx.home.join(".gemini").exists());
+        assert!(instruction_items(&fx.home).is_empty());
+    }
+
+    #[test]
+    fn agentdeck_blocks_are_restored_and_removed_with_their_plugin() {
+        let fx = fixture();
+        let set = |on: bool| {
+            Registry::update(&fx.paths, |r| {
+                for name in [
+                    crate::plugins::PLUGIN_AGENT_PROCESS,
+                    crate::plugins::PLUGIN_ROUTER,
+                ] {
+                    if on {
+                        r.plugins.insert(name.into(), true);
+                    } else {
+                        r.plugins.remove(name);
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        };
+        let block_items = || {
+            gather(&fx.paths, &fx.home, None)
+                .unwrap()
+                .into_iter()
+                .filter(|i| i.instance == BLOCKS_GROUP_ID)
+                .collect::<Vec<_>>()
+        };
+        let agents = fx.home.join("AGENTS.md");
+        set(true);
+        // CLAUDE.md links to AGENTS.md: one block item plus the shipped skills.
+        assert_eq!(block_items().len(), 2);
+        assert!(block_items().iter().all(|i| i.kind == ItemKind::Additive));
+        restore_blocks(&fx.paths, &fx.home).unwrap();
+        let skill = crate::plugins::plugin_skills_dir(&fx.paths).join("coordinator/SKILL.md");
+        let shipped = fs::read_to_string(&skill).unwrap();
+        let link = fx.home.join(".claude/skills/coordinator");
+        assert_eq!(fs::read_link(&link).unwrap(), skill.parent().unwrap());
+        let fresh = fs::read_to_string(&agents).unwrap();
+        assert!(
+            fresh.starts_with("me\n<!-- agent-process:begin -->\n"),
+            "{fresh}"
+        );
+        assert!(fresh.contains("<!-- model-route:begin -->"), "{fresh}");
+        assert!(block_items().is_empty());
+
+        // Hand edits to shipped skills are reverted.
+        fs::write(&skill, "mine").unwrap();
+        assert_eq!(block_items().len(), 1);
+        restore_blocks(&fx.paths, &fx.home).unwrap();
+        assert_eq!(fs::read_to_string(&skill).unwrap(), shipped);
+
+        // A hand edit inside a block is reverted; text outside survives.
+        let edited = fresh
+            .replacen("me\n", "me\nmine\n", 1)
+            .replace("agent-process list", "agent-process ls");
+        fs::write(&agents, &edited).unwrap();
+        assert_eq!(block_items().len(), 1);
+        apply_additive(&fx.paths, &fx.home, None).unwrap();
+        assert_eq!(
+            fs::read_to_string(&agents).unwrap(),
+            fresh.replacen("me\n", "me\nmine\n", 1)
+        );
+
+        // Disabled plugins leave no agentdeck lines behind.
+        set(false);
+        restore_blocks(&fx.paths, &fx.home).unwrap();
+        assert_eq!(fs::read_to_string(&agents).unwrap(), "me\nmine\n");
+        assert!(!skill.exists());
+        assert!(fs::symlink_metadata(&link).is_err());
+
+        // Broken markers are never rewritten blindly.
+        fs::write(&agents, "<!-- agent-process:begin -->\nx\n").unwrap();
+        let items = block_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, ItemKind::Decision);
+        assert!(restore_blocks(&fx.paths, &fx.home).is_err());
     }
 
     #[test]

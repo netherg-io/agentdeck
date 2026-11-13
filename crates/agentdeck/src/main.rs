@@ -5,7 +5,9 @@ mod cmd_claude;
 mod cmd_codex;
 mod cmd_daemon;
 mod cmd_harness;
+mod cmd_imagegen;
 mod cmd_login;
+mod cmd_mcp_server;
 mod cmd_migrate;
 mod cmd_opencode;
 mod cmd_plugin;
@@ -105,11 +107,24 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Enable or disable built-in plugins (agent-process, ai-usage, router).
+    /// Remove everything agentdeck wrote outside its own data: plugin
+    /// hooks, links, the unit and every agentdeck block in instruction files.
+    /// Run before deleting the binary; config and state are kept.
+    Uninstall {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Enable or disable built-in plugins (agent-process, ai-usage, router, imagegen, mcp-server).
     Plugin {
         #[command(subcommand)]
         cmd: cmd_plugin::PluginCmd,
     },
+    /// Generate or edit one image through Vercel AI Gateway or OpenRouter
+    /// (plugin imagegen). Prints one JSON line.
+    Imagegen(cmd_imagegen::ImagegenArgs),
+    /// Serve the agentdeck MCP tools on stdio: skills, shared instructions
+    /// and drift for every harness (plugin mcp-server).
+    McpServer,
     /// Sync shared skills into every harness skill dir.
     Skills {
         #[command(subcommand)]
@@ -314,6 +329,9 @@ async fn async_main(paths: &Paths, cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Ps(args) => cmd_ps::run(args)?,
         Cmd::Service { cmd } => cmd_service::run(paths, cmd)?,
         Cmd::Plugin { cmd } => cmd_plugin::run(paths, cmd)?,
+        Cmd::Uninstall { dry_run } => cmd_plugin::uninstall(paths, dry_run)?,
+        Cmd::Imagegen(args) => std::process::exit(cmd_imagegen::run(paths, args).await),
+        Cmd::McpServer => cmd_mcp_server::run(paths)?,
         Cmd::Skills { cmd } => cmd_shared::run_skills(paths, cmd)?,
         Cmd::Instructions { cmd } => cmd_shared::run_instructions(paths, cmd)?,
         Cmd::Mcp { cmd } => cmd_shared::run_mcp(paths, cmd)?,

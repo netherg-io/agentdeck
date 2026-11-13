@@ -15,19 +15,19 @@ pub const DEBOUNCE: Duration = Duration::from_secs(2);
 pub const RESCAN: Duration = Duration::from_secs(10 * 60);
 
 /// Roots whose direct children matter: registry file parent, Claude profile
-/// and `.claude.json` parents, Codex main/shadow homes. Non-recursive: link-
+/// and `.claude.json` parents, global instructions, Codex shadow homes. Non-recursive: link-
 /// level drift lives at the top level; the rescan covers deeper entries
 /// (`.hook-trust` records, sessions churn would otherwise rescan constantly).
 fn watch_roots(paths: &Paths, home: &Path) -> Vec<PathBuf> {
     let mut roots = vec![paths.config_dir.clone(), home.to_path_buf()];
+    roots.extend(
+        agentdeck_core::shared::instruction_targets(home)
+            .into_iter()
+            .filter_map(|(path, _)| path.parent().map(Path::to_path_buf)),
+    );
     let Ok(reg) = Registry::load(paths) else {
         return roots;
     };
-    let primary = home.join(".claude");
-    if primary.is_dir() {
-        roots.push(primary);
-    }
-    roots.push(home.join(".codex"));
     for inst in &reg.instances {
         let dir = sync_expand(&inst.home, home);
         if inst.harness == agentdeck_core::Harness::Claude
@@ -67,6 +67,14 @@ pub fn scan_once(
             return 0;
         }
     };
+    match sync::restore_blocks(paths, home) {
+        Ok(applied) => {
+            for c in &applied {
+                eprintln!("agentdeck sync: {}", c.describe());
+            }
+        }
+        Err(e) => eprintln!("agentdeck sync: block restore failed: {e:#}"),
+    }
     if sync::auto_apply_enabled(paths) {
         match sync::apply_additive(paths, home, t3_root) {
             Ok(applied) => {
@@ -83,7 +91,7 @@ pub fn scan_once(
     } else {
         let n = items
             .iter()
-            .filter(|i| i.kind == sync::ItemKind::Additive)
+            .filter(|i| i.kind == sync::ItemKind::Additive && i.instance != sync::BLOCKS_GROUP_ID)
             .count();
         if n > 0 {
             eprintln!(
@@ -203,7 +211,8 @@ mod tests {
         for name in ["skills", "agents", "plugins"] {
             fs::create_dir_all(dot.join(name)).unwrap();
         }
-        fs::write(dot.join("CLAUDE.md"), "me").unwrap();
+        fs::write(home.join("AGENTS.md"), "me").unwrap();
+        std::os::unix::fs::symlink(home.join("AGENTS.md"), dot.join("CLAUDE.md")).unwrap();
         fs::write(dot.join("settings.json"), "{\"theme\":\"dark\"}\n").unwrap();
         fs::write(
             home.join(".claude.json"),
@@ -235,6 +244,35 @@ mod tests {
         let inner = log.clone();
         let f = move |t: String, b: String| inner.lock().unwrap().push((t, b));
         (log, f)
+    }
+
+    #[test]
+    fn global_instruction_drift_notifies_and_watches_every_harness() {
+        let (_g, paths, home) = fixture();
+        sync::set_auto_apply(&paths, true, false).unwrap();
+        let (log, notify) = recorder();
+        scan_once(&paths, &home, None, &notify);
+        assert!(log.lock().unwrap().is_empty());
+        for (path, _) in agentdeck_core::shared::instruction_targets(&home) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let _ = fs::remove_file(&path);
+            fs::write(&path, "private client rules\n").unwrap();
+        }
+        let roots = watch_roots(&paths, &home);
+        for (path, _) in agentdeck_core::shared::instruction_targets(&home) {
+            assert!(roots.contains(&path.parent().unwrap().to_path_buf()));
+        }
+        assert!(roots.contains(&home));
+        assert_eq!(scan_once(&paths, &home, None, &notify), 1);
+        assert_eq!(log.lock().unwrap().len(), 1);
+        let body = log.lock().unwrap()[0].1.clone();
+        assert!(body.contains(sync::INSTRUCTIONS_GROUP_ID), "{body}");
+        assert!(!body.contains("private client rules"));
+        scan_once(&paths, &home, None, &notify);
+        assert_eq!(log.lock().unwrap().len(), 1);
+        for (path, _) in agentdeck_core::shared::instruction_targets(&home) {
+            assert_eq!(fs::read_to_string(path).unwrap(), "private client rules\n");
+        }
     }
 
     #[test]
