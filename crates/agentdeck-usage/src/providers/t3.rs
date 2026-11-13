@@ -315,21 +315,26 @@ fn claude_plan(cache: &T3ProviderCache) -> Option<String> {
                 s = rest.trim();
             }
         }
-        if s.is_empty()
-            || matches!(
-                s.to_ascii_lowercase().as_str(),
-                "claude" | "subscription" | "ai" | "default" | "oauth"
-            )
-        {
-            continue;
-        }
-        if s.contains('_') || s.contains('-') {
-            let h = crate::util::humanize_plan(s);
-            if !h.is_empty() {
-                return Some(h);
-            }
-        }
-        return Some(s.to_owned());
+        let normalized = match s.to_ascii_lowercase().as_str() {
+            "pro" | "claude_pro" | "default_claude_pro" => "Pro",
+            "max" | "claude_max" | "default_claude_max" => "Max",
+            "max 5x"
+            | "max_5x"
+            | "max-5x"
+            | "max (5x)"
+            | "claude_max_5x"
+            | "default_claude_max_5x" => "Max 5x",
+            "max 20x"
+            | "max_20x"
+            | "max-20x"
+            | "max (20x)"
+            | "claude_max_20x"
+            | "default_claude_max_20x" => "Max 20x",
+            "team" | "claude_team" | "default_claude_team" => "Team",
+            "enterprise" | "claude_enterprise" | "default_claude_enterprise" => "Enterprise",
+            _ => continue,
+        };
+        return Some(normalized.to_owned());
     }
     None
 }
@@ -348,30 +353,20 @@ fn codex_plan(cache: &T3ProviderCache) -> Option<String> {
                 s = rest.trim();
             }
         }
-        let lower = s.to_ascii_lowercase();
-        if s.is_empty() || matches!(lower.as_str(), "chatgpt" | "api" | "api_key" | "apikey") {
-            continue;
-        }
-        let normalized = match lower.as_str() {
+        let normalized = match s.to_ascii_lowercase().as_str() {
             "pro" => "Pro 20x",
             "prolite" | "pro lite" | "pro_lite" | "pro-lite" => "Pro 5x",
             "team" | "self_serve_business_usage_based" => "Business",
             "self_serve_business_prolite" => "Business Premium",
-            "business" | "ent26" | "enterprise_cbp_usage_based" => "Enterprise",
+            "business" | "ent26" | "enterprise" | "enterprise_cbp_usage_based" => "Enterprise",
             "enterprise_cbp_automation" => "Enterprise (Automation)",
-            "edu_plus" | "edu plus" => "Edu Plus",
-            "edu_pro" | "edu pro" => "Edu Pro",
+            "edu" => "Edu",
+            "edu_plus" | "edu plus" | "edu-plus" => "Edu Plus",
+            "edu_pro" | "edu pro" | "edu-pro" => "Edu Pro",
             "plus" => "Plus",
             "free" => "Free",
             "go" => "Go",
-            _ if s.contains('_') || s.contains('-') => {
-                let h = crate::util::humanize_plan(s);
-                if !h.is_empty() {
-                    return Some(h);
-                }
-                continue;
-            }
-            _ => return Some(s.to_owned()),
+            _ => continue,
         };
         return Some(normalized.to_owned());
     }
@@ -1423,5 +1418,122 @@ mod tests {
         );
         assert_eq!(empty.status, "waiting");
         assert!(empty.windows.is_empty());
+    }
+
+    #[test]
+    fn claude_and_codex_plan_normalization_and_unknown_fallback() {
+        let (t3, _g) = setup("plans", SETTINGS_ALL);
+
+        let check = |inst: &str,
+                     provider: &'static str,
+                     auth_type: Option<&str>,
+                     auth_label: Option<&str>,
+                     expected: Option<&str>| {
+            let mut auth = serde_json::Map::new();
+            auth.insert("status".into(), serde_json::json!("authenticated"));
+            if let Some(t) = auth_type {
+                auth.insert("type".into(), serde_json::json!(t));
+            }
+            if let Some(l) = auth_label {
+                auth.insert("label".into(), serde_json::json!(l));
+            }
+            let body = serde_json::json!({
+                "enabled": true,
+                "status": "ready",
+                "auth": auth,
+                "usageLimits": {
+                    "checkedAt": CHECKED_RECENT,
+                    "windows": [{ "id": if provider == "claude" { "five_hour" } else { "primary" }, "windowDurationMins": 300, "usedPercent": 10 }]
+                }
+            });
+            write_cache(&t3, inst, &body.to_string());
+            let st = fetch_from_root(&t3, src(inst, provider, Some(inst)), 900, NOW);
+            assert_eq!(
+                st.plan.as_deref(),
+                expected,
+                "provider={provider} type={auth_type:?} label={auth_label:?}"
+            );
+        };
+
+        check(
+            "claude-main",
+            "claude",
+            Some("Claude Pro"),
+            Some("Claude Pro Subscription"),
+            Some("Pro"),
+        );
+        check(
+            "claude-main",
+            "claude",
+            Some("default_claude_max_5x"),
+            Some("Claude Max 5x Subscription"),
+            Some("Max 5x"),
+        );
+        check(
+            "claude-main",
+            "claude",
+            Some("default_claude_max_20x"),
+            None,
+            Some("Max 20x"),
+        );
+        check("claude-main", "claude", Some("claude_max"), None, Some("Max"));
+        check(
+            "claude-main",
+            "claude",
+            Some("default_claude_ai"),
+            None,
+            None,
+        );
+        check(
+            "claude-main",
+            "claude",
+            Some("apiKey"),
+            Some("Claude API Key"),
+            None,
+        );
+        check(
+            "claude-main",
+            "claude",
+            Some("unknown_tier"),
+            Some("Claude Mystery"),
+            None,
+        );
+
+        check(
+            "codex-main",
+            "codex",
+            Some("chatgpt"),
+            Some("ChatGPT Plus Subscription"),
+            Some("Plus"),
+        );
+        check(
+            "codex-main",
+            "codex",
+            Some("chatgpt"),
+            Some("ChatGPT Free Subscription"),
+            Some("Free"),
+        );
+        check(
+            "codex-main",
+            "codex",
+            Some("pro"),
+            Some("ChatGPT Pro Subscription"),
+            Some("Pro 20x"),
+        );
+        check(
+            "codex-main",
+            "codex",
+            Some("prolite"),
+            Some("ChatGPT"),
+            Some("Pro 5x"),
+        );
+        check("codex-main", "codex", Some("chatgpt"), Some("ChatGPT"), None);
+        check(
+            "codex-main",
+            "codex",
+            Some("some_future_tier"),
+            Some("ChatGPT Mystery"),
+            None,
+        );
     }
 }
