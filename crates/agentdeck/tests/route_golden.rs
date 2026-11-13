@@ -979,3 +979,110 @@ fn t3_reader_output_drives_router_quota_gates() {
         }
     }
 }
+
+#[test]
+fn recent_quota_failure_blocks_instance_until_reset() {
+    let fx = Fixture::new(&[SOL, OPUS]);
+    let db = rusqlite::Connection::open(fx.dir.join(".t3/userdata/statev2.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE orchestration_v2_projection_subagents (
+        subagent_id TEXT, provider_instance_id TEXT, status TEXT, completed_at TEXT,
+        updated_at TEXT, payload_json TEXT);
+        INSERT INTO orchestration_v2_projection_subagents VALUES ('failed-child', 'codex', 'failed',
+        strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+        '{\"result\":\"You have reached your quota for this period. Your limit will reset in 3 hours, 22 seconds.\"}');").unwrap();
+    let jev = answers_for(
+        &[
+            ("codex_gpt_6_1_sol", level(2.9, 0.95)),
+            ("claudeagent_claude_opus_5_5", level(2.4, 0.95)),
+        ],
+        1.0,
+        1.0,
+    );
+    let mock = write_mock(&fx, &jev);
+    let run = || {
+        let (code, out, err) = run_rust(
+            &fx,
+            &["--source", "claudeAgent", "Implement the parser"],
+            &mock,
+            None,
+        );
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+    let before = std::fs::read(fx.dir.join(".t3/userdata/statev2.sqlite")).unwrap();
+    let limited = run();
+    assert_eq!(limited["target"]["model"], OPUS.1);
+    let blocked = limited["ranking"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["provider"] == SOL.0)
+        .unwrap();
+    assert_eq!(blocked["eligible"], false);
+    assert!(
+        blocked["policyBan"]
+            .as_str()
+            .unwrap()
+            .contains("recent quota failure")
+    );
+    assert_eq!(
+        std::fs::read(fx.dir.join(".t3/userdata/statev2.sqlite")).unwrap(),
+        before
+    );
+    db.execute_batch("UPDATE orchestration_v2_projection_subagents SET completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now','-4 hours')").unwrap();
+    assert_eq!(run()["target"]["model"], SOL.1);
+}
+
+#[test]
+fn repeated_provider_errors_lower_rank_without_exclusion() {
+    let fx = Fixture::new(&[SOL, OPUS]);
+    let db = rusqlite::Connection::open(fx.dir.join(".t3/userdata/statev2.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE orchestration_v2_projection_subagents (
+        subagent_id TEXT, provider_instance_id TEXT, status TEXT, completed_at TEXT,
+        updated_at TEXT, payload_json TEXT);",
+    )
+    .unwrap();
+    let mock = write_mock(
+        &fx,
+        &answers_for(
+            &[
+                ("codex_gpt_6_1_sol", level(2.7, 0.95)),
+                ("claudeagent_claude_opus_5_5", level(2.6, 0.95)),
+            ],
+            1.0,
+            1.0,
+        ),
+    );
+    let run = || {
+        let (code, out, err) = run_rust(
+            &fx,
+            &["--source", "unknown", "Implement the parser"],
+            &mock,
+            None,
+        );
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+    assert_eq!(run()["target"]["model"], SOL.1);
+    for id in ["first", "second"] {
+        db.execute(
+            "INSERT INTO orchestration_v2_projection_subagents VALUES (?1, 'codex', 'failed',
+            strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            '{\"result\":\"Provider stopped this turn because of an error.\"}')",
+            [id],
+        )
+        .unwrap();
+    }
+    let degraded = run();
+    assert_eq!(degraded["target"]["model"], OPUS.1);
+    let failed = degraded["ranking"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["provider"] == SOL.0)
+        .unwrap();
+    assert_eq!(failed["eligible"], true);
+    assert_eq!(failed["failurePenalty"], 0.05);
+    assert!(failed.get("policyBan").is_none());
+}

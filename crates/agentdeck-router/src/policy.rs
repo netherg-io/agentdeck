@@ -737,6 +737,7 @@ pub struct Candidate {
     pub policy_ban: Option<String>,
     pub fit: f64,
     pub quality: f64,
+    pub failure_penalty: f64,
     pub confidence: f64,
     pub allowed: bool,
     pub task_cost: Option<f64>,
@@ -809,7 +810,8 @@ pub fn rank_candidates(
             let owner_bonus = family_of(&c.model).map_or(0.0, |f| f.owner_bonus);
             let score = c.quality - shared_quota_penalty - paid_credit_penalty
                 + cheap_model_bonus
-                + owner_bonus;
+                + owner_bonus
+                - c.failure_penalty;
             Ranked {
                 account: own,
                 shared_quota,
@@ -1130,6 +1132,7 @@ mod user_rules_tests {
             no_review: true,
             policy_ban: ban.map(str::to_string),
             fit: 0.9,
+            failure_penalty: 0.0,
             quality: 0.8,
             confidence: 0.9,
             allowed: true,
@@ -1225,6 +1228,7 @@ mod unknown_models_tests {
             no_review: false,
             policy_ban: None,
             fit,
+            failure_penalty: 0.0,
             quality: 0.8,
             confidence: 0.9,
             allowed,
@@ -1407,6 +1411,7 @@ mod legacy_suite_edges {
             policy_ban: None,
             fit,
             quality,
+            failure_penalty: 0.0,
             confidence: 0.9,
             allowed,
             task_cost: Some(task_cost),
@@ -1422,6 +1427,37 @@ mod legacy_suite_edges {
                 balances: vec![],
             },
         }
+    }
+
+    #[test]
+    fn repeated_failures_penalize_only_the_affected_instance() {
+        let mut failed = cand(
+            "instance-a",
+            "gpt-example",
+            0.95,
+            0.8,
+            true,
+            0.1,
+            Some(1.0),
+            0,
+        );
+        failed.failure_penalty = 0.1;
+        let healthy = cand(
+            "instance-b",
+            "gpt-example",
+            0.95,
+            0.8,
+            true,
+            0.1,
+            Some(1.0),
+            0,
+        );
+        let ranked = rank_candidates(&cfg(&[]), vec![failed, healthy], 1, None, (0.0, 0.0, 0.0));
+        assert_eq!(ranked[0].candidate.provider, "instance-b");
+        assert!(ranked.iter().all(|r| r.eligible));
+        assert!((ranked[0].score - ranked[1].score - 0.1).abs() < 1e-9);
+        assert_eq!(ranked[0].candidate.quality, ranked[1].candidate.quality);
+        assert!(!validate_target(&ranked, "instance-a", "gpt-example").allowed);
     }
 
     #[test]

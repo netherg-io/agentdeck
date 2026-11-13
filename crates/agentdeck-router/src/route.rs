@@ -3,7 +3,7 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::load::{AgentLoad, read_active_agents};
+use crate::load::{AgentLoad, read_active_agents, read_instance_failures};
 use crate::policy::{
     Candidate, MIN_FIT, NO_REVIEW_BAN, QuotaProvenance, QuotaWindow, QuotaWindowEstimate, Ranked,
     RouterConfig, UsageAccount, UsageSnapshot, budget_allowed, budget_cost_full, enabled_favorites,
@@ -1825,6 +1825,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         .unwrap_or(0.0)
         .round() as i64)
         .clamp(0, 3);
+    let failures = read_instance_failures(&env.home.join(".t3/userdata/statev2.sqlite"), now);
     let mut candidates: Vec<Candidate> = vec![];
     for (provider, model, profile) in &favorites {
         let a = answers
@@ -1881,6 +1882,15 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         {
             policy_ban = Some("excluded: account hit a usage limit".to_string());
         }
+        let failure = failures.get(provider);
+        if let Some(until) = failure.and_then(|f| f.quota_until) {
+            policy_ban = policy_ban.or_else(|| {
+                Some(format!(
+                    "recent quota failure; retry after {} seconds",
+                    (until - now).ceil() as u64
+                ))
+            });
+        }
         let probs = a.get("probabilities");
         // Jev judges every favorite, including ones without a roster family,
         // on the honest "unprofiled; capability unknown" criterion above; a
@@ -1905,6 +1915,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
             no_review,
             policy_ban,
             fit,
+            failure_penalty: failure.map_or(0.0, |f| f.penalty),
             quality: a.get("score").and_then(Value::as_f64).unwrap_or(0.0)
                 / (CAPABILITY.len() - 1) as f64,
             confidence: a.get("confidence").and_then(Value::as_f64).unwrap_or(0.0),
@@ -1978,6 +1989,9 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         }
         m.insert("fit".into(), num(c.fit));
         m.insert("quality".into(), num(c.quality));
+        if c.failure_penalty > 0.0 {
+            m.insert("failurePenalty".into(), num(c.failure_penalty));
+        }
         m.insert("confidence".into(), num(c.confidence));
         m.insert("allowed".into(), Value::from(c.allowed));
         m.insert(
@@ -2552,6 +2566,7 @@ mod quota_estimate_tests {
             no_review: false,
             policy_ban: None,
             fit: 0.9,
+            failure_penalty: 0.0,
             quality: 0.8,
             confidence: 0.9,
             allowed: true,
@@ -2582,6 +2597,7 @@ mod quota_estimate_tests {
             no_review: false,
             policy_ban: None,
             fit: 0.0,
+            failure_penalty: 0.0,
             quality: 0.0,
             confidence: 0.0,
             allowed: true,
