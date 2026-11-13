@@ -259,7 +259,9 @@ alone was ignored (agents used native subagents and never ran the router), so ea
 ## Instance capacity
 
 Agentdeck's `[[instance]].max_parallel` (positive integer, absent = unlimited)
-becomes `instanceLimits` in exported router JSON. The router reads the live
+becomes `instanceLimits` in exported router JSON. Each `ranking[]` entry carries
+`unlimitedParallel` (true when the instance has no `max_parallel`); limited
+instances also carry `maxParallel`, `instanceActiveAgents` and `pendingLaunches`. The router reads the live
 registry, counts all active T3 threads and subagents by exact provider instance
 across coordinators and models, and excludes full instances. Queued and waiting
 runs also occupy slots; completed/idle threads do not. Shared quota accounts do
