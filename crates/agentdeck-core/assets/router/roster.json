@@ -63,7 +63,7 @@
     {
       "match": "gemini-.*hydrogen",
       "burn": 0.05,
-      "ownerBonus": 0.1,
+      "ownerBonus": 0.15,
       "spendToZero": true,
       "profile": "Google Gemini 4 Hydrogen: fast agentic coder with strong self-testing. On a real debugging unit (a protocol-dependent parsing bug in a 1.7k-line Python CLI wrapper, judged by hidden behaviour checks) it scored 7/8 in about 4-5 minutes in both runs, level with Muse Spark (7/8 in 27 minutes) and close to GPT-6.1 Sol (8/8 in 6 minutes); it wrote thorough end-to-end tests but missed one resume edge case and widened scope slightly beyond the brief. Long autonomous sessions and original visual design are unproven."
     },

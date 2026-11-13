@@ -1722,7 +1722,7 @@ mod legacy_suite_edges {
             ),
             "claude-sonnet-5-5"
         );
-        // Owner bonus (roster: Hydrogen +0.1) beats Muse's quality and cheap edge.
+        // Owner bonus (roster: Hydrogen +0.15) beats Muse's quality and cheap edge.
         assert_eq!(
             pick(
                 cheap("opencode-go/muse-spark-1.3-contributor", 0.1, 0.81),
