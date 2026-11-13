@@ -239,8 +239,10 @@ pub fn plan_migration(paths: &Paths, old: &OldTree) -> anyhow::Result<MigrationP
     let raw = fs::read_to_string(&old.config_toml).map_err(|error| {
         anyhow::anyhow!("no old config at {}: {error}", old.config_toml.display())
     })?;
-    let config: LegacyConfig = toml::from_str(&raw)
-        .map_err(|error| anyhow::anyhow!("invalid TOML in {}: {error}", old.config_toml.display()))?;
+    agentdeck_usage::config::parse_str(&raw, &old.config_toml)?;
+    let config: LegacyConfig = toml::from_str(&raw).map_err(|error| {
+        anyhow::anyhow!("invalid TOML in {}: {error}", old.config_toml.display())
+    })?;
     let reg = Registry::load(paths)?;
 
     let mut plan = MigrationPlan::default();

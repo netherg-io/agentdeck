@@ -131,8 +131,10 @@ dependencies = [
  "notify-debouncer-mini",
  "reqwest",
  "rusqlite",
+ "serde",
  "serde_json",
  "tokio",
+ "toml 0.8.23",
 ]
 
 [[package]]

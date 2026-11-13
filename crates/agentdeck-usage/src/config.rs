@@ -6,8 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use agentdeck_core::usage::{UsageEntry, UsageKind};
 
-/// Ниже этого значения refresh становится бессмысленно частым: каждый Codex
-/// аккаунт поднимает отдельный subprocess.
+/// Minimum interval between balance polls and T3 cache reads.
 pub const MIN_REFRESH_SECONDS: u64 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,8 +28,6 @@ impl Default for Config {
         }
     }
 }
-
-impl Config {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "lowercase")]
@@ -415,9 +412,15 @@ token_file = "/etc/acp.json"
 "#;
         let parsed = parse_str(old_toml, Path::new("old-config.toml")).unwrap();
         assert_eq!(parsed.accounts.len(), 3);
-        assert_eq!(parsed.accounts[0].t3_instance().as_deref(), Some("claudeAgent"));
+        assert_eq!(
+            parsed.accounts[0].t3_instance().as_deref(),
+            Some("claudeAgent")
+        );
         assert_eq!(parsed.accounts[1].t3_instance().as_deref(), Some("codex"));
-        assert_eq!(parsed.accounts[2].t3_instance().as_deref(), Some("antigravity"));
+        assert_eq!(
+            parsed.accounts[2].t3_instance().as_deref(),
+            Some("antigravity")
+        );
     }
 
     #[test]

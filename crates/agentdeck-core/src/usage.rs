@@ -364,19 +364,31 @@ mod tests {
         .unwrap();
         assert_eq!(reg.usage.len(), 4);
         assert_eq!(
-            reg.usage[0].extra.get("config_dir").and_then(|v| v.as_str()),
+            reg.usage[0]
+                .extra
+                .get("config_dir")
+                .and_then(|v| v.as_str()),
             Some("~/.claude")
         );
         assert_eq!(
-            reg.usage[1].extra.get("codex_home").and_then(|v| v.as_str()),
+            reg.usage[1]
+                .extra
+                .get("codex_home")
+                .and_then(|v| v.as_str()),
             Some("~/.codex")
         );
         assert_eq!(
-            reg.usage[2].extra.get("token_file").and_then(|v| v.as_str()),
+            reg.usage[2]
+                .extra
+                .get("token_file")
+                .and_then(|v| v.as_str()),
             Some("/etc/acp.json")
         );
         assert_eq!(
-            reg.usage[3].extra.get("api_key_file").and_then(|v| v.as_str()),
+            reg.usage[3]
+                .extra
+                .get("api_key_file")
+                .and_then(|v| v.as_str()),
             Some("f")
         );
         // duplicate usage ids

@@ -428,7 +428,7 @@ fn add_form(form: &Form, instances: &[String]) -> crate::overlay::Modal<'static,
         }
         if matches!(
             kind,
-            UsageKind::Claude | UsageKind::Codex | UsageKind::Antigravity | UsageKind::OpencodeGo
+            UsageKind::Claude | UsageKind::Codex | UsageKind::Antigravity
         ) && !instances.is_empty()
         {
             body.push(field(
