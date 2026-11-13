@@ -52,17 +52,6 @@ pub enum UsageCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Run a provider status-line hook: stdin JSON becomes the stdout line,
-    /// written through the same state dir the daemon reads.
-    Hook {
-        #[command(subcommand)]
-        hook: HookCmd,
-    },
-    /// Inspect hook installation. Read-only: installing is an owner step.
-    Hooks {
-        #[command(subcommand)]
-        hooks: HooksCmd,
-    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -74,39 +63,6 @@ pub enum UsageKindArg {
     Openrouter,
     Vercel,
     OpencodeGo,
-}
-
-#[derive(clap::Subcommand)]
-pub enum HookCmd {
-    /// Claude Code statusLine hook. Reads Claude JSON from stdin.
-    Claude {
-        #[arg(long)]
-        account: String,
-    },
-    /// Agy status-line hook. Reads official agy JSON from stdin.
-    Agy {
-        #[arg(long)]
-        account: String,
-    },
-}
-
-#[derive(clap::Subcommand)]
-pub enum HooksCmd {
-    /// Print the current hook command and the one it would become, per
-    /// Claude/agy account. Read-only.
-    Plan {
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-/// Shared `~/.config` base (what `dirs::config_dir` returns on Linux).
-/// Kept local so this binary needs no extra dependency for one lookup.
-fn shared_config_base() -> anyhow::Result<std::path::PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve config base: set HOME"))
 }
 
 impl UsageKindArg {
@@ -219,44 +175,8 @@ pub async fn run(paths: &Paths, cmd: UsageCmd) -> anyhow::Result<()> {
                 print_doctor(&report);
             }
         }
-        UsageCmd::Hook { hook } => match hook {
-            HookCmd::Claude { account } => agentdeck_usage::hooks::run_claude_hook(&account)?,
-            HookCmd::Agy { account } => agentdeck_usage::hooks::run_agy_hook(&account)?,
-        },
-        UsageCmd::Hooks { hooks } => match hooks {
-            HooksCmd::Plan { json } => {
-                let reg = agentdeck_core::Registry::load(paths)?;
-                let accounts = agentdeck_usage::config::accounts_from_registry(&reg.usage)?;
-                let plan = agentdeck_usage::hooks::plan(
-                    &std::env::current_exe()?,
-                    &shared_config_base()?,
-                    &accounts,
-                );
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&plan)?);
-                } else {
-                    print_hook_plan(&plan);
-                }
-            }
-        },
     }
     Ok(())
-}
-
-fn print_hook_plan(plan: &[agentdeck_usage::hooks::HookPlanEntry]) {
-    println!("agentdeck usage hooks plan (read-only; installing is an owner step)\n");
-    for e in plan {
-        println!("{} {}", e.kind, e.id);
-        println!("  location: {}", e.location.display());
-        match &e.current {
-            Some(cmd) => println!("  current:  {cmd}"),
-            None => println!("  current:  (not installed)"),
-        }
-        println!("  desired:  {}", e.desired);
-        if e.up_to_date {
-            println!("  status:   up-to-date");
-        }
-    }
 }
 
 fn print_doctor(report: &daemon::DoctorReport) {

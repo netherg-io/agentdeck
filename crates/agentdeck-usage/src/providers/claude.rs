@@ -1,5 +1,4 @@
-use anyhow::{Context, Result};
-use serde_json::Value;
+use anyhow::Result;
 
 use crate::model::AccountState;
 use crate::providers::t3::{self, T3Source};
@@ -35,62 +34,9 @@ pub fn humanize_age(seconds: i64) -> String {
     }
 }
 
-/// Pure status-line formatter for Claude Code's stdin JSON (kept for hooks until U2).
-pub fn status_line_from_payload(raw: &str) -> Result<String> {
-    let payload: Value =
-        serde_json::from_str(raw).context("Claude hook получил некорректный JSON")?;
-
-    let mut parts = Vec::new();
-    if let Some(model) = payload
-        .pointer("/model/display_name")
-        .and_then(Value::as_str)
-    {
-        parts.push(format!("[{model}]"));
-    }
-
-    if let Some(limits) = payload.get("rate_limits").and_then(Value::as_object) {
-        let mut entries: Vec<_> = limits
-            .iter()
-            .filter_map(|(key, value)| {
-                let used = value.get("used_percentage")?.as_f64()?;
-                Some((key.clone(), 100.0 - used.clamp(0.0, 100.0)))
-            })
-            .collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        for (key, remaining) in entries {
-            parts.push(format!("{} {remaining:.0}% left", short_key(&key)));
-        }
-    }
-
-    Ok(parts.join(" · "))
-}
-
-fn short_key(key: &str) -> String {
-    let (base, suffix) = if let Some(rest) = key.strip_prefix("five_hour") {
-        ("5h", rest)
-    } else if let Some(rest) = key.strip_prefix("seven_day") {
-        ("7d", rest)
-    } else {
-        return key.to_owned();
-    };
-    match suffix.strip_prefix('_') {
-        Some(suffix) if !suffix.is_empty() => format!("{base}/{suffix}"),
-        _ => base.to_owned(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn formats_status_line_from_claude_stdin() {
-        let line = status_line_from_payload(
-            r#"{"model":{"display_name":"Sonnet"},"rate_limits":{"five_hour":{"used_percentage":12.4},"seven_day_sonnet":{"used_percentage":80}}}"#,
-        )
-        .unwrap();
-        assert_eq!(line, "[Sonnet] · 5h 88% left · 7d/sonnet 20% left");
-    }
 
     #[test]
     fn humanizes_age_values() {
