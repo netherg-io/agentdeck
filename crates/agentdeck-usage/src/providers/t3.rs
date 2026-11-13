@@ -158,35 +158,34 @@ pub fn fetch_from_root(
         .map(str::to_owned);
     let plan = provider_plan(source.provider, source.explicit_plan, &cache);
 
-    let Some(limits) = cache.usage_limits else {
-        let auth_status = cache.auth.as_ref().and_then(|a| a.status.as_deref());
-        let cache_status = cache.status.as_deref();
-        let detail = cache
-            .message
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
+    let auth_status = cache.auth.as_ref().and_then(|a| a.status.as_deref());
+    let cache_status = cache.status.as_deref();
+    let detail = cache
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
-        if auth_status == Some("unauthenticated") || cache_status == Some("unauthenticated") {
-            let msg = detail.map_or_else(
-                || format!("T3 instance {instance_id:?} is unauthenticated; sign in via T3 Code"),
-                |d| {
-                    format!(
-                        "T3 instance {instance_id:?} is unauthenticated ({d}); sign in via T3 Code"
-                    )
-                },
-            );
-            return make_state("unauthenticated", plan, email, Vec::new(), Some(msg), now);
-        }
-        if let Some(st) =
-            cache_status.filter(|s| matches!(*s, "error" | "unavailable" | "disabled"))
-        {
-            let msg = detail.map_or_else(
-                || format!("T3 instance {instance_id:?} has status {st} without usageLimits; check it in T3 Code"),
-                |d| format!("T3 instance {instance_id:?} error ({st}): {d}; check it in T3 Code"),
-            );
-            return make_state("error", plan, email, Vec::new(), Some(msg), now);
-        }
+    if auth_status == Some("unauthenticated") || cache_status == Some("unauthenticated") {
+        let msg = detail.map_or_else(
+            || format!("T3 instance {instance_id:?} is unauthenticated; sign in via T3 Code"),
+            |d| {
+                format!(
+                    "T3 instance {instance_id:?} is unauthenticated ({d}); sign in via T3 Code"
+                )
+            },
+        );
+        return make_state("unauthenticated", plan, email, Vec::new(), Some(msg), now);
+    }
+    if let Some(st) = cache_status.filter(|s| matches!(*s, "error" | "unavailable" | "disabled")) {
+        let msg = detail.map_or_else(
+            || format!("T3 instance {instance_id:?} has status {st}; check it in T3 Code"),
+            |d| format!("T3 instance {instance_id:?} error ({st}): {d}; check it in T3 Code"),
+        );
+        return make_state("error", plan, email, Vec::new(), Some(msg), now);
+    }
+
+    let Some(limits) = cache.usage_limits else {
         let msg = detail.map_or_else(
             || format!("T3 cache for {instance_id:?} has no usageLimits yet; wait for T3 health refresh"),
             |d| format!("T3 cache for {instance_id:?} has no usageLimits ({d}); wait for T3 health refresh"),
@@ -1200,5 +1199,74 @@ mod tests {
         );
         assert_eq!(st.windows[0].label, "Spark · Неделя");
         assert_eq!(st.windows[0].duration_mins, Some(10_080));
+    }
+
+    #[test]
+    fn retained_usage_limits_are_not_published_ok_when_cache_or_auth_fails() {
+        let (t3, _g) = setup("retained-status", SETTINGS_ALL);
+
+        let write_with = |status: &str, auth_status: Option<&str>, message: Option<&str>| {
+            let auth_json = auth_status
+                .map(|a| format!(r#","auth":{{"status":"{a}","type":"Claude Pro"}}"#))
+                .unwrap_or_default();
+            let msg_json = message
+                .map(|m| format!(r#","message":"{m}""#))
+                .unwrap_or_default();
+            write_cache(
+                &t3,
+                "claude-main",
+                &format!(
+                    r#"{{"enabled":true,"status":"{status}"{auth_json}{msg_json},"usageLimits":{{"checkedAt":"{CHECKED_RECENT}","windows":[{{"id":"five_hour","kind":"session","label":"Session","windowDurationMins":300,"usedPercent":10}}]}}}}"#
+                ),
+            );
+        };
+
+        write_with("warning", Some("unauthenticated"), Some("login required"));
+        let st = fetch_from_root(
+            &t3,
+            src("claude-main", "claude", Some("claude-main")),
+            900,
+            NOW,
+        );
+        assert_eq!(st.status, "unauthenticated");
+        assert!(st.windows.is_empty());
+        assert!(st.error.as_deref().unwrap().contains("login required"));
+
+        write_with("unauthenticated", None, None);
+        let st = fetch_from_root(
+            &t3,
+            src("claude-main", "claude", Some("claude-main")),
+            900,
+            NOW,
+        );
+        assert_eq!(st.status, "unauthenticated");
+        assert!(st.windows.is_empty());
+
+        for bad_status in ["error", "unavailable", "disabled"] {
+            write_with(bad_status, Some("authenticated"), Some("probe failed"));
+            let st = fetch_from_root(
+                &t3,
+                src("claude-main", "claude", Some("claude-main")),
+                900,
+                NOW,
+            );
+            assert_eq!(st.status, "error", "cache.status={bad_status}");
+            assert!(st.windows.is_empty(), "cache.status={bad_status}");
+            assert!(
+                st.error.as_deref().unwrap().contains("probe failed"),
+                "cache.status={bad_status}"
+            );
+        }
+
+        // Warning with authenticated status and valid limits still publishes ok.
+        write_with("warning", Some("authenticated"), None);
+        let st = fetch_from_root(
+            &t3,
+            src("claude-main", "claude", Some("claude-main")),
+            900,
+            NOW,
+        );
+        assert_eq!(st.status, "ok");
+        assert_eq!(st.windows.len(), 1);
     }
 }
