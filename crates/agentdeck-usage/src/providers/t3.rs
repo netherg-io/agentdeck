@@ -193,6 +193,30 @@ pub fn fetch_from_root(
         return make_state("waiting", plan, email, Vec::new(), Some(msg), now);
     };
 
+    let windows = map_windows(source.provider, limits.windows);
+    if windows.is_empty()
+        && let Some(unavail) = limits.unavailable
+    {
+        let reason = unavail
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("unknown");
+        let msg = match unavail
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(extra) => {
+                format!("T3 reports no subscription limits for this instance: {reason} ({extra})")
+            }
+            None => format!("T3 reports no subscription limits for this instance: {reason}"),
+        };
+        return make_state("error", plan, email, Vec::new(), Some(msg), now);
+    }
+
     let Some(checked_at) = limits
         .checked_at
         .as_deref()
@@ -209,7 +233,6 @@ pub fn fetch_from_root(
         );
     };
 
-    let windows = map_windows(source.provider, limits.windows);
     if windows.is_empty() {
         return make_state(
             "waiting",
@@ -1268,5 +1291,73 @@ mod tests {
         );
         assert_eq!(st.status, "ok");
         assert_eq!(st.windows.len(), 1);
+    }
+
+    #[test]
+    fn usage_limits_unavailable_is_terminal_error_not_waiting() {
+        let (t3, _g) = setup("unavailable", SETTINGS_ALL);
+
+        write_cache(
+            &t3,
+            "claude-main",
+            &format!(
+                r#"{{"enabled":true,"status":"ready","usageLimits":{{"checkedAt":"{CHECKED_RECENT}","windows":[],"unavailable":{{"reason":"unsupported"}}}}}}"#
+            ),
+        );
+        let st = fetch_from_root(
+            &t3,
+            src("claude-main", "claude", Some("claude-main")),
+            900,
+            NOW,
+        );
+        assert_eq!(st.status, "error");
+        assert!(st.windows.is_empty());
+        assert_eq!(
+            st.error.as_deref(),
+            Some("T3 reports no subscription limits for this instance: unsupported")
+        );
+
+        write_cache(
+            &t3,
+            "codex-main",
+            &format!(
+                r#"{{"enabled":true,"status":"ready","usageLimits":{{"checkedAt":"{CHECKED_RECENT}","windows":[],"unavailable":{{"reason":"unsupported","message":"use connected account"}}}}}}"#
+            ),
+        );
+        let st = fetch_from_root(
+            &t3,
+            src("codex-main", "codex", Some("codex-main")),
+            900,
+            NOW,
+        );
+        assert_eq!(st.status, "error");
+        assert!(st.windows.is_empty());
+        let err = st.error.unwrap();
+        assert!(
+            err.starts_with("T3 reports no subscription limits for this instance: unsupported")
+                && err.contains("use connected account"),
+            "{err}"
+        );
+
+        // Even without checkedAt or reason, unavailable is still terminal.
+        write_cache(
+            &t3,
+            "claude-main",
+            r#"{"enabled":true,"status":"ready","usageLimits":{"windows":[],"unavailable":{}}}"#,
+        );
+        let st = fetch_from_root(
+            &t3,
+            src("claude-main", "claude", Some("claude-main")),
+            900,
+            NOW,
+        );
+        assert_eq!(st.status, "error");
+        assert!(st.windows.is_empty());
+        assert!(
+            st.error
+                .as_deref()
+                .unwrap()
+                .starts_with("T3 reports no subscription limits for this instance: ")
+        );
     }
 }

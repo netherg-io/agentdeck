@@ -532,11 +532,22 @@ pub struct T3UsageWindow {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct T3UsageLimitsUnavailable {
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct T3UsageLimits {
     #[serde(default)]
     pub checked_at: Option<String>,
     #[serde(default, deserialize_with = "empty_if_null")]
     pub windows: Vec<T3UsageWindow>,
+    #[serde(default)]
+    pub unavailable: Option<T3UsageLimitsUnavailable>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
