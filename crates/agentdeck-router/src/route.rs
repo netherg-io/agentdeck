@@ -722,6 +722,14 @@ fn quota(
         return unknown_quota("no ai-usage account", !load.known, None);
     };
     let mut acc = acc.clone();
+    // A window whose reset already passed is a stale reading of a finished
+    // period (e.g. the poller is in backoff): treat it as refilled.
+    for w in acc.windows.iter_mut() {
+        if w.resets_at.is_some_and(|r| r.is_finite() && r <= now) {
+            w.remaining_percent = 100.0;
+            w.resets_at = None;
+        }
+    }
     let plan_key = if acc.provider == "codex" {
         crate::policy::roster()["codexPlanTypes"]
             .get(&acc.plan)
@@ -2591,5 +2599,125 @@ mod probe_tests {
         unsafe { std::env::remove_var("AGENTDECK_ROUTE_MOCK_JEV") };
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(r.unwrap(), (0.0, 0.0, Some(0.001)));
+    }
+}
+
+#[cfg(test)]
+mod live_quota_shape_tests {
+    use super::*;
+
+    const NOW: f64 = 1_794_569_047.0;
+
+    // Router accounts and usage state as generated on 2026-11-13, when
+    // `agy-main` (account name `agy`) had its gemini-5h window exhausted.
+    fn cfg() -> RouterConfig {
+        crate::policy::parse_router_config(
+            serde_json::json!({"pool": [], "accounts": {
+                "agy": {"instances": ["antigravity"], "usageProvider": "antigravity"},
+                "claude_second": {"instances": ["claude_second"], "usageProvider": "claude", "usageId": "claude-second"},
+                "codex": {"instances": ["codex"], "usageProvider": "codex", "usageId": "codex-main"},
+                "openrouter": {"instances": ["opencode"], "usageProvider": "openrouter"},
+                "opencode-go": {"instances": ["opencode"], "usageProvider": "opencode-go", "modelPrefix": "opencode-go/"}
+            }}),
+            "test",
+        )
+        .unwrap()
+    }
+
+    fn usage(gemini_5h_resets: f64) -> Vec<UsageAccountFull> {
+        let state = serde_json::json!({"accounts": [
+            {"id": "agy-main", "provider": "antigravity", "status": "ok", "plan": "Google AI Pro",
+             "updated_at": NOW - 40.0, "balances": [], "windows": [
+                {"key": "gemini-5h", "label": "Gemini · 5h", "used_percent": 100.0, "remaining_percent": 0.0,
+                 "duration_mins": 300, "resets_at": gemini_5h_resets, "scope": null},
+                {"key": "gemini-weekly", "used_percent": 34.8, "remaining_percent": 65.2,
+                 "duration_mins": 10080, "resets_at": NOW + 188_000.0, "scope": null},
+                {"key": "3p-5h", "used_percent": 8.2, "remaining_percent": 91.8,
+                 "duration_mins": 300, "resets_at": NOW + 14_000.0, "scope": "Сторонние модели"},
+                {"key": "3p-weekly", "used_percent": 4.6, "remaining_percent": 95.4,
+                 "duration_mins": 10080, "resets_at": NOW + 556_000.0, "scope": "Сторонние модели"},
+                {"key": "gemini-argon-wtu-weekly", "used_percent": 44.2, "remaining_percent": 55.8,
+                 "duration_mins": 10080, "resets_at": NOW + 351_000.0, "scope": "Gemini Argon"}]},
+            {"id": "claude-second", "provider": "claude", "status": "ok", "plan": "Pro",
+             "updated_at": NOW - 40.0, "balances": [], "windows": [
+                {"key": "session", "used_percent": 0.0, "remaining_percent": 100.0, "duration_mins": 300, "resets_at": null},
+                {"key": "weekly_all", "used_percent": 100.0, "remaining_percent": 0.0, "duration_mins": 10080, "resets_at": NOW + 124_000.0},
+                {"key": "weekly_scoped:fable", "used_percent": 0.0, "remaining_percent": 100.0, "duration_mins": 10080,
+                 "resets_at": NOW + 124_000.0, "scope": "Fable"}]}
+        ]});
+        let path = std::env::temp_dir().join(format!(
+            "agentdeck-live-quota-{}-{gemini_5h_resets}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, state.to_string()).unwrap();
+        let parsed = parse_usage_state(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        parsed
+    }
+
+    fn allowed(usage: &[UsageAccountFull], provider: &str, model: &str) -> [bool; 4] {
+        let load = AgentLoad {
+            known: true,
+            agents: vec![],
+            note: None,
+        };
+        quota(
+            &cfg(),
+            &Measured::default(),
+            usage,
+            &load,
+            provider,
+            model,
+            NOW,
+        )
+        .allowed
+    }
+
+    #[test]
+    fn exhausted_antigravity_gemini_window_blocks_only_its_models() {
+        let u = usage(NOW + 2_480.0);
+        assert_eq!(
+            allowed(&u, "antigravity", "gemini-4-hydrogen-high"),
+            [false; 4]
+        );
+        assert_eq!(
+            allowed(&u, "antigravity", "gemini-4-hydrogen-xhigh"),
+            [false; 4]
+        );
+        assert_eq!(
+            allowed(&u, "antigravity", "gemini-3.8-flash-high"),
+            [false; 4]
+        );
+        // Argon and third-party models have their own windows.
+        assert!(allowed(&u, "antigravity", "gemini-4-argon-low")[1]);
+        assert!(allowed(&u, "antigravity", "claude-opus-5-5-high")[1]);
+        let note = quota(
+            &cfg(),
+            &Measured::default(),
+            &u,
+            &AgentLoad {
+                known: true,
+                agents: vec![],
+                note: None,
+            },
+            "antigravity",
+            "gemini-4-hydrogen-high",
+            NOW,
+        )
+        .note;
+        assert!(!note.contains("no ai-usage account"), "{note}");
+    }
+
+    #[test]
+    fn passed_reset_makes_the_window_usable_again() {
+        let u = usage(NOW - 60.0);
+        assert!(allowed(&u, "antigravity", "gemini-4-hydrogen-high")[1]);
+    }
+
+    #[test]
+    fn claude_weekly_all_exhaustion_blocks_every_model_on_that_account() {
+        let u = usage(NOW + 2_480.0);
+        assert_eq!(allowed(&u, "claude_second", "claude-opus-5-5"), [false; 4]);
+        assert_eq!(allowed(&u, "claude_second", "claude-fable-5-2"), [false; 4]);
     }
 }
