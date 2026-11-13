@@ -146,3 +146,62 @@ fn instance_run_preserves_profile_arguments_and_exit_status() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn legacy_usage_hooks_exit_zero_quietly() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = std::env::temp_dir().join(format!("agentdeck-hook-compat-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    for (args, stdin_body) in [
+        (
+            vec!["usage", "hook", "claude", "--account", "claude-main"],
+            r#"{"model":{"display_name":"Sonnet"},"rate_limits":{"five_hour":{"used_percentage":12}}}"#,
+        ),
+        (
+            vec!["usage", "hook", "claude", "--account", "claude-main"],
+            "",
+        ),
+        (
+            vec!["usage", "hook", "agy", "--account", "agy-main"],
+            r#"{"model":{"display_name":"Gemini"},"quota":{"gemini-5h":{"remaining_fraction":0.5}}}"#,
+        ),
+        (vec!["usage", "hook", "agy", "--account", "agy-main"], "{}"),
+    ] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_agentdeck"))
+            .args(&args)
+            .env("AGENTDECK_CONFIG_DIR", dir.join("config"))
+            .env("AGENTDECK_STATE_DIR", dir.join("state"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin_body.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty(), "{args:?} stdout: {:?}", out.stdout);
+        assert!(out.stderr.is_empty(), "{args:?} stderr: {:?}", out.stderr);
+    }
+
+    let help = Command::new(env!("CARGO_BIN_EXE_agentdeck"))
+        .args(["usage", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help_text = String::from_utf8_lossy(&help.stdout);
+    assert!(!help_text.contains("\n  hook"), "{help_text}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

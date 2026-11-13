@@ -6,8 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use agentdeck_core::usage::{UsageEntry, UsageKind};
 
-/// Ниже этого значения refresh становится бессмысленно частым: каждый Codex
-/// аккаунт поднимает отдельный subprocess.
+/// Minimum interval between balance polls and T3 cache reads.
 pub const MIN_REFRESH_SECONDS: u64 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,25 +29,21 @@ impl Default for Config {
     }
 }
 
-impl Config {}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "lowercase")]
 pub enum AccountConfig {
     Claude {
         id: String,
         name: String,
-        config_dir: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<String>,
         plan: Option<String>,
     },
     Codex {
         id: String,
         name: String,
-        codex_home: PathBuf,
-        #[serde(default = "default_codex_command")]
-        command: String,
-        #[serde(default = "default_codex_limit_id")]
-        limit_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<String>,
     },
     Deepseek {
         id: String,
@@ -76,13 +71,14 @@ pub enum AccountConfig {
         id: String,
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        token_file: Option<PathBuf>,
+        instance: Option<String>,
     },
-    /// Учётные данные читаются из базы OpenCode (`/connect`).
     #[serde(rename = "opencode-go")]
     OpencodeGo {
         id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         db_file: Option<PathBuf>,
     },
@@ -125,19 +121,15 @@ impl AccountConfig {
         }
     }
 
-    /// Каталог, которым аккаунт владеет монопольно. Два аккаунта одного
-    /// провайдера не могут его делить: для Claude это привело бы к драке за
-    /// один `statusLine`, для Codex — к перепутанным лимитам.
-    pub fn exclusive_dir(&self) -> Option<&Path> {
-        match self {
-            Self::Claude { config_dir, .. } => Some(config_dir),
-            Self::Codex { codex_home, .. } => Some(codex_home),
-            Self::Deepseek { .. }
-            | Self::Openrouter { .. }
-            | Self::Vercel { .. }
-            | Self::Antigravity { .. }
-            | Self::OpencodeGo { .. } => None,
-        }
+    pub fn t3_instance(&self) -> Option<String> {
+        let instance = match self {
+            Self::Claude { instance, .. }
+            | Self::Codex { instance, .. }
+            | Self::Antigravity { instance, .. }
+            | Self::OpencodeGo { instance, .. } => instance.as_deref(),
+            Self::Deepseek { .. } | Self::Openrouter { .. } | Self::Vercel { .. } => return None,
+        };
+        crate::providers::t3::resolve_instance_slug(self.provider(), instance)
     }
 }
 
@@ -147,14 +139,6 @@ fn default_refresh_seconds() -> u64 {
 
 fn default_stale_seconds() -> i64 {
     crate::providers::claude::DEFAULT_STALE_SECONDS
-}
-
-pub(crate) fn default_codex_command() -> String {
-    "codex".to_owned()
-}
-
-pub(crate) fn default_codex_limit_id() -> String {
-    "codex".to_owned()
 }
 
 pub(crate) fn default_deepseek_base_url() -> String {
@@ -179,10 +163,10 @@ pub fn parse_str(raw: &str, what: &Path) -> Result<Config> {
 }
 
 /// Проверяет инварианты, которые нельзя выразить типами: уникальность ID и
-/// монопольность каталогов провайдеров.
+/// уникальность привязки к инстансам T3.
 pub fn validate(config: &Config) -> Result<()> {
     let mut seen_ids: HashMap<&str, ()> = HashMap::new();
-    let mut seen_dirs: HashMap<(&'static str, PathBuf), &str> = HashMap::new();
+    let mut seen_instances: HashMap<String, &str> = HashMap::new();
 
     for account in &config.accounts {
         crate::util::validate_id(account.id())
@@ -192,19 +176,15 @@ pub fn validate(config: &Config) -> Result<()> {
             bail!("Дублирующийся ID аккаунта: '{}'", account.id());
         }
 
-        if let Some(dir) = account.exclusive_dir() {
-            // Сравниваем развёрнутые пути: '~/.codex' и '/home/user/.codex'
-            // указывают на один каталог.
-            let key = (account.provider(), crate::util::expand_home(dir));
-            if let Some(previous) = seen_dirs.insert(key, account.id()) {
-                bail!(
-                    "Аккаунты '{}' и '{}' используют один каталог {}; для {} нужны отдельные каталоги",
-                    previous,
-                    account.id(),
-                    dir.display(),
-                    account.provider()
-                );
-            }
+        if let Some(instance) = account.t3_instance()
+            && let Some(previous) = seen_instances.insert(instance.clone(), account.id())
+        {
+            bail!(
+                "Источники '{}' и '{}' указывают на один инстанс T3 '{}'",
+                previous,
+                account.id(),
+                instance
+            );
         }
     }
 
@@ -216,7 +196,7 @@ pub fn validate(config: &Config) -> Result<()> {
 }
 
 /// Build the provider account list from validated `[[usage]]` registry entries.
-/// Reuses [`validate`] so the exclusive-dir invariants match the old parser.
+/// Reuses [`validate`] so duplicate ids and duplicate T3 instances are rejected.
 pub fn accounts_from_registry(entries: &[UsageEntry]) -> Result<Vec<AccountConfig>> {
     let mut accounts = Vec::with_capacity(entries.len());
     for e in entries {
@@ -225,24 +205,17 @@ pub fn accounts_from_registry(entries: &[UsageEntry]) -> Result<Vec<AccountConfi
         } else {
             e.display.clone()
         };
-        let path_field = |field: &str, v: &Option<String>| -> Result<std::path::PathBuf> {
-            v.as_ref()
-                .map(std::path::PathBuf::from)
-                .with_context(|| format!("usage {:?}: missing {field:?}", e.id))
-        };
         accounts.push(match e.kind {
             UsageKind::Claude => AccountConfig::Claude {
                 id: e.id.clone(),
                 name,
-                config_dir: path_field("config_dir", &e.config_dir)?,
+                instance: e.instance.clone(),
                 plan: None,
             },
             UsageKind::Codex => AccountConfig::Codex {
                 id: e.id.clone(),
                 name,
-                codex_home: path_field("codex_home", &e.codex_home)?,
-                command: default_codex_command(),
-                limit_id: default_codex_limit_id(),
+                instance: e.instance.clone(),
             },
             UsageKind::Deepseek => AccountConfig::Deepseek {
                 id: e.id.clone(),
@@ -265,12 +238,13 @@ pub fn accounts_from_registry(entries: &[UsageEntry]) -> Result<Vec<AccountConfi
             UsageKind::Antigravity => AccountConfig::Antigravity {
                 id: e.id.clone(),
                 name,
-                token_file: e.token_file.as_ref().map(std::path::PathBuf::from),
+                instance: e.instance.clone(),
             },
             UsageKind::OpencodeGo => AccountConfig::OpencodeGo {
                 id: e.id.clone(),
                 name,
-                db_file: e.db_file.as_ref().map(std::path::PathBuf::from),
+                instance: e.instance.clone(),
+                db_file: e.db_file.as_ref().map(PathBuf::from),
             },
         });
     }
@@ -299,30 +273,28 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn claude(id: &str, dir: &str) -> AccountConfig {
+    fn claude(id: &str, instance: Option<&str>) -> AccountConfig {
         AccountConfig::Claude {
             id: id.to_owned(),
             name: id.to_owned(),
-            config_dir: PathBuf::from(dir),
+            instance: instance.map(str::to_owned),
             plan: None,
         }
     }
 
-    fn codex(id: &str, home: &str) -> AccountConfig {
+    fn codex(id: &str, instance: Option<&str>) -> AccountConfig {
         AccountConfig::Codex {
             id: id.to_owned(),
             name: id.to_owned(),
-            codex_home: PathBuf::from(home),
-            command: "codex".to_owned(),
-            limit_id: "codex".to_owned(),
+            instance: instance.map(str::to_owned),
         }
     }
 
-    fn antigravity(id: &str) -> AccountConfig {
+    fn antigravity(id: &str, instance: Option<&str>) -> AccountConfig {
         AccountConfig::Antigravity {
             id: id.to_owned(),
             name: id.to_owned(),
-            token_file: None,
+            instance: instance.map(str::to_owned),
         }
     }
 
@@ -332,8 +304,8 @@ mod tests {
             refresh_seconds: 60,
             stale_seconds: 3_600,
             accounts: vec![
-                claude("claude-main", "~/.claude"),
-                codex("codex-main", "~/.codex"),
+                claude("claude-main", Some("claude-main")),
+                codex("codex-main", Some("codex")),
                 AccountConfig::Deepseek {
                     id: "deepseek-main".to_owned(),
                     name: "DeepSeek".to_owned(),
@@ -346,7 +318,7 @@ mod tests {
                     api_key_env: "AI_USAGE_OPENROUTER_OPENROUTER_MAIN".to_owned(),
                     base_url: "https://openrouter.ai/api/v1".to_owned(),
                 },
-                antigravity("agy-main"),
+                antigravity("agy-main", Some("antigravity")),
             ],
         };
 
@@ -380,8 +352,8 @@ mod tests {
             refresh_seconds: 30,
             stale_seconds: 1_800,
             accounts: vec![
-                claude("primary", "~/.claude-one"),
-                claude("secondary", "~/.claude-two"),
+                claude("primary", Some("claude-1")),
+                claude("secondary", Some("claude-2")),
             ],
         };
 
@@ -402,7 +374,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_account_ids_across_providers() {
         let config = Config {
-            accounts: vec![claude("same", "~/.claude"), codex("same", "~/.codex")],
+            accounts: vec![claude("same", Some("c")), codex("same", Some("x"))],
             ..Config::default()
         };
         let error = validate(&config).unwrap_err().to_string();
@@ -410,71 +382,51 @@ mod tests {
     }
 
     #[test]
-    fn rejects_two_claude_accounts_sharing_a_config_dir() {
-        // Это ломало бы восстановление statusLine при удалении.
-        let config = Config {
-            accounts: vec![claude("one", "~/.claude"), claude("two", "~/.claude")],
-            ..Config::default()
-        };
-        let error = validate(&config).unwrap_err().to_string();
-        assert!(error.contains("один каталог"), "{error}");
-    }
+    fn old_shape_config_with_legacy_fields_loads_without_error() {
+        let old_toml = r#"
+refresh_seconds = 120
+stale_seconds = 3600
 
-    #[test]
-    fn rejects_two_codex_accounts_sharing_codex_home() {
-        let config = Config {
-            accounts: vec![codex("one", "~/.codex"), codex("two", "~/.codex")],
-            ..Config::default()
-        };
-        assert!(validate(&config).is_err());
-    }
+[[accounts]]
+provider = "claude"
+id = "claude-main"
+name = "Claude"
+instance = "claudeAgent"
+config_dir = "~/.claude"
 
-    #[test]
-    fn claude_and_codex_may_share_a_path_value() {
-        // Каталоги монопольны в пределах одного провайдера, а не глобально.
-        let config = Config {
-            accounts: vec![claude("c", "~/.shared"), codex("x", "~/.shared")],
-            ..Config::default()
-        };
-        validate(&config).unwrap();
-    }
+[[accounts]]
+provider = "codex"
+id = "codex-main"
+name = "Codex"
+instance = "codex"
+codex_home = "~/.codex"
+command = "codex"
+limit_id = "codex"
 
-    #[test]
-    fn antigravity_accounts_need_only_unique_ids() {
-        let config = Config {
-            accounts: vec![antigravity("agy-main"), antigravity("agy-work")],
-            ..Config::default()
-        };
-        validate(&config).unwrap();
-    }
-
-    #[test]
-    fn antigravity_round_trips_token_file() {
-        let config = Config {
-            accounts: vec![AccountConfig::Antigravity {
-                id: "agy-custom".to_owned(),
-                name: "Custom ACP".to_owned(),
-                token_file: Some(PathBuf::from("/etc/acp.json")),
-            }],
-            ..Config::default()
-        };
-        let raw = toml::to_string(&config).unwrap();
-        assert!(raw.contains("token_file = \"/etc/acp.json\""));
-        let parsed: Config = toml::from_str(&raw).unwrap();
+[[accounts]]
+provider = "antigravity"
+id = "agy-main"
+name = "Google AI Pro"
+instance = "antigravity"
+token_file = "/etc/acp.json"
+"#;
+        let parsed = parse_str(old_toml, Path::new("old-config.toml")).unwrap();
+        assert_eq!(parsed.accounts.len(), 3);
         assert_eq!(
-            parsed.accounts[0],
-            AccountConfig::Antigravity {
-                id: "agy-custom".to_owned(),
-                name: "Custom ACP".to_owned(),
-                token_file: Some(PathBuf::from("/etc/acp.json")),
-            }
+            parsed.accounts[0].t3_instance().as_deref(),
+            Some("claudeAgent")
+        );
+        assert_eq!(parsed.accounts[1].t3_instance().as_deref(), Some("codex"));
+        assert_eq!(
+            parsed.accounts[2].t3_instance().as_deref(),
+            Some("antigravity")
         );
     }
 
     #[test]
     fn rejects_ids_that_would_escape_the_cache_directory() {
         let config = Config {
-            accounts: vec![claude("../../etc", "~/.claude")],
+            accounts: vec![claude("../../etc", Some("claude"))],
             ..Config::default()
         };
         assert!(validate(&config).is_err());
@@ -499,12 +451,14 @@ stale_seconds = 3600
 provider = "claude"
 id = "claude-main"
 name = "Claude"
+instance = "claude-main"
 config_dir = "~/.claude"
 
 [[accounts]]
 provider = "codex"
 id = "codex-main"
 name = "Codex Personal"
+instance = "codex-main"
 codex_home = "~/.codex"
 command = "codex"
 limit_id = "codex"
@@ -527,11 +481,13 @@ base_url = "https://openrouter.ai/api/v1"
 provider = "antigravity"
 id = "agy-main"
 name = "Google AI Pro"
+instance = "agy-main"
 
 [[accounts]]
 provider = "antigravity"
 id = "agy-file"
 name = "Custom ACP"
+instance = "agy-file"
 token_file = "/etc/acp.json"
 
 [[accounts]]
@@ -543,17 +499,37 @@ db_file = "/data/opencode.db"
         let reg_toml = r#"
 version = 1
 
+[[instance]]
+id = "claude-main"
+harness = "claude"
+home = "~/.claude"
+
+[[instance]]
+id = "codex-main"
+harness = "codex"
+home = "~/.codex"
+
+[[instance]]
+id = "agy-main"
+harness = "agy"
+home = "~/.gemini"
+
+[[instance]]
+id = "agy-file"
+harness = "agy"
+home = "~/.gemini-alt"
+
 [[usage]]
 id = "claude-main"
 kind = "claude"
 display = "Claude"
-config_dir = "~/.claude"
+instance = "claude-main"
 
 [[usage]]
 id = "codex-main"
 kind = "codex"
 display = "Codex Personal"
-codex_home = "~/.codex"
+instance = "codex-main"
 
 [[usage]]
 id = "deepseek-main"
@@ -571,12 +547,13 @@ api_key_env = "AGENTDECK_OPENROUTER_MAIN"
 id = "agy-main"
 kind = "antigravity"
 display = "Google AI Pro"
+instance = "agy-main"
 
 [[usage]]
 id = "agy-file"
 kind = "antigravity"
 display = "Custom ACP"
-token_file = "/etc/acp.json"
+instance = "agy-file"
 
 [[usage]]
 id = "opencode-go"
@@ -591,13 +568,53 @@ db_file = "/data/opencode.db"
     }
 
     #[test]
-    fn registry_adapter_rejects_shared_claude_dirs() {
+    fn registry_adapter_propagates_instance() {
         let reg = agentdeck_core::Registry::from_toml(
             "version = 1\n\
-             [[usage]]\nid = \"one\"\nkind = \"claude\"\nconfig_dir = \"~/.claude\"\n\
-             [[usage]]\nid = \"two\"\nkind = \"claude\"\nconfig_dir = \"~/.claude\"\n",
+             [[instance]]\nid = \"claude-main\"\nharness = \"claude\"\nhome = \"~/.claude\"\n\
+             [[usage]]\nid = \"claude-main\"\nkind = \"claude\"\ninstance = \"claude-main\"\n\
+             [[usage]]\nid = \"opencode-go\"\nkind = \"opencode-go\"\n",
         )
         .unwrap();
-        assert!(accounts_from_registry(&reg.usage).is_err());
+        let accounts = accounts_from_registry(&reg.usage).unwrap();
+        assert!(matches!(
+            &accounts[0],
+            AccountConfig::Claude { instance: Some(i), .. } if i == "claude-main"
+        ));
+        assert!(matches!(
+            &accounts[1],
+            AccountConfig::OpencodeGo { instance: None, .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_two_usage_sources_pointing_at_same_t3_instance() {
+        let reg = agentdeck_core::Registry::from_toml(
+            "version = 1\n\
+             [[instance]]\nid = \"claude-main\"\nharness = \"claude\"\nhome = \"~/.claude\"\n\
+             [[usage]]\nid = \"one\"\nkind = \"claude\"\ninstance = \"claude-main\"\n\
+             [[usage]]\nid = \"two\"\nkind = \"claude\"\ninstance = \"claude-main\"\n",
+        )
+        .unwrap();
+        let err = accounts_from_registry(&reg.usage).unwrap_err().to_string();
+        assert!(
+            err.contains("one") && err.contains("two") && err.contains("claude-main"),
+            "{err}"
+        );
+
+        let go_reg = agentdeck_core::Registry::from_toml(
+            "version = 1\n\
+             [[instance]]\nid = \"opencode\"\nharness = \"opencode\"\nhome = \"~\"\n\
+             [[usage]]\nid = \"go-a\"\nkind = \"opencode-go\"\n\
+             [[usage]]\nid = \"go-b\"\nkind = \"opencode-go\"\ninstance = \"opencode\"\n",
+        )
+        .unwrap();
+        let err = accounts_from_registry(&go_reg.usage)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("go-a") && err.contains("go-b") && err.contains("opencode"),
+            "{err}"
+        );
     }
 }

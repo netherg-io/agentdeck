@@ -356,8 +356,9 @@ pub fn router_block(exe: &Path) -> String {
     let route = format!("{} route", exe.display());
     format!(
         "## Delegation routing (agentdeck router)\n\n\
-        - Route every `delegate_task` target first: `{route} \"<goal, inputs, read-only or edits, expected size>\"` \
-        (add `--source <provider instance>` when the source is unknown; `--effort medium|high|xhigh` overrides the reasoning level). Only exact active pool entries are candidates; \
+        - Route every `delegate_task` target first on its complete task text: write the task to a file, then \
+        `{route} - < task.txt` (the launch hook judges the same full text, so a short goal can get a different verdict; \
+        add `--source <provider instance>` when the source is unknown; `--effort medium|high|xhigh` overrides the reasoning level). Only exact active pool entries are candidates; \
         never restore removed entries under another id. Before routing, call T3 `orchestrator_capabilities` and pipe its \
         `structuredContent` JSON to `{route} --catalog`; refresh after provider/model changes. Pass the complete returned \
         `target` (including `options`) as the `delegate_task` target; append a returned `briefHint` verbatim. \
@@ -1280,20 +1281,15 @@ mod tests {
             kind,
             instance: instance.map(str::to_string),
             display: String::new(),
-            config_dir: None,
-            codex_home: None,
-            token_file: None,
             api_key_env: None,
             db_file: None,
             extra: Default::default(),
         };
-        match kind {
-            UsageKind::Claude => e.config_dir = Some("~/.claude".into()),
-            UsageKind::Codex => e.codex_home = Some("~/.codex".into()),
-            UsageKind::Deepseek | UsageKind::Openrouter | UsageKind::Vercel => {
-                e.api_key_env = Some("AGENTDECK_TEST_KEY".into());
-            }
-            UsageKind::Antigravity | UsageKind::OpencodeGo => {}
+        if matches!(
+            kind,
+            UsageKind::Deepseek | UsageKind::Openrouter | UsageKind::Vercel
+        ) {
+            e.api_key_env = Some("AGENTDECK_TEST_KEY".into());
         }
         e
     }

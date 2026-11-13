@@ -3,7 +3,7 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::load::{AgentLoad, read_active_agents};
+use crate::load::{AgentLoad, read_active_agents, read_instance_failures};
 use crate::policy::{
     Candidate, MIN_FIT, NO_REVIEW_BAN, QuotaProvenance, QuotaWindow, QuotaWindowEstimate, Ranked,
     RouterConfig, UsageAccount, UsageSnapshot, budget_allowed, budget_cost_full, enabled_favorites,
@@ -1825,6 +1825,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         .unwrap_or(0.0)
         .round() as i64)
         .clamp(0, 3);
+    let failures = read_instance_failures(&env.home.join(".t3/userdata/statev2.sqlite"), now);
     let mut candidates: Vec<Candidate> = vec![];
     for (provider, model, profile) in &favorites {
         let a = answers
@@ -1881,6 +1882,15 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         {
             policy_ban = Some("excluded: account hit a usage limit".to_string());
         }
+        let failure = failures.get(provider);
+        if let Some(until) = failure.and_then(|f| f.quota_until) {
+            policy_ban = policy_ban.or_else(|| {
+                Some(format!(
+                    "recent quota failure; retry after {} seconds",
+                    (until - now).ceil() as u64
+                ))
+            });
+        }
         let probs = a.get("probabilities");
         // Jev judges every favorite, including ones without a roster family,
         // on the honest "unprofiled; capability unknown" criterion above; a
@@ -1905,6 +1915,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
             no_review,
             policy_ban,
             fit,
+            failure_penalty: failure.map_or(0.0, |f| f.penalty),
             quality: a.get("score").and_then(Value::as_f64).unwrap_or(0.0)
                 / (CAPABILITY.len() - 1) as f64,
             confidence: a.get("confidence").and_then(Value::as_f64).unwrap_or(0.0),
@@ -1978,6 +1989,9 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         }
         m.insert("fit".into(), num(c.fit));
         m.insert("quality".into(), num(c.quality));
+        if c.failure_penalty > 0.0 {
+            m.insert("failurePenalty".into(), num(c.failure_penalty));
+        }
         m.insert("confidence".into(), num(c.confidence));
         m.insert("allowed".into(), Value::from(c.allowed));
         m.insert(
@@ -2411,6 +2425,32 @@ mod quota_estimate_tests {
     }
 
     #[test]
+    fn near_empty_short_window_rejects_size_two() {
+        let mut cfg = test_cfg();
+        cfg.account
+            .insert("antigravity".into(), "antigravity".into());
+        let mut acc = codex_acc("Google AI Pro", 0.0);
+        acc.provider = "antigravity".into();
+        acc.id = None;
+        acc.windows[0].key = "gemini-5h".into();
+        acc.windows[0].duration_mins = 300.0;
+        acc.windows[0].remaining_percent = 100.0 - 99.6;
+        let q = quota(
+            &cfg,
+            &Measured::default(),
+            &[acc],
+            &load_known(),
+            "antigravity",
+            "gemini-4-hydrogen-high",
+            NOW,
+        );
+        assert!(
+            !q.allowed[2],
+            "a nearly exhausted short window cannot fund another launch"
+        );
+    }
+
+    #[test]
     fn measured_basis_reports_sample_count() {
         let cfg = test_cfg();
         // "Pro 5x" maps via codexPlanTypes to raw plan "prolite".
@@ -2526,6 +2566,7 @@ mod quota_estimate_tests {
             no_review: false,
             policy_ban: None,
             fit: 0.9,
+            failure_penalty: 0.0,
             quality: 0.8,
             confidence: 0.9,
             allowed: true,
@@ -2556,6 +2597,7 @@ mod quota_estimate_tests {
             no_review: false,
             policy_ban: None,
             fit: 0.0,
+            failure_penalty: 0.0,
             quality: 0.0,
             confidence: 0.0,
             allowed: true,
@@ -2719,5 +2761,118 @@ mod live_quota_shape_tests {
         let u = usage(NOW + 2_480.0);
         assert_eq!(allowed(&u, "claude_second", "claude-opus-5-5"), [false; 4]);
         assert_eq!(allowed(&u, "claude_second", "claude-fable-5-2"), [false; 4]);
+    }
+
+    #[test]
+    fn opencode_go_monthly_43200_uses_weekly_factor_not_nan_short_factor() {
+        let load = AgentLoad {
+            known: true,
+            agents: vec![],
+            note: None,
+        };
+        let state_with_43200 = serde_json::json!({"accounts": [{
+            "id": "opencode-go", "provider": "opencode-go", "status": "ok", "plan": "Go",
+            "updated_at": NOW - 40.0, "balances": [], "windows": [
+                {"key": "rolling", "label": "5 часов", "used_percent": 2.0, "remaining_percent": 98.0, "duration_mins": 300, "resets_at": NOW + 3_600.0},
+                {"key": "weekly", "label": "Неделя", "used_percent": 10.0, "remaining_percent": 90.0, "duration_mins": 10080, "resets_at": NOW + 200_000.0},
+                {"key": "monthly", "label": "Месяц", "used_percent": 95.0, "remaining_percent": 5.0, "duration_mins": 43200, "resets_at": NOW + 2_000_000.0}
+            ]
+        }]});
+        let mut state_with_null = state_with_43200.clone();
+        state_with_null["accounts"][0]["windows"][2]["duration_mins"] = Value::Null;
+
+        let parse = |val: Value| {
+            let p = std::env::temp_dir().join(format!(
+                "agentdeck-router-b1-{}-{}.json",
+                std::process::id(),
+                val["accounts"][0]["windows"][2]["duration_mins"]
+            ));
+            std::fs::write(&p, val.to_string()).unwrap();
+            let u = parse_usage_state(&p).unwrap();
+            std::fs::remove_file(&p).ok();
+            u
+        };
+
+        let u_43200 = parse(state_with_43200);
+        let u_null = parse(state_with_null);
+        let q_43200 = quota(
+            &cfg(),
+            &Measured::default(),
+            &u_43200,
+            &load,
+            "opencode",
+            "opencode-go/glm-5",
+            NOW,
+        );
+        let q_null = quota(
+            &cfg(),
+            &Measured::default(),
+            &u_null,
+            &load,
+            "opencode",
+            "opencode-go/glm-5",
+            NOW,
+        );
+        // With 43200 mins (what old opencode_go.rs and T3 mapper both publish),
+        // monthly gets factor 1.0; null/NaN would wrongly apply short-window factor 5.0.
+        assert_eq!(q_43200.allowed, [true, true, true, true]);
+        assert_eq!(q_null.allowed, [true, true, true, false]);
+        assert!(q_43200.cost.unwrap()[3] < q_null.cost.unwrap()[3]);
+    }
+
+    #[test]
+    fn antigravity_coarse_windows_reject_near_empty_quota() {
+        let load = AgentLoad {
+            known: true,
+            agents: vec![],
+            note: None,
+        };
+        let state = serde_json::json!({"accounts": [{
+            "id": "agy-main", "provider": "antigravity", "status": "ok", "plan": "Google AI Pro",
+            "updated_at": NOW - 40.0, "balances": [], "windows": [
+                {"key": "claude-quota", "label": "Claude Quota", "used_percent": 20.0, "remaining_percent": 80.0, "duration_mins": null, "resets_at": null, "scope": null},
+                {"key": "gemini-quota", "label": "Gemini Quota", "used_percent": 99.5, "remaining_percent": 0.5, "duration_mins": null, "resets_at": null, "scope": null},
+                {"key": "gpt-quota", "label": "GPT Quota", "used_percent": 15.0, "remaining_percent": 85.0, "duration_mins": null, "resets_at": null, "scope": null}
+            ]
+        }]});
+        let p = std::env::temp_dir().join(format!(
+            "agentdeck-router-agy-coarse-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&p, state.to_string()).unwrap();
+        let u = parse_usage_state(&p).unwrap();
+        std::fs::remove_file(&p).ok();
+
+        // Missing durations use short-window admission; a fractional remainder cannot fund a launch.
+        let q_gemini = quota(
+            &cfg(),
+            &Measured::default(),
+            &u,
+            &load,
+            "antigravity",
+            "gemini-4-hydrogen-high",
+            NOW,
+        );
+        let q_3p = quota(
+            &cfg(),
+            &Measured::default(),
+            &u,
+            &load,
+            "antigravity",
+            "claude-opus-5-5-high",
+            NOW,
+        );
+        let q_argon = quota(
+            &cfg(),
+            &Measured::default(),
+            &u,
+            &load,
+            "antigravity",
+            "gemini-4-argon-low",
+            NOW,
+        );
+        assert_eq!(q_gemini.allowed, [false; 4]);
+        assert_eq!(q_3p.allowed, [true, true, true, true]);
+        assert_eq!(q_argon.allowed, [true, true, false, false]);
     }
 }

@@ -1,13 +1,12 @@
 //! `[[usage]]` quota sources in `instances.toml`: stable usage ids with
-//! kind-specific source pointers (paths and env-var names only, never secrets).
+//! instance bindings or API-key env-var names (never secrets).
 //!
 //! ```toml
 //! [[usage]]
 //! id = "codex-main"       # EXACT old ai-usage account id, kept byte-verbatim
 //! kind = "codex"
-//! instance = "codex-main" # optional registry instance id (absent for standalone kinds)
+//! instance = "codex-main" # registry instance id (required for claude/codex/antigravity)
 //! display = "Codex main"
-//! codex_home = "~/.codex"
 //! ```
 
 use std::collections::BTreeSet;
@@ -69,12 +68,6 @@ pub struct UsageEntry {
     #[serde(default)]
     pub display: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config_dir: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex_home: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_file: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub db_file: Option<String>,
@@ -119,38 +112,17 @@ impl UsageEntry {
             Ok(())
         };
         match self.kind {
-            UsageKind::Claude => {
-                req("config_dir", &self.config_dir)?;
-                no("codex_home", &self.codex_home)?;
-                no("token_file", &self.token_file)?;
-                no("api_key_env", &self.api_key_env)?;
-                no("db_file", &self.db_file)?;
-            }
-            UsageKind::Codex => {
-                req("codex_home", &self.codex_home)?;
-                no("config_dir", &self.config_dir)?;
-                no("token_file", &self.token_file)?;
-                no("api_key_env", &self.api_key_env)?;
-                no("db_file", &self.db_file)?;
-            }
-            UsageKind::Antigravity => {
-                no("config_dir", &self.config_dir)?;
-                no("codex_home", &self.codex_home)?;
+            UsageKind::Claude | UsageKind::Codex | UsageKind::Antigravity => {
+                req("instance", &self.instance)?;
                 no("api_key_env", &self.api_key_env)?;
                 no("db_file", &self.db_file)?;
             }
             UsageKind::Deepseek | UsageKind::Openrouter | UsageKind::Vercel => {
                 // Keys live in the 0600 env file; the schema only holds the var name.
                 req("api_key_env", &self.api_key_env)?;
-                no("config_dir", &self.config_dir)?;
-                no("codex_home", &self.codex_home)?;
-                no("token_file", &self.token_file)?;
                 no("db_file", &self.db_file)?;
             }
             UsageKind::OpencodeGo => {
-                no("config_dir", &self.config_dir)?;
-                no("codex_home", &self.codex_home)?;
-                no("token_file", &self.token_file)?;
                 no("api_key_env", &self.api_key_env)?;
             }
         }
@@ -313,20 +285,15 @@ mod tests {
             kind,
             instance: None,
             display: String::new(),
-            config_dir: None,
-            codex_home: None,
-            token_file: None,
             api_key_env: None,
             db_file: None,
             extra: Default::default(),
         };
-        match kind {
-            UsageKind::Claude => e.config_dir = Some("~/.claude".into()),
-            UsageKind::Codex => e.codex_home = Some("~/.codex".into()),
-            UsageKind::Deepseek | UsageKind::Openrouter | UsageKind::Vercel => {
-                e.api_key_env = Some("AGENTDECK_TEST_KEY".into());
-            }
-            UsageKind::Antigravity | UsageKind::OpencodeGo => {}
+        if matches!(
+            kind,
+            UsageKind::Deepseek | UsageKind::Openrouter | UsageKind::Vercel
+        ) {
+            e.api_key_env = Some("AGENTDECK_TEST_KEY".into());
         }
         e
     }
@@ -356,14 +323,24 @@ mod tests {
         assert!(
             Registry::from_toml("version = 1\n[[usage]]\nid = \"a\"\nkind = \"nope\"\n").is_err()
         );
-        // claude without config_dir
+        // subscription kinds need an instance (opencode-go defaults to "opencode")
+        for kind in ["claude", "codex", "antigravity"] {
+            let err = Registry::from_toml(&format!(
+                "version = 1\n[[usage]]\nid = \"a\"\nkind = \"{kind}\"\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("missing \"instance\""), "{kind}: {err}");
+        }
         assert!(
-            Registry::from_toml("version = 1\n[[usage]]\nid = \"a\"\nkind = \"claude\"\n").is_err()
+            Registry::from_toml("version = 1\n[[usage]]\nid = \"a\"\nkind = \"opencode-go\"\n")
+                .is_ok()
         );
-        // codex pointer on a claude entry
+        // api_key_env on a subscription entry is rejected
         assert!(
             Registry::from_toml(
-                "version = 1\n[[usage]]\nid = \"a\"\nkind = \"claude\"\nconfig_dir = \"x\"\ncodex_home = \"y\"\n"
+                "version = 1\n[[instance]]\nid = \"c\"\nharness = \"claude\"\nhome = \"~/.claude\"\n\
+                 [[usage]]\nid = \"a\"\nkind = \"claude\"\ninstance = \"c\"\napi_key_env = \"E\"\n"
             )
             .is_err()
         );
@@ -372,13 +349,43 @@ mod tests {
             Registry::from_toml("version = 1\n[[usage]]\nid = \"a\"\nkind = \"deepseek\"\n")
                 .is_err()
         );
-        // a stale api_key_file key is preserved verbatim, not rejected
+        // stale legacy fields (config_dir, codex_home, command, limit_id, token_file, api_key_file)
+        // stay in `extra` and load cleanly without error
         let reg = Registry::from_toml(
-            "version = 1\n[[usage]]\nid = \"a\"\nkind = \"deepseek\"\napi_key_env = \"E\"\napi_key_file = \"f\"\n",
+            "version = 1\n\
+             [[instance]]\nid = \"c\"\nharness = \"claude\"\nhome = \"~/.claude\"\n\
+             [[instance]]\nid = \"x\"\nharness = \"codex\"\nhome = \"~/.codex\"\n\
+             [[instance]]\nid = \"g\"\nharness = \"agy\"\nhome = \"~/.gemini\"\n\
+             [[usage]]\nid = \"c1\"\nkind = \"claude\"\ninstance = \"c\"\nconfig_dir = \"~/.claude\"\n\
+             [[usage]]\nid = \"x1\"\nkind = \"codex\"\ninstance = \"x\"\ncodex_home = \"~/.codex\"\ncommand = \"codex\"\nlimit_id = \"codex\"\n\
+             [[usage]]\nid = \"g1\"\nkind = \"antigravity\"\ninstance = \"g\"\ntoken_file = \"/etc/acp.json\"\n\
+             [[usage]]\nid = \"d1\"\nkind = \"deepseek\"\napi_key_env = \"E\"\napi_key_file = \"f\"\n",
         )
         .unwrap();
+        assert_eq!(reg.usage.len(), 4);
         assert_eq!(
             reg.usage[0]
+                .extra
+                .get("config_dir")
+                .and_then(|v| v.as_str()),
+            Some("~/.claude")
+        );
+        assert_eq!(
+            reg.usage[1]
+                .extra
+                .get("codex_home")
+                .and_then(|v| v.as_str()),
+            Some("~/.codex")
+        );
+        assert_eq!(
+            reg.usage[2]
+                .extra
+                .get("token_file")
+                .and_then(|v| v.as_str()),
+            Some("/etc/acp.json")
+        );
+        assert_eq!(
+            reg.usage[3]
                 .extra
                 .get("api_key_file")
                 .and_then(|v| v.as_str()),
@@ -387,15 +394,17 @@ mod tests {
         // duplicate usage ids
         assert!(
             Registry::from_toml(
-                "version = 1\n[[usage]]\nid = \"a\"\nkind = \"codex\"\ncodex_home = \"x\"\n\
-                 [[usage]]\nid = \"a\"\nkind = \"codex\"\ncodex_home = \"y\"\n"
+                "version = 1\n\
+                 [[instance]]\nid = \"x\"\nharness = \"codex\"\nhome = \"~/.codex\"\n\
+                 [[usage]]\nid = \"a\"\nkind = \"codex\"\ninstance = \"x\"\n\
+                 [[usage]]\nid = \"a\"\nkind = \"codex\"\ninstance = \"x\"\n"
             )
             .is_err()
         );
         // instance must exist
         assert!(
             Registry::from_toml(
-                "version = 1\n[[usage]]\nid = \"a\"\nkind = \"codex\"\ncodex_home = \"x\"\ninstance = \"ghost\"\n"
+                "version = 1\n[[usage]]\nid = \"a\"\nkind = \"codex\"\ninstance = \"ghost\"\n"
             )
             .is_err()
         );

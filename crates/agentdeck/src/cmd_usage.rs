@@ -21,12 +21,6 @@ pub enum UsageCmd {
         #[arg(long)]
         display: Option<String>,
         #[arg(long)]
-        config_dir: Option<String>,
-        #[arg(long)]
-        codex_home: Option<String>,
-        #[arg(long)]
-        token_file: Option<String>,
-        #[arg(long)]
         api_key_env: Option<String>,
         #[arg(long)]
         db_file: Option<String>,
@@ -47,21 +41,18 @@ pub enum UsageCmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Show sources, backoff ages and state freshness. Read-only, no network.
+    /// Show sources and state freshness. Read-only, no network.
     Doctor {
         #[arg(long)]
         json: bool,
     },
-    /// Run a provider status-line hook: stdin JSON becomes the stdout line,
-    /// written through the same state dir the daemon reads.
+    // shortcut: keeps still-registered `usage hook claude|agy --account ...`
+    // commands exiting 0 quietly instead of emitting clap errors on every prompt;
+    // drop after installed machines run `plugin enable ai-usage` cleanup (next major bump).
+    #[command(hide = true)]
     Hook {
-        #[command(subcommand)]
-        hook: HookCmd,
-    },
-    /// Inspect hook installation. Read-only: installing is an owner step.
-    Hooks {
-        #[command(subcommand)]
-        hooks: HooksCmd,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        _args: Vec<String>,
     },
 }
 
@@ -74,39 +65,6 @@ pub enum UsageKindArg {
     Openrouter,
     Vercel,
     OpencodeGo,
-}
-
-#[derive(clap::Subcommand)]
-pub enum HookCmd {
-    /// Claude Code statusLine hook. Reads Claude JSON from stdin.
-    Claude {
-        #[arg(long)]
-        account: String,
-    },
-    /// Agy status-line hook. Reads official agy JSON from stdin.
-    Agy {
-        #[arg(long)]
-        account: String,
-    },
-}
-
-#[derive(clap::Subcommand)]
-pub enum HooksCmd {
-    /// Print the current hook command and the one it would become, per
-    /// Claude/agy account. Read-only.
-    Plan {
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-/// Shared `~/.config` base (what `dirs::config_dir` returns on Linux).
-/// Kept local so this binary needs no extra dependency for one lookup.
-fn shared_config_base() -> anyhow::Result<std::path::PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve config base: set HOME"))
 }
 
 impl UsageKindArg {
@@ -145,9 +103,6 @@ pub async fn run(paths: &Paths, cmd: UsageCmd) -> anyhow::Result<()> {
             kind,
             instance,
             display,
-            config_dir,
-            codex_home,
-            token_file,
             api_key_env,
             db_file,
             dry_run,
@@ -157,9 +112,6 @@ pub async fn run(paths: &Paths, cmd: UsageCmd) -> anyhow::Result<()> {
                 kind: kind.as_core(),
                 instance: opt(instance),
                 display: display.unwrap_or_default(),
-                config_dir: opt(config_dir),
-                codex_home: opt(codex_home),
-                token_file: opt(token_file),
                 api_key_env: opt(api_key_env),
                 db_file: opt(db_file),
                 extra: Default::default(),
@@ -219,48 +171,20 @@ pub async fn run(paths: &Paths, cmd: UsageCmd) -> anyhow::Result<()> {
                 print_doctor(&report);
             }
         }
-        UsageCmd::Hook { hook } => match hook {
-            HookCmd::Claude { account } => agentdeck_usage::hooks::run_claude_hook(&account)?,
-            HookCmd::Agy { account } => agentdeck_usage::hooks::run_agy_hook(&account)?,
-        },
-        UsageCmd::Hooks { hooks } => match hooks {
-            HooksCmd::Plan { json } => {
-                let reg = agentdeck_core::Registry::load(paths)?;
-                let accounts = agentdeck_usage::config::accounts_from_registry(&reg.usage)?;
-                let plan = agentdeck_usage::hooks::plan(
-                    &std::env::current_exe()?,
-                    &shared_config_base()?,
-                    &accounts,
-                );
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&plan)?);
-                } else {
-                    print_hook_plan(&plan);
-                }
-            }
-        },
+        UsageCmd::Hook { .. } => {
+            let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+        }
     }
     Ok(())
 }
 
-fn print_hook_plan(plan: &[agentdeck_usage::hooks::HookPlanEntry]) {
-    println!("agentdeck usage hooks plan (read-only; installing is an owner step)\n");
-    for e in plan {
-        println!("{} {}", e.kind, e.id);
-        println!("  location: {}", e.location.display());
-        match &e.current {
-            Some(cmd) => println!("  current:  {cmd}"),
-            None => println!("  current:  (not installed)"),
-        }
-        println!("  desired:  {}", e.desired);
-        if e.up_to_date {
-            println!("  status:   up-to-date");
-        }
-    }
-}
-
 fn print_doctor(report: &daemon::DoctorReport) {
     println!("agentdeck usage doctor\n");
+    if report.t3_health_refresh_interval_ms == Some(0) {
+        println!(
+            "T3 background refresh is off (providerHealthRefreshInterval=0; Settings -> Providers -> Health check interval); quotas update only on manual refresh and go stale."
+        );
+    }
     println!("sources: {}", report.sources.len());
     for s in &report.sources {
         let inst = s
@@ -269,13 +193,6 @@ fn print_doctor(report: &daemon::DoctorReport) {
             .map(|i| format!(" instance={i}"))
             .unwrap_or_default();
         println!("  {} {}{} {}", s.id, s.kind, inst, s.source);
-    }
-    for b in &report.backoffs {
-        match (b.age_secs, b.retry_in_secs) {
-            (_, Some(retry)) => println!("  backoff {}: retry in {} с", b.id, retry),
-            (Some(age), None) => println!("  backoff {}: last update {} с ago", b.id, age),
-            (None, None) => println!("  backoff {}: no state at {}", b.id, b.file.display()),
-        }
     }
     for f in [&report.canonical]
         .into_iter()

@@ -888,17 +888,7 @@ fn native_harness_decisions() {
                 .contains("explicit exact providerInstanceId/model")
         );
     }
-    // Codex native tool outside T3 passes through silently.
-    {
-        let fx = fx_for();
-        let input = serde_json::json!({"tool_name": "spawn_agent",
-            "tool_input": {"task": hinted("Fix the typo"), "target": sol},
-            "inT3": true, "model": "gpt-6-astra"});
-        let (code, out, err) = run_rust(&fx, "codex", &input.to_string());
-        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
-        assert_eq!(out, b"");
-        assert!(decisions(&fx.dir).is_empty());
-    }
+    // The outside-T3 case uses a synthetic chain in hook::tests; this process may itself run under T3.
     // Codex native tool under a T3 ancestry routes, then reroutes to
     // delegate_task (native launches never dispatch directly).
     {
@@ -982,4 +972,79 @@ fn native_harness_decisions() {
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["decision"], "allow");
     }
+}
+
+#[test]
+fn denial_preflight_reuses_full_task_and_hook_verdict() {
+    let short_jev = answers_for(
+        &[
+            ("codex_gpt_6_1_sol", level(2.0, 0.95)),
+            ("claudeagent_claude_opus_5_5", level(2.9, 0.95)),
+        ],
+        0.0,
+        0.0,
+    );
+    let fx = Fixture::new(&[SOL, OPUS], &short_jev, None);
+    let short = Command::new(env!("CARGO_BIN_EXE_agentdeck"))
+        .args(["route", "--source", "codex", "Fix the parser"])
+        .envs(fx.base_env("rt-rust"))
+        .env("AGENTDECK_ROUTE_MOCK_JEV", &fx.mock_jev)
+        .output()
+        .unwrap();
+    assert!(short.status.success());
+    let short: serde_json::Value = serde_json::from_slice(&short.stdout).unwrap();
+    assert_eq!(short["target"]["model"], OPUS.1);
+    std::fs::write(&fx.mock_jev, healthy_jev().to_string()).unwrap();
+    let task = format!(
+        "Fix the parser. Reproduce the escaped-delimiter failure, patch the scanner, and test malformed input.\n\n{}",
+        shared_hint()
+    );
+    let mut input = delegate_input(
+        "delegate_task",
+        &task,
+        short["target"].clone(),
+        serde_json::json!({}),
+    );
+    input["source"] = "codex".into();
+    let (code, out, err) = run_rust(&fx, "shell", &input.to_string());
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    let verdict: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(verdict["decision"], "deny");
+    let reason = verdict["reason"].as_str().unwrap();
+    let command = reason
+        .split('`')
+        .find(|s| s.starts_with("agentdeck route --source"))
+        .expect("denial must give the exact advance-validation command");
+    assert!(reason.contains("exact delegate_task.task"));
+    assert!(command.contains("--validate-target 'claudeAgent' 'claude-opus-5-5' - < task.txt"));
+    std::fs::write(fx.dir.join("task.txt"), &task).unwrap();
+    let preflight = Command::new("sh")
+        .args([
+            "-c",
+            &format!(
+                "exec \"$1\" {}",
+                command.strip_prefix("agentdeck ").unwrap()
+            ),
+            "preflight",
+            env!("CARGO_BIN_EXE_agentdeck"),
+        ])
+        .current_dir(&fx.dir)
+        .envs(fx.base_env("rt-rust"))
+        .env("AGENTDECK_ROUTE_MOCK_JEV", &fx.mock_jev)
+        .output()
+        .unwrap();
+    assert!(
+        preflight.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preflight.stderr)
+    );
+    let preflight: serde_json::Value = serde_json::from_slice(&preflight.stdout).unwrap();
+    assert_eq!(preflight["jevCache"], "hit");
+    assert_eq!(preflight["validation"]["allowed"], false);
+    let record = last_record(&fx);
+    assert_eq!(preflight["target"], record["target"]);
+    assert_eq!(
+        canon_output(&serde_json::to_vec(&preflight["ranking"]).unwrap()),
+        canon_output(&serde_json::to_vec(&record["ranking"]).unwrap())
+    );
 }

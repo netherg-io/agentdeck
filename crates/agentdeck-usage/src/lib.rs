@@ -1,7 +1,6 @@
 pub mod config;
 pub mod daemon;
 pub mod history;
-pub mod hooks;
 pub mod model;
 pub mod providers;
 pub mod util;

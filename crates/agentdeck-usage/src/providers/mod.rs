@@ -4,6 +4,7 @@ pub mod codex;
 pub mod deepseek;
 pub mod opencode_go;
 pub mod openrouter;
+pub mod t3;
 pub mod vercel;
 
 use crate::config::AccountConfig;
@@ -19,15 +20,12 @@ pub async fn fetch(account: AccountConfig, stale_seconds: i64) -> AccountState {
             id,
             name,
             plan,
-            config_dir,
-        } => claude::fetch(&id, &name, plan, &config_dir, stale_seconds).await,
+            instance,
+            ..
+        } => claude::fetch(&id, &name, plan, instance.as_deref(), stale_seconds).await,
         AccountConfig::Codex {
-            id,
-            name,
-            codex_home,
-            command,
-            limit_id,
-        } => codex::fetch(&id, &name, &codex_home, &command, &limit_id).await,
+            id, name, instance, ..
+        } => codex::fetch(&id, &name, instance.as_deref(), stale_seconds).await,
         AccountConfig::Deepseek {
             id,
             name,
@@ -47,13 +45,11 @@ pub async fn fetch(account: AccountConfig, stale_seconds: i64) -> AccountState {
             base_url,
         } => vercel::fetch(&id, &name, &api_key_env, &base_url).await,
         AccountConfig::Antigravity {
-            id,
-            name,
-            token_file,
-        } => antigravity::fetch(&id, &name, token_file.as_deref(), stale_seconds).await,
-        AccountConfig::OpencodeGo { id, name, db_file } => {
-            opencode_go::fetch(&id, &name, db_file.as_deref()).await
-        }
+            id, name, instance, ..
+        } => antigravity::fetch(&id, &name, instance.as_deref(), stale_seconds).await,
+        AccountConfig::OpencodeGo {
+            id, name, instance, ..
+        } => opencode_go::fetch(&id, &name, instance.as_deref(), stale_seconds).await,
     };
 
     result.unwrap_or_else(|error| AccountState::error(&id, &name, provider, error.to_string()))

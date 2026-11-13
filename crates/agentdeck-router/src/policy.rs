@@ -657,10 +657,16 @@ pub fn budget_allowed(
     now: f64,
 ) -> [bool; 4] {
     [0, 1, 2, 3].map(|size| {
-        windows
-            .iter()
-            .all(|w| headroom(w, reserve_percent, now) > weekly[size] * window_factor(w))
-            && balances.iter().all(|b| *b > USD_COST[size] * burn)
+        windows.iter().all(|w| {
+            let estimate = weekly[size] * window_factor(w);
+            // Subpercent burn estimates cannot safely fund a fresh launch near a short-window limit.
+            let required = if w.duration_mins >= 10080.0 {
+                estimate
+            } else {
+                estimate.max(1.0)
+            };
+            headroom(w, reserve_percent, now) > required
+        }) && balances.iter().all(|b| *b > USD_COST[size] * burn)
     })
 }
 
@@ -731,6 +737,7 @@ pub struct Candidate {
     pub policy_ban: Option<String>,
     pub fit: f64,
     pub quality: f64,
+    pub failure_penalty: f64,
     pub confidence: f64,
     pub allowed: bool,
     pub task_cost: Option<f64>,
@@ -803,7 +810,8 @@ pub fn rank_candidates(
             let owner_bonus = family_of(&c.model).map_or(0.0, |f| f.owner_bonus);
             let score = c.quality - shared_quota_penalty - paid_credit_penalty
                 + cheap_model_bonus
-                + owner_bonus;
+                + owner_bonus
+                - c.failure_penalty;
             Ranked {
                 account: own,
                 shared_quota,
@@ -1124,6 +1132,7 @@ mod user_rules_tests {
             no_review: true,
             policy_ban: ban.map(str::to_string),
             fit: 0.9,
+            failure_penalty: 0.0,
             quality: 0.8,
             confidence: 0.9,
             allowed: true,
@@ -1219,6 +1228,7 @@ mod unknown_models_tests {
             no_review: false,
             policy_ban: None,
             fit,
+            failure_penalty: 0.0,
             quality: 0.8,
             confidence: 0.9,
             allowed,
@@ -1401,6 +1411,7 @@ mod legacy_suite_edges {
             policy_ban: None,
             fit,
             quality,
+            failure_penalty: 0.0,
             confidence: 0.9,
             allowed,
             task_cost: Some(task_cost),
@@ -1416,6 +1427,37 @@ mod legacy_suite_edges {
                 balances: vec![],
             },
         }
+    }
+
+    #[test]
+    fn repeated_failures_penalize_only_the_affected_instance() {
+        let mut failed = cand(
+            "instance-a",
+            "gpt-example",
+            0.95,
+            0.8,
+            true,
+            0.1,
+            Some(1.0),
+            0,
+        );
+        failed.failure_penalty = 0.1;
+        let healthy = cand(
+            "instance-b",
+            "gpt-example",
+            0.95,
+            0.8,
+            true,
+            0.1,
+            Some(1.0),
+            0,
+        );
+        let ranked = rank_candidates(&cfg(&[]), vec![failed, healthy], 1, None, (0.0, 0.0, 0.0));
+        assert_eq!(ranked[0].candidate.provider, "instance-b");
+        assert!(ranked.iter().all(|r| r.eligible));
+        assert!((ranked[0].score - ranked[1].score - 0.1).abs() < 1e-9);
+        assert_eq!(ranked[0].candidate.quality, ranked[1].candidate.quality);
+        assert!(!validate_target(&ranked, "instance-a", "gpt-example").allowed);
     }
 
     #[test]
@@ -1503,6 +1545,33 @@ mod legacy_suite_edges {
         assert!(!allowed(&timed(1.0, 1.0), weekly, 1.0, &[], now, 1));
         assert!(!allowed(&timed(5.0, 0.0), weekly, 1.0, &[], now, 1));
         assert!(!allowed(&timed(5.0, -1.0), weekly, 1.0, &[], now, 1));
+    }
+
+    #[test]
+    fn short_window_launch_floor_and_estimate_boundaries() {
+        let weekly = [0.01, 0.03, 0.075, 0.2];
+        for (remaining, expected) in [(0.4, false), (0.999, false), (1.0, false), (1.001, true)] {
+            let windows = [w("session", remaining, 300.0, None, None)];
+            assert_eq!(
+                budget_allowed(&windows, &[], &weekly, 0.05, 0.0, 0.0)[2],
+                expected
+            );
+        }
+        // Larger estimates still require their full cost; weekly admission is unchanged.
+        for (remaining, expected) in [(7.499, false), (7.5, false), (7.501, true)] {
+            let windows = [w("session", remaining, 300.0, None, None)];
+            assert_eq!(
+                budget_allowed(&windows, &[], &[0.2, 0.6, 1.5, 4.0], 1.0, 0.0, 0.0)[2],
+                expected
+            );
+        }
+        let weekly_window = [w("week", 0.4, 10080.0, None, None)];
+        assert!(budget_allowed(&weekly_window, &[], &weekly, 0.05, 0.0, 0.0)[2]);
+        let healthy = [w("session", 20.0, 300.0, None, None)];
+        assert_eq!(
+            budget_allowed(&healthy, &[], &weekly, 0.05, 0.0, 0.0),
+            [true; 4]
+        );
     }
 
     #[test]

@@ -5,8 +5,112 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use agentdeck_core::{Change, Instance, Paths, Registry, UsageEntry, UsageKind, plan_write_file};
-use agentdeck_usage::config::AccountConfig;
+use agentdeck_core::{
+    Change, Harness, Instance, Paths, Registry, UsageEntry, UsageKind, plan_write_file,
+};
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct LegacyConfig {
+    #[serde(default)]
+    accounts: Vec<LegacyAccount>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "provider", rename_all = "lowercase")]
+enum LegacyAccount {
+    Claude {
+        id: String,
+        name: String,
+        #[serde(default)]
+        config_dir: PathBuf,
+    },
+    Codex {
+        id: String,
+        name: String,
+        #[serde(default)]
+        codex_home: PathBuf,
+        #[serde(default = "default_codex_command")]
+        command: String,
+    },
+    Deepseek {
+        id: String,
+        name: String,
+        api_key_env: String,
+    },
+    Openrouter {
+        id: String,
+        name: String,
+        api_key_env: String,
+    },
+    Vercel {
+        id: String,
+        name: String,
+        api_key_env: String,
+    },
+    Antigravity {
+        id: String,
+        name: String,
+        #[serde(default)]
+        token_file: Option<PathBuf>,
+    },
+    #[serde(rename = "opencode-go")]
+    OpencodeGo {
+        id: String,
+        name: String,
+        #[serde(default)]
+        db_file: Option<PathBuf>,
+    },
+}
+
+fn default_codex_command() -> String {
+    "codex".to_owned()
+}
+
+impl LegacyAccount {
+    fn id(&self) -> &str {
+        match self {
+            Self::Claude { id, .. }
+            | Self::Codex { id, .. }
+            | Self::Deepseek { id, .. }
+            | Self::Openrouter { id, .. }
+            | Self::Vercel { id, .. }
+            | Self::Antigravity { id, .. }
+            | Self::OpencodeGo { id, .. } => id,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Claude { name, .. }
+            | Self::Codex { name, .. }
+            | Self::Deepseek { name, .. }
+            | Self::Openrouter { name, .. }
+            | Self::Vercel { name, .. }
+            | Self::Antigravity { name, .. }
+            | Self::OpencodeGo { name, .. } => name,
+        }
+    }
+
+    fn provider(&self) -> &'static str {
+        match self {
+            Self::Claude { .. } => "claude",
+            Self::Codex { .. } => "codex",
+            Self::Deepseek { .. } => "deepseek",
+            Self::Openrouter { .. } => "openrouter",
+            Self::Vercel { .. } => "vercel",
+            Self::Antigravity { .. } => "antigravity",
+            Self::OpencodeGo { .. } => "opencode-go",
+        }
+    }
+
+    fn needs_instance(&self) -> bool {
+        matches!(
+            self,
+            Self::Claude { .. } | Self::Codex { .. } | Self::Antigravity { .. }
+        )
+    }
+}
 
 #[derive(clap::Subcommand)]
 pub enum MigrateCmd {
@@ -101,9 +205,9 @@ pub fn migrate_ai_usage(paths: &Paths, old: &OldTree, dry_run: bool) -> anyhow::
         println!("  file: kept newer {}", kept.display());
     }
     println!("  remaining owner steps (owner-run, this command never runs them):");
-    println!("  - agentdeck usage doctor   (check sources, backoffs, freshness)");
+    println!("  - agentdeck usage doctor   (check sources, freshness)");
     println!(
-        "  - agentdeck usage once --compat-write-ai-usage   (smoke poll while the old daemon still runs)"
+        "  - agentdeck usage once --compat-write-ai-usage   (read T3 quotas and poll balances after stopping the old daemon)"
     );
     println!("  - stop the old ai-usage service, then start the new daemon unit");
     println!(
@@ -135,7 +239,10 @@ pub fn plan_migration(paths: &Paths, old: &OldTree) -> anyhow::Result<MigrationP
     let raw = fs::read_to_string(&old.config_toml).map_err(|error| {
         anyhow::anyhow!("no old config at {}: {error}", old.config_toml.display())
     })?;
-    let config = agentdeck_usage::config::parse_str(&raw, &old.config_toml)?;
+    agentdeck_usage::config::parse_str(&raw, &old.config_toml)?;
+    let config: LegacyConfig = toml::from_str(&raw).map_err(|error| {
+        anyhow::anyhow!("invalid TOML in {}: {error}", old.config_toml.display())
+    })?;
     let reg = Registry::load(paths)?;
 
     let mut plan = MigrationPlan::default();
@@ -143,6 +250,7 @@ pub fn plan_migration(paths: &Paths, old: &OldTree) -> anyhow::Result<MigrationP
         let instance = resolve_instance(account, &reg.instances);
         let entry = usage_entry(account, instance.clone())?;
         let already = reg.usage.iter().any(|u| u.id == entry.id);
+        let missing_instance = !already && entry.instance.is_none() && account.needs_instance();
         plan.rows.push(MappingRow {
             id: account.id().to_owned(),
             kind: account.provider(),
@@ -150,18 +258,13 @@ pub fn plan_migration(paths: &Paths, old: &OldTree) -> anyhow::Result<MigrationP
             source: source_pointer(account),
             note: if already {
                 Some("already present".to_owned())
-            } else if entry.instance.is_none()
-                && matches!(
-                    account,
-                    AccountConfig::Claude { .. } | AccountConfig::Codex { .. }
-                )
-            {
+            } else if missing_instance {
                 Some("no matching instance".to_owned())
             } else {
                 None
             },
         });
-        if !already {
+        if !already && !missing_instance {
             plan.new_entries.push(entry);
         }
     }
@@ -231,20 +334,22 @@ fn should_copy(src: &Path, dest: &Path) -> bool {
     s >= d
 }
 
-/// Cooldowns, snapshots, history. `state.json` is regenerated by the daemon
-/// and stays out; anything else in the old tree is not ours to copy.
+/// History survives the cutover; obsolete provider snapshots and cooldowns do not.
 fn is_migrated_state_file(name: &str) -> bool {
-    ((name.starts_with("claude-usage-") || name.starts_with("antigravity-usage-"))
-        && name.ends_with(".json"))
-        || name == "history.jsonl"
-        || name == "history.jsonl.1"
+    name == "history.jsonl" || name == "history.jsonl.1"
 }
 
-/// `instance` matches the account's login dir against registry instance homes.
-fn resolve_instance(account: &AccountConfig, instances: &[Instance]) -> Option<String> {
+/// `instance` matches the account's login dir against registry instance homes,
+/// or resolves the unique `agy` instance for Antigravity.
+fn resolve_instance(account: &LegacyAccount, instances: &[Instance]) -> Option<String> {
+    if matches!(account, LegacyAccount::Antigravity { .. }) {
+        let mut agy = instances.iter().filter(|i| i.harness == Harness::Agy);
+        let first = agy.next()?;
+        return agy.next().is_none().then(|| first.id.clone());
+    }
     let dir = match account {
-        AccountConfig::Claude { config_dir, .. } => Some(config_dir),
-        AccountConfig::Codex { codex_home, .. } => Some(codex_home),
+        LegacyAccount::Claude { config_dir, .. } => Some(config_dir),
+        LegacyAccount::Codex { codex_home, .. } => Some(codex_home),
         _ => None,
     }?;
     let want = agentdeck_usage::util::expand_home(dir);
@@ -255,22 +360,22 @@ fn resolve_instance(account: &AccountConfig, instances: &[Instance]) -> Option<S
 }
 
 /// Path or env-var NAME, never a secret value.
-fn source_pointer(account: &AccountConfig) -> String {
+fn source_pointer(account: &LegacyAccount) -> String {
     match account {
-        AccountConfig::Claude { config_dir, .. } => config_dir.display().to_string(),
-        AccountConfig::Codex {
+        LegacyAccount::Claude { config_dir, .. } => config_dir.display().to_string(),
+        LegacyAccount::Codex {
             codex_home,
             command,
             ..
         } => format!("{command} CODEX_HOME={}", codex_home.display()),
-        AccountConfig::Deepseek { api_key_env, .. } => api_key_env.clone(),
-        AccountConfig::Openrouter { api_key_env, .. }
-        | AccountConfig::Vercel { api_key_env, .. } => api_key_env.clone(),
-        AccountConfig::Antigravity { token_file, .. } => token_file
+        LegacyAccount::Deepseek { api_key_env, .. } => api_key_env.clone(),
+        LegacyAccount::Openrouter { api_key_env, .. }
+        | LegacyAccount::Vercel { api_key_env, .. } => api_key_env.clone(),
+        LegacyAccount::Antigravity { token_file, .. } => token_file
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "auto-discovery".to_owned()),
-        AccountConfig::OpencodeGo { db_file, .. } => db_file
+        LegacyAccount::OpencodeGo { db_file, .. } => db_file
             .clone()
             .unwrap_or_else(agentdeck_usage::providers::opencode_go::default_db_file)
             .display()
@@ -278,7 +383,7 @@ fn source_pointer(account: &AccountConfig) -> String {
     }
 }
 
-fn usage_entry(account: &AccountConfig, instance: Option<String>) -> anyhow::Result<UsageEntry> {
+fn usage_entry(account: &LegacyAccount, instance: Option<String>) -> anyhow::Result<UsageEntry> {
     let kind = UsageKind::parse(account.provider())?;
     let path_string = |p: &Path| p.to_string_lossy().into_owned();
     let mut entry = UsageEntry {
@@ -286,29 +391,22 @@ fn usage_entry(account: &AccountConfig, instance: Option<String>) -> anyhow::Res
         kind,
         instance,
         display: account.name().to_owned(),
-        config_dir: None,
-        codex_home: None,
-        token_file: None,
         api_key_env: None,
         db_file: None,
         extra: Default::default(),
     };
     match account {
-        AccountConfig::Claude { config_dir, .. } => {
-            entry.config_dir = Some(path_string(config_dir))
-        }
-        AccountConfig::Codex { codex_home, .. } => entry.codex_home = Some(path_string(codex_home)),
-        AccountConfig::Deepseek { api_key_env, .. }
-        | AccountConfig::Openrouter { api_key_env, .. }
-        | AccountConfig::Vercel { api_key_env, .. } => {
+        LegacyAccount::Deepseek { api_key_env, .. }
+        | LegacyAccount::Openrouter { api_key_env, .. }
+        | LegacyAccount::Vercel { api_key_env, .. } => {
             entry.api_key_env = Some(api_key_env.clone());
         }
-        AccountConfig::Antigravity { token_file, .. } => {
-            entry.token_file = token_file.as_ref().map(|p| path_string(p));
-        }
-        AccountConfig::OpencodeGo { db_file, .. } => {
+        LegacyAccount::OpencodeGo { db_file, .. } => {
             entry.db_file = db_file.as_ref().map(|p| path_string(p));
         }
+        LegacyAccount::Claude { .. }
+        | LegacyAccount::Codex { .. }
+        | LegacyAccount::Antigravity { .. } => {}
     }
     Ok(entry)
 }
@@ -536,22 +634,21 @@ name = "OpenCode Go"
         assert_eq!(instance("claude-main").as_deref(), Some("claude-main"));
         assert_eq!(instance("codex-main").as_deref(), Some("codex-main"));
         assert_eq!(instance("claude-orphan"), None);
-        assert_eq!(instance("agy-main"), None);
+        assert_eq!(instance("agy-main").as_deref(), Some("agy-main"));
         assert_eq!(instance("openrouter-main"), None);
         assert!(plan.registry_change.is_some());
-        // 1 secrets + 4 state files.
-        assert_eq!(plan.file_changes.len(), 5);
+        // 1 secrets + 2 history files.
+        assert_eq!(plan.file_changes.len(), 3);
 
         migrate_ai_usage(&f.paths, &f.old, false).unwrap();
 
         let reg = Registry::load(&f.paths).unwrap();
-        assert_eq!(reg.usage.len(), 7);
+        assert_eq!(reg.usage.len(), 6);
         assert_eq!(
             reg.usage.iter().map(|u| u.id.clone()).collect::<Vec<_>>(),
             [
                 "claude-main",
                 "codex-main",
-                "claude-orphan",
                 "agy-main",
                 "openrouter-main",
                 "deepseek-main",
@@ -564,7 +661,6 @@ name = "OpenCode Go"
             [
                 "claude",
                 "codex",
-                "claude",
                 "antigravity",
                 "openrouter",
                 "deepseek",
@@ -583,17 +679,18 @@ name = "OpenCode Go"
         );
 
         let new_usage = f.paths.state_dir.join("usage");
-        for name in [
-            "claude-usage-claude-main.json",
-            "antigravity-usage-agy-main.json",
-            "history.jsonl",
-            "history.jsonl.1",
-        ] {
+        for name in ["history.jsonl", "history.jsonl.1"] {
             assert_eq!(
                 fs::read(new_usage.join(name)).unwrap(),
                 fs::read(f.old.state_dir.join(name)).unwrap(),
                 "{name}"
             );
+        }
+        for name in [
+            "claude-usage-claude-main.json",
+            "antigravity-usage-agy-main.json",
+        ] {
+            assert!(!new_usage.join(name).exists());
         }
         assert!(!new_usage.join("state.json").exists());
         assert!(!new_usage.join("notes.txt").exists());

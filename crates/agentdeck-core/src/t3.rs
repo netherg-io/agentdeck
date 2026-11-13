@@ -14,6 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags};
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::Paths;
@@ -503,6 +504,127 @@ pub fn cache_health(t3_root: &Path, id: &str) -> Option<CacheHealth> {
             .and_then(Value::as_str)
             .map(str::to_string),
     })
+}
+
+fn empty_if_null<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct T3UsageWindow {
+    pub id: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub window_duration_mins: Option<u64>,
+    #[serde(default)]
+    pub used_percent: Option<f64>,
+    #[serde(default)]
+    pub resets_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct T3UsageLimitsUnavailable {
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct T3UsageLimits {
+    #[serde(default)]
+    pub checked_at: Option<String>,
+    #[serde(default, deserialize_with = "empty_if_null")]
+    pub windows: Vec<T3UsageWindow>,
+    #[serde(default)]
+    pub unavailable: Option<T3UsageLimitsUnavailable>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct T3AuthInfo {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default, rename = "type")]
+    pub auth_type: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct T3ProviderCache {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub checked_at: Option<String>,
+    #[serde(default)]
+    pub auth: Option<T3AuthInfo>,
+    #[serde(default)]
+    pub usage_limits: Option<T3UsageLimits>,
+}
+
+pub fn cache_file(t3_root: &Path, id: &str) -> PathBuf {
+    caches_dir(t3_root).join(format!("{id}.json"))
+}
+
+/// Authoritative enabled flag for one T3 instance from `userdata/settings.json`
+/// (`providerInstances.<id>.enabled`). Returns `Ok(None)` when the instance id is
+/// absent from `providerInstances`; refuses missing/corrupt settings.
+pub fn read_instance_enabled(t3_root: &Path, id: &str) -> anyhow::Result<Option<bool>> {
+    check_t3_slug(id)?;
+    if !t3_root.exists() {
+        anyhow::bail!(
+            "T3 data directory not found at {}; start T3 Code",
+            t3_root.display()
+        );
+    }
+    let settings_path = settings_file(t3_root);
+    let raw = fs::read(&settings_path)
+        .map_err(|e| anyhow::anyhow!("cannot read T3 {}: {e}", settings_path.display()))?;
+    let settings = parse_settings_strict(&raw)?;
+    let pi = settings
+        .get("providerInstances")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("T3 settings.json has no providerInstances object"))?;
+    let Some(entry) = pi.get(id) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        entry
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    ))
+}
+
+/// Read and strictly parse `caches/<id>.json` (`Ok(None)` if the file does not
+/// exist; `Err` on half-written/malformed JSON or I/O error).
+pub fn read_usage_cache(t3_root: &Path, id: &str) -> anyhow::Result<Option<T3ProviderCache>> {
+    check_t3_slug(id)?;
+    let path = cache_file(t3_root, id);
+    let raw = match fs::read(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => anyhow::bail!("cannot read T3 cache {}: {e}", path.display()),
+    };
+    let parsed: T3ProviderCache = serde_json::from_slice(&raw)
+        .map_err(|e| anyhow::anyhow!("invalid T3 cache {}: {e}", path.display()))?;
+    Ok(Some(parsed))
 }
 
 /// Read-only thread count from `statev2.sqlite` (read-only connection, never
@@ -1445,5 +1567,37 @@ mod tests {
             ("two".to_string(), want("two")),
         ]);
         assert_eq!(merge_settings(&old, &desired).unwrap(), old);
+    }
+
+    #[test]
+    fn read_instance_enabled_reads_settings_not_cache() {
+        let (_paths, t3, _g) = setup("enabled", SETTINGS);
+        assert_eq!(read_instance_enabled(&t3, "codex").unwrap(), Some(true));
+        assert_eq!(read_instance_enabled(&t3, "foreign").unwrap(), Some(false));
+        assert_eq!(read_instance_enabled(&t3, "ghost").unwrap(), None);
+        assert!(read_instance_enabled(&t3.join("missing"), "codex").is_err());
+        assert!(read_instance_enabled(&t3, "../escape").is_err());
+    }
+
+    #[test]
+    fn read_usage_cache_handles_valid_missing_and_half_written() {
+        let (_paths, t3, _g) = setup("usage-cache", SETTINGS);
+        assert!(read_usage_cache(&t3, "codex").unwrap().is_none());
+
+        fs::write(
+            cache_file(&t3, "codex"),
+            r#"{"enabled":true,"status":"ready","usageLimits":{"checkedAt":"2026-11-13T10:00:00.000Z","windows":[{"id":"primary","kind":"session","label":"Session","usedPercent":12.5},{"id":"custom","kind":"other","label":"Custom","windowDurationMins":60,"usedPercent":40,"resetsAt":"2026-11-13T11:00:00Z"}]}}"#,
+        )
+        .unwrap();
+        let cache = read_usage_cache(&t3, "codex").unwrap().unwrap();
+        assert_eq!(cache.status.as_deref(), Some("ready"));
+        let limits = cache.usage_limits.unwrap();
+        assert_eq!(limits.windows.len(), 2);
+        assert_eq!(limits.windows[0].used_percent, Some(12.5));
+        assert_eq!(limits.windows[0].window_duration_mins, None);
+        assert_eq!(limits.windows[0].resets_at, None);
+
+        fs::write(cache_file(&t3, "broken"), "{\"status\":\"ready\",\"usage").unwrap();
+        assert!(read_usage_cache(&t3, "broken").is_err());
     }
 }

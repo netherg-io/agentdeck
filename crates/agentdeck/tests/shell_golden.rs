@@ -174,6 +174,7 @@ fn write_fake(dir: &std::path::Path) {
 data = sys.stdin.buffer.read()
 open(os.environ['DUMP_STDIN'], 'wb').write(data)
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+open(os.environ['DUMP_SOCKET_PATH'], 'w').write(os.environ['T3_SHELL_MCP_SOCKET'])
 s.connect(os.environ['T3_SHELL_MCP_SOCKET'])
 line = b''
 while not line.endswith(b'\n'):
@@ -189,7 +190,20 @@ open(os.environ['DUMP_SOCK'], 'wb').write(line)
 
 #[test]
 fn streaming_proxy_matches_golden() {
-    let dir = std::env::temp_dir().join(format!(
+    check_streaming_proxy(std::env::temp_dir(), false);
+}
+
+#[test]
+fn streaming_proxy_handles_long_tmpdir_and_runtime_paths() {
+    let base = std::env::temp_dir().join(format!("agentdeck-long-{}", "x".repeat(120)));
+    for tmpdir_only in [false, true] {
+        check_streaming_proxy(base.clone(), tmpdir_only);
+    }
+    std::fs::remove_dir(&base).unwrap();
+}
+
+fn check_streaming_proxy(base: PathBuf, tmpdir_only: bool) {
+    let dir = base.join(format!(
         "agentdeck-shell-cli-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -221,6 +235,10 @@ fn streaming_proxy_matches_golden() {
             .arg("--input-format").arg("stream-json")
             .arg("--mcp-config").arg(serde_json::json!({"mcpServers": serde_json::from_str::<serde_json::Value>(GOOD).unwrap()}).to_string());
         child_env(&mut cmd, &dir, "rust");
+        cmd.env("TMPDIR", &dir);
+        if tmpdir_only {
+            cmd.env_remove("XDG_RUNTIME_DIR");
+        }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -257,6 +275,9 @@ fn streaming_proxy_matches_golden() {
         ),
         "rust stderr: {rerr}"
     );
+    let socket_path = PathBuf::from(std::fs::read_to_string(dir.join("socket-path-rust")).unwrap());
+    assert!(!socket_path.exists());
+    assert!(!socket_path.parent().unwrap().exists());
     // The proxy removes its own session directory on exit.
     let leftovers: Vec<_> = std::fs::read_dir(dir.join("rt-rust")).unwrap().collect();
     assert!(
@@ -271,6 +292,7 @@ fn child_env(cmd: &mut Command, dir: &std::path::Path, tag: &str) {
     cmd.env("XDG_RUNTIME_DIR", dir.join(format!("rt-{tag}")));
     cmd.env("DUMP_STDIN", dir.join(format!("stdin-{tag}")));
     cmd.env("DUMP_SOCK", dir.join(format!("sock-{tag}")));
+    cmd.env("DUMP_SOCKET_PATH", dir.join(format!("socket-path-{tag}")));
 }
 
 #[test]

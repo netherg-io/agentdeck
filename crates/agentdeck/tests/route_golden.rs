@@ -852,3 +852,237 @@ fn catalog_save_contract() {
     assert_ne!(code, 0);
     assert_eq!(std::fs::read(&catalog_path).unwrap(), before);
 }
+
+#[test]
+fn t3_reader_output_drives_router_quota_gates() {
+    use agentdeck_usage::providers::t3::{T3Source, fetch_from_root};
+    use serde_json::json;
+
+    const NOW: i64 = 1_794_569_047;
+    let cases = [
+        (
+            "codex",
+            "codex",
+            "codex",
+            "gpt-6.1-sol",
+            json!([{"id":"primary", "kind":"monthly", "label":"Monthly", "windowDurationMins":43200, "usedPercent":95}]),
+            Some(43_200),
+        ),
+        (
+            "opencode-go",
+            "opencode",
+            "opencode",
+            "opencode-go/glm-5",
+            json!([{"id":"go_monthly", "kind":"monthly", "label":"Monthly", "usedPercent":95}]),
+            Some(43_200),
+        ),
+        (
+            "antigravity",
+            "antigravity",
+            "antigravity",
+            "gemini-4-hydrogen-high",
+            json!([
+                {"id":"claude-quota", "kind":"other", "label":"Claude Quota", "usedPercent":20},
+                {"id":"gemini-quota", "kind":"other", "label":"Gemini Quota", "usedPercent":99.5},
+                {"id":"gpt-quota", "kind":"other", "label":"GPT Quota", "usedPercent":15}
+            ]),
+            None,
+        ),
+    ];
+    let allowed_sizes = |output: &str| {
+        output
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("allowed sizes: "))
+            .expect("router reports allowed sizes")
+            .to_owned()
+    };
+    for (provider, instance, driver, model, windows, duration) in cases {
+        let fx = Fixture::new(&[(instance, model)]);
+        let t3 = fx.dir.join(".t3");
+        std::fs::create_dir_all(t3.join("caches")).unwrap();
+        std::fs::write(
+            t3.join("userdata/settings.json"),
+            json!({"providerInstances": {instance: {"driver":driver, "enabled":true}}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            agentdeck_core::t3::cache_file(&t3, instance),
+            json!({"status":"ready", "auth":{"status":"authenticated", "label":"ChatGPT Free Subscription"},
+                "usageLimits":{"checkedAt":"2026-11-13T11:24:07Z", "windows":windows}}).to_string(),
+        ).unwrap();
+        let account = fetch_from_root(
+            &t3,
+            T3Source {
+                id: "fixture-source",
+                name: "Fixture",
+                provider,
+                instance: Some(instance),
+                explicit_plan: None,
+            },
+            900,
+            NOW,
+        );
+        assert_eq!(account.status, "ok", "{provider}: {:?}", account.error);
+        assert_eq!(
+            account.windows.len(),
+            if duration.is_some() { 1 } else { 3 }
+        );
+        for window in &account.windows {
+            assert_eq!(window.duration_mins, duration, "{provider}: {}", window.key);
+            assert_eq!(window.scope, None);
+        }
+        let state = json!({"accounts":[account]});
+        let state_path = fx.dir.join(".local/state/ai-usage/state.json");
+        std::fs::write(&state_path, state.to_string()).unwrap();
+        std::fs::write(fx.dir.join("router.json"), json!({
+            "version":1, "pool":[{"providerInstanceId":instance, "model":model, "enabled":true}],
+            "accounts":{"fixture":{"instances":[instance], "usageProvider":provider, "usageId":"fixture-source"}},
+            "usageStatePath":state_path,
+        }).to_string()).unwrap();
+        std::fs::write(
+            fx.dir.join(".local/state/model-route/catalog.json"),
+            json!({
+                "providers":[{"providerInstanceId":instance, "driverKind":driver, "models":[{"id":model, "options":[]}]}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mock = write_mock(&fx, &json!({}));
+        let (code, stdout, stderr) = run_rust(&fx, &["--check"], &mock, None);
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&stderr));
+        assert!(stdout.contains(&format!("{instance}/{model}")), "{stdout}");
+        assert!(!stdout.contains("no ai-usage account"), "{stdout}");
+        assert!(stdout.contains("allowed sizes:"), "{stdout}");
+        if duration.is_some() {
+            let mut wrong_duration = state;
+            wrong_duration["accounts"][0]["windows"][0]["duration_mins"] = json!(null);
+            std::fs::write(&state_path, wrong_duration.to_string()).unwrap();
+            let (code, wrong, _) = run_rust(&fx, &["--check"], &mock, None);
+            assert_eq!(code, 0);
+            assert_ne!(
+                allowed_sizes(&stdout),
+                allowed_sizes(&String::from_utf8(wrong).unwrap()),
+                "{provider}: monthly duration must affect routing"
+            );
+        } else {
+            assert_eq!(allowed_sizes(&stdout), "none", "{stdout}");
+            let mut healthy = state;
+            healthy["accounts"][0]["windows"][1]["remaining_percent"] = json!(80);
+            std::fs::write(&state_path, healthy.to_string()).unwrap();
+            let (code, stdout, _) = run_rust(&fx, &["--check"], &mock, None);
+            assert_eq!(code, 0);
+            assert_eq!(
+                allowed_sizes(&String::from_utf8(stdout).unwrap()),
+                "0,1,2,3"
+            );
+        }
+    }
+}
+
+#[test]
+fn recent_quota_failure_blocks_instance_until_reset() {
+    let fx = Fixture::new(&[SOL, OPUS]);
+    let db = rusqlite::Connection::open(fx.dir.join(".t3/userdata/statev2.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE orchestration_v2_projection_subagents (
+        subagent_id TEXT, provider_instance_id TEXT, status TEXT, completed_at TEXT,
+        updated_at TEXT, payload_json TEXT);
+        INSERT INTO orchestration_v2_projection_subagents VALUES ('failed-child', 'codex', 'failed',
+        strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+        '{\"result\":\"You have reached your quota for this period. Your limit will reset in 3 hours, 22 seconds.\"}');").unwrap();
+    let jev = answers_for(
+        &[
+            ("codex_gpt_6_1_sol", level(2.9, 0.95)),
+            ("claudeagent_claude_opus_5_5", level(2.4, 0.95)),
+        ],
+        1.0,
+        1.0,
+    );
+    let mock = write_mock(&fx, &jev);
+    let run = || {
+        let (code, out, err) = run_rust(
+            &fx,
+            &["--source", "claudeAgent", "Implement the parser"],
+            &mock,
+            None,
+        );
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+    let before = std::fs::read(fx.dir.join(".t3/userdata/statev2.sqlite")).unwrap();
+    let limited = run();
+    assert_eq!(limited["target"]["model"], OPUS.1);
+    let blocked = limited["ranking"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["provider"] == SOL.0)
+        .unwrap();
+    assert_eq!(blocked["eligible"], false);
+    assert!(
+        blocked["policyBan"]
+            .as_str()
+            .unwrap()
+            .contains("recent quota failure")
+    );
+    assert_eq!(
+        std::fs::read(fx.dir.join(".t3/userdata/statev2.sqlite")).unwrap(),
+        before
+    );
+    db.execute_batch("UPDATE orchestration_v2_projection_subagents SET completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now','-4 hours')").unwrap();
+    assert_eq!(run()["target"]["model"], SOL.1);
+}
+
+#[test]
+fn repeated_provider_errors_lower_rank_without_exclusion() {
+    let fx = Fixture::new(&[SOL, OPUS]);
+    let db = rusqlite::Connection::open(fx.dir.join(".t3/userdata/statev2.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE orchestration_v2_projection_subagents (
+        subagent_id TEXT, provider_instance_id TEXT, status TEXT, completed_at TEXT,
+        updated_at TEXT, payload_json TEXT);",
+    )
+    .unwrap();
+    let mock = write_mock(
+        &fx,
+        &answers_for(
+            &[
+                ("codex_gpt_6_1_sol", level(2.7, 0.95)),
+                ("claudeagent_claude_opus_5_5", level(2.6, 0.95)),
+            ],
+            1.0,
+            1.0,
+        ),
+    );
+    let run = || {
+        let (code, out, err) = run_rust(
+            &fx,
+            &["--source", "unknown", "Implement the parser"],
+            &mock,
+            None,
+        );
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+    assert_eq!(run()["target"]["model"], SOL.1);
+    for id in ["first", "second"] {
+        db.execute(
+            "INSERT INTO orchestration_v2_projection_subagents VALUES (?1, 'codex', 'failed',
+            strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            '{\"result\":\"Provider stopped this turn because of an error.\"}')",
+            [id],
+        )
+        .unwrap();
+    }
+    let degraded = run();
+    assert_eq!(degraded["target"]["model"], OPUS.1);
+    let failed = degraded["ranking"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["provider"] == SOL.0)
+        .unwrap();
+    assert_eq!(failed["eligible"], true);
+    assert_eq!(failed["failurePenalty"], 0.05);
+    assert!(failed.get("policyBan").is_none());
+}

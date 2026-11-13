@@ -120,15 +120,13 @@ fn visibility_path(paths: &Paths) -> PathBuf {
 }
 
 /// Label key and whether the field is required, per kind.
-fn source_field(kind: UsageKind) -> (&'static str, bool) {
+fn source_field(kind: UsageKind) -> Option<(&'static str, bool)> {
     match kind {
-        UsageKind::Claude => ("usage-config-dir", true),
-        UsageKind::Codex => ("usage-codex-home", true),
+        UsageKind::Claude | UsageKind::Codex | UsageKind::Antigravity => None,
         UsageKind::Deepseek | UsageKind::Openrouter | UsageKind::Vercel => {
-            ("usage-api-key-env", false)
+            Some(("usage-api-key-env", false))
         }
-        UsageKind::Antigravity => ("usage-token-file", false),
-        UsageKind::OpencodeGo => ("usage-db-file", false),
+        UsageKind::OpencodeGo => Some(("usage-db-file", false)),
     }
 }
 
@@ -181,20 +179,19 @@ fn entry_of(form: &Form) -> anyhow::Result<UsageEntry> {
         kind,
         instance: form.instance.clone(),
         display: form.display.trim().to_string(),
-        config_dir: None,
-        codex_home: None,
-        token_file: None,
         api_key_env: None,
         db_file: None,
         extra: Default::default(),
     };
-    *match kind {
-        UsageKind::Claude => &mut entry.config_dir,
-        UsageKind::Codex => &mut entry.codex_home,
-        UsageKind::Deepseek | UsageKind::Openrouter | UsageKind::Vercel => &mut entry.api_key_env,
-        UsageKind::Antigravity => &mut entry.token_file,
-        UsageKind::OpencodeGo => &mut entry.db_file,
-    } = source;
+    match kind {
+        UsageKind::Deepseek | UsageKind::Openrouter | UsageKind::Vercel => {
+            entry.api_key_env = source;
+        }
+        UsageKind::OpencodeGo => {
+            entry.db_file = source;
+        }
+        UsageKind::Claude | UsageKind::Codex | UsageKind::Antigravity => {}
+    }
     if is_key_kind(kind) && entry.api_key_env.is_none() {
         entry.api_key_env = Some(default_key_env(kind, &form.id));
     }
@@ -391,12 +388,6 @@ fn add_form(form: &Form, instances: &[String]) -> crate::overlay::Modal<'static,
             .into(),
     )];
     if let Some(kind) = form.kind {
-        let (key, required) = source_field(kind);
-        let label = if required {
-            loader().get(key)
-        } else {
-            fl!(loader(), "usage-optional", what = loader().get(key))
-        };
         body.push(field(
             fl!(loader(), "usage-id"),
             input(&format!("{}-main", kind.as_str()), &form.id, Msg::Id),
@@ -415,20 +406,31 @@ fn add_form(form: &Form, instances: &[String]) -> crate::overlay::Modal<'static,
                     .into(),
             ));
         }
-        let placeholder = if is_key_kind(kind) {
-            default_key_env(
-                kind,
-                if form.id.trim().is_empty() {
-                    "main"
-                } else {
-                    &form.id
-                },
-            )
-        } else {
-            String::new()
-        };
-        body.push(field(label, input(&placeholder, &form.source, Msg::Source)));
-        if matches!(kind, UsageKind::Claude | UsageKind::Codex) && !instances.is_empty() {
+        if let Some((key, required)) = source_field(kind) {
+            let label = if required {
+                loader().get(key)
+            } else {
+                fl!(loader(), "usage-optional", what = loader().get(key))
+            };
+            let placeholder = if is_key_kind(kind) {
+                default_key_env(
+                    kind,
+                    if form.id.trim().is_empty() {
+                        "main"
+                    } else {
+                        &form.id
+                    },
+                )
+            } else {
+                String::new()
+            };
+            body.push(field(label, input(&placeholder, &form.source, Msg::Source)));
+        }
+        if matches!(
+            kind,
+            UsageKind::Claude | UsageKind::Codex | UsageKind::Antigravity
+        ) && !instances.is_empty()
+        {
             body.push(field(
                 fl!(loader(), "usage-instance"),
                 pick_list(instances.to_vec(), form.instance.clone(), Msg::Instance)
@@ -643,10 +645,16 @@ mod tests {
             (e.id.as_str(), e.api_key_env.as_deref()),
             ("ds", Some("DEEPSEEK_KEY"))
         );
-        assert!(e.config_dir.is_none() && e.codex_home.is_none());
+        assert!(e.db_file.is_none());
         form.kind = Some(UsageKind::OpencodeGo);
         form.source = "  ".into();
         assert!(entry_of(&form).unwrap().db_file.is_none());
+        form.kind = Some(UsageKind::Claude);
+        form.source = "/ignored".into();
+        form.instance = Some("claude-main".into());
+        let claude = entry_of(&form).unwrap();
+        assert_eq!(claude.instance.as_deref(), Some("claude-main"));
+        assert!(claude.api_key_env.is_none() && claude.db_file.is_none());
         form.kind = None;
         assert!(entry_of(&form).is_err());
     }

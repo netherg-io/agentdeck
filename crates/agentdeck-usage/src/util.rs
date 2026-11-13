@@ -3,20 +3,9 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-
-/// Process-wide state-dir override. The `agentdeck` binary sets it once at
-/// startup to `XDG_STATE/agentdeck/usage`; unset, the default stays the
-/// `ai-usage` tree the compat copies and the migrator read.
-static STATE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
-
-/// Set once at `agentdeck` startup, before any provider runs. Later calls are ignored.
-pub fn set_state_dir_override(dir: PathBuf) {
-    let _ = STATE_DIR_OVERRIDE.set(dir);
-}
 
 pub fn unix_now() -> i64 {
     SystemTime::now()
@@ -50,25 +39,8 @@ pub fn state_file() -> PathBuf {
     runtime_dir().join("state.json")
 }
 
-/// Каталог для данных, которые обязаны пережить перезагрузку.
-///
-/// `runtime_dir()` лежит на tmpfs: для Claude, Codex и DeepSeek это и правильно
-/// — там кеш, который демон восполняет сам. Провайдеру, чей единственный
-/// источник данных снаружи (`agy` присылает квоту сам и только пока запущен),
-/// такой каталог означает потерю данных при каждой перезагрузке.
-///
-/// The `agentdeck` binary overrides this once at startup (see
-/// [`set_state_dir_override`]); unset, it is the `ai-usage` dir the compat
-/// copies and the migrator read.
-pub fn persistent_state_dir() -> PathBuf {
-    if let Some(dir) = STATE_DIR_OVERRIDE.get() {
-        return dir.clone();
-    }
-    legacy_persistent_state_dir()
-}
-
 /// The `~/.local/state/ai-usage` tree: compat copies, and everything the
-/// migrator reads. Never overridden.
+/// migrator reads.
 pub fn legacy_persistent_state_dir() -> PathBuf {
     dirs::state_dir()
         .map(|dir| dir.join("ai-usage"))
@@ -147,42 +119,6 @@ pub fn humanize_plan(raw: &str) -> String {
 
 pub fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-/// Каталоги, которые пользовательские установщики (npm, standalone-инсталляторы
-/// Claude/Codex) используют по умолчанию.
-///
-/// `ai-usage.service` поднимается из `default.target` раньше, чем GNOME-сессия
-/// импортирует PATH логин-шелла: демон стартует с голым
-/// `/usr/local/sbin:/usr/local/bin:/usr/bin`, где `~/.local/bin` нет. Поэтому
-/// одного PATH для поиска бинарника провайдера недостаточно.
-const EXTRA_BIN_DIRS: [&str; 3] = ["~/.local/bin", "~/bin", "/usr/local/bin"];
-
-/// Разворачивает имя команды в абсолютный путь.
-///
-/// Возвращает `None`, если команду найти не удалось: вызывающий сам решает,
-/// сообщить об этом или оставить исходное значение.
-pub fn resolve_command(command: &str) -> Option<String> {
-    let path = Path::new(command);
-    if path.components().count() > 1 {
-        let expanded = expand_home(path);
-        return expanded
-            .is_file()
-            .then(|| expanded.to_string_lossy().into_owned());
-    }
-
-    let from_path = env::var_os("PATH")
-        .map(|value| env::split_paths(&value).collect::<Vec<_>>())
-        .unwrap_or_default();
-    let extra = EXTRA_BIN_DIRS.iter().map(|dir| expand_home(Path::new(dir)));
-
-    for directory in from_path.into_iter().chain(extra) {
-        let candidate = directory.join(command);
-        if candidate.is_file() {
-            return Some(candidate.to_string_lossy().into_owned());
-        }
-    }
-    None
 }
 
 /// Shared loader: `path` holds `KEY=value` lines, existing process vars win.
@@ -298,30 +234,6 @@ mod tests {
     }
 
     #[test]
-    fn state_dir_override_redirects_cooldown_files() {
-        // This is the only test that ever sets the override: before this
-        // point the default must be the old tree.
-        assert!(legacy_persistent_state_dir().ends_with("ai-usage"));
-        assert_eq!(persistent_state_dir(), legacy_persistent_state_dir());
-
-        let dir = temp_dir("state-override");
-        let target = dir.join("usage");
-        set_state_dir_override(target.clone());
-
-        assert_eq!(persistent_state_dir(), target);
-        // Cooldown/snapshot files follow the override (same dir the new
-        // daemon passes as its cooldown dir).
-        assert_eq!(
-            crate::providers::antigravity::snapshot_path("agy-main"),
-            target.join("antigravity-usage-agy-main.json")
-        );
-        // Compat and the old binary keep the old tree even while set.
-        assert!(legacy_persistent_state_dir().ends_with("ai-usage"));
-        assert_ne!(persistent_state_dir(), legacy_persistent_state_dir());
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
     fn accepts_safe_ids() {
         for id in ["claude-main", "codex_work", "a1", "A-B_9"] {
             validate_id(id).unwrap_or_else(|error| panic!("{id} отклонён: {error}"));
@@ -363,60 +275,5 @@ mod tests {
             expand_home(Path::new("/absolute/path")),
             PathBuf::from("/absolute/path")
         );
-    }
-
-    #[test]
-    fn resolves_a_command_found_only_in_a_user_bin_dir() {
-        // Регрессия: ai-usage.service стартует из default.target раньше, чем
-        // GNOME импортирует PATH сессии, и получает PATH без ~/.local/bin.
-        // Поиск обязан покрывать пользовательские каталоги сам.
-        let Some(home) = dirs::home_dir() else {
-            return;
-        };
-        let dir = home.join(".local/bin");
-        if fs::create_dir_all(&dir).is_err() {
-            return;
-        }
-        let name = format!("ai-usage-test-probe-{}", std::process::id());
-        let probe = dir.join(&name);
-        if fs::write(&probe, b"#!/bin/sh\n").is_err() {
-            return;
-        }
-        fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
-
-        // PATH, с которым сервис реально стартует после reboot.
-        let saved = env::var_os("PATH");
-        unsafe { env::set_var("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin") };
-        let resolved = resolve_command(&name);
-        match saved {
-            Some(value) => unsafe { env::set_var("PATH", value) },
-            None => unsafe { env::remove_var("PATH") },
-        }
-        let _ = fs::remove_file(&probe);
-
-        assert_eq!(
-            resolved.as_deref(),
-            Some(probe.to_string_lossy().as_ref()),
-            "команда из ~/.local/bin должна находиться без помощи PATH"
-        );
-    }
-
-    #[test]
-    fn resolves_an_absolute_path_only_if_it_exists() {
-        assert_eq!(
-            resolve_command("/usr/bin/env").as_deref(),
-            Some("/usr/bin/env")
-        );
-        assert!(resolve_command("/nonexistent/path/to/codex").is_none());
-    }
-
-    #[test]
-    fn unknown_command_resolves_to_nothing() {
-        assert!(resolve_command("ai-usage-definitely-not-a-real-command").is_none());
-    }
-
-    #[test]
-    fn does_not_resolve_a_directory_as_a_command() {
-        assert!(resolve_command("/usr/bin").is_none());
     }
 }

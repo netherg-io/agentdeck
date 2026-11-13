@@ -74,9 +74,6 @@ fn write_registry(paths: &Paths) {
             kind: agentdeck_core::UsageKind::Claude,
             instance: Some("claude-main".into()),
             display: "Claude main".into(),
-            config_dir: Some("~/.claude".into()),
-            codex_home: None,
-            token_file: None,
             api_key_env: None,
             db_file: None,
             extra: Default::default(),
@@ -86,9 +83,6 @@ fn write_registry(paths: &Paths) {
             kind: agentdeck_core::UsageKind::Openrouter,
             instance: None,
             display: "OpenRouter".into(),
-            config_dir: None,
-            codex_home: None,
-            token_file: None,
             api_key_env: Some("AGENTDECK_TEST_KEY".into()),
             db_file: None,
             extra: Default::default(),
@@ -1087,10 +1081,15 @@ fn quota_module_hides_providers_and_adds_and_removes_sources() {
     // A refused add (missing required field) shows the reason and no Apply.
     run(&mut state, Msg::OpenAdd);
     run(&mut state, Msg::Kind(Kind(UsageKind::Claude)));
+    {
+        let mut ui = iced_test::simulator(app::view(&state));
+        ui.find("Instance").unwrap();
+        assert!(ui.find("Claude config directory").is_err());
+    }
     run(&mut state, Msg::Id("claude-gui".into()));
     run(&mut state, Msg::AskAdd);
     iced_test::simulator(app::view(&state))
-        .find(r#"usage "claude-gui" (kind claude): missing "config_dir""#)
+        .find(r#"usage "claude-gui" (kind claude): missing "instance""#)
         .unwrap();
     run(&mut state, Msg::Confirm);
     assert!(

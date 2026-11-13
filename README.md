@@ -2,19 +2,19 @@
 
 Linux-only manager for harness instances and accounts: Claude Code, Codex,
 OpenCode and Antigravity (`agy`). One Rust binary holds the CLI, the iced GUI
-and the usage polling daemon; the COSMIC panel applet is a separate binary.
+and the usage daemon; the COSMIC panel applet is a separate binary.
 
 What it does:
 
 - Keeps a registry (`~/.config/agentdeck/instances.toml`) of harness
   instances, the model pool and quota sources; the CLI, GUI and daemon share
   it under a file lock.
-- Polls usage quotas (5-hour, weekly and per-model windows, balances) in the
-  background and publishes one `state.json` for the panel, the GUI and the
-  router. Login happens only through the official CLIs inside agentdeck's PTY.
+- Reads subscription quotas from T3 Code's cache and polls API-key balances
+  (OpenRouter, Vercel AI Gateway, DeepSeek). Publishes one `state.json` for the
+  panel, GUI and router. Login uses the official CLIs inside agentdeck's PTY.
 - Syncs shared state across instances: secondary accounts, Codex shadow
   homes, skills, instruction files, MCP lists, terminal wrappers.
-- Ships built-in plugins with no standalone copies: usage polling, the model
+- Ships built-in plugins with no standalone copies: usage monitoring, the model
   router, the agent-process supervisor and gateway image generation.
 
 ## Install
@@ -38,13 +38,26 @@ cargo install --locked --path crates/agentdeck-applet
 Then add **agentdeck** in the COSMIC panel settings. The applet reads the same
 `state.json` the daemon publishes; no network calls, no credentials.
 
+Subscription quotas (`claude`, `codex`, `antigravity`, `opencode-go`) require
+T3 Code with the corresponding provider instance enabled. In T3 **Settings →
+Providers → Health check interval**, choose a nonzero interval
+(`providerHealthRefreshInterval` in milliseconds). With `0`, quotas change
+only on manual refresh and go stale. `agentdeck usage doctor` reports this.
+Agentdeck does not install quota capture hooks. Claude and Antigravity quota
+status lines have been removed permanently.
+
+`[[usage]]` entries for Claude, Codex and Antigravity require `instance`, the
+registered T3 provider instance ID. OpenCode Go defaults to `opencode`.
+Legacy source fields in existing configs still load; new sources use the
+instance binding instead of provider login paths or commands.
+
 ## CLI overview
 
 ```text
 agentdeck instance      registry instances in instances.toml (list/add/rename/remove)
 agentdeck pool          model catalog and explicit routing selections
-agentdeck usage         [[usage]] quota sources (once/doctor/hooks plan)
-agentdeck daemon        usage polling daemon (single writer)
+agentdeck usage         [[usage]] quota sources (add/remove/once/doctor)
+agentdeck daemon        usage daemon (single writer)
 agentdeck login <id>    official login CLI for an instance inside a PTY
 agentdeck claude        sync and drift-check secondary Claude accounts
 agentdeck codex         sync, check and fix Codex shadow homes
@@ -137,7 +150,7 @@ Agentdeck provider shortcuts, use `agentdeck wrapper remove-launchers` (supports
 
 Built-in, enabled per machine with `agentdeck plugin enable <name>`:
 
-- `ai-usage` — quota polling daemon unit, hooks and status-line integration.
+- `ai-usage` — daemon unit for T3 subscription quotas and API-key balances.
 - `router` — model pool JSON and the delegation router.
 - `agent-process` — supervised background processes with the same CLI and
   registry as the standalone script it replaces.
@@ -165,10 +178,12 @@ disable removes them. Plugin data is kept.
 ## Migration from ai-usage
 
 Step-by-step runbook: [`docs/MIGRATION.md`](docs/MIGRATION.md).
+After installing a build with T3 quotas, run `agentdeck plugin enable ai-usage`
+to remove the old quota hook registrations.
 
 ```sh
 agentdeck migrate ai-usage --dry-run
-agentdeck migrate ai-usage   # copy-only: ids, secrets, cooldowns
+agentdeck migrate ai-usage   # copy-only: ids, secrets, history
 ```
 
 ## License

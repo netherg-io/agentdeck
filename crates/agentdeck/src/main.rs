@@ -46,7 +46,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: cmd_usage::UsageCmd,
     },
-    /// Run the usage polling daemon (single writer).
+    /// Read T3 subscription quotas and poll API-key balances (single writer).
     Daemon(cmd_daemon::DaemonArgs),
     /// Sync and drift-check secondary Claude accounts.
     Claude {
@@ -268,10 +268,6 @@ fn main() -> anyhow::Result<()> {
     {
         return agentdeck_core::launch::run_cli(&paths, id, args);
     }
-    // Providers write cooldowns/snapshots via util::persistent_state_dir();
-    // point it at the new tree before anything runs. Unset, everything keeps
-    // the old ai-usage paths (old binary, compat copies, migrator sources).
-    agentdeck_usage::util::set_state_dir_override(paths.state_dir.join("usage"));
     agentdeck_usage::daemon::load_agentdeck_secrets(&paths.config_dir)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

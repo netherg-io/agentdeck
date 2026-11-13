@@ -495,6 +495,34 @@ fn in_t3(harness: &str, chain: &[Vec<String>], input: &Value) -> bool {
     }
 }
 
+fn route_args(source: &str, validate: Option<(&str, &str)>) -> Vec<String> {
+    let mut args = vec!["route".into(), "--source".into(), source.into()];
+    if let Some((provider, model)) = validate {
+        args.extend(["--validate-target".into(), provider.into(), model.into()]);
+    }
+    args.push("-".into());
+    args
+}
+
+fn preflight_hint(source: &str, provider: &str, model: &str) -> String {
+    let args = route_args(source, Some((provider, model)));
+    let command = args
+        .iter()
+        .enumerate()
+        .map(|(i, arg)| {
+            if matches!(i, 0 | 1 | 3 | 6) {
+                arg.clone()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\"'\"'"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        " To obtain this routing verdict before dispatch, save the exact delegate_task.task text in task.txt and run `agentdeck {command} < task.txt`. Use the full task, not a shortened goal; quota and load are rechecked at dispatch."
+    )
+}
+
 /// Run the router in this binary (`route ...`) with `task_text` on stdin.
 fn run_route(
     source: &str,
@@ -503,21 +531,7 @@ fn run_route(
 ) -> anyhow::Result<Value> {
     let exe = std::env::current_exe()?;
     let mut child = std::process::Command::new(exe)
-        .arg("route")
-        .arg("--source")
-        .arg(source)
-        .args(
-            validate
-                .map(|(p, m)| {
-                    vec![
-                        "--validate-target".to_string(),
-                        p.to_string(),
-                        m.to_string(),
-                    ]
-                })
-                .unwrap_or_default(),
-        )
-        .arg("-")
+        .args(route_args(source, validate))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1095,8 +1109,21 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
             .unwrap_or_default();
         let reason = format!(
             "model-route: {reason_text}.{warning}{choice_warning}{}",
-            if !allowed_now && !retry_hint.is_empty() {
-                format!(" {retry_hint}{USER_CHOICE_HINT}")
+            if !allowed_now {
+                format!(
+                    " {retry_hint}{}{USER_CHOICE_HINT}",
+                    preflight_hint(
+                        instance.as_deref().unwrap_or_default(),
+                        target
+                            .and_then(|t| t.get("providerInstanceId"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        target
+                            .and_then(|t| t.get("model"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )
+                )
             } else {
                 String::new()
             }
@@ -1224,6 +1251,21 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{strip_tags, t3_server};
+
+    #[test]
+    fn native_context_requires_matching_harness_ancestry() {
+        let input = serde_json::json!({"inT3": true});
+        let codex = vec!["codex".into(), "app-server".into()];
+        let server = vec!["/test/t3".into(), "serve".into()];
+        assert!(!super::in_t3("codex", &[], &input));
+        assert!(!super::in_t3("codex", std::slice::from_ref(&codex), &input));
+        assert!(!super::in_t3(
+            "codex",
+            std::slice::from_ref(&server),
+            &input
+        ));
+        assert!(super::in_t3("codex", &[codex, server], &input));
+    }
 
     #[test]
     fn recognizes_node_and_native_t3_servers() {
