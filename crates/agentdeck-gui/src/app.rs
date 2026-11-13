@@ -879,7 +879,7 @@ fn preview_plugin(state: &mut State, name: &str, enable: bool) {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    let exe = std::env::current_exe().unwrap_or_default();
+    let exe = agentdeck_core::current_exe().unwrap_or_default();
     let files = agentdeck_core::plugins::default_instruction_files(&home);
     let planned = if enable {
         agentdeck_core::plugins::plan_enable(&paths, &home, &files, &exe, name, false)
@@ -905,7 +905,7 @@ fn apply_plugin(paths: &agentdeck_core::Paths, pending: &Pending) -> Result<Stri
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    let exe = std::env::current_exe().unwrap_or_default();
+    let exe = agentdeck_core::current_exe().unwrap_or_default();
     let files = agentdeck_core::plugins::default_instruction_files(&home);
     let planned = if pending.enable {
         agentdeck_core::plugins::plan_enable(paths, &home, &files, &exe, &pending.name, false)

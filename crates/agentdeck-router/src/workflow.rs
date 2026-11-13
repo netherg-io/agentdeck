@@ -523,7 +523,7 @@ pub fn run_router(task: &str, source: &str) -> anyhow::Result<Value> {
 
 /// `run_router` with `--exclude` for instances whose account hit a usage limit.
 pub fn run_router_excluding(task: &str, source: &str, exclude: &[String]) -> anyhow::Result<Value> {
-    let exe = std::env::current_exe()?;
+    let exe = agentdeck_core::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["route", "--source", source]);
     for x in exclude {
@@ -1059,7 +1059,7 @@ fn auto_eval_spawn(state_file: &std::path::Path, step: &str, thread: &str, sampl
     let Ok((out, err)) = log else {
         return "skipped:cannot start evaluator".to_string();
     };
-    let mut cmd = match std::env::current_exe() {
+    let mut cmd = match agentdeck_core::current_exe() {
         Ok(exe) => std::process::Command::new(exe),
         Err(_) => return "skipped:cannot start evaluator".to_string(),
     };

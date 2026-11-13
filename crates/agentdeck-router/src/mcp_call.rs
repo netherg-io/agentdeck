@@ -336,7 +336,7 @@ fn spawn_with_input(
 }
 
 fn this_exe_route(args: &[&str], input: &str, timeout_secs: u64) -> anyhow::Result<String> {
-    let exe = std::env::current_exe()?;
+    let exe = agentdeck_core::current_exe()?;
     let out = spawn_with_input(
         exe.as_os_str(),
         args,

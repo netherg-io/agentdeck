@@ -188,7 +188,7 @@ pub fn load(paths: &Paths) -> Data {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
-    let exe = std::env::current_exe().unwrap_or_default();
+    let exe = agentdeck_core::current_exe().unwrap_or_default();
     data.plugins = plugins::status(paths, &home, &exe)
         .into_iter()
         .map(|s| PluginRow {

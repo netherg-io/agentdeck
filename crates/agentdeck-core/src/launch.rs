@@ -239,7 +239,7 @@ pub fn launch_cli(paths: &crate::Paths, id: &str) -> anyhow::Result<()> {
             names.join(", "),
         )
     })?;
-    let exe = std::env::current_exe()
+    let exe = crate::current_exe()
         .map_err(|e| anyhow::anyhow!("cannot find the running agentdeck executable: {e}"))?;
     let argv = terminal_command(&terminal, prefix, &exe, &inst.id, paths, &path_env);
     let mut child = Command::new(&argv[0])

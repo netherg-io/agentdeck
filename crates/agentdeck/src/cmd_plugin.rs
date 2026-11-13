@@ -40,7 +40,7 @@ pub fn run(paths: &Paths, cmd: PluginCmd) -> anyhow::Result<()> {
     match cmd {
         PluginCmd::List => {
             let home = home_dir()?;
-            let exe = std::env::current_exe()?;
+            let exe = agentdeck_core::current_exe()?;
             for st in plugins::status(paths, &home, &exe) {
                 println!(
                     "{} enabled={} available={}",
@@ -60,7 +60,7 @@ pub fn run(paths: &Paths, cmd: PluginCmd) -> anyhow::Result<()> {
             dry_run,
         } => {
             let home = home_dir()?;
-            let exe = std::env::current_exe()?;
+            let exe = agentdeck_core::current_exe()?;
             let files = plugins::default_instruction_files(&home);
             let changes = plugins::plan_enable(paths, &home, &files, &exe, &name, replace)?;
             if changes.is_empty() {
@@ -81,7 +81,7 @@ pub fn run(paths: &Paths, cmd: PluginCmd) -> anyhow::Result<()> {
         }
         PluginCmd::Disable { name, dry_run } => {
             let home = home_dir()?;
-            let exe = std::env::current_exe()?;
+            let exe = agentdeck_core::current_exe()?;
             let files = plugins::default_instruction_files(&home);
             let changes = plugins::plan_disable(paths, &home, &files, &exe, &name)?;
             if changes.is_empty() {
@@ -108,7 +108,7 @@ pub fn run(paths: &Paths, cmd: PluginCmd) -> anyhow::Result<()> {
 /// before anything else is touched.
 pub fn uninstall(paths: &Paths, dry_run: bool) -> anyhow::Result<()> {
     let home = home_dir()?;
-    let exe = std::env::current_exe()?;
+    let exe = agentdeck_core::current_exe()?;
     let files = plugins::default_instruction_files(&home);
     let mut reg = Registry::load(paths)?;
     for name in [
