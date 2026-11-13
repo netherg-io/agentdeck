@@ -279,7 +279,7 @@ pub fn load_router_json(file: &str) -> anyhow::Result<RouterConfig> {
     )
 }
 
-fn parse_router_config(data: Value, source: &str) -> anyhow::Result<RouterConfig> {
+pub(crate) fn parse_router_config(data: Value, source: &str) -> anyhow::Result<RouterConfig> {
     let fail = |why: String| {
         anyhow::anyhow!(
             "model-route: router JSON unusable at {source}: {why}; regenerate it with `agentdeck router json`"
@@ -444,7 +444,17 @@ pub fn owns_usage(cfg: &RouterConfig, account: &UsageAccount, instance: &str, mo
     {
         return id == uid;
     }
-    account.provider == account_of(cfg, instance, model).unwrap_or_default()
+    // Account names derive from usage ids (`agy-main` -> `agy`), so compare
+    // the account's usageProvider, not its name.
+    let Some(name) = account_of(cfg, instance, model) else {
+        return false;
+    };
+    let provider = cfg
+        .meta
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map_or(name.as_str(), |(_, m)| m.usage_provider.as_str());
+    account.provider == provider
 }
 
 pub fn enabled_favorites(favorites: Vec<Value>, settings: &Value) -> Vec<Value> {
