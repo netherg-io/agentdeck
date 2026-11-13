@@ -494,22 +494,315 @@ pub fn plan_disable_agent_process(
     Ok(changes)
 }
 
-/// Enable = install the daemon unit (never start it); disable = uninstall
-/// (refuses while active). Plugin data is kept either way.
-pub fn plan_enable_ai_usage(paths: &Paths) -> anyhow::Result<Vec<Change>> {
-    Ok(crate::service::plan_install(paths)?.into_iter().collect())
+/// Enable = install the daemon unit (never start it) and remove obsolete
+/// capture hooks once written by earlier setups. Disable = uninstall the unit
+/// (refuses while active) and remove those obsolete hooks. Other plugin data
+/// is kept either way.
+pub fn plan_enable_ai_usage(paths: &Paths, home: &Path) -> anyhow::Result<Vec<Change>> {
+    let mut changes: Vec<Change> = crate::service::plan_install(paths)?.into_iter().collect();
+    changes.extend(plan_cleanup_legacy_hooks(paths, home)?);
+    Ok(changes)
 }
 
 pub fn apply_enable_ai_usage(changes: &[Change]) -> anyhow::Result<()> {
     crate::service::apply_install(changes)
 }
 
-pub fn plan_disable_ai_usage() -> anyhow::Result<Vec<Change>> {
-    Ok(crate::service::plan_uninstall()?.into_iter().collect())
+pub fn plan_disable_ai_usage(paths: &Paths, home: &Path) -> anyhow::Result<Vec<Change>> {
+    let mut changes: Vec<Change> = crate::service::plan_uninstall()?.into_iter().collect();
+    changes.extend(plan_cleanup_legacy_hooks(paths, home)?);
+    Ok(changes)
 }
 
 pub fn apply_disable_ai_usage(changes: &[Change]) -> anyhow::Result<()> {
     crate::service::apply_uninstall(changes)
+}
+
+fn split_shell_words(input: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut quote: Option<char> = None;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some('"') if c == '\\' => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            }
+            Some(_) => cur.push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                in_token = true;
+            }
+            None if c.is_whitespace() => {
+                if in_token {
+                    out.push(std::mem::take(&mut cur));
+                    in_token = false;
+                }
+            }
+            None if c == '\\' => {
+                in_token = true;
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            }
+            None => {
+                in_token = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_token {
+        out.push(cur);
+    }
+    out
+}
+
+fn strip_exec(words: &[String]) -> &[String] {
+    match words.first().map(String::as_str) {
+        Some("exec") => &words[1..],
+        _ => words,
+    }
+}
+
+fn exe_is(word: &str, names: &[&str]) -> bool {
+    Path::new(word)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| names.contains(&n))
+}
+
+fn is_legacy_claude_hook_command(cmd: &str) -> bool {
+    let words = split_shell_words(cmd);
+    let words = strip_exec(&words);
+    (words.len() >= 2 && exe_is(&words[0], &["ai-usage", "agentdeck"]) && words[1] == "claude-hook")
+        || (words.len() >= 4
+            && exe_is(&words[0], &["agentdeck"])
+            && words[1] == "usage"
+            && words[2] == "hook"
+            && words[3] == "claude")
+}
+
+fn is_legacy_agy_hook_command(cmd: &str) -> bool {
+    let words = split_shell_words(cmd);
+    let words = strip_exec(&words);
+    (words.len() >= 2 && exe_is(&words[0], &["ai-usage", "agentdeck"]) && words[1] == "agy-hook")
+        || (words.len() >= 4
+            && exe_is(&words[0], &["agentdeck"])
+            && words[1] == "usage"
+            && words[2] == "hook"
+            && words[3] == "agy")
+}
+
+fn is_legacy_agy_script(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    if !text.starts_with("#!/bin/sh") {
+        return false;
+    }
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    lines.len() == 1 && is_legacy_agy_hook_command(lines[0])
+}
+
+fn push_unique_path(out: &mut Vec<PathBuf>, seen: &mut Vec<PathBuf>, path: PathBuf) {
+    let key = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    if !seen.contains(&key) {
+        seen.push(key);
+        out.push(path);
+    }
+}
+
+fn claude_settings_candidates(home: &Path, reg: &Registry) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = Vec::new();
+    push_unique_path(&mut out, &mut seen, home.join(".claude/settings.json"));
+    if let Ok(entries) = fs::read_dir(home) {
+        let mut extra: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".claude-"))
+            .map(|e| e.path().join("settings.json"))
+            .collect();
+        extra.sort();
+        for p in extra {
+            push_unique_path(&mut out, &mut seen, p);
+        }
+    }
+    for inst in &reg.instances {
+        if inst.harness == crate::Harness::Claude {
+            let dir = crate::sync::expand_tilde(&inst.home, home);
+            push_unique_path(&mut out, &mut seen, dir.join("settings.json"));
+        }
+    }
+    for u in &reg.usage {
+        if u.kind == crate::usage::UsageKind::Claude
+            && let Some(dir) = &u.config_dir
+        {
+            let dir = crate::sync::expand_tilde(dir, home);
+            push_unique_path(&mut out, &mut seen, dir.join("settings.json"));
+        }
+    }
+    out
+}
+
+fn agy_hooks_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = Vec::new();
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        push_unique_path(
+            &mut out,
+            &mut seen,
+            PathBuf::from(xdg).join("ai-usage/hooks"),
+        );
+    }
+    push_unique_path(&mut out, &mut seen, home.join(".config/ai-usage/hooks"));
+    out
+}
+
+fn agy_settings_candidates(home: &Path, reg: &Registry) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = Vec::new();
+    push_unique_path(
+        &mut out,
+        &mut seen,
+        home.join(".gemini/antigravity-cli/settings.json"),
+    );
+    for inst in &reg.instances {
+        if inst.harness == crate::Harness::Agy {
+            let dir = crate::sync::expand_tilde(&inst.home, home);
+            let gemini = if dir.file_name().and_then(|n| n.to_str()) == Some(".gemini") {
+                dir
+            } else {
+                dir.join(".gemini")
+            };
+            push_unique_path(
+                &mut out,
+                &mut seen,
+                gemini.join("antigravity-cli/settings.json"),
+            );
+        }
+    }
+    out
+}
+
+fn settings_backup_label(path: &Path, prefix: &str) -> String {
+    let parent = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(|s| s.trim_start_matches('.'))
+        .filter(|s| !s.is_empty())
+        .unwrap_or("profile");
+    format!("{prefix}-{parent}-settings.json")
+}
+
+fn plan_strip_status_line(
+    path: PathBuf,
+    state_dir: &Path,
+    backup_label: &str,
+    matches_cmd: impl FnOnce(&str) -> bool,
+) -> anyhow::Result<Option<Change>> {
+    let old = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut value: serde_json::Value = serde_json::from_slice(&old)
+        .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", path.display()))?;
+    let Some(root) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    let Some(cmd) = root
+        .get("statusLine")
+        .and_then(|s| s.get("command"))
+        .and_then(|c| c.as_str())
+    else {
+        return Ok(None);
+    };
+    if !matches_cmd(cmd) {
+        return Ok(None);
+    }
+    root.remove("statusLine");
+    let new = (serde_json::to_string_pretty(&value)? + "\n").into_bytes();
+    if new == old {
+        return Ok(None);
+    }
+    Ok(Some(Change::WriteFile {
+        path,
+        contents: new,
+        old: Some(old),
+        backup: Some(backup_dest(state_dir, backup_label)),
+    }))
+}
+
+fn plan_cleanup_legacy_hooks(paths: &Paths, home: &Path) -> anyhow::Result<Vec<Change>> {
+    let reg = Registry::load(paths).unwrap_or_default();
+    let mut changes = Vec::new();
+
+    for path in claude_settings_candidates(home, &reg) {
+        let label = settings_backup_label(&path, "claude");
+        if let Some(c) = plan_strip_status_line(
+            path,
+            &paths.state_dir,
+            &label,
+            is_legacy_claude_hook_command,
+        )? {
+            changes.push(c);
+        }
+    }
+
+    let mut removed_scripts = Vec::new();
+    for hooks_dir in agy_hooks_dirs(home) {
+        let Ok(rd) = fs::read_dir(&hooks_dir) else {
+            continue;
+        };
+        let mut scripts: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("agy-") && n.ends_with(".sh"))
+                    && fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file())
+            })
+            .collect();
+        scripts.sort();
+        for path in scripts {
+            if let Ok(bytes) = fs::read(&path)
+                && is_legacy_agy_script(&bytes)
+            {
+                if let Ok(canon) = fs::canonicalize(&path) {
+                    removed_scripts.push(canon);
+                }
+                removed_scripts.push(path.clone());
+                changes.push(Change::Remove { path });
+            }
+        }
+    }
+
+    for path in agy_settings_candidates(home, &reg) {
+        let label = settings_backup_label(&path, "agy");
+        if let Some(c) = plan_strip_status_line(path, &paths.state_dir, &label, |cmd| {
+            if is_legacy_agy_hook_command(cmd) {
+                return true;
+            }
+            let cmd_path = crate::sync::expand_tilde(cmd.trim(), home);
+            let canon = fs::canonicalize(&cmd_path).ok();
+            removed_scripts.contains(&cmd_path)
+                || canon.as_ref().is_some_and(|c| removed_scripts.contains(c))
+        })? {
+            changes.push(c);
+        }
+    }
+
+    Ok(changes)
 }
 
 #[derive(Debug, Clone)]
@@ -746,7 +1039,7 @@ pub fn plan_enable(
         PLUGIN_AGENT_PROCESS => {
             plan_enable_agent_process(home, files, exe, replace, &paths.state_dir)?
         }
-        PLUGIN_AI_USAGE => plan_enable_ai_usage(paths)?,
+        PLUGIN_AI_USAGE => plan_enable_ai_usage(paths, home)?,
         PLUGIN_ROUTER => plan_enable_router(paths, home, files, exe, replace)?,
         // Only the flag and its skill (synced after apply).
         PLUGIN_IMAGEGEN => Vec::new(),
@@ -792,7 +1085,7 @@ pub fn plan_disable(
     }
     let mut changes = match name {
         PLUGIN_AGENT_PROCESS => plan_disable_agent_process(home, files, exe, &paths.state_dir)?,
-        PLUGIN_AI_USAGE => plan_disable_ai_usage()?,
+        PLUGIN_AI_USAGE => plan_disable_ai_usage(paths, home)?,
         PLUGIN_ROUTER => plan_disable_router(paths, home, files, exe)?,
         PLUGIN_IMAGEGEN => Vec::new(),
         PLUGIN_MCP_SERVER => {
@@ -837,10 +1130,20 @@ pub fn apply_all(
             |c| !matches!(c, Change::WriteFile { path, .. } if *path == paths.registry_file()),
         );
     if name == PLUGIN_AI_USAGE {
-        if enable {
-            crate::service::apply_install(&file_changes)?;
+        let touches_unit = crate::service::unit_path().ok().is_some_and(|unit| {
+            file_changes.iter().any(|c| match c {
+                Change::WriteFile { path, .. } | Change::Remove { path } => *path == unit,
+                _ => false,
+            })
+        });
+        if touches_unit {
+            if enable {
+                crate::service::apply_install(&file_changes)?;
+            } else {
+                crate::service::apply_uninstall(&file_changes)?;
+            }
         } else {
-            crate::service::apply_uninstall(&file_changes)?;
+            apply_changes(&file_changes)?;
         }
     } else {
         apply_changes(&file_changes)?;
@@ -1209,13 +1512,13 @@ mod tests {
     #[test]
     fn ai_usage_enable_never_starts_disable_refuses_while_active() {
         let _env = test_env_lock();
-        let (_g, _home, paths, _files, _exe) = setup("aiusage");
+        let (_g, home, paths, _files, _exe) = setup("aiusage");
         let log = std::env::var_os("FAKE_SYSTEMCTL_LOG")
             .map(PathBuf::from)
             .unwrap();
 
         // Enable plans a unit write; applying reloads but never starts.
-        let changes = plan_enable_ai_usage(&paths).unwrap();
+        let changes = plan_enable_ai_usage(&paths, &home).unwrap();
         assert_eq!(changes.len(), 1);
         apply_enable_ai_usage(&changes).unwrap();
         let calls = fs::read_to_string(&log).unwrap();
@@ -1227,16 +1530,158 @@ mod tests {
         unsafe {
             std::env::set_var("FAKE_SYSTEMCTL_ACTIVE", "active");
         }
-        assert!(plan_disable_ai_usage().is_err());
+        assert!(plan_disable_ai_usage(&paths, &home).is_err());
         assert!(unit_path().unwrap().exists());
 
         unsafe {
             std::env::set_var("FAKE_SYSTEMCTL_ACTIVE", "inactive");
         }
-        let changes = plan_disable_ai_usage().unwrap();
+        let changes = plan_disable_ai_usage(&paths, &home).unwrap();
         assert_eq!(changes.len(), 1);
         apply_disable_ai_usage(&changes).unwrap();
         assert!(!unit_path().unwrap().exists());
+    }
+
+    #[test]
+    fn ai_usage_layout_pass_removes_obsolete_hooks_idempotently() {
+        let _env = test_env_lock();
+        let (g, home, paths, files, exe) = setup("aiusage-cleanup");
+
+        // Plant existing enabled plugin + unit so re-running enable tests the upgrade pass.
+        let init = plan_enable(&paths, &home, &files, &exe, PLUGIN_AI_USAGE, false).unwrap();
+        apply_all(&paths, PLUGIN_AI_USAGE, true, &init).unwrap();
+
+        let claude_main = home.join(".claude/settings.json");
+        let claude_second = home.join(".claude-second/settings.json");
+        let claude_custom = home.join(".claude-custom/settings.json");
+        let claude_null = home.join(".claude-null/settings.json");
+        let agy_main_script = g.0.join("config/ai-usage/hooks/agy-agy-main.sh");
+        let agy_old_script = home.join(".config/ai-usage/hooks/agy-legacy.sh");
+        let agy_custom_script = g.0.join("config/ai-usage/hooks/agy-custom.sh");
+        let agy_settings = home.join(".gemini/antigravity-cli/settings.json");
+
+        for p in [
+            &claude_main,
+            &claude_second,
+            &claude_custom,
+            &claude_null,
+            &agy_main_script,
+            &agy_old_script,
+            &agy_custom_script,
+            &agy_settings,
+        ] {
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+        }
+
+        fs::write(
+            &claude_main,
+            "{\n  \"theme\": \"dark\",\n  \"statusLine\": {\n    \"type\": \"command\",\n    \"command\": \"'/opt/bin/agentdeck' usage hook claude --account 'claude-main'\",\n    \"padding\": 0\n  },\n  \"hooks\": {}\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            &claude_second,
+            "{\n  \"model\": \"sonnet\",\n  \"statusLine\": {\n    \"type\": \"command\",\n    \"command\": \"'/usr/local/bin/ai-usage' claude-hook --account 'claude-second'\",\n    \"padding\": 0\n  }\n}\n",
+        )
+        .unwrap();
+        let custom_claude_bytes = "{\n  \"statusLine\": {\n    \"type\": \"command\",\n    \"command\": \"/home/user/ai-usage-scripts/mine.sh\",\n    \"padding\": 0\n  }\n}\n";
+        fs::write(&claude_custom, custom_claude_bytes).unwrap();
+        let null_claude_bytes = "{\n  \"theme\": \"light\",\n  \"statusLine\": null\n}\n";
+        fs::write(&claude_null, null_claude_bytes).unwrap();
+
+        fs::write(
+            &agy_main_script,
+            "#!/bin/sh\nexec '/opt/bin/agentdeck' usage hook agy --account 'agy-main'\n",
+        )
+        .unwrap();
+        fs::write(
+            &agy_old_script,
+            "#!/bin/sh\nexec '/usr/local/bin/ai-usage' agy-hook --account 'agy-legacy'\n",
+        )
+        .unwrap();
+        let custom_agy_script_bytes = "#!/bin/sh\necho custom-status\n";
+        fs::write(&agy_custom_script, custom_agy_script_bytes).unwrap();
+        fs::write(
+            &agy_settings,
+            format!(
+                "{{\n  \"otherKey\": true,\n  \"statusLine\": {{\n    \"type\": \"command\",\n    \"command\": \"{}\",\n    \"enabled\": true,\n    \"stack_with_default\": true\n  }}\n}}\n",
+                agy_main_script.display()
+            ),
+        )
+        .unwrap();
+
+        let changes = plan_enable(&paths, &home, &files, &exe, PLUGIN_AI_USAGE, false).unwrap();
+        assert!(!changes.is_empty());
+        apply_all(&paths, PLUGIN_AI_USAGE, true, &changes).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&claude_main).unwrap(),
+            "{\n  \"theme\": \"dark\",\n  \"hooks\": {}\n}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&claude_second).unwrap(),
+            "{\n  \"model\": \"sonnet\"\n}\n"
+        );
+        assert!(!agy_main_script.exists());
+        assert!(!agy_old_script.exists());
+        assert_eq!(
+            fs::read_to_string(&agy_settings).unwrap(),
+            "{\n  \"otherKey\": true\n}\n"
+        );
+
+        // Foreign / user-written files stay byte-identical.
+        assert_eq!(
+            fs::read_to_string(&claude_custom).unwrap(),
+            custom_claude_bytes
+        );
+        assert_eq!(fs::read_to_string(&claude_null).unwrap(), null_claude_bytes);
+        assert_eq!(
+            fs::read_to_string(&agy_custom_script).unwrap(),
+            custom_agy_script_bytes
+        );
+
+        // Backups exist for modified settings files.
+        assert!(fs::read_dir(paths.backup_dir()).unwrap().count() >= 3);
+
+        // Idempotent: second run produces no changes.
+        assert!(
+            plan_enable(&paths, &home, &files, &exe, PLUGIN_AI_USAGE, false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ai_usage_disable_cleans_obsolete_hooks_and_keeps_foreign_agy_status_line() {
+        let _env = test_env_lock();
+        let (_g, home, paths, files, exe) = setup("aiusage-disable-cleanup");
+
+        let claude_main = home.join(".claude/settings.json");
+        let agy_settings = home.join(".gemini/antigravity-cli/settings.json");
+        let custom_agy_script = home.join(".local/bin/my-statusline.sh");
+        for p in [&claude_main, &agy_settings, &custom_agy_script] {
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+        }
+        fs::write(
+            &claude_main,
+            "{\n  \"statusLine\": {\n    \"type\": \"command\",\n    \"command\": \"/opt/bin/agentdeck usage hook claude --account main\"\n  }\n}\n",
+        )
+        .unwrap();
+        let foreign_agy_bytes = format!(
+            "{{\n  \"statusLine\": {{\n    \"type\": \"command\",\n    \"command\": \"{}\"\n  }}\n}}\n",
+            custom_agy_script.display()
+        );
+        fs::write(&agy_settings, &foreign_agy_bytes).unwrap();
+        fs::write(&custom_agy_script, "#!/bin/sh\necho ok\n").unwrap();
+
+        let changes = plan_disable(&paths, &home, &files, &exe, PLUGIN_AI_USAGE).unwrap();
+        apply_all(&paths, PLUGIN_AI_USAGE, false, &changes).unwrap();
+
+        assert_eq!(fs::read_to_string(&claude_main).unwrap(), "{}\n");
+        assert_eq!(
+            fs::read_to_string(&agy_settings).unwrap(),
+            foreign_agy_bytes
+        );
+        assert!(custom_agy_script.exists());
     }
 
     #[test]
