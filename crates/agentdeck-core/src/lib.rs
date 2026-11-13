@@ -29,3 +29,15 @@ pub use paths::Paths;
 pub use pool::{PoolEntry, PoolValue};
 pub use registry::{AddSpec, Harness, Instance, Registry};
 pub use usage::{UsageEntry, UsageKind};
+
+/// `std::env::current_exe`, minus the " (deleted)" suffix Linux reports after
+/// `cargo install` replaced the running binary; the installed path is what
+/// generated hooks, units and instruction blocks must name.
+pub fn current_exe() -> std::io::Result<std::path::PathBuf> {
+    let exe = std::env::current_exe()?;
+    Ok(exe
+        .to_str()
+        .and_then(|s| s.strip_suffix(" (deleted)"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or(exe))
+}

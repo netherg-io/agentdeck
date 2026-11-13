@@ -36,7 +36,7 @@ pub fn unit_path() -> anyhow::Result<PathBuf> {
 }
 
 fn render_unit(paths: &Paths) -> anyhow::Result<Vec<u8>> {
-    let exe = env::current_exe()?;
+    let exe = crate::current_exe()?;
     let bin_dir = exe
         .parent()
         .ok_or_else(|| anyhow::anyhow!("current exe has no parent dir"))?;

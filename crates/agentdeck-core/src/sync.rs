@@ -153,7 +153,7 @@ pub fn instruction_items(home: &Path) -> Vec<SyncItem> {
 }
 
 fn plan_blocks(reg: &Registry, paths: &Paths, home: &Path) -> anyhow::Result<Vec<Change>> {
-    let exe = std::env::current_exe()?;
+    let exe = crate::current_exe()?;
     crate::plugins::plan_managed_blocks(reg, home, &exe, &paths.state_dir)
 }
 

@@ -529,7 +529,7 @@ fn run_route(
     validate: Option<(&str, &str)>,
     task_text: &str,
 ) -> anyhow::Result<Value> {
-    let exe = std::env::current_exe()?;
+    let exe = agentdeck_core::current_exe()?;
     let mut child = std::process::Command::new(exe)
         .args(route_args(source, validate))
         .stdin(std::process::Stdio::piped())
