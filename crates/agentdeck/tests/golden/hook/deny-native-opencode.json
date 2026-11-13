@@ -38,14 +38,15 @@
           "allowed": true,
           "taskCost": 0.005,
           "quota": "Week 80% left; resets in Rh (0 active agents; count unknown)",
+          "score": 0.967,
           "activeAgents": 0,
+          "unlimitedParallel": true,
           "account": "codex",
           "sharedQuota": false,
           "sharedQuotaPenalty": 0,
           "paidCreditPenalty": 0,
           "cheapModelBonus": 0,
-          "eligible": true,
-          "score": 0.967
+          "eligible": true
         },
         {
           "provider": "claudeAgent",
@@ -65,14 +66,15 @@
           "allowed": true,
           "taskCost": 0.1,
           "quota": "Week 60% left; resets in Rh, 5h 20% left; resets in Rh (0 active agents; count unknown)",
+          "score": 0.8,
           "activeAgents": 0,
+          "unlimitedParallel": true,
           "account": "claude",
           "sharedQuota": false,
           "sharedQuotaPenalty": 0,
           "paidCreditPenalty": 0,
           "cheapModelBonus": 0,
-          "eligible": true,
-          "score": 0.8
+          "eligible": true
         }
       ],
       "activeLoad": {

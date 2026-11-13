@@ -2003,7 +2003,10 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         m.insert("quota".into(), Value::from(c.quota_note.clone()));
         m.insert("quotaEstimate".into(), quota_estimate_json(c));
         m.insert("activeAgents".into(), Value::from(c.active_agents as u64));
-        if let Some(limit) = current_cfg.instance_limits.get(&c.provider) {
+        let limit = current_cfg.instance_limits.get(&c.provider);
+        // Absent max_parallel means no cap: say so, since null would read as "unknown".
+        m.insert("unlimitedParallel".into(), Value::from(limit.is_none()));
+        if let Some(limit) = limit {
             m.insert("maxParallel".into(), Value::from(*limit));
             m.insert(
                 "instanceActiveAgents".into(),
