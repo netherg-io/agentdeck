@@ -80,13 +80,29 @@ fn reset_label(mins: i64) -> String {
     }
 }
 
-fn quota_row(bar: &QuotaBar) -> Element<'_, Message> {
+pub(crate) fn quota_label(bar: &QuotaBar) -> String {
     // Window labels stay as the provider data gives them; the scope marks a
     // per-model window so it is not confused with the shared one.
-    let label = match &bar.scope {
-        Some(scope) => format!("{} · {scope}", bar.label),
-        None => bar.label.clone(),
-    };
+    match bar
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(scope)
+            if !bar
+                .label
+                .split('·')
+                .any(|part| part.trim().eq_ignore_ascii_case(scope)) =>
+        {
+            format!("{} · {scope}", bar.label)
+        }
+        _ => bar.label.clone(),
+    }
+}
+
+fn quota_row(bar: &QuotaBar) -> Element<'_, Message> {
+    let label = quota_label(bar);
     // Fixed side columns keep every bar the same length across cards.
     let reset = bar.resets_in_mins.map(reset_label).unwrap_or_default();
     row![
@@ -369,7 +385,32 @@ pub fn remove_modal(ask: &RemoveAsk) -> Modal<'_, Message> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_parallel;
+    use super::{parse_parallel, quota_label};
+    use crate::data::QuotaBar;
+
+    fn bar(label: &str, scope: Option<&str>) -> QuotaBar {
+        QuotaBar {
+            label: label.to_string(),
+            used_percent: 12.5,
+            scope: scope.map(str::to_string),
+            resets_in_mins: None,
+        }
+    }
+
+    #[test]
+    fn quota_label_does_not_duplicate_scope_already_in_label() {
+        assert_eq!(quota_label(&bar("5 часов", None)), "5 часов");
+        assert_eq!(
+            quota_label(&bar("Неделя · Fable", Some("Fable"))),
+            "Неделя · Fable"
+        );
+        assert_eq!(
+            quota_label(&bar("Сторонние модели · Неделя", Some("Сторонние модели"))),
+            "Сторонние модели · Неделя"
+        );
+        assert_eq!(quota_label(&bar("Week", Some("Opus"))), "Week · Opus");
+        assert_eq!(quota_label(&bar("5 часов", Some("  "))), "5 часов");
+    }
 
     #[test]
     fn parallel_limit_accepts_blank_or_positive_u32() {
