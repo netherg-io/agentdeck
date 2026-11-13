@@ -1,6 +1,6 @@
 [package]
 name = "agentdeck-gui"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2024"
 description = "Desktop GUI shell for agentdeck (iced)"
 license = "GPL-3.0-or-later"
