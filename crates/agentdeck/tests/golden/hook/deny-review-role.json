@@ -1,6 +1,6 @@
 {
   "exit": 0,
-  "stdout": "{\"decision\":\"deny\",\"reason\":\"model-route: never for audits or reviews (user rule 2026-10-17). Use target {\\\"providerInstanceId\\\":\\\"codex\\\",\\\"model\\\":\\\"gpt-6.1-sol\\\",\\\"options\\\":{\\\"reasoningEffort\\\":\\\"high\\\"}} with the same task and no runtimeMode. If the user explicitly asked for a specific model, call delegate_task with that exact target and start the task with [route:user-choice]; routing then only warns.\"}",
+  "stdout": "{\"decision\":\"deny\",\"reason\":\"model-route: never for audits or reviews (user rule 2026-10-17). Use target {\\\"providerInstanceId\\\":\\\"codex\\\",\\\"model\\\":\\\"gpt-6.1-sol\\\",\\\"options\\\":{\\\"reasoningEffort\\\":\\\"high\\\"}} with the same task and no runtimeMode. To obtain this routing verdict before dispatch, save the exact delegate_task.task text in task.txt and run `agentdeck route --source 'antigravity' --validate-target 'antigravity' 'gemini-4-argon-medium' - < task.txt`. Use the full task, not a shortened goal; quota and load are rechecked at dispatch. If the user explicitly asked for a specific model, call delegate_task with that exact target and start the task with [route:user-choice]; routing then only warns.\"}",
   "records": [
     {
       "t": "",
@@ -8,7 +8,7 @@
       "instance": "antigravity",
       "toolName": "delegate_task",
       "decision": "deny:delegate",
-      "reason": "model-route: never for audits or reviews (user rule 2026-10-17). Use target {\"providerInstanceId\":\"codex\",\"model\":\"gpt-6.1-sol\",\"options\":{\"reasoningEffort\":\"high\"}} with the same task and no runtimeMode. If the user explicitly asked for a specific model, call delegate_task with that exact target and start the task with [route:user-choice]; routing then only warns.",
+      "reason": "model-route: never for audits or reviews (user rule 2026-10-17). Use target {\"providerInstanceId\":\"codex\",\"model\":\"gpt-6.1-sol\",\"options\":{\"reasoningEffort\":\"high\"}} with the same task and no runtimeMode. To obtain this routing verdict before dispatch, save the exact delegate_task.task text in task.txt and run `agentdeck route --source 'antigravity' --validate-target 'antigravity' 'gemini-4-argon-medium' - < task.txt`. Use the full task, not a shortened goal; quota and load are rechecked at dispatch. If the user explicitly asked for a specific model, call delegate_task with that exact target and start the task with [route:user-choice]; routing then only warns.",
       "target": {
         "providerInstanceId": "codex",
         "model": "gpt-6.1-sol",
