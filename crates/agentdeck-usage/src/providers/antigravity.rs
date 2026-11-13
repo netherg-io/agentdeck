@@ -278,7 +278,11 @@ async fn request_quota_summary(
         let resp = client
             .post(endpoint)
             .bearer_auth(access_token)
-            .header("User-Agent", "antigravity/1.1.9")
+            // The old "antigravity/1.1.9" UA gets only the 3p buckets back (2026-11-13).
+            .header(
+                "User-Agent",
+                "antigravity/hub/2.24.0 (aidev_client; os_type=linux; arch=x64; cl=963137146)",
+            )
             .json(&serde_json::json!({ "project": project_id }))
             .send()
             .await;
@@ -305,7 +309,8 @@ async fn request_quota_summary(
     bail!(last_err.unwrap_or_else(|| "Не удалось получить квоту от Google API".to_owned()))
 }
 
-/// Flattens both responses; the earlier (production) bucket wins on a duplicate id.
+/// Flattens both responses; on a duplicate id, the more depleted bucket wins
+/// (daily tracks Gemini Flash/Pro usage while production tracks Argon).
 fn merge_quota_responses(
     first: Option<QuotaSummaryResponse>,
     next: QuotaSummaryResponse,
@@ -318,7 +323,11 @@ fn merge_quota_responses(
     };
     let mut buckets = first.map(flatten).unwrap_or_default();
     for bucket in flatten(next) {
-        if !buckets.iter().any(|b| b.bucket_id == bucket.bucket_id) {
+        if let Some(existing) = buckets.iter_mut().find(|b| b.bucket_id == bucket.bucket_id) {
+            if bucket.remaining_fraction < existing.remaining_fraction {
+                *existing = bucket;
+            }
+        } else {
             buckets.push(bucket);
         }
     }
@@ -328,10 +337,9 @@ fn merge_quota_responses(
     }
 }
 
-/// Keeps windows that only one source reports (the Argon bucket comes only from the
-/// agy hook) until they reset, so a live poll and a hook write no longer erase each other.
-// ponytail: a carried window keeps its last value until reset or the next agy hook;
-// drop this once the quota API returns every bucket.
+/// Keeps polled windows that an agy hook payload omits (Argon drops the Gemini
+/// pool) until they reset. Live polls never carry: the quota API returns every
+/// bucket, and a carried window froze at its old value until reset.
 fn carry_missing_windows(snapshot: &mut Snapshot, prev: Option<&Snapshot>, now: i64) {
     let Some(prev) = prev else { return };
     let active = active_family(snapshot.model.as_deref());
@@ -410,10 +418,8 @@ pub async fn live_quota(token_file: &Path, prev: Option<&Snapshot>) -> Result<Sn
         .or_else(|| Some("Google AI Pro".to_owned()));
     let model = detect_model(prev);
 
-    let mut snapshot = snapshot_from_quota_response(quota_res, email, plan, model, now)
-        .context("Google API не вернул бакетов квоты")?;
-    carry_missing_windows(&mut snapshot, prev, now);
-    Ok(snapshot)
+    snapshot_from_quota_response(quota_res, email, plan, model, now)
+        .context("Google API не вернул бакетов квоты")
 }
 
 fn detect_model(prev: Option<&Snapshot>) -> Option<String> {
@@ -695,6 +701,7 @@ fn family_for_key(key: &str) -> String {
 fn scope_for_family(family: &str) -> Option<String> {
     match family {
         "gemini" => Some("Gemini".to_owned()),
+        f if f.starts_with("gemini-argon") => Some("Gemini Argon".to_owned()),
         "3p" | "third-party" | "third_party" => Some("Сторонние модели".to_owned()),
         _ => None,
     }
@@ -705,6 +712,8 @@ fn active_family(model: Option<&str>) -> Option<&'static str> {
     let model = model?.trim().to_ascii_lowercase();
     if model.is_empty() {
         None
+    } else if model.contains("argon") {
+        Some("gemini-argon-wtu")
     } else if model.contains("gemini") {
         Some("gemini")
     } else {
@@ -1235,13 +1244,13 @@ mod tests {
     }
 
     #[test]
-    fn production_buckets_win_and_daily_only_buckets_are_added() {
+    fn more_depleted_buckets_win_and_missing_buckets_are_added() {
         let parse = |raw: &str| serde_json::from_str::<QuotaSummaryResponse>(raw).unwrap();
         let prod = parse(
-            r#"{"buckets":[{"bucketId":"gemini-weekly","remainingFraction":0.5},{"bucketId":"3p-5h","remainingFraction":1}]}"#,
+            r#"{"buckets":[{"bucketId":"gemini-weekly","remainingFraction":1.0},{"bucketId":"gemini-argon-wtu-weekly","remainingFraction":0.68},{"bucketId":"3p-5h","remainingFraction":0.61}]}"#,
         );
         let daily = parse(
-            r#"{"groups":[{"buckets":[{"bucketId":"3p-5h","remainingFraction":0.1},{"bucketId":"x-weekly","remainingFraction":0.9}]}]}"#,
+            r#"{"groups":[{"buckets":[{"bucketId":"gemini-weekly","remainingFraction":0.99},{"bucketId":"gemini-argon-wtu-weekly","remainingFraction":0.92},{"bucketId":"3p-5h","remainingFraction":0.62},{"bucketId":"x-weekly","remainingFraction":0.9}]}]}"#,
         );
         let merged = merge_quota_responses(Some(prod), daily);
         let ids: Vec<_> = merged
@@ -1252,11 +1261,23 @@ mod tests {
         assert_eq!(
             ids,
             [
-                ("gemini-weekly".into(), 0.5),
-                ("3p-5h".into(), 1.0),
+                ("gemini-weekly".into(), 0.99),
+                ("gemini-argon-wtu-weekly".into(), 0.68),
+                ("3p-5h".into(), 0.61),
                 ("x-weekly".into(), 0.9)
             ]
         );
+        let snap = snapshot_from_quota_response(merged, None, None, None, 1_700_000_000).unwrap();
+        let state = state_from_snapshot("agy", "Agy", snap, None, 1_700_000_000, 900);
+        let argon = state
+            .windows
+            .iter()
+            .find(|w| w.key == "gemini-argon-wtu-weekly")
+            .unwrap();
+        assert_eq!(argon.label, "Gemini Argon · Неделя");
+        assert_eq!(argon.scope.as_deref(), Some("Gemini Argon"));
+        assert_eq!(state.windows[0].key, "gemini-weekly");
+        assert_eq!(state.windows[0].scope, None);
     }
 
     #[test]
