@@ -38,11 +38,13 @@ cargo install --locked --path crates/agentdeck-applet
 Then add **agentdeck** in the COSMIC panel settings. The applet reads the same
 `state.json` the daemon publishes; no network calls, no credentials.
 
-Subscription quotas (`claude`, `codex`, `antigravity`, `opencode-go`) require
+Subscription quotas (`claude`, `codex`, `antigravity`) require
 T3 Code with the corresponding provider instance enabled. In T3 **Settings →
 Providers → Health check interval**, choose a nonzero interval
 (`providerHealthRefreshInterval` in milliseconds). With `0`, quotas change
 only on manual refresh and go stale. `agentdeck usage doctor` reports this.
+OpenCode Go is polled directly from the OpenCode login, with T3's `opencode`
+cache as the fallback, because T3 refreshes its limits only manually.
 Agentdeck does not install quota capture hooks. Claude and Antigravity quota
 status lines have been removed permanently.
 

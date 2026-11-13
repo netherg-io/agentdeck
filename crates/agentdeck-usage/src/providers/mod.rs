@@ -48,8 +48,20 @@ pub async fn fetch(account: AccountConfig, stale_seconds: i64) -> AccountState {
             id, name, instance, ..
         } => antigravity::fetch(&id, &name, instance.as_deref(), stale_seconds).await,
         AccountConfig::OpencodeGo {
-            id, name, instance, ..
-        } => opencode_go::fetch(&id, &name, instance.as_deref(), stale_seconds).await,
+            id,
+            name,
+            instance,
+            db_file,
+        } => {
+            opencode_go::fetch(
+                &id,
+                &name,
+                instance.as_deref(),
+                db_file.as_deref(),
+                stale_seconds,
+            )
+            .await
+        }
     };
 
     result.unwrap_or_else(|error| AccountState::error(&id, &name, provider, error.to_string()))

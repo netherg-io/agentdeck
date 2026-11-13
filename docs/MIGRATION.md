@@ -10,11 +10,13 @@ After installing a build with this change, run `agentdeck plugin enable ai-usage
 to remove the old quota hook registrations. Claude and Antigravity quota status
 lines have been removed permanently; no quota capture hooks replace them.
 
-Subscription quotas (`claude`, `codex`, `antigravity`, `opencode-go`) require T3
+Subscription quotas (`claude`, `codex`, `antigravity`) require T3
 Code with their provider instances enabled. In T3 **Settings → Providers → Health
 check interval**, select a nonzero interval (`providerHealthRefreshInterval` in
 milliseconds). At `0`, only manual refresh updates the cache and quotas go stale.
 OpenRouter, Vercel AI Gateway and DeepSeek balances are still polled by agentdeck.
+OpenCode Go is polled directly from the OpenCode login (T3 refreshes its limits only
+manually); T3's `opencode` cache is the fallback when that poll fails.
 
 ## 0. Install the binary and fill the registry
 
