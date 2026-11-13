@@ -155,7 +155,7 @@ pub fn read_instance_failures(
             .unwrap_or_default()
             .to_lowercase();
         static QUOTA: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            regex::Regex::new(r"(?i)(quota|usage[ -]?limit|rate[ -]?limit).*(reach|exceed|exhaust)|(?:reach|exceed|exhaust|insufficient).*(quota|usage[ -]?limit|rate[ -]?limit)").unwrap()
+            regex::Regex::new(r"(?i)(quota|usage[ -]?limit|rate[ -]?limit).*(reach|exceed|exhaust)|(?:reach|exceed|exhaust|insufficient).*(quota|usage[ -]?limit|rate[ -]?limit)|hit your [^\n]*limit").unwrap()
         });
         if QUOTA.is_match(&header) {
             let until = reset_time(&result, finished).unwrap_or(finished + 15.0 * 60.0);
@@ -566,6 +566,23 @@ mod failure_tests {
             Some(time() + 900.0)
         );
         assert!(read_instance_failures(&fx.file, time() + 900.0).is_empty());
+    }
+
+    #[test]
+    fn hit_your_limit_counts_as_quota_failure() {
+        let fx = Fixture::new();
+        // Claude wording; its "resets 7pm (zone)" has no in/after/at, so the fixed cooldown applies.
+        fx.child(
+            "a",
+            "claude",
+            "failed",
+            FINISHED,
+            "You've hit your 5-hour limit · resets 7pm (Europe/Kyiv)",
+        );
+        assert_eq!(
+            read_instance_failures(&fx.file, time())["claude"].quota_until,
+            Some(time() + 900.0)
+        );
     }
 
     #[test]
