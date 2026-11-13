@@ -148,16 +148,23 @@ pub fn read_instance_failures(
             continue;
         }
         let result = result.unwrap_or_default();
-        // The appended assistant transcript can discuss errors without being the cause of failure.
-        let header = result
-            .split("\n\nLast assistant message before the run failed:")
+        // The appended assistant transcript can discuss errors without being the cause of failure;
+        // only a leading harness banner ("⚠ Individual quota reached…", Antigravity) counts from it.
+        let mut parts = result.splitn(2, "\n\nLast assistant message before the run failed:");
+        let mut header = parts.next().unwrap_or_default().to_lowercase();
+        if let Some(banner) = parts
             .next()
-            .unwrap_or_default()
-            .to_lowercase();
+            .and_then(|last| last.lines().map(str::trim).find(|l| !l.is_empty()))
+            .filter(|l| l.starts_with('⚠'))
+        {
+            header.push('\n');
+            header.push_str(&banner.to_lowercase());
+        }
         static QUOTA: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
             regex::Regex::new(r"(?i)(quota|usage[ -]?limit|rate[ -]?limit).*(reach|exceed|exhaust)|(?:reach|exceed|exhaust|insufficient).*(quota|usage[ -]?limit|rate[ -]?limit)|hit your [^\n]*limit").unwrap()
         });
         if QUOTA.is_match(&header) {
+            // shortcut: blocks the whole instance, so Antigravity's Argon (own weekly bucket) waits too; key by model if that matters.
             let until = reset_time(&result, finished).unwrap_or(finished + 15.0 * 60.0);
             if until > now {
                 let entry = out
@@ -191,7 +198,7 @@ fn reset_time(result: &str, finished: f64) -> Option<f64> {
     });
     static DURATION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
-            r"(?i)(\d+(?:\.\d+)?)\s*(days?|hours?|hrs?|minutes?|mins?|seconds?|secs?|[dhms])\b",
+            r"(?i)(\d+(?:\.\d+)?)\s*(days?|hours?|hrs?|minutes?|mins?|seconds?|secs?|[dhms])",
         )
         .unwrap()
     });
@@ -566,6 +573,26 @@ mod failure_tests {
             Some(time() + 900.0)
         );
         assert!(read_instance_failures(&fx.file, time() + 900.0).is_empty());
+    }
+
+    #[test]
+    fn antigravity_quota_banner_blocks_until_compact_reset() {
+        let fx = Fixture::new();
+        fx.child("a", "antigravity", "failed", FINISHED,
+            "Antigravity stopped this turn because of an error.\n\nLast assistant message before the run failed:\n\n\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h39m34s.");
+        assert_eq!(
+            read_instance_failures(&fx.file, time())["antigravity"].quota_until,
+            Some(time() + 2.0 * 3600.0 + 39.0 * 60.0 + 34.0)
+        );
+        // Model prose that mentions a quota is not a banner.
+        fx.child("b", "other", "failed", FINISHED,
+            "Antigravity stopped this turn because of an error.\n\nLast assistant message before the run failed:\n\nChecking whether the quota reached its limit; resets in 3 hours.");
+        assert_eq!(
+            read_instance_failures(&fx.file, time())
+                .get("other")
+                .and_then(|f| f.quota_until),
+            None
+        );
     }
 
     #[test]
