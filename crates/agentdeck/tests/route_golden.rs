@@ -852,3 +852,114 @@ fn catalog_save_contract() {
     assert_ne!(code, 0);
     assert_eq!(std::fs::read(&catalog_path).unwrap(), before);
 }
+
+#[test]
+fn t3_reader_output_drives_router_quota_gates() {
+    use agentdeck_usage::providers::t3::{T3Source, fetch_from_root};
+    use serde_json::json;
+
+    const NOW: i64 = 1_794_569_047;
+    let cases = [
+        (
+            "codex",
+            "codex",
+            "codex",
+            "gpt-6.1-sol",
+            json!([{"id":"primary", "kind":"monthly", "label":"Monthly", "windowDurationMins":43200, "usedPercent":95}]),
+            Some(43_200),
+        ),
+        (
+            "opencode-go",
+            "opencode",
+            "opencode",
+            "opencode-go/glm-5",
+            json!([{"id":"go_monthly", "kind":"monthly", "label":"Monthly", "usedPercent":95}]),
+            Some(43_200),
+        ),
+        (
+            "antigravity",
+            "antigravity",
+            "antigravity",
+            "gemini-4-hydrogen-high",
+            json!([
+                {"id":"claude-quota", "kind":"other", "label":"Claude Quota", "usedPercent":20},
+                {"id":"gemini-quota", "kind":"other", "label":"Gemini Quota", "usedPercent":99.5},
+                {"id":"gpt-quota", "kind":"other", "label":"GPT Quota", "usedPercent":15}
+            ]),
+            None,
+        ),
+    ];
+    for (provider, instance, driver, model, windows, duration) in cases {
+        let fx = Fixture::new(&[(instance, model)]);
+        let t3 = fx.dir.join(".t3");
+        std::fs::create_dir_all(t3.join("caches")).unwrap();
+        std::fs::write(
+            t3.join("userdata/settings.json"),
+            json!({"providerInstances": {instance: {"driver":driver, "enabled":true}}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            agentdeck_core::t3::cache_file(&t3, instance),
+            json!({"status":"ready", "auth":{"status":"authenticated", "label":"ChatGPT Free Subscription"},
+                "usageLimits":{"checkedAt":"2026-11-13T11:24:07Z", "windows":windows}}).to_string(),
+        ).unwrap();
+        let account = fetch_from_root(
+            &t3,
+            T3Source {
+                id: "fixture-source",
+                name: "Fixture",
+                provider,
+                instance: Some(instance),
+                explicit_plan: None,
+            },
+            900,
+            NOW,
+        );
+        assert_eq!(account.status, "ok", "{provider}: {:?}", account.error);
+        assert_eq!(
+            account.windows.len(),
+            if duration.is_some() { 1 } else { 3 }
+        );
+        for window in &account.windows {
+            assert_eq!(window.duration_mins, duration, "{provider}: {}", window.key);
+            assert_eq!(window.scope, None);
+        }
+        let state = json!({"accounts":[account]});
+        let state_path = fx.dir.join(".local/state/ai-usage/state.json");
+        std::fs::write(&state_path, state.to_string()).unwrap();
+        std::fs::write(fx.dir.join("router.json"), json!({
+            "version":1, "pool":[{"providerInstanceId":instance, "model":model, "enabled":true}],
+            "accounts":{"fixture":{"instances":[instance], "usageProvider":provider, "usageId":"fixture-source"}},
+            "usageStatePath":state_path,
+        }).to_string()).unwrap();
+        std::fs::write(
+            fx.dir.join(".local/state/model-route/catalog.json"),
+            json!({
+                "providers":[{"providerInstanceId":instance, "models":[{"id":model}]}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mock = write_mock(&fx, &json!({}));
+        let (code, stdout, stderr) = run_rust(&fx, &["--check"], &mock, None);
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&stderr));
+        assert!(stdout.contains(&format!("{instance}/{model}")), "{stdout}");
+        assert!(!stdout.contains("no ai-usage account"), "{stdout}");
+        assert!(stdout.contains("allowed sizes:"), "{stdout}");
+        if duration.is_some() {
+            let mut wrong_duration = state;
+            wrong_duration["accounts"][0]["windows"][0]["duration_mins"] = json!(null);
+            std::fs::write(&state_path, wrong_duration.to_string()).unwrap();
+            let (code, wrong, _) = run_rust(&fx, &["--check"], &mock, None);
+            assert_eq!(code, 0);
+            assert_ne!(
+                stdout,
+                String::from_utf8(wrong).unwrap(),
+                "{provider}: monthly duration must affect routing"
+            );
+        } else {
+            assert!(stdout.contains("allowed sizes: 0,1,2"), "{stdout}");
+        }
+    }
+}
