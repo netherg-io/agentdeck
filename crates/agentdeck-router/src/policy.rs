@@ -36,6 +36,8 @@ pub struct Family {
     pub spend_to_zero: bool,
     pub no_review: bool,
     pub brief_hint: Option<String>,
+    /// Owner preference added to the score as is (roster `ownerBonus`).
+    pub owner_bonus: f64,
 }
 
 fn families() -> Vec<(String, Family)> {
@@ -66,6 +68,7 @@ fn families() -> Vec<(String, Family)> {
                         .get("briefHint")
                         .and_then(|v| v.as_str())
                         .map(str::to_string),
+                    owner_bonus: f.get("ownerBonus").and_then(Value::as_f64).unwrap_or(0.0),
                 },
             ))
         })
@@ -787,7 +790,10 @@ pub fn rank_candidates(
                 && c.reasoning_error.is_none()
                 && c.policy_ban.is_none()
                 && c.fit >= MIN_FIT;
-            let score = c.quality - shared_quota_penalty - paid_credit_penalty + cheap_model_bonus;
+            let owner_bonus = family_of(&c.model).map_or(0.0, |f| f.owner_bonus);
+            let score = c.quality - shared_quota_penalty - paid_credit_penalty
+                + cheap_model_bonus
+                + owner_bonus;
             Ranked {
                 account: own,
                 shared_quota,
@@ -1715,6 +1721,15 @@ mod legacy_suite_edges {
                 2
             ),
             "claude-sonnet-5-5"
+        );
+        // Owner bonus (roster: Hydrogen +0.15) beats Muse's quality and cheap edge.
+        assert_eq!(
+            pick(
+                cheap("opencode-go/muse-spark-1.3-contributor", 0.1, 0.81),
+                cheap("gemini-4-hydrogen-high", 0.05, 0.725),
+                0
+            ),
+            "gemini-4-hydrogen-high"
         );
         // Eligibility uses the raw fit, never a rounded one.
         let fit = |f: f64| {

@@ -41,7 +41,7 @@ Selection policy:
   capability score normalized to 0..1; its top level requires a substantial practical advantage for this
   particular task, not merely a generally stronger model.
 - Difficulty and size are independent. Mechanical edits across many files remain routine; a small concurrency
-  bug can be hard. Eligible candidates rank by `score = quality - sharedQuotaPenalty - paidCreditPenalty + cheapModelBonus`.
+  bug can be hard. Eligible candidates rank by `score = quality - sharedQuotaPenalty - paidCreditPenalty + cheapModelBonus + ownerBonus`.
   In `roster.json`, `routing.sharedQuotaPenalty` defaults to **0.05**: shared-account use costs 0.05 score points (one Jev level is 0.33).
   `routing.cheapModelBonus` is **0.15** × `max(0, 1 - burn)` (Haiku burn 0.1: +0.135, Sonnet 0.6: +0.06, unknown or
   burn >= 1: 0): a cheap model wins a small quality gap, never a whole Jev level (0.33).
@@ -178,6 +178,7 @@ Keep prepared payloads and responses private (`umask 077`) until checkpointing/r
 - `families`: regex per model family, first match wins. Profiles describe durable family strengths, not versions.
 - `minEffort` (optional, per family): lowest ordinary effort the router selects or the hook accepts for that family (Muse Spark: `high`, user rule 2026-10-10). Difficulty above the floor still raises effort; explicit lower requests are denied with a repaired target.
 - `spendToZero` (optional, per family): ignores any weekly reserve and uses task cost 0 for tie-breaks; the task must still fit the remaining quota (Muse Spark, user rule 2026-10-14).
+- `ownerBonus` (optional, per family): added to the score unscaled, to prefer a family the owner chose (Gemini Hydrogen +0.15 over Muse Spark, user rule 2026-11-13: faster, its Gemini quota is not a constraint).
 - `briefHint` (optional, per family): fixed text for gaps a model reliably has (Muse Spark needs the long-command/PARTIAL guidance). The coordinator chooses and names skills in each task brief; family hints do not ask children to select skills. `agentdeck route` composes it after the shared policy and returns the entire string as `briefHint` (winner) and `requestedBriefHint` (validated target); the hook denies a `delegate_task` whose task lacks it verbatim, and `agentdeck route workflow prepare` appends it.
   Built 2026-10-04 from multi-generation benchmark trends (Artificial Analysis, Arena, Epoch, OSWorld, SWE-bench,
   vendor cards) plus the user's experience. GPT is ranked best at computer use and debugging from the user's own

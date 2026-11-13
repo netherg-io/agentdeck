@@ -61,6 +61,13 @@
       "profile": "OpenAI. Durable leader in hard math, algorithms and science reasoning, and the most token-efficient frontier family. The best at computer use (driving GUIs, browsers, desktop apps) and at debugging: reproducing bugs, tracing failures, race conditions, crashes. Strong at shell, terminal and DevOps work and as an independent second opinion from another vendor. Weak on factual recall: verify facts it states."
     },
     {
+      "match": "gemini-.*hydrogen",
+      "burn": 0.05,
+      "ownerBonus": 0.15,
+      "spendToZero": true,
+      "profile": "Google Gemini 4 Hydrogen: fast agentic coder with strong self-testing. On a real debugging unit (a protocol-dependent parsing bug in a 1.7k-line Python CLI wrapper, judged by hidden behaviour checks) it scored 7/8 in about 4-5 minutes in both runs, level with Muse Spark (7/8 in 27 minutes) and close to GPT-6.1 Sol (8/8 in 6 minutes); it wrote thorough end-to-end tests but missed one resume edge case and widened scope slightly beyond the brief. Long autonomous sessions and original visual design are unproven."
+    },
+    {
       "match": "gemini-.*flash",
       "burn": 1,
       "profile": "Google fast tier. Durable leader in multimodal input: takes almost anything natively (images, screenshots, video, audio, PDFs, scans, spreadsheets, huge files, mixed media). Strong at high-volume work, web research, summarisation and broad read-only exploration. On hard, well-specified coding (concurrency debugging, spec-exact parsers, Rust fixes, optimisation, log-driven incident analysis, features in a real library) it matched GPT-6.1 Sol on hidden tests, but took about twice as long and used far more tokens. Weakest of five families at original web design from a brief (stock templates, mobile overflow) despite browser self-checks. Ambiguous architecture and long autonomous implementation are unproven."
