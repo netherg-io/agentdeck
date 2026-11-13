@@ -249,6 +249,20 @@ pub fn failure_backoff(consecutive_failures: u32, max_interval: u64) -> Duration
     Duration::from_secs(backoff.min(max_interval))
 }
 
+pub(crate) fn has_transient_error(state: &AppState) -> bool {
+    state.accounts.iter().any(|a| {
+        if model::is_t3_subscription(&a.provider) {
+            providers::t3::is_transient_account_state(a)
+                || (a.status == "error"
+                    && a.error
+                        .as_deref()
+                        .is_some_and(|e| e.starts_with("Провайдер не ответил")))
+        } else {
+            a.status == "error" || (a.status == "stale" && a.error.is_some())
+        }
+    })
+}
+
 /// Однострочный итог цикла в journal: статус, возраст данных и ошибка каждого
 /// аккаунта. Смотреть: journalctl --user -u agentdeck-usage.service
 fn log_cycle(state: &AppState) {
@@ -309,12 +323,7 @@ pub async fn run_daemon(
             eprintln!("Не удалось дописать history.jsonl: {error}");
         }
 
-        let has_transient_error = state
-            .accounts
-            .iter()
-            .any(|a| a.status == "error" || (a.status == "stale" && a.error.is_some()));
-
-        let sleep_duration = if has_transient_error {
+        let sleep_duration = if has_transient_error(&state) {
             consecutive_failures = consecutive_failures.saturating_add(1);
             failure_backoff(consecutive_failures, interval)
         } else {
@@ -752,5 +761,114 @@ mod tests {
         assert_eq!(state.accounts[0].status, "error");
         assert!(state.accounts[0].windows.is_empty());
         assert!(state.accounts[0].error.is_some());
+    }
+
+    #[test]
+    fn t3_non_transient_errors_do_not_trigger_short_backoff() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentdeck-daemon-retry-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("userdata")).unwrap();
+        fs::create_dir_all(dir.join("caches")).unwrap();
+        fs::write(
+            dir.join("userdata/settings.json"),
+            r#"{"providerInstances":{
+                "claude-ok":{"driver":"claudeAgent","enabled":true},
+                "claude-dis":{"driver":"claudeAgent","enabled":false}
+            }}"#,
+        )
+        .unwrap();
+        let _guard = Guard(dir.clone());
+
+        let wrap = |account: model::AccountState| AppState {
+            schema_version: model::SCHEMA_VERSION,
+            updated_at: 1_794_570_000,
+            accounts: vec![account],
+        };
+        let src = |id: &'static str, inst: Option<&'static str>| providers::t3::T3Source {
+            id,
+            name: id,
+            provider: "claude",
+            instance: inst,
+            explicit_plan: None,
+        };
+
+        // 1. Instance disabled in T3 -> not transient
+        let disabled = providers::t3::fetch_from_root(
+            &dir,
+            src("claude-dis", Some("claude-dis")),
+            900,
+            1_794_570_000,
+        );
+        assert_eq!(disabled.status, "error");
+        assert!(!has_transient_error(&wrap(disabled)));
+
+        // 2. Source without T3 instance -> not transient
+        let no_inst = providers::t3::fetch_from_root(&dir, src("claude-none", None), 900, 1_794_570_000);
+        assert_eq!(no_inst.status, "error");
+        assert!(!has_transient_error(&wrap(no_inst)));
+
+        // 3. usageLimits.unavailable -> not transient
+        fs::write(
+            agentdeck_core::t3::cache_file(&dir, "claude-ok"),
+            r#"{"enabled":true,"status":"ready","usageLimits":{"checkedAt":"2026-11-13T11:35:00Z","windows":[],"unavailable":{"reason":"unsupported"}}}"#,
+        )
+        .unwrap();
+        let unavail = providers::t3::fetch_from_root(
+            &dir,
+            src("claude-ok", Some("claude-ok")),
+            900,
+            1_794_570_000,
+        );
+        assert_eq!(unavail.status, "error");
+        assert!(!has_transient_error(&wrap(unavail)));
+
+        // 4. Stale T3 cache -> not transient
+        fs::write(
+            agentdeck_core::t3::cache_file(&dir, "claude-ok"),
+            r#"{"enabled":true,"status":"ready","usageLimits":{"checkedAt":"2026-11-13T10:00:00Z","windows":[{"id":"five_hour","usedPercent":10}]}}"#,
+        )
+        .unwrap();
+        let stale = providers::t3::fetch_from_root(
+            &dir,
+            src("claude-ok", Some("claude-ok")),
+            900,
+            1_794_570_000,
+        );
+        assert_eq!(stale.status, "stale");
+        assert!(!has_transient_error(&wrap(stale)));
+
+        // 5. Half-written / parse failure -> transient
+        fs::write(
+            agentdeck_core::t3::cache_file(&dir, "claude-ok"),
+            r#"{"enabled":true,"status":"ready","usageLimits":{"#,
+        )
+        .unwrap();
+        let parse_err = providers::t3::fetch_from_root(
+            &dir,
+            src("claude-ok", Some("claude-ok")),
+            900,
+            1_794_570_000,
+        );
+        assert_eq!(parse_err.status, "error");
+        assert!(has_transient_error(&wrap(parse_err)));
+
+        // 6. Missing cache file during rewrite -> transient
+        fs::remove_file(agentdeck_core::t3::cache_file(&dir, "claude-ok")).unwrap();
+        let missing = providers::t3::fetch_from_root(
+            &dir,
+            src("claude-ok", Some("claude-ok")),
+            900,
+            1_794_570_000,
+        );
+        assert_eq!(missing.status, "waiting");
+        assert!(has_transient_error(&wrap(missing)));
+
+        // 7. Balance provider error/stale -> still transient
+        let bal_err = model::AccountState::error("or", "OpenRouter", "openrouter", "network timeout");
+        assert!(has_transient_error(&wrap(bal_err)));
     }
 }

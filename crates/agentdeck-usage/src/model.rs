@@ -130,7 +130,7 @@ pub struct AppState {
     pub accounts: Vec<AccountState>,
 }
 
-fn is_t3_subscription(provider: &str) -> bool {
+pub(crate) fn is_t3_subscription(provider: &str) -> bool {
     matches!(provider, "claude" | "codex" | "antigravity" | "opencode-go")
 }
 

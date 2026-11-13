@@ -11,6 +11,29 @@ use crate::model::{AccountState, FIVE_HOUR_MINS, QuotaWindow, WEEKLY_MINS, label
 const MONTHLY_MINS: u64 = 30 * 24 * 60;
 const WINDOW_SUFFIXES: [&str; 5] = ["5h", "five_hour", "five-hour", "weekly", "week"];
 
+const CACHE_MISSING_PREFIX: &str = "T3 cache missing for enabled instance ";
+const CACHE_REWRITE_SUFFIX: &str = "; wait for T3 Code to finish writing cache";
+const SETTINGS_CHECK_SUFFIX: &str = "; check T3 Code installation and userdata/settings.json";
+
+/// True only for T3 states caused by a transient read/parse race (missing
+/// cache file during rewrite, half-written JSON, or settings parse failure),
+/// never for disabled instances, unavailable limits, missing instance config,
+/// unauthenticated accounts, or stale timestamps.
+pub(crate) fn is_transient_account_state(account: &AccountState) -> bool {
+    let Some(err) = account.error.as_deref() else {
+        return false;
+    };
+    match account.status.as_str() {
+        "waiting" => err.starts_with(CACHE_MISSING_PREFIX),
+        "error" => {
+            err.ends_with(CACHE_REWRITE_SUFFIX)
+                || (err.ends_with(SETTINGS_CHECK_SUFFIX)
+                    && !err.starts_with("T3 data directory not found"))
+        }
+        _ => false,
+    }
+}
+
 pub struct T3Source<'a> {
     pub id: &'a str,
     pub name: &'a str,
@@ -97,7 +120,7 @@ pub fn fetch_from_root(
                 source.id,
                 source.name,
                 source.provider,
-                format!("{err}; check T3 Code installation and userdata/settings.json"),
+                format!("{err}{SETTINGS_CHECK_SUFFIX}"),
             );
         }
         Ok(None) => {
@@ -131,7 +154,7 @@ pub fn fetch_from_root(
                 source.id,
                 source.name,
                 source.provider,
-                format!("{err}; wait for T3 Code to finish writing cache"),
+                format!("{err}{CACHE_REWRITE_SUFFIX}"),
             );
         }
         Ok(None) => {
@@ -141,7 +164,7 @@ pub fn fetch_from_root(
                 None,
                 Vec::new(),
                 Some(format!(
-                    "T3 cache missing for enabled instance {instance_id:?}; open T3 Code or trigger a health refresh"
+                    "{CACHE_MISSING_PREFIX}{instance_id:?}; open T3 Code or trigger a health refresh"
                 )),
                 now,
             );
