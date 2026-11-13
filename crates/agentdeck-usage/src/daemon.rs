@@ -1,9 +1,9 @@
 //! Polling loop and state publishing shared by `agentdeck daemon` and
 //! `agentdeck usage once`.
 //!
-//! Per-provider deadline, last-known-good merge, SIGTERM drain (incl. the
-//! Claude detached write-back via `finish_refreshes`), history writes, failure
-//! backoff. The daemon reads `[[usage]]` once at startup (restart to apply).
+//! Per-provider deadline, last-known-good merge for balance sources, SIGTERM
+//! drain, history writes, failure backoff. The daemon reads `[[usage]]` once at
+//! startup (restart to apply).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -276,7 +276,7 @@ fn log_cycle(state: &AppState) {
 /// Run the polling loop until SIGTERM/SIGINT. `load` provides fresh
 /// `(accounts, refresh_seconds, stale_seconds)` every cycle.
 /// Holds the single-writer lock for life; refuses while the old service is
-/// active. Drains in-flight Claude credential write-back before returning.
+/// active.
 pub async fn run_daemon(
     paths: &DaemonPaths,
     old_service_active: fn() -> bool,
@@ -328,7 +328,6 @@ pub async fn run_daemon(
             _ = interrupt.recv() => break,
         }
     }
-    providers::claude::finish_refreshes().await?;
     Ok(())
 }
 
@@ -424,100 +423,64 @@ fn state_file_info(path: &Path, now: i64) -> DoctorStateFile {
     }
 }
 
-fn backoff_info(id: &str, file: PathBuf, now: i64) -> DoctorBackoff {
-    let meta_age = fs::metadata(&file)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.elapsed().ok())
-        .map(|d| d.as_secs() as i64);
-    // Generic peek at the Claude cooldown field; unknown files just show mtime.
-    let retry_in_secs = fs::read_to_string(&file)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|v| v.get("next_attempt_at").and_then(serde_json::Value::as_i64))
-        .map(|next| next.saturating_sub(now))
-        .filter(|retry| *retry > 0);
-    DoctorBackoff {
-        id: id.to_owned(),
-        file,
-        age_secs: meta_age,
-        retry_in_secs,
-    }
-}
-
 pub fn doctor(
     paths: &DaemonPaths,
     accounts: &[AccountConfig],
     old_service_active: fn() -> bool,
 ) -> DoctorReport {
     let now = util::unix_now();
+    let t3_root = agentdeck_core::t3::t3_root().ok();
+    let t3_source = |kind: &str, instance: Option<&str>| -> (Option<String>, String) {
+        let resolved = providers::t3::resolve_instance_slug(kind, instance);
+        let source = match (&resolved, &t3_root) {
+            (Some(inst), Some(root)) => agentdeck_core::t3::cache_file(root, inst)
+                .display()
+                .to_string(),
+            (Some(inst), None) => format!("t3:caches/{inst}.json"),
+            (None, _) => "missing T3 instance".to_owned(),
+        };
+        (resolved, source)
+    };
+
     let sources = accounts
         .iter()
         .map(|a| {
-            let (kind, source) = match a {
-                AccountConfig::Claude { config_dir, .. } => {
-                    ("claude", config_dir.display().to_string())
+            let (kind, instance, source) = match a {
+                AccountConfig::Claude { instance, .. } => {
+                    let (inst, src) = t3_source("claude", instance.as_deref());
+                    ("claude", inst, src)
                 }
-                AccountConfig::Codex {
-                    codex_home,
-                    command,
-                    ..
-                } => (
-                    "codex",
-                    format!("{command} CODEX_HOME={}", codex_home.display()),
-                ),
-                AccountConfig::Deepseek { api_key_env, .. } => ("deepseek", api_key_env.clone()),
+                AccountConfig::Codex { instance, .. } => {
+                    let (inst, src) = t3_source("codex", instance.as_deref());
+                    ("codex", inst, src)
+                }
+                AccountConfig::Deepseek { api_key_env, .. } => {
+                    ("deepseek", None, api_key_env.clone())
+                }
                 AccountConfig::Openrouter { api_key_env, .. } => {
-                    ("openrouter", api_key_env.clone())
+                    ("openrouter", None, api_key_env.clone())
                 }
-                AccountConfig::Vercel { api_key_env, .. } => ("vercel", api_key_env.clone()),
-                AccountConfig::Antigravity { token_file, .. } => (
-                    "antigravity",
-                    token_file
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "auto-discovery".to_owned()),
-                ),
-                AccountConfig::OpencodeGo { db_file, .. } => (
-                    "opencode-go",
-                    db_file
-                        .clone()
-                        .unwrap_or_else(providers::opencode_go::default_db_file)
-                        .display()
-                        .to_string(),
-                ),
+                AccountConfig::Vercel { api_key_env, .. } => ("vercel", None, api_key_env.clone()),
+                AccountConfig::Antigravity { instance, .. } => {
+                    let (inst, src) = t3_source("antigravity", instance.as_deref());
+                    ("antigravity", inst, src)
+                }
+                AccountConfig::OpencodeGo { instance, .. } => {
+                    let (inst, src) = t3_source("opencode-go", instance.as_deref());
+                    ("opencode-go", inst, src)
+                }
             };
             DoctorSource {
                 id: a.id().to_owned(),
                 kind: kind.to_owned(),
-                instance: None,
+                instance,
                 source,
             }
         })
         .collect::<Vec<_>>();
-    let backoffs = accounts
-        .iter()
-        .filter_map(|a| match a {
-            AccountConfig::Claude { id, .. } => Some(backoff_info(
-                id,
-                paths
-                    .cooldown_dir
-                    .join(providers::claude::usage_cache_file_name(id)),
-                now,
-            )),
-            AccountConfig::Antigravity { id, .. } => Some(backoff_info(
-                id,
-                paths
-                    .cooldown_dir
-                    .join(providers::antigravity::snapshot_file_name(id)),
-                now,
-            )),
-            _ => None,
-        })
-        .collect();
     DoctorReport {
         sources,
-        backoffs,
+        backoffs: Vec::new(),
         canonical: state_file_info(&paths.canonical, now),
         runtime: state_file_info(&paths.runtime, now),
         compat_canonical: paths
@@ -718,14 +681,28 @@ mod tests {
     #[test]
     fn doctor_is_read_only_and_reports_everything() {
         let (paths, _g) = temp_paths("doctor");
-        let accounts = vec![AccountConfig::Antigravity {
-            id: "agy-main".to_owned(),
-            name: "Agy".to_owned(),
-            token_file: None,
-        }];
+        let accounts = vec![
+            AccountConfig::Antigravity {
+                id: "agy-main".to_owned(),
+                name: "Agy".to_owned(),
+                instance: Some("antigravity".to_owned()),
+                token_file: None,
+            },
+            AccountConfig::OpencodeGo {
+                id: "opencode-go".to_owned(),
+                name: "OpenCode Go".to_owned(),
+                instance: None,
+                db_file: None,
+            },
+        ];
         let report = doctor(&paths, &accounts, || false);
-        assert_eq!(report.sources.len(), 1);
+        assert_eq!(report.sources.len(), 2);
         assert_eq!(report.sources[0].id, "agy-main");
+        assert_eq!(report.sources[0].instance.as_deref(), Some("antigravity"));
+        assert!(report.sources[0].source.contains("antigravity.json"));
+        assert_eq!(report.sources[1].instance.as_deref(), Some("opencode"));
+        assert!(report.sources[1].source.contains("opencode.json"));
+        assert!(report.backoffs.is_empty());
         assert!(!report.old_service_active);
         assert!(!report.lock_held);
         assert!(report.canonical.updated_at.is_none());
@@ -736,5 +713,44 @@ mod tests {
 
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("agy-main"));
+    }
+
+    #[tokio::test]
+    async fn refresh_cycle_does_not_resurface_old_windows_on_subscription_error() {
+        let prev = AppState {
+            schema_version: model::SCHEMA_VERSION,
+            updated_at: 1_700_000_000,
+            accounts: vec![model::AccountState {
+                id: "claude-main".to_owned(),
+                name: "Claude".to_owned(),
+                provider: "claude".to_owned(),
+                status: "ok".to_owned(),
+                plan: Some("Pro".to_owned()),
+                email: None,
+                model: None,
+                windows: vec![model::QuotaWindow::new(
+                    "session",
+                    "5 часов",
+                    42.0,
+                    Some(model::FIVE_HOUR_MINS),
+                    None,
+                )],
+                balances: Vec::new(),
+                error: None,
+                updated_at: 1_700_000_000,
+            }],
+        };
+        let accounts = vec![AccountConfig::Claude {
+            id: "claude-main".to_owned(),
+            name: "Claude".to_owned(),
+            plan: None,
+            instance: None,
+            config_dir: PathBuf::new(),
+        }];
+        let state = refresh_cycle(&accounts, 900, Some(prev)).await;
+        assert_eq!(state.accounts.len(), 1);
+        assert_eq!(state.accounts[0].status, "error");
+        assert!(state.accounts[0].windows.is_empty());
+        assert!(state.accounts[0].error.is_some());
     }
 }

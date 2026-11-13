@@ -157,6 +157,7 @@ mod tests {
         AccountConfig::Claude {
             id: id.to_owned(),
             name: id.to_owned(),
+            instance: None,
             config_dir: dir.to_path_buf(),
             plan: None,
         }
@@ -186,6 +187,7 @@ mod tests {
             AccountConfig::Antigravity {
                 id: "agy-main".to_owned(),
                 name: "Agy".to_owned(),
+                instance: None,
                 token_file: None,
             },
         ];
@@ -215,6 +217,7 @@ mod tests {
         let codex = AccountConfig::Codex {
             id: "codex-main".to_owned(),
             name: "Codex".to_owned(),
+            instance: None,
             codex_home: PathBuf::from("/fake/.codex"),
             command: "codex".to_owned(),
             limit_id: "codex".to_owned(),

@@ -2720,4 +2720,118 @@ mod live_quota_shape_tests {
         assert_eq!(allowed(&u, "claude_second", "claude-opus-5-5"), [false; 4]);
         assert_eq!(allowed(&u, "claude_second", "claude-fable-5-2"), [false; 4]);
     }
+
+    #[test]
+    fn opencode_go_monthly_43200_uses_weekly_factor_not_nan_short_factor() {
+        let load = AgentLoad {
+            known: true,
+            agents: vec![],
+            note: None,
+        };
+        let state_with_43200 = serde_json::json!({"accounts": [{
+            "id": "opencode-go", "provider": "opencode-go", "status": "ok", "plan": "Go",
+            "updated_at": NOW - 40.0, "balances": [], "windows": [
+                {"key": "rolling", "label": "5 часов", "used_percent": 2.0, "remaining_percent": 98.0, "duration_mins": 300, "resets_at": NOW + 3_600.0},
+                {"key": "weekly", "label": "Неделя", "used_percent": 10.0, "remaining_percent": 90.0, "duration_mins": 10080, "resets_at": NOW + 200_000.0},
+                {"key": "monthly", "label": "Месяц", "used_percent": 95.0, "remaining_percent": 5.0, "duration_mins": 43200, "resets_at": NOW + 2_000_000.0}
+            ]
+        }]});
+        let mut state_with_null = state_with_43200.clone();
+        state_with_null["accounts"][0]["windows"][2]["duration_mins"] = Value::Null;
+
+        let parse = |val: Value| {
+            let p = std::env::temp_dir().join(format!(
+                "agentdeck-router-b1-{}-{}.json",
+                std::process::id(),
+                val["accounts"][0]["windows"][2]["duration_mins"]
+            ));
+            std::fs::write(&p, val.to_string()).unwrap();
+            let u = parse_usage_state(&p).unwrap();
+            std::fs::remove_file(&p).ok();
+            u
+        };
+
+        let u_43200 = parse(state_with_43200);
+        let u_null = parse(state_with_null);
+        let q_43200 = quota(
+            &cfg(),
+            &Measured::default(),
+            &u_43200,
+            &load,
+            "opencode",
+            "opencode-go/glm-5",
+            NOW,
+        );
+        let q_null = quota(
+            &cfg(),
+            &Measured::default(),
+            &u_null,
+            &load,
+            "opencode",
+            "opencode-go/glm-5",
+            NOW,
+        );
+        // With 43200 mins (what old opencode_go.rs and T3 mapper both publish),
+        // monthly gets factor 1.0; null/NaN would wrongly apply short-window factor 5.0.
+        assert_eq!(q_43200.allowed, [true, true, true, true]);
+        assert_eq!(q_null.allowed, [true, true, true, false]);
+        assert!(q_43200.cost.unwrap()[3] < q_null.cost.unwrap()[3]);
+    }
+
+    #[test]
+    fn antigravity_coarse_windows_without_duration_match_legacy_routing() {
+        let load = AgentLoad {
+            known: true,
+            agents: vec![],
+            note: None,
+        };
+        let state = serde_json::json!({"accounts": [{
+            "id": "agy-main", "provider": "antigravity", "status": "ok", "plan": "Google AI Pro",
+            "updated_at": NOW - 40.0, "balances": [], "windows": [
+                {"key": "claude-quota", "label": "Claude Quota", "used_percent": 20.0, "remaining_percent": 80.0, "duration_mins": null, "resets_at": null, "scope": null},
+                {"key": "gemini-quota", "label": "Gemini Quota", "used_percent": 99.5, "remaining_percent": 0.5, "duration_mins": null, "resets_at": null, "scope": null},
+                {"key": "gpt-quota", "label": "GPT Quota", "used_percent": 15.0, "remaining_percent": 85.0, "duration_mins": null, "resets_at": null, "scope": null}
+            ]
+        }]});
+        let p = std::env::temp_dir().join(format!(
+            "agentdeck-router-agy-coarse-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&p, state.to_string()).unwrap();
+        let u = parse_usage_state(&p).unwrap();
+        std::fs::remove_file(&p).ok();
+
+        // Legacy antigravity.rs also published duration_mins: null for keys without 5h/week;
+        // verify router gating matches across Gemini, 3P and Argon models.
+        let q_gemini = quota(
+            &cfg(),
+            &Measured::default(),
+            &u,
+            &load,
+            "antigravity",
+            "gemini-4-hydrogen-high",
+            NOW,
+        );
+        let q_3p = quota(
+            &cfg(),
+            &Measured::default(),
+            &u,
+            &load,
+            "antigravity",
+            "claude-opus-5-5-high",
+            NOW,
+        );
+        let q_argon = quota(
+            &cfg(),
+            &Measured::default(),
+            &u,
+            &load,
+            "antigravity",
+            "gemini-4-argon-low",
+            NOW,
+        );
+        assert_eq!(q_gemini.allowed, [true, true, true, false]);
+        assert_eq!(q_3p.allowed, [true, true, true, true]);
+        assert_eq!(q_argon.allowed, [true, true, false, false]);
+    }
 }

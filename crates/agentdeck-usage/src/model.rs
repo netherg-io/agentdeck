@@ -130,12 +130,17 @@ pub struct AppState {
     pub accounts: Vec<AccountState>,
 }
 
-/// Сохраняет последние удачные данные при разовом сбое провайдера.
+fn is_t3_subscription(provider: &str) -> bool {
+    matches!(provider, "claude" | "codex" | "antigravity" | "opencode-go")
+}
+
+/// Сохраняет последние удачные данные при разовом сбое провайдера баланса.
 ///
-/// Без этого одна сетевая ошибка стирала квоту из панели целиком, хотя
-/// минутной давности цифры всё ещё полезны. Аккаунт помечается `stale`,
-/// текст ошибки сохраняется, а `updated_at` остаётся от удачного ответа —
-/// поэтому UI может показать реальный возраст данных.
+/// Без этого одна сетевая ошибка стирала бы баланс из панели, хотя минутной
+/// давности цифры всё ещё полезны. T3-провайдеры квот (`claude`, `codex`,
+/// `antigravity`, `opencode-go`) уже кешируются на диске самим T3: ошибка без
+/// окон (например, отключённый инстанс или битый кеш) никогда не должна
+/// воскрешать старые цифры.
 pub fn merge_with_previous(
     previous: Option<AppState>,
     fresh: Vec<AccountState>,
@@ -150,7 +155,10 @@ pub fn merge_with_previous(
     fresh
         .into_iter()
         .map(|account| {
-            if account.status != "error" || account.has_data() {
+            if account.status != "error"
+                || account.has_data()
+                || is_t3_subscription(&account.provider)
+            {
                 return account;
             }
             let Some(old) = previous
@@ -235,17 +243,65 @@ mod tests {
         assert_eq!(label_for_duration(None), "Лимит");
     }
 
+    fn good_balance(id: &str) -> AccountState {
+        AccountState {
+            id: id.to_owned(),
+            name: "OpenRouter".to_owned(),
+            provider: "openrouter".to_owned(),
+            status: "ok".to_owned(),
+            plan: Some("Credits".to_owned()),
+            email: None,
+            model: None,
+            windows: Vec::new(),
+            balances: vec![BalanceInfo {
+                currency: "USD".to_owned(),
+                total: "12.50".to_owned(),
+                granted: None,
+                topped_up: None,
+            }],
+            error: None,
+            updated_at: 1_000,
+        }
+    }
+
     #[test]
-    fn keeps_last_good_data_when_provider_fails() {
-        let fresh = vec![AccountState::error("codex-main", "Codex", "codex", "сеть")];
-        let merged = merge_with_previous(previous(vec![good("codex-main")]), fresh);
+    fn keeps_last_good_data_when_balance_provider_fails() {
+        let fresh = vec![AccountState::error(
+            "openrouter-main",
+            "OpenRouter",
+            "openrouter",
+            "сеть",
+        )];
+        let merged = merge_with_previous(previous(vec![good_balance("openrouter-main")]), fresh);
 
         assert_eq!(merged[0].status, "stale");
         assert_eq!(merged[0].error.as_deref(), Some("сеть"));
-        assert_eq!(merged[0].windows[0].used_percent, 54.0);
-        assert_eq!(merged[0].plan.as_deref(), Some("plus"));
+        assert_eq!(merged[0].balances[0].total, "12.50");
+        assert_eq!(merged[0].plan.as_deref(), Some("Credits"));
         // Возраст берётся от удачного ответа, иначе UI покажет свежесть, которой нет.
         assert_eq!(merged[0].updated_at, 1_000);
+    }
+
+    #[test]
+    fn subscription_error_never_resurfaces_previous_windows() {
+        for (id, provider) in [
+            ("claude-main", "claude"),
+            ("codex-main", "codex"),
+            ("agy-main", "antigravity"),
+            ("opencode-go", "opencode-go"),
+        ] {
+            let mut prev = good(id);
+            prev.provider = provider.to_owned();
+            let fresh = vec![AccountState::error(id, id, provider, "disabled in T3")];
+            let merged = merge_with_previous(previous(vec![prev]), fresh);
+            assert_eq!(merged[0].status, "error", "{provider}");
+            assert!(merged[0].windows.is_empty(), "{provider}");
+            assert_eq!(
+                merged[0].error.as_deref(),
+                Some("disabled in T3"),
+                "{provider}"
+            );
+        }
     }
 
     #[test]
@@ -273,17 +329,27 @@ mod tests {
 
     #[test]
     fn error_without_history_stays_an_error() {
-        let fresh = vec![AccountState::error("codex-new", "Codex", "codex", "сеть")];
-        let merged = merge_with_previous(previous(vec![good("codex-main")]), fresh);
+        let fresh = vec![AccountState::error(
+            "openrouter-new",
+            "OpenRouter",
+            "openrouter",
+            "сеть",
+        )];
+        let merged = merge_with_previous(previous(vec![good_balance("openrouter-main")]), fresh);
         assert_eq!(merged[0].status, "error");
-        assert!(merged[0].windows.is_empty());
+        assert!(merged[0].balances.is_empty());
     }
 
     #[test]
     fn does_not_borrow_data_from_a_different_provider_with_the_same_id() {
-        let mut other = good("shared");
-        other.provider = "claude".to_owned();
-        let fresh = vec![AccountState::error("shared", "Codex", "codex", "сеть")];
+        let mut other = good_balance("shared");
+        other.provider = "deepseek".to_owned();
+        let fresh = vec![AccountState::error(
+            "shared",
+            "OpenRouter",
+            "openrouter",
+            "сеть",
+        )];
         let merged = merge_with_previous(previous(vec![other]), fresh);
         assert_eq!(merged[0].status, "error");
     }
@@ -293,9 +359,14 @@ mod tests {
         let stale_schema = Some(AppState {
             schema_version: SCHEMA_VERSION + 1,
             updated_at: 1_000,
-            accounts: vec![good("codex-main")],
+            accounts: vec![good_balance("openrouter-main")],
         });
-        let fresh = vec![AccountState::error("codex-main", "Codex", "codex", "сеть")];
+        let fresh = vec![AccountState::error(
+            "openrouter-main",
+            "OpenRouter",
+            "openrouter",
+            "сеть",
+        )];
         let merged = merge_with_previous(stale_schema, fresh);
         assert_eq!(merged[0].status, "error");
     }

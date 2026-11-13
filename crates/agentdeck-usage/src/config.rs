@@ -38,12 +38,18 @@ pub enum AccountConfig {
     Claude {
         id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<String>,
+        #[serde(default)]
         config_dir: PathBuf,
         plan: Option<String>,
     },
     Codex {
         id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<String>,
+        #[serde(default)]
         codex_home: PathBuf,
         #[serde(default = "default_codex_command")]
         command: String,
@@ -76,13 +82,16 @@ pub enum AccountConfig {
         id: String,
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         token_file: Option<PathBuf>,
     },
-    /// Учётные данные читаются из базы OpenCode (`/connect`).
     #[serde(rename = "opencode-go")]
     OpencodeGo {
         id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         db_file: Option<PathBuf>,
     },
@@ -130,9 +139,15 @@ impl AccountConfig {
     /// один `statusLine`, для Codex — к перепутанным лимитам.
     pub fn exclusive_dir(&self) -> Option<&Path> {
         match self {
-            Self::Claude { config_dir, .. } => Some(config_dir),
-            Self::Codex { codex_home, .. } => Some(codex_home),
-            Self::Deepseek { .. }
+            Self::Claude { config_dir, .. } if !config_dir.as_os_str().is_empty() => {
+                Some(config_dir)
+            }
+            Self::Codex { codex_home, .. } if !codex_home.as_os_str().is_empty() => {
+                Some(codex_home)
+            }
+            Self::Claude { .. }
+            | Self::Codex { .. }
+            | Self::Deepseek { .. }
             | Self::Openrouter { .. }
             | Self::Vercel { .. }
             | Self::Antigravity { .. }
@@ -225,22 +240,27 @@ pub fn accounts_from_registry(entries: &[UsageEntry]) -> Result<Vec<AccountConfi
         } else {
             e.display.clone()
         };
-        let path_field = |field: &str, v: &Option<String>| -> Result<std::path::PathBuf> {
-            v.as_ref()
-                .map(std::path::PathBuf::from)
-                .with_context(|| format!("usage {:?}: missing {field:?}", e.id))
-        };
         accounts.push(match e.kind {
             UsageKind::Claude => AccountConfig::Claude {
                 id: e.id.clone(),
                 name,
-                config_dir: path_field("config_dir", &e.config_dir)?,
+                instance: e.instance.clone(),
+                config_dir: e
+                    .config_dir
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_default(),
                 plan: None,
             },
             UsageKind::Codex => AccountConfig::Codex {
                 id: e.id.clone(),
                 name,
-                codex_home: path_field("codex_home", &e.codex_home)?,
+                instance: e.instance.clone(),
+                codex_home: e
+                    .codex_home
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_default(),
                 command: default_codex_command(),
                 limit_id: default_codex_limit_id(),
             },
@@ -265,12 +285,14 @@ pub fn accounts_from_registry(entries: &[UsageEntry]) -> Result<Vec<AccountConfi
             UsageKind::Antigravity => AccountConfig::Antigravity {
                 id: e.id.clone(),
                 name,
-                token_file: e.token_file.as_ref().map(std::path::PathBuf::from),
+                instance: e.instance.clone(),
+                token_file: e.token_file.as_ref().map(PathBuf::from),
             },
             UsageKind::OpencodeGo => AccountConfig::OpencodeGo {
                 id: e.id.clone(),
                 name,
-                db_file: e.db_file.as_ref().map(std::path::PathBuf::from),
+                instance: e.instance.clone(),
+                db_file: e.db_file.as_ref().map(PathBuf::from),
             },
         });
     }
@@ -303,6 +325,7 @@ mod tests {
         AccountConfig::Claude {
             id: id.to_owned(),
             name: id.to_owned(),
+            instance: None,
             config_dir: PathBuf::from(dir),
             plan: None,
         }
@@ -312,6 +335,7 @@ mod tests {
         AccountConfig::Codex {
             id: id.to_owned(),
             name: id.to_owned(),
+            instance: None,
             codex_home: PathBuf::from(home),
             command: "codex".to_owned(),
             limit_id: "codex".to_owned(),
@@ -322,6 +346,7 @@ mod tests {
         AccountConfig::Antigravity {
             id: id.to_owned(),
             name: id.to_owned(),
+            instance: None,
             token_file: None,
         }
     }
@@ -454,6 +479,7 @@ mod tests {
             accounts: vec![AccountConfig::Antigravity {
                 id: "agy-custom".to_owned(),
                 name: "Custom ACP".to_owned(),
+                instance: None,
                 token_file: Some(PathBuf::from("/etc/acp.json")),
             }],
             ..Config::default()
@@ -466,6 +492,7 @@ mod tests {
             AccountConfig::Antigravity {
                 id: "agy-custom".to_owned(),
                 name: "Custom ACP".to_owned(),
+                instance: None,
                 token_file: Some(PathBuf::from("/etc/acp.json")),
             }
         );
@@ -599,5 +626,25 @@ db_file = "/data/opencode.db"
         )
         .unwrap();
         assert!(accounts_from_registry(&reg.usage).is_err());
+    }
+
+    #[test]
+    fn registry_adapter_propagates_instance() {
+        let reg = agentdeck_core::Registry::from_toml(
+            "version = 1\n\
+             [[instance]]\nid = \"claude-main\"\nharness = \"claude\"\nhome = \"~/.claude\"\n\
+             [[usage]]\nid = \"claude-main\"\nkind = \"claude\"\ninstance = \"claude-main\"\nconfig_dir = \"~/.claude\"\n\
+             [[usage]]\nid = \"opencode-go\"\nkind = \"opencode-go\"\n",
+        )
+        .unwrap();
+        let accounts = accounts_from_registry(&reg.usage).unwrap();
+        assert!(matches!(
+            &accounts[0],
+            AccountConfig::Claude { instance: Some(i), .. } if i == "claude-main"
+        ));
+        assert!(matches!(
+            &accounts[1],
+            AccountConfig::OpencodeGo { instance: None, .. }
+        ));
     }
 }
