@@ -657,10 +657,16 @@ pub fn budget_allowed(
     now: f64,
 ) -> [bool; 4] {
     [0, 1, 2, 3].map(|size| {
-        windows
-            .iter()
-            .all(|w| headroom(w, reserve_percent, now) > weekly[size] * window_factor(w))
-            && balances.iter().all(|b| *b > USD_COST[size] * burn)
+        windows.iter().all(|w| {
+            let estimate = weekly[size] * window_factor(w);
+            // Subpercent burn estimates cannot safely fund a fresh launch near a short-window limit.
+            let required = if w.duration_mins >= 10080.0 {
+                estimate
+            } else {
+                estimate.max(1.0)
+            };
+            headroom(w, reserve_percent, now) > required
+        }) && balances.iter().all(|b| *b > USD_COST[size] * burn)
     })
 }
 
@@ -1503,6 +1509,33 @@ mod legacy_suite_edges {
         assert!(!allowed(&timed(1.0, 1.0), weekly, 1.0, &[], now, 1));
         assert!(!allowed(&timed(5.0, 0.0), weekly, 1.0, &[], now, 1));
         assert!(!allowed(&timed(5.0, -1.0), weekly, 1.0, &[], now, 1));
+    }
+
+    #[test]
+    fn short_window_launch_floor_and_estimate_boundaries() {
+        let weekly = [0.01, 0.03, 0.075, 0.2];
+        for (remaining, expected) in [(0.4, false), (0.999, false), (1.0, false), (1.001, true)] {
+            let windows = [w("session", remaining, 300.0, None, None)];
+            assert_eq!(
+                budget_allowed(&windows, &[], &weekly, 0.05, 0.0, 0.0)[2],
+                expected
+            );
+        }
+        // Larger estimates still require their full cost; weekly admission is unchanged.
+        for (remaining, expected) in [(7.499, false), (7.5, false), (7.501, true)] {
+            let windows = [w("session", remaining, 300.0, None, None)];
+            assert_eq!(
+                budget_allowed(&windows, &[], &[0.2, 0.6, 1.5, 4.0], 1.0, 0.0, 0.0)[2],
+                expected
+            );
+        }
+        let weekly_window = [w("week", 0.4, 10080.0, None, None)];
+        assert!(budget_allowed(&weekly_window, &[], &weekly, 0.05, 0.0, 0.0)[2]);
+        let healthy = [w("session", 20.0, 300.0, None, None)];
+        assert_eq!(
+            budget_allowed(&healthy, &[], &weekly, 0.05, 0.0, 0.0),
+            [true; 4]
+        );
     }
 
     #[test]

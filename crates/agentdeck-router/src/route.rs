@@ -2411,6 +2411,32 @@ mod quota_estimate_tests {
     }
 
     #[test]
+    fn near_empty_short_window_rejects_size_two() {
+        let mut cfg = test_cfg();
+        cfg.account
+            .insert("antigravity".into(), "antigravity".into());
+        let mut acc = codex_acc("Google AI Pro", 0.0);
+        acc.provider = "antigravity".into();
+        acc.id = None;
+        acc.windows[0].key = "gemini-5h".into();
+        acc.windows[0].duration_mins = 300.0;
+        acc.windows[0].remaining_percent = 100.0 - 99.6;
+        let q = quota(
+            &cfg,
+            &Measured::default(),
+            &[acc],
+            &load_known(),
+            "antigravity",
+            "gemini-4-hydrogen-high",
+            NOW,
+        );
+        assert!(
+            !q.allowed[2],
+            "a nearly exhausted short window cannot fund another launch"
+        );
+    }
+
+    #[test]
     fn measured_basis_reports_sample_count() {
         let cfg = test_cfg();
         // "Pro 5x" maps via codexPlanTypes to raw plan "prolite".
@@ -2779,7 +2805,7 @@ mod live_quota_shape_tests {
     }
 
     #[test]
-    fn antigravity_coarse_windows_without_duration_match_legacy_routing() {
+    fn antigravity_coarse_windows_reject_near_empty_quota() {
         let load = AgentLoad {
             known: true,
             agents: vec![],
@@ -2801,8 +2827,7 @@ mod live_quota_shape_tests {
         let u = parse_usage_state(&p).unwrap();
         std::fs::remove_file(&p).ok();
 
-        // Legacy antigravity.rs also published duration_mins: null for keys without 5h/week;
-        // verify router gating matches across Gemini, 3P and Argon models.
+        // Missing durations use short-window admission; a fractional remainder cannot fund a launch.
         let q_gemini = quota(
             &cfg(),
             &Measured::default(),
@@ -2830,7 +2855,7 @@ mod live_quota_shape_tests {
             "gemini-4-argon-low",
             NOW,
         );
-        assert_eq!(q_gemini.allowed, [true, true, true, false]);
+        assert_eq!(q_gemini.allowed, [false; 4]);
         assert_eq!(q_3p.allowed, [true, true, true, true]);
         assert_eq!(q_argon.allowed, [true, true, false, false]);
     }

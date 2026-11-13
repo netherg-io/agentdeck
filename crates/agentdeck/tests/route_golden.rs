@@ -966,7 +966,16 @@ fn t3_reader_output_drives_router_quota_gates() {
                 "{provider}: monthly duration must affect routing"
             );
         } else {
-            assert_eq!(allowed_sizes(&stdout), "0,1,2", "{stdout}");
+            assert_eq!(allowed_sizes(&stdout), "none", "{stdout}");
+            let mut healthy = state;
+            healthy["accounts"][0]["windows"][1]["remaining_percent"] = json!(80);
+            std::fs::write(&state_path, healthy.to_string()).unwrap();
+            let (code, stdout, _) = run_rust(&fx, &["--check"], &mock, None);
+            assert_eq!(code, 0);
+            assert_eq!(
+                allowed_sizes(&String::from_utf8(stdout).unwrap()),
+                "0,1,2,3"
+            );
         }
     }
 }
