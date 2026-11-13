@@ -611,23 +611,43 @@ fn title_case(value: &str) -> String {
         .join(" ")
 }
 
+fn parse_digits(s: &str, expected_len: usize) -> Option<i64> {
+    if s.len() != expected_len || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
 /// Minimal RFC 3339 timestamp parser returning unix seconds.
 pub(crate) fn parse_rfc3339(value: &str) -> Option<i64> {
     let (date, rest) = value.trim().split_once(['T', 't'])?;
     let (time, offset) = split_offset(rest)?;
 
     let mut date = date.split('-');
-    let year: i64 = date.next()?.parse().ok()?;
-    let month: i64 = date.next()?.parse().ok()?;
-    let day: i64 = date.next()?.parse().ok()?;
+    let year = parse_digits(date.next()?, 4)?;
+    let month = parse_digits(date.next()?, 2)?;
+    let day = parse_digits(date.next()?, 2)?;
     if date.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
 
     let mut time = time.split(':');
-    let hour: i64 = time.next()?.parse().ok()?;
-    let minute: i64 = time.next()?.parse().ok()?;
-    let second: i64 = time.next().unwrap_or("0").split('.').next()?.parse().ok()?;
+    let hour = parse_digits(time.next()?, 2)?;
+    let minute = parse_digits(time.next()?, 2)?;
+    let sec_part = time.next()?;
+    if time.next().is_some() {
+        return None;
+    }
+    let second_str = match sec_part.split_once('.') {
+        Some((secs, frac)) => {
+            if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            secs
+        }
+        None => sec_part,
+    };
+    let second = parse_digits(second_str, 2)?;
     if hour > 23 || minute > 59 || second > 60 {
         return None;
     }
@@ -639,12 +659,24 @@ fn split_offset(rest: &str) -> Option<(&str, i64)> {
     if let Some(time) = rest.strip_suffix(['Z', 'z']) {
         return Some((time, 0));
     }
-    let index = rest.rfind(['+', '-'])?;
-    let (time, offset) = rest.split_at(index);
-    let sign = if offset.starts_with('-') { -1 } else { 1 };
-    let mut parts = offset[1..].split(':');
-    let hours: i64 = parts.next()?.parse().ok()?;
-    let minutes: i64 = parts.next().unwrap_or("0").parse().ok()?;
+    let idx = rest.len().checked_sub(6)?;
+    if !rest.is_char_boundary(idx) {
+        return None;
+    }
+    let (time, offset) = rest.split_at(idx);
+    let sign = match offset.as_bytes()[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    if offset.as_bytes()[3] != b':' {
+        return None;
+    }
+    let hours = parse_digits(&offset[1..3], 2)?;
+    let minutes = parse_digits(&offset[4..6], 2)?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
     Some((time, sign * (hours * 3_600 + minutes * 60)))
 }
 
@@ -1535,5 +1567,38 @@ mod tests {
             Some("ChatGPT Mystery"),
             None,
         );
+    }
+
+    #[test]
+    fn parse_rfc3339_rejects_negative_fields_and_colonless_offsets() {
+        assert_eq!(parse_rfc3339("2026-11-13T11:40:00Z"), Some(NOW));
+        assert_eq!(
+            parse_rfc3339("2026-11-13T11:35:00.000Z"),
+            Some(1_794_569_700)
+        );
+        assert_eq!(parse_rfc3339("2026-11-13t13:40:00+02:00"), Some(NOW));
+        assert_eq!(parse_rfc3339("2026-11-13T06:40:00-05:00"), Some(NOW));
+
+        for bad in [
+            "-2026-11-13T11:40:00Z",
+            "2026--1-13T11:40:00Z",
+            "2026-11--1T11:40:00Z",
+            "2026-11-13T-1:40:00Z",
+            "2026-11-13T11:-4:00Z",
+            "2026-11-13T11:40:-1Z",
+            "2026-11-13T+1:40:00Z",
+            "2026-11-13T11:40:00+-2:00",
+            "2026-11-13T11:40:00+02:-30",
+            "2026-11-13T11:40:00+0200",
+            "2026-11-13T11:40:00-0500",
+            "2026-11-13T11:40:00+02",
+            "2026-11-13T11:40:00+25:00",
+            "2026-11-13T11:40:00+02:60",
+            "2026-11-13T11:40:00+02:00:00",
+            "2026-11-13T11:40:00.abcZ",
+            "2026-11-13T11:40:00.Z",
+        ] {
+            assert_eq!(parse_rfc3339(bad), None, "expected None for {bad:?}");
+        }
     }
 }
