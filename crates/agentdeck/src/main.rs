@@ -268,7 +268,7 @@ fn main() -> anyhow::Result<()> {
     {
         return agentdeck_core::launch::run_cli(&paths, id, args);
     }
-    // Providers write cooldowns/snapshots via util::persistent_state_dir();
+    // Usage history uses util::persistent_state_dir();
     // point it at the new tree before anything runs. Unset, everything keeps
     // the old ai-usage paths (old binary, compat copies, migrator sources).
     agentdeck_usage::util::set_state_dir_override(paths.state_dir.join("usage"));

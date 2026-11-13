@@ -59,8 +59,6 @@ pub struct DaemonPaths {
     pub compat_runtime: Vec<PathBuf>,
     /// Append-only usage history.
     pub history: PathBuf,
-    /// Directory of provider cooldown/snapshot files (ensured to exist).
-    pub cooldown_dir: PathBuf,
     /// Single-writer lock file.
     pub lock: PathBuf,
 }
@@ -78,7 +76,6 @@ impl DaemonPaths {
             compat_canonical: vec![util::legacy_persistent_state_dir().join("state.json")],
             compat_runtime: vec![util::state_file()],
             history: dir.join("history.jsonl"),
-            cooldown_dir: dir.clone(),
             lock: dir.join(LOCK_FILE_NAME),
         }
     }
@@ -305,9 +302,6 @@ pub async fn run_daemon(
         .into());
     }
     let _lock = acquire_lock(&paths.lock)?;
-    if !paths.cooldown_dir.exists() {
-        fs::create_dir_all(&paths.cooldown_dir)?;
-    }
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut consecutive_failures: u32 = 0;
@@ -394,14 +388,6 @@ pub struct DoctorSource {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct DoctorBackoff {
-    pub id: String,
-    pub file: PathBuf,
-    pub age_secs: Option<i64>,
-    pub retry_in_secs: Option<i64>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
 pub struct DoctorStateFile {
     pub path: PathBuf,
     pub updated_at: Option<i64>,
@@ -411,7 +397,6 @@ pub struct DoctorStateFile {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DoctorReport {
     pub sources: Vec<DoctorSource>,
-    pub backoffs: Vec<DoctorBackoff>,
     pub canonical: DoctorStateFile,
     pub runtime: DoctorStateFile,
     pub compat_canonical: Vec<DoctorStateFile>,
@@ -489,7 +474,6 @@ pub fn doctor(
         .collect::<Vec<_>>();
     DoctorReport {
         sources,
-        backoffs: Vec::new(),
         canonical: state_file_info(&paths.canonical, now),
         runtime: state_file_info(&paths.runtime, now),
         compat_canonical: paths
@@ -538,7 +522,6 @@ mod tests {
                 compat_canonical: vec![compat.join("state.json")],
                 compat_runtime: vec![compat.join("run-state.json")],
                 history: usage.join("history.jsonl"),
-                cooldown_dir: usage.clone(),
                 lock: usage.join(LOCK_FILE_NAME),
             },
             Guard(dir),
@@ -710,7 +693,6 @@ mod tests {
         assert!(report.sources[0].source.contains("antigravity.json"));
         assert_eq!(report.sources[1].instance.as_deref(), Some("opencode"));
         assert!(report.sources[1].source.contains("opencode.json"));
-        assert!(report.backoffs.is_empty());
         assert!(!report.old_service_active);
         assert!(!report.lock_held);
         assert!(report.canonical.updated_at.is_none());

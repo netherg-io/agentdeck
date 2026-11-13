@@ -41,7 +41,7 @@ pub enum UsageCmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Show sources, backoff ages and state freshness. Read-only, no network.
+    /// Show sources and state freshness. Read-only, no network.
     Doctor {
         #[arg(long)]
         json: bool,
@@ -188,13 +188,6 @@ fn print_doctor(report: &daemon::DoctorReport) {
             .map(|i| format!(" instance={i}"))
             .unwrap_or_default();
         println!("  {} {}{} {}", s.id, s.kind, inst, s.source);
-    }
-    for b in &report.backoffs {
-        match (b.age_secs, b.retry_in_secs) {
-            (_, Some(retry)) => println!("  backoff {}: retry in {} с", b.id, retry),
-            (Some(age), None) => println!("  backoff {}: last update {} с ago", b.id, age),
-            (None, None) => println!("  backoff {}: no state at {}", b.id, b.file.display()),
-        }
     }
     for f in [&report.canonical]
         .into_iter()
