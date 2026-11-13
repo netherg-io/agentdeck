@@ -8,7 +8,13 @@ pub fn catalog_file(state_home: &std::path::Path) -> std::path::PathBuf {
     state_home.join("model-route/catalog.json")
 }
 
-const IDS: [&str; 4] = ["reasoningEffort", "effort", "variant", "thinking"];
+const IDS: [&str; 5] = [
+    "reasoningEffort",
+    "effort",
+    "variant",
+    "thinking",
+    "thought_level",
+];
 const LEVELS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 const RANK: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -136,15 +142,37 @@ pub fn save_catalog(state_home: &std::path::Path, mut data: Value) -> anyhow::Re
             let _ = std::fs::create_dir_all(parent);
         }
     }
-    let out = serde_json::json!({
-        "providers": providers.iter().map(|p| serde_json::json!({
-            "providerInstanceId": p.get("providerInstanceId"),
-            "driverKind": p.get("driverKind"),
-            "models": p.get("models").and_then(Value::as_array).cloned().unwrap_or_default().iter().map(|m| serde_json::json!({
-                "id": m.get("id"),
-                "options": m.get("options").cloned().unwrap_or(Value::from(Vec::<Value>::new())),
-            })).collect::<Vec<_>>(),
+    let mut merged: Vec<Value> = providers.iter().map(|p| serde_json::json!({
+        "providerInstanceId": p.get("providerInstanceId"),
+        "driverKind": p.get("driverKind"),
+        "models": p.get("models").and_then(Value::as_array).cloned().unwrap_or_default().iter().map(|m| serde_json::json!({
+            "id": m.get("id"),
+            "options": m.get("options").cloned().unwrap_or(Value::from(Vec::<Value>::new())),
         })).collect::<Vec<_>>(),
+    })).collect();
+    // A searched orchestrator_capabilities lists other providers with no models (or not at all);
+    // keep their previously saved models instead of making every other instance unroutable.
+    // shortcut: a provider that truly lost all its models keeps stale ones until T3 lists any again.
+    if let Ok(previous) = read_catalog(state_home)
+        && let Some(previous) = previous.get("providers").and_then(Value::as_array)
+    {
+        for old in previous {
+            let id = old.get("providerInstanceId");
+            let old_has_models = old["models"].as_array().is_some_and(|m| !m.is_empty());
+            match merged
+                .iter_mut()
+                .find(|p| p.get("providerInstanceId") == id)
+            {
+                Some(p) if old_has_models && p["models"].as_array().is_some_and(Vec::is_empty) => {
+                    p["models"] = old["models"].clone();
+                }
+                Some(_) => {}
+                None => merged.push(old.clone()),
+            }
+        }
+    }
+    let out = serde_json::json!({
+        "providers": merged,
         "updatedAt": chrono_now_iso(),
     });
     let tmp = file.with_extension(format!("json.{}.tmp", std::process::id()));
@@ -734,6 +762,44 @@ mod legacy_suite_tests {
 
     fn target(provider: &str, model: &str, options: Value) -> Value {
         serde_json::json!({"providerInstanceId": provider, "model": model, "options": options})
+    }
+
+    #[test]
+    fn antigravity_thought_level_maps_like_effort() {
+        let c = serde_json::json!({"providers": [{"providerInstanceId": "antigravity",
+            "driverKind": "antigravity", "models": [{"id": "gemini-4-hydrogen",
+            "options": [select("thought_level", &["low", "medium", "high", "xhigh"])]}]}]});
+        for (difficulty, value) in ["medium", "high", "xhigh"].iter().enumerate() {
+            assert_eq!(
+                reasoning_target(&c, "antigravity", "gemini-4-hydrogen", difficulty as i64)
+                    .unwrap()["options"],
+                serde_json::json!({"thought_level": value})
+            );
+        }
+    }
+
+    #[test]
+    fn partial_catalog_keeps_models_of_unlisted_providers() {
+        let home = std::env::temp_dir().join(format!(
+            "catalog-merge-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        save_catalog(&home, catalog()).unwrap();
+        // A searched capabilities result: one provider with models, the rest empty or absent.
+        save_catalog(&home, serde_json::json!({"providers": [
+            {"providerInstanceId": "codex", "driverKind": "codex", "models": []},
+            {"providerInstanceId": "antigravity", "driverKind": "antigravity", "models": [{"id": "gemini-4-hydrogen"}]},
+        ]})).unwrap();
+        let saved = read_catalog(&home).unwrap();
+        assert!(find_model(&saved, "codex", "sol").is_some());
+        assert!(find_model(&saved, "claudeAgent", "claude-opus").is_some());
+        assert!(find_model(&saved, "antigravity", "gemini-4-hydrogen").is_some());
+        // A provider that lists models replaces its old list.
+        assert!(find_model(&saved, "antigravity", "gemini-high").is_none());
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]

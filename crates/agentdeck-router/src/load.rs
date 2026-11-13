@@ -175,7 +175,7 @@ pub fn read_instance_failures(
         if count >= 2 {
             out.entry(provider)
                 .or_insert_with(InstanceFailures::default)
-                .penalty = 0.05 * (count - 1).min(3) as f64;
+                .penalty = 0.1 * (count - 1).min(3) as f64;
         }
     }
     out
@@ -604,11 +604,11 @@ mod failure_tests {
             "API Error: connection failed.",
         );
         let result = read_instance_failures(&fx.file, time());
-        assert_eq!(result["flaky"].penalty, 0.05);
+        assert_eq!(result["flaky"].penalty, 0.1);
         assert_eq!(result["flaky"].quota_until, None);
         fx.child("c", "flaky", "failed", FINISHED, "Provider stopped this turn because of an error.\n\nLast assistant message before the run failed:\n\nInvestigating usage limit reached; resets in 3 hours.");
         let result = read_instance_failures(&fx.file, time());
-        assert_eq!(result["flaky"].penalty, 0.1);
+        assert_eq!(result["flaky"].penalty, 0.2);
         assert_eq!(result["flaky"].quota_until, None);
         assert!(read_instance_failures(&fx.file, time() + 7200.0).is_empty());
         fx.child("d", "flaky", "idle", "2026-11-13T12:01:00Z", "Done");
