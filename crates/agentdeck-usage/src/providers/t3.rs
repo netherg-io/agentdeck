@@ -217,21 +217,7 @@ pub fn fetch_from_root(
         return make_state("error", plan, email, Vec::new(), Some(msg), now);
     }
 
-    let Some(checked_at) = limits
-        .checked_at
-        .as_deref()
-        .or(cache.checked_at.as_deref())
-        .and_then(parse_rfc3339)
-    else {
-        return AccountState::error(
-            source.id,
-            source.name,
-            source.provider,
-            format!(
-                "T3 cache for {instance_id:?} has missing or invalid usageLimits.checkedAt; wait for T3 health refresh"
-            ),
-        );
-    };
+    let checked_at = limits.checked_at.as_deref().and_then(parse_rfc3339);
 
     if windows.is_empty() {
         return make_state(
@@ -242,9 +228,22 @@ pub fn fetch_from_root(
             Some(format!(
                 "T3 cache for {instance_id:?} has empty usageLimits.windows; wait for T3 health refresh"
             )),
-            checked_at,
+            checked_at.unwrap_or(now),
         );
     }
+
+    let Some(checked_at) = checked_at else {
+        return make_state(
+            "stale",
+            plan,
+            email,
+            windows,
+            Some(format!(
+                "T3 cache for {instance_id:?} has missing or invalid usageLimits.checkedAt; wait for T3 health refresh"
+            )),
+            0,
+        );
+    };
 
     let age = now.saturating_sub(checked_at);
     if checked_at > now {
@@ -1359,5 +1358,70 @@ mod tests {
                 .unwrap()
                 .starts_with("T3 reports no subscription limits for this instance: ")
         );
+    }
+
+    #[test]
+    fn missing_usage_limits_checked_at_does_not_borrow_top_level_and_marks_stale() {
+        let (t3, _g) = setup("missing-checked-at", SETTINGS_ALL);
+
+        // Top-level checkedAt is recent (health probe), but usageLimits.checkedAt is omitted.
+        write_cache(
+            &t3,
+            "claude-main",
+            &format!(
+                r#"{{"enabled":true,"status":"ready","checkedAt":"{CHECKED_RECENT}","usageLimits":{{"windows":[{{"id":"five_hour","kind":"session","label":"Session","windowDurationMins":300,"usedPercent":15}}]}}}}"#
+            ),
+        );
+        let st = fetch_from_root(
+            &t3,
+            src("claude-main", "claude", Some("claude-main")),
+            900,
+            NOW,
+        );
+        assert_eq!(st.status, "stale");
+        assert_eq!(st.windows.len(), 1);
+        assert_eq!(st.updated_at, 0);
+        assert!(
+            st.error
+                .as_deref()
+                .unwrap()
+                .contains("usageLimits.checkedAt")
+        );
+
+        // Invalid usageLimits.checkedAt with windows also marks stale with unknown age.
+        write_cache(
+            &t3,
+            "claude-main",
+            &format!(
+                r#"{{"enabled":true,"status":"ready","checkedAt":"{CHECKED_RECENT}","usageLimits":{{"checkedAt":"not-a-timestamp","windows":[{{"id":"five_hour","kind":"session","label":"Session","windowDurationMins":300,"usedPercent":15}}]}}}}"#
+            ),
+        );
+        let bad_ts = fetch_from_root(
+            &t3,
+            src("claude-main", "claude", Some("claude-main")),
+            900,
+            NOW,
+        );
+        assert_eq!(bad_ts.status, "stale");
+        assert_eq!(bad_ts.windows.len(), 1);
+        assert_eq!(bad_ts.updated_at, 0);
+        assert!(bad_ts.error.is_some());
+
+        // Missing usageLimits.checkedAt with empty windows still reports waiting.
+        write_cache(
+            &t3,
+            "claude-main",
+            &format!(
+                r#"{{"enabled":true,"status":"ready","checkedAt":"{CHECKED_RECENT}","usageLimits":{{"windows":[]}}}}"#
+            ),
+        );
+        let empty = fetch_from_root(
+            &t3,
+            src("claude-main", "claude", Some("claude-main")),
+            900,
+            NOW,
+        );
+        assert_eq!(empty.status, "waiting");
+        assert!(empty.windows.is_empty());
     }
 }
