@@ -295,27 +295,29 @@ fn launch_streaming(argv: &[String]) -> i32 {
     let original = original_bin();
     let read_file = |p: &str| std::fs::read_to_string(p).ok();
     let connection = Arc::new(Mutex::new(seed_from_args(argv, read_file)));
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+    let mut runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    // Short suffix: the socket path must stay under SUN_LEN (108 bytes).
+    // Linux sun_path includes a NUL byte; long XDG_RUNTIME_DIR/TMPDIR values need a short fallback.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    let dir = runtime.join(format!(
+    let suffix = format!(
         "claude-shell-mcp-{:x}-{:x}",
         std::process::id(),
         nanos & 0xffffff
-    ));
-    if let Err(_e) = std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
+    );
+    let candidate = runtime.join(&suffix).join("t3-shell-mcp.sock");
+    if candidate.as_os_str().len() >= 108 {
+        runtime = PathBuf::from("/tmp");
+    }
+    let dir = runtime.join(suffix);
+    if std::fs::create_dir_all(&runtime).is_err()
+        || std::fs::DirBuilder::new().mode(0o700).create(&dir).is_err()
     {
         return 1;
     }
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     let socket_path = dir.join("t3-shell-mcp.sock");
     let server = match serve_once(socket_path.clone(), dir.clone(), connection.clone()) {
         Ok(s) => s,
