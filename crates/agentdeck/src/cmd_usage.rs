@@ -52,6 +52,14 @@ pub enum UsageCmd {
         #[arg(long)]
         json: bool,
     },
+    // shortcut: keeps still-registered `usage hook claude|agy --account ...`
+    // commands exiting 0 quietly instead of emitting clap errors on every prompt;
+    // drop after installed machines run `plugin enable ai-usage` cleanup (next major bump).
+    #[command(hide = true)]
+    Hook {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        _args: Vec<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -174,6 +182,9 @@ pub async fn run(paths: &Paths, cmd: UsageCmd) -> anyhow::Result<()> {
             } else {
                 print_doctor(&report);
             }
+        }
+        UsageCmd::Hook { .. } => {
+            let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
         }
     }
     Ok(())
