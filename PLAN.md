@@ -1,8 +1,8 @@
 # agentdeck — plan
 
 Public, Linux-only Rust app (iced GUI + CLI in one binary) that manages harness instances/accounts for Claude Code,
-Codex, OpenCode and Antigravity (agy). Works without any other service; T3, ai-usage and the model-route router are
-optional built-in plugins. License: GPLv3 (ai-usage moves in with its git history).
+Codex, OpenCode and Antigravity (agy). Subscription quotas and the model router require T3 Code;
+instance management and API-key balances work independently. License: GPLv3 (ai-usage moves in with its git history).
 
 ## Decisions
 
@@ -29,9 +29,15 @@ optional built-in plugins. License: GPLv3 (ai-usage moves in with its git histor
 - Model pool lives in agentdeck (instance ID + exact model + options + enabled). Its UI shows all cached models;
   new entries start disabled and T3 favorites have no effect. The Rust router derives its pool and account/usage
   maps from the current registry; generated JSON remains an explicit compatibility export.
-- ai-usage plugin: quotas derived from registry instances; API-key accounts (OpenRouter, DeepSeek, OpenCode Go) are a
-  separate "usage source" type. Only the COSMIC applet stays (separate binary).
-- Optional systemd user service `agentdeck daemon`: quota polling + background sync. Additive changes auto-apply;
+- T3 Code is required for subscription quotas (owner, 2026-11-13): Claude, Codex, Antigravity and OpenCode Go
+  read T3's caches; the old provider polling code is deleted. T3's Settings → Providers → Health check interval
+  (`providerHealthRefreshInterval`) must be nonzero. Agentdeck still polls API-key balances (OpenRouter, Vercel,
+  DeepSeek). `[[usage]]` binds subscription sources to instances; OpenCode Go defaults to `opencode`.
+- Claude and Antigravity quota status lines are removed permanently (owner, 2026-11-13). No quota capture hooks.
+  After upgrading, `agentdeck plugin enable ai-usage` removes old hook registrations.
+- ai-usage plugin: subscription cache reads, balance polling and the daemon unit. Only the COSMIC applet stays
+  a separate binary.
+- Optional systemd user service `agentdeck daemon`: T3 cache reads, balance polling + background sync. Additive changes auto-apply;
   overwrites/deletions wait for a GUI decision via a desktop notification. GUI works without it.
 - T3 itself is not managed (owner, 2026-10-24): no start/stop/service control of T3; agentdeck only edits T3
   `providerInstances` and reads its caches/db.

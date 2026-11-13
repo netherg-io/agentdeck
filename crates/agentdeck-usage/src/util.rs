@@ -50,12 +50,7 @@ pub fn state_file() -> PathBuf {
     runtime_dir().join("state.json")
 }
 
-/// Каталог для данных, которые обязаны пережить перезагрузку.
-///
-/// `runtime_dir()` лежит на tmpfs: для Claude, Codex и DeepSeek это и правильно
-/// — там кеш, который демон восполняет сам. Провайдеру, чей единственный
-/// источник данных снаружи (`agy` присылает квоту сам и только пока запущен),
-/// такой каталог означает потерю данных при каждой перезагрузке.
+/// Persistent usage state and compatibility paths.
 ///
 /// The `agentdeck` binary overrides this once at startup (see
 /// [`set_state_dir_override`]); unset, it is the `ai-usage` dir the compat

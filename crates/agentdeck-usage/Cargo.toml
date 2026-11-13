@@ -2,7 +2,7 @@
 name = "agentdeck-usage"
 version = "0.1.14"
 edition = "2024"
-description = "Usage polling providers, state model and history for agentdeck"
+description = "T3 subscription quotas, API-key balances, state model and history for agentdeck"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/netherg-io/agentdeck"
 rust-version = "1.93"

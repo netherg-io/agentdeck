@@ -46,7 +46,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: cmd_usage::UsageCmd,
     },
-    /// Run the usage polling daemon (single writer).
+    /// Read T3 subscription quotas and poll API-key balances (single writer).
     Daemon(cmd_daemon::DaemonArgs),
     /// Sync and drift-check secondary Claude accounts.
     Claude {

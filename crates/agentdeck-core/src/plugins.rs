@@ -1,4 +1,4 @@
-//! Built-in plugins: the `agent-process` launcher, the `ai-usage` daemon unit,
+//! Built-in plugins: the `agent-process` launcher, the `ai-usage` T3 quota/balance daemon unit,
 //! the `router` (model-route copy) and `imagegen` (gateway image skill). Plugin state lives in `instances.toml`
 //! under `[plugins]` (absent table = nothing enabled, so old files stay
 //! valid). Enabling a plugin lays out its files and instruction block;

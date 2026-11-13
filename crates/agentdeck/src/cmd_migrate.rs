@@ -207,7 +207,7 @@ pub fn migrate_ai_usage(paths: &Paths, old: &OldTree, dry_run: bool) -> anyhow::
     println!("  remaining owner steps (owner-run, this command never runs them):");
     println!("  - agentdeck usage doctor   (check sources, freshness)");
     println!(
-        "  - agentdeck usage once --compat-write-ai-usage   (smoke poll while the old daemon still runs)"
+        "  - agentdeck usage once --compat-write-ai-usage   (read T3 quotas and poll balances after stopping the old daemon)"
     );
     println!("  - stop the old ai-usage service, then start the new daemon unit");
     println!(

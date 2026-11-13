@@ -1,9 +1,8 @@
-//! Polling loop and state publishing shared by `agentdeck daemon` and
+//! T3 cache reads, balance polling and state publishing shared by `agentdeck daemon` and
 //! `agentdeck usage once`.
 //!
 //! Per-provider deadline, last-known-good merge for balance sources, SIGTERM
-//! drain, history writes, failure backoff. The daemon reads `[[usage]]` once at
-//! startup (restart to apply).
+//! drain, history writes, failure backoff. The daemon reloads `[[usage]]` each cycle.
 
 use std::fs;
 use std::path::{Path, PathBuf};
