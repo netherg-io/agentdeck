@@ -3,20 +3,9 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-
-/// Process-wide state-dir override. The `agentdeck` binary sets it once at
-/// startup to `XDG_STATE/agentdeck/usage`; unset, the default stays the
-/// `ai-usage` tree the compat copies and the migrator read.
-static STATE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
-
-/// Set once at `agentdeck` startup, before any provider runs. Later calls are ignored.
-pub fn set_state_dir_override(dir: PathBuf) {
-    let _ = STATE_DIR_OVERRIDE.set(dir);
-}
 
 pub fn unix_now() -> i64 {
     SystemTime::now()
@@ -50,20 +39,8 @@ pub fn state_file() -> PathBuf {
     runtime_dir().join("state.json")
 }
 
-/// Persistent usage state and compatibility paths.
-///
-/// The `agentdeck` binary overrides this once at startup (see
-/// [`set_state_dir_override`]); unset, it is the `ai-usage` dir the compat
-/// copies and the migrator read.
-pub fn persistent_state_dir() -> PathBuf {
-    if let Some(dir) = STATE_DIR_OVERRIDE.get() {
-        return dir.clone();
-    }
-    legacy_persistent_state_dir()
-}
-
 /// The `~/.local/state/ai-usage` tree: compat copies, and everything the
-/// migrator reads. Never overridden.
+/// migrator reads.
 pub fn legacy_persistent_state_dir() -> PathBuf {
     dirs::state_dir()
         .map(|dir| dir.join("ai-usage"))
@@ -254,24 +231,6 @@ mod tests {
     fn an_unknown_plan_is_shown_rather_than_dropped() {
         assert_eq!(humanize_plan("some_future_tier_3x"), "Some Future Tier 3x");
         assert_eq!(humanize_plan(""), "");
-    }
-
-    #[test]
-    fn state_dir_override_redirects_persistent_state() {
-        // This is the only test that ever sets the override: before this
-        // point the default must be the old tree.
-        assert!(legacy_persistent_state_dir().ends_with("ai-usage"));
-        assert_eq!(persistent_state_dir(), legacy_persistent_state_dir());
-
-        let dir = temp_dir("state-override");
-        let target = dir.join("usage");
-        set_state_dir_override(target.clone());
-
-        assert_eq!(persistent_state_dir(), target);
-        // Compat and the old binary keep the old tree even while set.
-        assert!(legacy_persistent_state_dir().ends_with("ai-usage"));
-        assert_ne!(persistent_state_dir(), legacy_persistent_state_dir());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

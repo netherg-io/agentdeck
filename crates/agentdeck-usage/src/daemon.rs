@@ -64,9 +64,7 @@ pub struct DaemonPaths {
 
 impl DaemonPaths {
     /// Production paths for the new daemon. Compat copies point at the old
-    /// ai-usage state files the router and the current applet still read.
-    /// They use the legacy (never overridden) paths even when the process
-    /// override redirects providers into the new tree.
+    /// ai-usage state files old applet builds still read.
     pub fn for_agentdeck(state_dir: &Path, runtime_dir: &Path) -> Self {
         let dir = state_dir.join("usage");
         Self {
