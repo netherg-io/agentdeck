@@ -807,7 +807,8 @@ mod tests {
         assert!(!has_transient_error(&wrap(disabled)));
 
         // 2. Source without T3 instance -> not transient
-        let no_inst = providers::t3::fetch_from_root(&dir, src("claude-none", None), 900, 1_794_570_000);
+        let no_inst =
+            providers::t3::fetch_from_root(&dir, src("claude-none", None), 900, 1_794_570_000);
         assert_eq!(no_inst.status, "error");
         assert!(!has_transient_error(&wrap(no_inst)));
 
@@ -868,7 +869,8 @@ mod tests {
         assert!(has_transient_error(&wrap(missing)));
 
         // 7. Balance provider error/stale -> still transient
-        let bal_err = model::AccountState::error("or", "OpenRouter", "openrouter", "network timeout");
+        let bal_err =
+            model::AccountState::error("or", "OpenRouter", "openrouter", "network timeout");
         assert!(has_transient_error(&wrap(bal_err)));
     }
 }

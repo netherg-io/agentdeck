@@ -193,9 +193,7 @@ pub fn fetch_from_root(
         let msg = detail.map_or_else(
             || format!("T3 instance {instance_id:?} is unauthenticated; sign in via T3 Code"),
             |d| {
-                format!(
-                    "T3 instance {instance_id:?} is unauthenticated ({d}); sign in via T3 Code"
-                )
+                format!("T3 instance {instance_id:?} is unauthenticated ({d}); sign in via T3 Code")
             },
         );
         return make_state("unauthenticated", plan, email, Vec::new(), Some(msg), now);
@@ -1531,7 +1529,13 @@ mod tests {
             None,
             Some("Max 20x"),
         );
-        check("claude-main", "claude", Some("claude_max"), None, Some("Max"));
+        check(
+            "claude-main",
+            "claude",
+            Some("claude_max"),
+            None,
+            Some("Max"),
+        );
         check(
             "claude-main",
             "claude",
@@ -1582,7 +1586,13 @@ mod tests {
             Some("ChatGPT"),
             Some("Pro 5x"),
         );
-        check("codex-main", "codex", Some("chatgpt"), Some("ChatGPT"), None);
+        check(
+            "codex-main",
+            "codex",
+            Some("chatgpt"),
+            Some("ChatGPT"),
+            None,
+        );
         check(
             "codex-main",
             "codex",
