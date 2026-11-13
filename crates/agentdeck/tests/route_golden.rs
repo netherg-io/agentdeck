@@ -889,6 +889,13 @@ fn t3_reader_output_drives_router_quota_gates() {
             None,
         ),
     ];
+    let allowed_sizes = |output: &str| {
+        output
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("allowed sizes: "))
+            .expect("router reports allowed sizes")
+            .to_owned()
+    };
     for (provider, instance, driver, model, windows, duration) in cases {
         let fx = Fixture::new(&[(instance, model)]);
         let t3 = fx.dir.join(".t3");
@@ -954,12 +961,12 @@ fn t3_reader_output_drives_router_quota_gates() {
             let (code, wrong, _) = run_rust(&fx, &["--check"], &mock, None);
             assert_eq!(code, 0);
             assert_ne!(
-                stdout,
-                String::from_utf8(wrong).unwrap(),
+                allowed_sizes(&stdout),
+                allowed_sizes(&String::from_utf8(wrong).unwrap()),
                 "{provider}: monthly duration must affect routing"
             );
         } else {
-            assert!(stdout.contains("allowed sizes: 0,1,2"), "{stdout}");
+            assert_eq!(allowed_sizes(&stdout), "0,1,2", "{stdout}");
         }
     }
 }
