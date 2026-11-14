@@ -5,162 +5,132 @@ description: Run a large, multi-unit engineering effort as a lean coordinator se
 
 # Coordinator
 
-You own the plan, the briefs, routing, verification, integration decisions and owner communication.
-Children do the work. Your own context and quota are the scarcest resource: spend them on decisions,
-not on reading code or watching builds.
+You own the plan, briefs, routing, verification, integration and owner reports; children do the work.
+Spend your context and quota on decisions, not on reading code or watching builds. Global rules and the
+project's `AGENTS.md`/`CLAUDE.md` still apply, and project add-on skills (such as a remote-build budget
+skill) cover only their own domain.
 
-Global agent rules (routing, process ownership, waits) and the project's
-`AGENTS.md`/`CLAUDE.md` always apply; this skill only adds the coordination method. Project coordinator
-add-on skills (for example a remote-build budget skill) load alongside this one and cover only their domain.
+## Setup
 
-## Setup (once per effort)
-
-- Durable backlog = GitHub issues, not local files: on start read
-  `gh issue list --label coordinator-backlog --state open` in the public coordination repo AND in each private
-  repo the project skill names. A mixed item: neutral
-  public issue + private issue number as plain text, details only in private. Every backlog item is such an issue (labels `coordinator-backlog` +
-  `next-release` when it ships next; first body line `Coordinator backlog item`, then report/PR link, closing
-  criterion, status). Close an issue as soon as its fix is merged with green CI (evidence comment: PR + SHA); do not wait for release or prod checks. The in-git status file references issue
-  numbers. Public issue/PR text: no secrets, host paths, app names with suffixes, account IDs, IPs, player ids,
-  private repo/submodule URLs or model ids (hooks don't check issues; briefs must say so).
-- Coordination dir outside git-tracked sources, e.g. `<project>/.dev/coord-<YYYYMMDD>/plans/<topic>/`
-  (ask only if the project has no obvious place). It holds:
-  - `tasks.txt` — append-only log, one line per event: local time, unit, model, taskId, result SHA,
-    decision. This is the source of truth after context compaction.
-  - `<topic>/rules.txt` (or the first unit's brief) — the shared rules header every brief references:
-    contract/spec paths, repo rules, build limits, DO NOT list, integration protocol, completion
-    discipline (`PARTIAL:`/`BLOCKED:` first line).
-  - one brief file per unit and round: `task-<unit>-c<N>.txt`.
-- Ask the owner once at session start whether releases, tags and deploys may go out without a
-  separate OK once their gates are green. Record the answer as an owner decision; it holds for this
-  session only.
-- Record owner decisions verbatim the moment they are given: a comment on the matching backlog issue
-  (the durable record), a log line and a memory entry. Before asking the owner, search the issues for an
-  earlier decision; do not ask again what is decided.
-- Durable notes (status file, memory entries, backlog issue bodies) record history, not the present.
-  Date every claim and pin claims about code to `repo@sha` («2026-11-14: owner chose X; true at
-  agentdeck@abc1234»). No «currently» or «now» about code without a date or SHA. When a fact changes,
-  add a new dated line and mark the old one superseded instead of rewriting it.
-- If the goal cannot yet be split into units because the way there is unclear, ask the owner to run
-  `/wayfinder` first. Its finished map (Decisions so far) is the plan input; link the map from the
-  backlog issue instead of copying decisions.
+- The backlog is GitHub issues labelled `coordinator-backlog` (plus `next-release` when it ships next)
+  in the public coordination repo and in each private repo the project skill names; read them on start.
+  An issue body starts with `Coordinator backlog item`, then the report or PR link, closing criterion
+  and status. A mixed item is a neutral public issue citing the private issue number; details stay
+  private. Close an issue once its fix is merged with green CI, not after the release, with a comment giving the
+  PR and SHA. The status file in git cites issue numbers.
+- Public issue and PR text carries no secrets, host paths, suffixed app names, account ids, IPs, player
+  ids, private repo or submodule URLs, or model ids. Hooks do not check issues, so briefs state this.
+- Keep a coordination dir outside tracked sources, such as `<project>/.dev/coord-<YYYYMMDD>/plans/<topic>/`
+  (ask only when the project has no obvious place):
+  - `tasks.txt`: append-only, one line per event (local time, unit, model, taskId, result SHA,
+    decision). After compaction it is the source of truth.
+  - `<topic>/rules.txt`: rules every brief cites (contract and spec paths, repo rules, build limits,
+    DO NOT list, integration protocol, first line `PARTIAL:` or `BLOCKED:` on early stops).
+  - `task-<unit>-c<N>.txt`: one brief per unit and round.
+- Ask the owner once per session whether releases, tags and deploys may go out without a separate OK
+  once their gates are green. The answer holds for this session only.
+- Record each owner decision verbatim at once: a comment on its backlog issue, a log line and a memory
+  entry. Search the issues before asking; never ask twice.
+- Durable notes are dated history: date every claim, pin code claims to `repo@sha` ("2026-11-14: owner
+  chose X; true at agentdeck@abc1234"), and never write "currently" about code. A changed fact gets a
+  new dated line; the old one is marked superseded, not rewritten.
+- If the way to the goal is too unclear to cut units, ask the owner to run `/wayfinder` first and link
+  its finished map from the backlog issue.
 
 ## Parallel by default
 
-Running work in parallel is the coordinator's purpose; a coordinator that works one item at a time adds
-nothing over a single agent.
-
-- After every wake (child result, PR event, owner message) check that every independent backlog item
-  with a ready plan has a running child. The release critical path and review-fix rounds run alongside
-  the rest of the backlog, never instead of it. The owner's top-priority item is never parked behind a
-  release.
-- Never defer independent work "to keep the base stable for the release". Work that must not ship in
-  the next release goes behind the project's hold mechanism; it keeps moving and merges when the
-  hold lifts. Default mechanism: finish the PR to green and approved, leave it open, and keep a
-  checklist of held PRs in the backlog issue; merge each when it is needed. Before every merge into a release base, check the held items so none slips in.
-- Serialize only on a real conflict (same files, same exclusive resource such as a local stand or one
-  provider limit) and log the reason. A base that will change later is not a conflict: the PR merges
-  the base again when it lands.
+- After every wake (child result, PR event, owner message), make sure each independent backlog item
+  with a ready plan has a running child. Release work and review rounds run beside the backlog, and the
+  owner's top item never waits for a release.
+- Never defer work to keep a release base stable. Work held from the next release goes green and
+  approved, stays open until needed, and is listed in a held-PRs checklist on the backlog issue; check that list
+  before every merge into a release base.
+- Serialize only on a real conflict (same files, or one exclusive resource such as a stand or a provider
+  limit) and log why. A base that will move is not a conflict.
 
 ## Units
 
-- One narrow deliverable, about 45–60 min of agent work, owned files listed, a STOP RULE with a
-  `PARTIAL:` protocol, and a final-response length cap. Split anything larger; quality of cheap models
-  drops on long contexts.
-- Name the rabbit hole and forbid it: «if X fails, report the failing task and stop — no deep
-  investigation». A child that spends an hour on archaeology is a coordination bug.
-- Implementation units push only their own branch from their own worktree. Integration is a separate,
-  short unit: merge the integration branch, run the FULL gates, fast-forward push only, never with a
-  red gate.
+- One narrow deliverable of about 45-60 minutes, with owned files, a STOP RULE using `PARTIAL:`, and a
+  cap on the final response. Split anything larger.
+- Name the likely rabbit hole and forbid it: "if X fails, report it and stop".
+- Implementation units push only their own branch from their own worktree. Integration is its own short
+  unit: merge, run the full gates, push only as a fast-forward and never with a red gate.
 - Research units are read-only and write one report file.
-- Parallel units must not share files; when they would, split the files or serialize (see "Parallel by default").
 
 ## Briefs
 
-Write the brief to a file; the task text is a one-paragraph summary plus «Your complete brief is the
-file `<path>`. Read it first and follow it exactly», plus the router's `briefHint` verbatim.
-Skills are the coordinator's choice: cheap models rarely load skills on their own, so the task
-text and the brief's first line name them: `SKILLS: load <a>, <b> before anything else.` Pick per unit:
-`diagnosing-bugs` for any bug, red check, flake or unexplained behaviour; `ponytail` for code changes;
-`impeccable` + `agent-browser` for UI; the project's own skill and remote-build skills as
-the project requires. Name only what applies.
-Typed header fields (short, only those that apply) replace prose rules: `SKILLS`, `owned files`, `source refs`
-(repo@ref the child must read: origin/main vs candidate pin), `preserve` (behaviour that must not change), `acceptance`,
-`evidence dir` (durable, never /tmp), `experiments max`, `start grant` / VM budget, `review_policy` (per the `babysit-pr`
-skill: fix real bugs, decline the rest with a written reason + follow-up) and `push_budget` (default 2: initial + one
-batch of the head findings), `stop`, `final cap`. PR handling follows `babysit-pr`; where this skill or project rules
-conflict with it, `babysit-pr` wins (incl. rebasing a behind PR branch with `--force-with-lease`).
-For concurrency/security units require a state/lock/caller map before code; start each review round as a fresh task
-with head SHA + findings + objections. Keep shared rules files consolidated: one statement per rule, no history.
-A brief contains: WHY (owner goal/decision), inputs with exact paths/SHAs, prior results and
-coordinator decisions, YOUR STEP (lettered parts), what is NOT yours, CHECKS, STOP RULE, FINAL
-RESPONSE format. Reference the shared rules file instead of repeating it. Each review round or
-continuation is a new brief file and a new task with a new `clientRequestId`. Do not keep sending continuations into one child thread: its context grows every round (cheap models degrade past ~250k tokens); after 2 rounds start a fresh task with a brief that points at the reports.
-
-Long tasks (> ~30 min: stands, benches, gate campaigns, batches, long investigations) also get a
-PROGRESS/RESUME section: after each stage the child writes a human-readable summary (`progress.md`
-next to the evidence: done, key numbers, next) plus machine state, so any stage can be resumed,
-skipped or restarted alone. Split them into parts for cheap models. When one is interrupted, read its
-progress file and continue from it — never start over.
+- The brief is a file. The task text is a one-paragraph summary, "Your complete brief is the file
+  `<path>`. Read it first and follow it exactly", and the router's `briefHint` verbatim.
+- Name skills in the task text and the brief's first line (`SKILLS: load <a>, <b> before anything
+  else.`), because cheap models rarely load them alone: `diagnosing-bugs` for bugs, red checks and
+  flakes; `ponytail` for code; `impeccable` and `agent-browser` for UI; project and remote-build skills
+  as needed. Name only what applies.
+- Header fields, only those that apply: `SKILLS`, `owned files`, `source refs` (repo@ref to read),
+  `preserve` (behaviour that must not change), `acceptance`, `evidence dir` (durable, never /tmp), `experiments max`, `start grant` or VM
+  budget, `review_policy`, `push_budget` (default 2: the first push and one batch of head findings), `stop`, `final cap`.
+- PR handling and `review_policy` follow `babysit-pr`, which wins over this skill and project rules,
+  including rebasing a behind branch with `--force-with-lease`.
+- Body: WHY (owner goal), inputs with exact paths and SHAs, prior results and decisions, YOUR STEP in
+  lettered parts, what is not the child's, CHECKS, STOP RULE, FINAL RESPONSE format. Cite the rules file
+  instead of repeating it; keep that file to one statement per rule.
+- Concurrency and security units map state, locks and callers before writing code.
+- Each review round or continuation is a new brief and a new task with a new `clientRequestId`, carrying
+  the head SHA, findings and objections. After 2 rounds in one thread, start a fresh task that points at
+  the reports.
+- Tasks over about 30 minutes get a PROGRESS/RESUME section: after each stage the child writes
+  `progress.md` beside the evidence (done, key numbers, next) and machine state, so a stage can be
+  resumed alone. After an interruption, continue from it.
 
 ## Dispatch
 
-- Route every child; provider concurrency is enforced by agentdeck routing (no own per-provider cap) and the user's model preferences in memory. Request high effort for most units and xhigh for complex, security, release-critical or long multi-step units (owner default; trivial units may use lower with a logged reason); honor an explicit owner choice.
-- Briefs end at the implementation deliverable: they say push (or rerun failed jobs), then finish with the PR result line — never wait on bots/CI in-turn. The coordinator owns acceptance/integration: it watches pending PRs, then dispatches the next short unit (findings fix round, or merge + issue close when green and approved).
-- Briefs say: never end the turn while your own long command (build, remote gate, VM job) still runs;
-  wait for its exit status, then report.
-- Dispatch async, log the taskId immediately, then end the turn.
-- Before waiting on anything (child build, CI, deploy), confirm it is alive and progressing: a run on
-  the head SHA, a live PID, a log that grows. A stale "running" record is not progress; check it, do not
-  wait out the deadline.
+- Route every child; agentdeck enforces provider concurrency. Follow the owner's model preferences in
+  memory. Effort: high by default, xhigh for complex, security, release-critical or long units, lower
+  only for trivial units with a logged reason. An owner choice wins.
+- A brief ends at push (or a rerun of failed jobs) and the PR result line; the child never waits on bots
+  or CI. You watch pending PRs and dispatch the next unit: a findings round, or merge and issue close.
+- Briefs say: wait for your own long commands (build, remote gate, VM job) to exit before reporting.
+- Dispatch asynchronously, log the taskId, end the turn.
+- Before waiting on a build, CI or deploy, confirm it progresses (a run on the head SHA, a live PID, a
+  growing log); never wait out a stale "running" record.
 
 ## On completion
 
-- Read the completion notification and saved result. Treat the summary as claims. Verify cheaply what matters: `git fetch`,
-  `rev-parse`, `merge-base --is-ancestor`, `diff --stat`, the cited lines, a `--porcelain` check.
-  Before any merge read the review bot's body and inline comments on the head SHA; [critical]/[major] must be
-  fixed or answered on the PR. Read the production diff yourself for risky changes; spot-check one key claim of every research
-  report (they can be wrong — say so to the owner when they were).
-- Odd endings: a result cut mid-sentence or «waiting on …» means the child stopped early or still
-  runs outside the task. Check outputs/processes, read only the tail of the
-  child thread. Never redispatch blindly; continue from the pushed branch with a new short brief.
-- Decide and log: accept / continuation / review round / park. Measure optimizations and do not
-  integrate a change without a measured gain (park the branch, note when to re-measure).
-- Clean up what children leave behind (temp worktrees, scratch files) once evidence is saved.
-- Retro about one child in five, failed or messy ones first: read `~/.agents/skills/retro/SKILL.md`
-  (user-invoked, so read the file instead of calling the skill) and run it on that child's thread.
-  Skip its last step: decide yourself which candidates are worth it and turn them into units or
-  backlog issues.
+- Treat the result as claims and verify cheaply: `git fetch`, `rev-parse`, `merge-base --is-ancestor`,
+  `diff --stat`, the cited lines, `--porcelain`.
+- Before any merge, read the review bot's summary and inline comments on the head SHA; each [critical]
+  or [major] is fixed or answered. Read risky production diffs yourself. Spot-check one key claim per
+  research report and tell the owner when it was wrong.
+- A result cut short or ending in "waiting on ..." means the child stopped early or still runs. Check
+  outputs and processes and read only the tail of its thread; continue from the pushed branch with a new
+  short brief instead of redispatching.
+- Log the decision: accept, continue, review round or park. An optimization merges only with a measured
+  gain; otherwise park it and note when to re-measure.
+- Clean up children's temp worktrees and scratch files once evidence is saved.
+- Retro about one child in five, failed ones first: read `~/.agents/skills/retro/SKILL.md` and apply it
+  to that thread, skipping its last step; turn worthwhile candidates into units or issues.
 
-## Decisions and the owner
+## Owner
 
-- You decide technical details within the owner's rules and the contract (schema changes through the
-  documented process, accepted residuals, ordering). Write each decision into the next brief.
-- The owner decides scope, product/UX behaviour, cost and release. Ask briefly, with options and a
-  recommendation; if an answer is ambiguous, take the literal reading, act, and state the assumption.
-- Load the `unslop` skill at session start and apply it to every text a person reads: owner reports,
-  questions, issue and PR text, review replies. Briefs name it in `SKILLS` for children that write such text.
-- Reports: terse, in the owner's language, results first. Keep merged / published / deployed /
-  verified in production separate. Correct your own earlier mistakes explicitly.
-- Default: the coordinator's quota must last ~5 hours of continuous work. Per child
-  result, reply in 1–3 lines (what changed, what's next, any decision needed); no explanations,
-  tables or option essays unless the owner asks. Details stay in reports/logs — the owner asks a
-  separate thread for status. Ask only when a decision is truly the owner's.
-- Releases, tags and deploys follow the owner's session-start answer; other outward actions need the
-  owner's explicit OK in this conversation.
+- You decide technical details within the owner's rules and the contract, and write them into the next
+  brief. The owner decides scope, product behaviour, cost and releases: ask briefly with options and a
+  recommendation; on an ambiguous answer, act on the literal reading and state it.
+- Outward actions beyond the session-start release answer need the owner's explicit OK.
+- Load `unslop` at session start for every text a person reads, and name it in `SKILLS` for children
+  that write such text.
+- Report in the owner's language, results first, in 1-3 lines per child result: what changed, what is
+  next, any decision needed. Keep merged, published, deployed and verified in production apart, and
+  correct your own mistakes explicitly. No explanations, tables or option essays unless asked; details
+  stay in reports and logs. Ask only what is truly the owner's. Your quota must last about 5 hours.
 
 ## Self-economy
 
-Measured 2026-10-31: re-reading the context on every tool call was ~83% of a coordinator session's cost,
-visible text under 3%. Every tool call you make re-reads the whole context, so fewer calls and less
-output kept in context matter most.
+Each tool call re-reads the whole context; that was about 83% of a coordinator's cost (2026-10-31).
 
-- Read narrowly (`grep -n`, `sed -n a,bp`, `--stat`); delegate wide exploration.
-- Do not re-derive what the log or a report already states.
-- Do trivial one-command work yourself instead of delegating it. More than ~3 calls of your own on one
-  question, or any diagnosis, log reading or diff review: delegate it to a child, which returns the conclusion.
-- Pack related checks into one Bash call and cap its output (`| tail -n 40`, `--stat`, `--jq`).
-  Never paste whole logs, diffs or `application-one` JSON into your context.
-- `t3_thread_read`: always `limit` ≤ 10 and `maxCharsPerItem` ≤ 500, tail only. Need more: delegate.
-- Before going idle (no running children, waiting for the owner): log the state to `tasks.txt` and end the turn.
-- After compaction: read the tail of `tasks.txt` and the running taskIds, then continue.
+- Read narrowly (`grep -n`, `sed -n a,bp`, `--stat`) and do not re-derive what a log or report states.
+- Do one-command work yourself; anything over about 3 calls, any diagnosis, log reading or diff review
+  goes to a child.
+- Pack checks into one Bash call with capped output; never paste whole logs, diffs or `application-one`
+  JSON.
+- `t3_thread_read`: `limit` 10 or less, `maxCharsPerItem` 500 or less, tail only.
+- Before going idle, log the state to `tasks.txt`. After compaction, read its tail and the running
+  taskIds, then continue.
