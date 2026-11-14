@@ -330,6 +330,10 @@ const ROUTER_SKILLS: &[(&str, &str)] = &[
         include_str!("../plugin-skills/coordinator/SKILL.md"),
     ),
     (
+        "coordinator/agents/openai.yaml",
+        include_str!("../plugin-skills/coordinator/agents/openai.yaml"),
+    ),
+    (
         "t3-routed-workflow/SKILL.md",
         include_str!("../plugin-skills/t3-routed-workflow/SKILL.md"),
     ),

@@ -1,6 +1,7 @@
 ---
 name: coordinator
-description: Run a large, multi-unit engineering effort as a lean coordinator session — split the work into short units, write file briefs, route and dispatch child agents, verify their claims, integrate, and keep the owner informed tersely. Use when the user asks for a coordinator/orchestrator session, «сессия координатора», or hands over a big task (many units, branches, reviews, long-running children) that should be delegated rather than done in this thread.
+description: "Coordinator session for a large multi-unit effort: plan, brief and dispatch routed children, verify, integrate, report."
+disable-model-invocation: true
 ---
 
 # Coordinator

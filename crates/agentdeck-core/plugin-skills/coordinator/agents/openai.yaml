@@ -1,0 +1,5 @@
+interface:
+  display_name: "Coordinator"
+  short_description: "Run a large effort through routed child agents"
+policy:
+  allow_implicit_invocation: false
