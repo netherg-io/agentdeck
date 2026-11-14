@@ -10,7 +10,8 @@ Children do the work. Your own context and quota are the scarcest resource: spen
 not on reading code or watching builds.
 
 Global agent rules (routing, process ownership, waits) and the project's
-`AGENTS.md`/`CLAUDE.md` always apply; this skill only adds the coordination method.
+`AGENTS.md`/`CLAUDE.md` always apply; this skill only adds the coordination method. Project coordinator
+add-on skills (for example a remote-build budget skill) load alongside this one and cover only their domain.
 
 ## Setup (once per effort)
 
@@ -30,7 +31,29 @@ Global agent rules (routing, process ownership, waits) and the project's
     contract/spec paths, repo rules, build limits, DO NOT list, integration protocol, completion
     discipline (`PARTIAL:`/`BLOCKED:` first line).
   - one brief file per unit and round: `task-<unit>-c<N>.txt`.
-- Record owner decisions verbatim (log line + a memory entry) the moment they are given.
+- Ask the owner once at session start whether releases, tags and deploys may go out without a
+  separate OK once their gates are green. Record the answer as an owner decision; it holds for this
+  session only.
+- Record owner decisions verbatim the moment they are given: a comment on the matching backlog issue
+  (the durable record), a log line and a memory entry. Before asking the owner, search the issues for an
+  earlier decision; do not ask again what is decided.
+
+## Parallel by default
+
+Running work in parallel is the coordinator's purpose; a coordinator that works one item at a time adds
+nothing over a single agent.
+
+- After every wake (child result, PR event, owner message) check that every independent backlog item
+  with a ready plan has a running child. The release critical path and review-fix rounds run alongside
+  the rest of the backlog, never instead of it. The owner's top-priority item is never parked behind a
+  release.
+- Never defer independent work "to keep the base stable for the release". Work that must not ship in
+  the next release goes behind the project's hold mechanism; it keeps moving and merges when the
+  hold lifts. Default mechanism: finish the PR to green and approved, leave it open, and keep a
+  checklist of held PRs in the backlog issue; merge each when it is needed. Before every merge into a release base, check the held items so none slips in.
+- Serialize only on a real conflict (same files, same exclusive resource such as a local stand or one
+  provider limit) and log the reason. A base that will change later is not a conflict: the PR merges
+  the base again when it lands.
 
 ## Units
 
@@ -43,7 +66,7 @@ Global agent rules (routing, process ownership, waits) and the project's
   short unit: merge the integration branch, run the FULL gates, fast-forward push only, never with a
   red gate.
 - Research units are read-only and write one report file.
-- Parallel units must not share files; when they would, serialize and say why in the log.
+- Parallel units must not share files; when they would, split the files or serialize (see "Parallel by default").
 
 ## Briefs
 
@@ -77,7 +100,12 @@ progress file and continue from it — never start over.
 
 - Route every child; provider concurrency is enforced by agentdeck routing (no own per-provider cap) and the user's model preferences in memory. Request high effort for most units and xhigh for complex, security, release-critical or long multi-step units (owner default; trivial units may use lower with a logged reason); honor an explicit owner choice.
 - Briefs end at the implementation deliverable: they say push (or rerun failed jobs), then finish with the PR result line — never wait on bots/CI in-turn. The coordinator owns acceptance/integration: it watches pending PRs, then dispatches the next short unit (findings fix round, or merge + issue close when green and approved).
+- Briefs say: never end the turn while your own long command (build, remote gate, VM job) still runs;
+  wait for its exit status, then report.
 - Dispatch async, log the taskId immediately, then end the turn.
+- Before waiting on anything (child build, CI, deploy), confirm it is alive and progressing: a run on
+  the head SHA, a live PID, a log that grows. A stale "running" record is not progress; check it, do not
+  wait out the deadline.
 
 ## On completion
 
@@ -99,13 +127,16 @@ progress file and continue from it — never start over.
   documented process, accepted residuals, ordering). Write each decision into the next brief.
 - The owner decides scope, product/UX behaviour, cost and release. Ask briefly, with options and a
   recommendation; if an answer is ambiguous, take the literal reading, act, and state the assumption.
+- Load the `unslop` skill at session start and apply it to every text a person reads: owner reports,
+  questions, issue and PR text, review replies. Briefs name it in `SKILLS` for children that write such text.
 - Reports: terse, in the owner's language, results first. Keep merged / published / deployed /
   verified in production separate. Correct your own earlier mistakes explicitly.
 - Default: the coordinator's quota must last ~5 hours of continuous work. Per child
   result, reply in 1–3 lines (what changed, what's next, any decision needed); no explanations,
   tables or option essays unless the owner asks. Details stay in reports/logs — the owner asks a
   separate thread for status. Ask only when a decision is truly the owner's.
-- Releases, tags, deploys and other outward actions need the owner's explicit OK in this conversation.
+- Releases, tags and deploys follow the owner's session-start answer; other outward actions need the
+  owner's explicit OK in this conversation.
 
 ## Self-economy
 
