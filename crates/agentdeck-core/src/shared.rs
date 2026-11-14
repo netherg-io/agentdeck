@@ -25,6 +25,8 @@ pub const SKILL_MARKER: &str = ".sync-skills-source";
 /// Skills that live per-harness and are never synced (sync-skills rule).
 /// Per-harness variants kept by their own installers, never synced.
 pub const SKIP_SKILLS: [&str; 2] = ["impeccable", "synced"];
+/// Ponytail plugin skills the owner does not want shared to other harnesses.
+const SKIP_PONYTAIL: [&str; 2] = ["ponytail-gain", "ponytail-help"];
 /// Owned-entry manifest in the state dir.
 const MANIFEST: &str = "shared-skills.json";
 
@@ -141,10 +143,13 @@ fn skill_sources(sources: &[PathBuf], home: &Path, plugin: bool) -> Vec<SkillSrc
         collect_skills(source, &mut out);
     }
     if plugin {
+        let mut ponytail = Vec::new();
         collect_skills(
             &home.join(".claude/plugins/marketplaces/ponytail/skills"),
-            &mut out,
+            &mut ponytail,
         );
+        ponytail.retain(|s| !SKIP_PONYTAIL.contains(&s.name.as_str()));
+        out.extend(ponytail);
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     // Stable sort keeps the later source last in each name group; keep that one.
@@ -1322,6 +1327,20 @@ mod tests {
     fn sync(fx: &Fx) {
         let changes = plan_skills_sync(&fx.home, &fx.paths).unwrap();
         apply_changes(&changes).unwrap();
+    }
+
+    #[test]
+    fn ponytail_gain_and_help_are_not_shared() {
+        let fx = skills_fixture();
+        let plugin = fx.home.join(".claude/plugins/marketplaces/ponytail/skills");
+        for name in ["ponytail", "ponytail-gain", "ponytail-help"] {
+            write_skill(&plugin, name, "# p\n");
+        }
+        sync(&fx);
+        let opencode = fx.home.join(".config/opencode/skills");
+        assert!(fs::read_link(opencode.join("ponytail")).is_ok());
+        assert!(fs::symlink_metadata(opencode.join("ponytail-gain")).is_err());
+        assert!(fs::symlink_metadata(opencode.join("ponytail-help")).is_err());
     }
 
     #[test]
