@@ -37,6 +37,13 @@ add-on skills (for example a remote-build budget skill) load alongside this one 
 - Record owner decisions verbatim the moment they are given: a comment on the matching backlog issue
   (the durable record), a log line and a memory entry. Before asking the owner, search the issues for an
   earlier decision; do not ask again what is decided.
+- Durable notes (status file, memory entries, backlog issue bodies) record history, not the present.
+  Date every claim and pin claims about code to `repo@sha` («2026-11-14: owner chose X; true at
+  agentdeck@abc1234»). No «currently» or «now» about code without a date or SHA. When a fact changes,
+  add a new dated line and mark the old one superseded instead of rewriting it.
+- If the goal cannot yet be split into units because the way there is unclear, ask the owner to run
+  `/wayfinder` first. Its finished map (Decisions so far) is the plan input; link the map from the
+  backlog issue instead of copying decisions.
 
 ## Parallel by default
 
@@ -74,7 +81,7 @@ Write the brief to a file; the task text is a one-paragraph summary plus «Your 
 file `<path>`. Read it first and follow it exactly», plus the router's `briefHint` verbatim.
 Skills are the coordinator's choice: cheap models rarely load skills on their own, so the task
 text and the brief's first line name them: `SKILLS: load <a>, <b> before anything else.` Pick per unit:
-`debug-flow` for any bug, red check, flake or unexplained behaviour; `ponytail` for code changes;
+`diagnosing-bugs` for any bug, red check, flake or unexplained behaviour; `ponytail` for code changes;
 `impeccable` + `agent-browser` for UI; the project's own skill and remote-build skills as
 the project requires. Name only what applies.
 Typed header fields (short, only those that apply) replace prose rules: `SKILLS`, `owned files`, `source refs`
@@ -120,6 +127,10 @@ progress file and continue from it — never start over.
 - Decide and log: accept / continuation / review round / park. Measure optimizations and do not
   integrate a change without a measured gain (park the branch, note when to re-measure).
 - Clean up what children leave behind (temp worktrees, scratch files) once evidence is saved.
+- Retro about one child in five, failed or messy ones first: read `~/.agents/skills/retro/SKILL.md`
+  (user-invoked, so read the file instead of calling the skill) and run it on that child's thread.
+  Skip its last step: decide yourself which candidates are worth it and turn them into units or
+  backlog issues.
 
 ## Decisions and the owner
 
