@@ -1,6 +1,6 @@
 ---
 name: imagegen-gateway
-description: "Last-resort raster image generation and editing through a paid API gateway (agentdeck imagegen: Vercel AI Gateway or OpenRouter). Use ONLY when it is the only working way to produce an image in this harness: no built-in image tool (such as Codex image_gen) and no other image-generation skill is available or they failed. Covers photos, illustrations, textures, sprites, product shots, UI mockups, backgrounds, transparent cutouts, background removal, and edits of an existing image. Not for charts, diagrams, or icons/logos better built as SVG/HTML/CSS."
+description: "Last-resort raster image generation and editing through a paid API gateway (agentdeck imagegen). Use only when no built-in or other image tool works in this harness. Not for charts, diagrams, or icons and logos better built as SVG/HTML/CSS."
 ---
 
 # Image generation through the gateway
