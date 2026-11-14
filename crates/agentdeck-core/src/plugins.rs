@@ -355,13 +355,27 @@ const PLUGIN_SKILLS: [(&str, &[(&str, &str)]); 2] = [
     (PLUGIN_IMAGEGEN, IMAGEGEN_SKILLS),
 ];
 
+/// Revision of the shipped skill files; bump it with every change to them
+/// (`shipped_skills_revision_is_bumped` pins the content hash). A build never
+/// rewrites skills that a build with a higher revision wrote, so a stale
+/// daemon or MCP server left running after an upgrade cannot roll them back.
+pub const PLUGIN_SKILLS_REV: u64 = 1;
+const PLUGIN_SKILLS_REV_FILE: &str = ".rev";
+
+fn stored_plugin_skills_rev(dir: &Path) -> u64 {
+    fs::read_to_string(dir.join(PLUGIN_SKILLS_REV_FILE))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 pub fn plugin_skills_dir(paths: &Paths) -> PathBuf {
     paths.state_dir.join("plugin-skills")
 }
 
 /// Shipped skill files match the binary while their plugin is enabled (hand
 /// edits are reverted); a disabled plugin's skills are removed, and the dir
-/// goes once no plugin ships anything.
+/// goes once no plugin ships anything. Skills written by a newer build stay.
 pub fn plan_plugin_skills(reg: &Registry, paths: &Paths) -> Vec<Change> {
     let dir = plugin_skills_dir(paths);
     let (on, off): (Vec<_>, Vec<_>) = PLUGIN_SKILLS
@@ -377,15 +391,27 @@ pub fn plan_plugin_skills(reg: &Registry, paths: &Paths) -> Vec<Change> {
             Vec::new()
         };
     }
-    let mut changes: Vec<Change> = on
-        .iter()
-        .flat_map(|(_, files)| files.iter())
-        .filter_map(|(rel, body)| {
-            let path = dir.join(rel);
-            let old = fs::read(&path).ok();
-            plan_write_file(path, old.as_deref(), body.as_bytes())
-        })
-        .collect();
+    if stored_plugin_skills_rev(&dir) > PLUGIN_SKILLS_REV {
+        return Vec::new();
+    }
+    let rev_path = dir.join(PLUGIN_SKILLS_REV_FILE);
+    let old_rev = fs::read(&rev_path).ok();
+    let mut changes: Vec<Change> = plan_write_file(
+        rev_path,
+        old_rev.as_deref(),
+        format!("{PLUGIN_SKILLS_REV}\n").as_bytes(),
+    )
+    .into_iter()
+    .collect();
+    changes.extend(
+        on.iter()
+            .flat_map(|(_, files)| files.iter())
+            .filter_map(|(rel, body)| {
+                let path = dir.join(rel);
+                let old = fs::read(&path).ok();
+                plan_write_file(path, old.as_deref(), body.as_bytes())
+            }),
+    );
     let mut gone: Vec<&str> = off
         .iter()
         .flat_map(|(_, files)| files.iter())
@@ -1214,6 +1240,50 @@ mod tests {
         assert!(!dir.exists());
         let reg = Registry::load(&paths).unwrap();
         assert!(plan_plugin_skills(&reg, &paths).is_empty());
+    }
+
+    #[test]
+    fn newer_plugin_skills_are_not_rolled_back() {
+        let _env = test_env_lock();
+        let (_g, _home, paths, _files, _exe) = setup("plugin-skills-rev");
+        Registry::update(&paths, |r| {
+            r.plugins.insert(PLUGIN_ROUTER.into(), true);
+            Ok(())
+        })
+        .unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        apply_changes(&plan_plugin_skills(&reg, &paths)).unwrap();
+        let dir = plugin_skills_dir(&paths);
+        assert_eq!(stored_plugin_skills_rev(&dir), PLUGIN_SKILLS_REV);
+        let skill = dir.join("coordinator/SKILL.md");
+        // An older build's text at the same revision is restored.
+        fs::write(&skill, "old\n").unwrap();
+        apply_changes(&plan_plugin_skills(&reg, &paths)).unwrap();
+        assert_ne!(fs::read_to_string(&skill).unwrap(), "old\n");
+        // A newer build's text is left alone.
+        fs::write(
+            dir.join(PLUGIN_SKILLS_REV_FILE),
+            format!("{}\n", PLUGIN_SKILLS_REV + 1),
+        )
+        .unwrap();
+        fs::write(&skill, "newer\n").unwrap();
+        assert!(plan_plugin_skills(&reg, &paths).is_empty());
+        assert_eq!(fs::read_to_string(&skill).unwrap(), "newer\n");
+    }
+
+    #[test]
+    fn shipped_skills_revision_is_bumped() {
+        // FNV-1a over every shipped file. When this fails after editing a
+        // shipped skill, bump PLUGIN_SKILLS_REV and update both numbers here.
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for (_, files) in PLUGIN_SKILLS {
+            for (rel, body) in files.iter() {
+                for b in rel.bytes().chain(body.bytes()) {
+                    hash = (hash ^ u64::from(b)).wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+        assert_eq!((PLUGIN_SKILLS_REV, hash), (1, 0x8ad0_51dd_2225_3094));
     }
 
     /// Every file, link and dir under `root` except agentdeck's own config
