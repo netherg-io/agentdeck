@@ -56,8 +56,10 @@ text and the brief's first line name them: `SKILLS: load <a>, <b> before anythin
 the project requires. Name only what applies.
 Typed header fields (short, only those that apply) replace prose rules: `SKILLS`, `owned files`, `source refs`
 (repo@ref the child must read: origin/main vs candidate pin), `preserve` (behaviour that must not change), `acceptance`,
-`evidence dir` (durable, never /tmp), `experiments max`, `start grant` / VM budget, `review_policy` (fix-all |
-critical-major) and `push_budget` (default 2: initial + one batch of all head findings), `stop`, `final cap`.
+`evidence dir` (durable, never /tmp), `experiments max`, `start grant` / VM budget, `review_policy` (per the `babysit-pr`
+skill: fix real bugs, decline the rest with a written reason + follow-up) and `push_budget` (default 2: initial + one
+batch of the head findings), `stop`, `final cap`. PR handling follows `babysit-pr`; where this skill or project rules
+conflict with it, `babysit-pr` wins (incl. rebasing a behind PR branch with `--force-with-lease`).
 For concurrency/security units require a state/lock/caller map before code; start each review round as a fresh task
 with head SHA + findings + objections. Keep shared rules files consolidated: one statement per rule, no history.
 A brief contains: WHY (owner goal/decision), inputs with exact paths/SHAs, prior results and
