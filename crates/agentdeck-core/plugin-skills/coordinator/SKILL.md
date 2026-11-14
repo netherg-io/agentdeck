@@ -30,7 +30,26 @@ Global agent rules (routing, process ownership, waits) and the project's
     contract/spec paths, repo rules, build limits, DO NOT list, integration protocol, completion
     discipline (`PARTIAL:`/`BLOCKED:` first line).
   - one brief file per unit and round: `task-<unit>-c<N>.txt`.
-- Record owner decisions verbatim (log line + a memory entry) the moment they are given.
+- Record owner decisions verbatim the moment they are given: a comment on the matching backlog issue
+  (the durable record), a log line and a memory entry. Before asking the owner, search the issues for an
+  earlier decision; do not ask again what is decided.
+
+## Parallel by default
+
+Running work in parallel is the coordinator's purpose; a coordinator that works one item at a time adds
+nothing over a single agent.
+
+- After every wake (child result, PR event, owner message) check that every independent backlog item
+  with a ready plan has a running child. The release critical path and review-fix rounds run alongside
+  the rest of the backlog, never instead of it. The owner's top-priority item is never parked behind a
+  release.
+- Never defer independent work "to keep the base stable for the release". Work that must not ship in
+  the next release goes behind the project's hold mechanism; it keeps moving and merges when the
+  hold lifts. If the project has no hold mechanism, building one is the next coordinator unit, not a
+  reason to wait. Before every merge into a release base, check the held items so none slips in.
+- Serialize only on a real conflict (same files, same exclusive resource such as a local stand or one
+  provider limit) and log the reason. A base that will change later is not a conflict: the PR merges
+  the base again when it lands.
 
 ## Units
 
@@ -43,7 +62,7 @@ Global agent rules (routing, process ownership, waits) and the project's
   short unit: merge the integration branch, run the FULL gates, fast-forward push only, never with a
   red gate.
 - Research units are read-only and write one report file.
-- Parallel units must not share files; when they would, serialize and say why in the log.
+- Parallel units must not share files; when they would, split the files or serialize (see "Parallel by default").
 
 ## Briefs
 
@@ -77,7 +96,12 @@ progress file and continue from it — never start over.
 
 - Route every child; provider concurrency is enforced by agentdeck routing (no own per-provider cap) and the user's model preferences in memory. Request high effort for most units and xhigh for complex, security, release-critical or long multi-step units (owner default; trivial units may use lower with a logged reason); honor an explicit owner choice.
 - Briefs end at the implementation deliverable: they say push (or rerun failed jobs), then finish with the PR result line — never wait on bots/CI in-turn. The coordinator owns acceptance/integration: it watches pending PRs, then dispatches the next short unit (findings fix round, or merge + issue close when green and approved).
+- Briefs say: never end the turn while your own long command (build, remote gate, VM job) still runs;
+  wait for its exit status, then report.
 - Dispatch async, log the taskId immediately, then end the turn.
+- Before waiting on anything (child build, CI, deploy), confirm it is alive and progressing: a run on
+  the head SHA, a live PID, a log that grows. A stale "running" record is not progress; check it, do not
+  wait out the deadline.
 
 ## On completion
 
