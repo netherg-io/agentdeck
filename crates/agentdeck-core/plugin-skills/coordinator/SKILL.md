@@ -127,6 +127,8 @@ progress file and continue from it — never start over.
   documented process, accepted residuals, ordering). Write each decision into the next brief.
 - The owner decides scope, product/UX behaviour, cost and release. Ask briefly, with options and a
   recommendation; if an answer is ambiguous, take the literal reading, act, and state the assumption.
+- Load the `unslop` skill at session start and apply it to every text a person reads: owner reports,
+  questions, issue and PR text, review replies. Briefs name it in `SKILLS` for children that write such text.
 - Reports: terse, in the owner's language, results first. Keep merged / published / deployed /
   verified in production separate. Correct your own earlier mistakes explicitly.
 - Default: the coordinator's quota must last ~5 hours of continuous work. Per child
