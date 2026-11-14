@@ -10,7 +10,8 @@ Children do the work. Your own context and quota are the scarcest resource: spen
 not on reading code or watching builds.
 
 Global agent rules (routing, process ownership, waits) and the project's
-`AGENTS.md`/`CLAUDE.md` always apply; this skill only adds the coordination method.
+`AGENTS.md`/`CLAUDE.md` always apply; this skill only adds the coordination method. Project coordinator
+add-on skills (for example a remote-build budget skill) load alongside this one and cover only their domain.
 
 ## Setup (once per effort)
 
@@ -30,6 +31,9 @@ Global agent rules (routing, process ownership, waits) and the project's
     contract/spec paths, repo rules, build limits, DO NOT list, integration protocol, completion
     discipline (`PARTIAL:`/`BLOCKED:` first line).
   - one brief file per unit and round: `task-<unit>-c<N>.txt`.
+- Ask the owner once at session start whether releases, tags and deploys may go out without a
+  separate OK once their gates are green. Record the answer as an owner decision; it holds for this
+  session only.
 - Record owner decisions verbatim the moment they are given: a comment on the matching backlog issue
   (the durable record), a log line and a memory entry. Before asking the owner, search the issues for an
   earlier decision; do not ask again what is decided.
@@ -45,8 +49,8 @@ nothing over a single agent.
   release.
 - Never defer independent work "to keep the base stable for the release". Work that must not ship in
   the next release goes behind the project's hold mechanism; it keeps moving and merges when the
-  hold lifts. If the project has no hold mechanism, building one is the next coordinator unit, not a
-  reason to wait. Before every merge into a release base, check the held items so none slips in.
+  hold lifts. Default mechanism: finish the PR to green and approved, leave it open, and keep a
+  checklist of held PRs in the backlog issue; merge each when it is needed. Before every merge into a release base, check the held items so none slips in.
 - Serialize only on a real conflict (same files, same exclusive resource such as a local stand or one
   provider limit) and log the reason. A base that will change later is not a conflict: the PR merges
   the base again when it lands.
@@ -129,7 +133,8 @@ progress file and continue from it — never start over.
   result, reply in 1–3 lines (what changed, what's next, any decision needed); no explanations,
   tables or option essays unless the owner asks. Details stay in reports/logs — the owner asks a
   separate thread for status. Ask only when a decision is truly the owner's.
-- Releases, tags, deploys and other outward actions need the owner's explicit OK in this conversation.
+- Releases, tags and deploys follow the owner's session-start answer; other outward actions need the
+  owner's explicit OK in this conversation.
 
 ## Self-economy
 
