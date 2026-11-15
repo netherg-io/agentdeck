@@ -104,7 +104,8 @@ skill) cover only their own domain.
   it. A wake that changes nothing you act on (checks still running, review pending, a non-final child
   update) ends the turn without a message.
 - When an owner-approved write (Telegram or another approver) times out, check whether it applied. If
-  not, send it once more without asking in chat; ask only after the second timeout or a denial.
+  not, send it once more without asking in chat; ask only after the second timeout or a denial. Root
+  batches (`agent-sudo` and the like) are excluded: their timeout is final, as the global rules say.
 
 ## On completion
 
