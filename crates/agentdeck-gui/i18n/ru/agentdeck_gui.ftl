@@ -323,3 +323,15 @@ drift-instr-resolved = Файл инструкций согласован.
 drift-instr-compare = Сравнение инструкций
 drift-instr-confirm-shared = Связать с общим
 drift-instr-confirm-local = Заменить общий
+
+nav-group-coordinator = Координатор
+nav-coordinator = Прогресс
+coord-empty = Координаторы ещё не сохранили ни цели, ни бэклога.
+coord-no-checklist = Чеклиста пока нет.
+coord-backlog = Бэклог { $project } · открыто { $count }
+coord-status-todo = Ждёт
+coord-status-running = Идёт
+coord-status-review = На ревью
+coord-status-done = Готово
+coord-status-blocked = Блок
+coord-status-held = Отложено
