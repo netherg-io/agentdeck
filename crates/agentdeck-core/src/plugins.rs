@@ -359,7 +359,7 @@ const PLUGIN_SKILLS: [(&str, &[(&str, &str)]); 2] = [
 /// (`shipped_skills_revision_is_bumped` pins the content hash). A build never
 /// rewrites skills that a build with a higher revision wrote, so a stale
 /// daemon or MCP server left running after an upgrade cannot roll them back.
-pub const PLUGIN_SKILLS_REV: u64 = 2;
+pub const PLUGIN_SKILLS_REV: u64 = 3;
 const PLUGIN_SKILLS_REV_FILE: &str = ".rev";
 
 fn stored_plugin_skills_rev(dir: &Path) -> u64 {
@@ -1283,7 +1283,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!((PLUGIN_SKILLS_REV, hash), (2, 0x9084_6cd2_0908_5594));
+        assert_eq!((PLUGIN_SKILLS_REV, hash), (3, 0xcb88_f6d8_9859_6824));
     }
 
     /// Every file, link and dir under `root` except agentdeck's own config
