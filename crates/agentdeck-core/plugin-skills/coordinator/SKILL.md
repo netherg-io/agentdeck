@@ -27,7 +27,8 @@ skill) cover only their own domain.
   for every finding, follow-up, deferred step or owner decision to act on, never only in chat, memory or
   files. An item has a closing criterion; labels such as `next-release` and `partial` mark release work
   and partly done items. Close it with `backlog_update` `close` ({pr, sha}) once its fix is merged with
-  green CI, not after the release. Cite items as `backlog:<project>#<id>`. User-facing bugs and tasks
+  green CI, not after the release; an item that lost its point closes with `reject` and the reason once
+  the owner agrees. Cite items as `backlog:<project>#<id>`. User-facing bugs and tasks
   still go to the product repo's issues.
 - Public issue and PR text carries no secrets, host paths, suffixed app names, account ids, IPs, player
   ids, private repo or submodule URLs, or model ids. Hooks do not check issues, so briefs state this.

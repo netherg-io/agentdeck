@@ -1310,7 +1310,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!((PLUGIN_SKILLS_REV, hash), (4, 0x19c4_7082_03fa_6998));
+        assert_eq!((PLUGIN_SKILLS_REV, hash), (4, 0x3d66_6396_367c_5524));
     }
 
     /// Every file, link and dir under `root` except agentdeck's own config

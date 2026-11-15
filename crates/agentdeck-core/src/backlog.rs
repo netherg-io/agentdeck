@@ -16,9 +16,15 @@ const MAX_TEXT: usize = 16 * 1024;
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Closed {
     pub at: String,
-    /// PR that fixed the item (`owner/repo#n` or URL) and the merged SHA.
+    /// PR that fixed the item (`owner/repo#n` or URL) and the merged SHA;
+    /// empty when the item was rejected.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pr: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sha: String,
+    /// Why it was closed without a fix (obsolete, duplicate, declined).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -76,6 +82,8 @@ pub struct Patch {
     pub links: Option<Vec<String>>,
     pub note: Option<String>,
     pub close: Option<ClosePatch>,
+    /// Close without a fix, with the reason.
+    pub reject: Option<String>,
     #[serde(default)]
     pub reopen: bool,
 }
@@ -200,8 +208,16 @@ pub fn update(paths: &Paths, project: &str, id: u64, patch: Patch) -> anyhow::Re
     {
         anyhow::bail!("closing needs the PR and the merged SHA (at least 7 hex chars)");
     }
-    if patch.close.is_some() && patch.reopen {
-        anyhow::bail!("pass close or reopen, not both");
+    if [patch.close.is_some(), patch.reject.is_some(), patch.reopen]
+        .iter()
+        .filter(|b| **b)
+        .count()
+        > 1
+    {
+        anyhow::bail!("pass only one of close, reject and reopen");
+    }
+    if patch.reject.as_deref().is_some_and(|r| r.trim().is_empty()) {
+        anyhow::bail!("reject needs the reason");
     }
     let (path, _lock) = locked(paths, project)?;
     let mut b = load_file(&path)?;
@@ -236,6 +252,15 @@ pub fn update(paths: &Paths, project: &str, id: u64, patch: Patch) -> anyhow::Re
             at: now.clone(),
             pr: c.pr,
             sha: c.sha,
+            reason: String::new(),
+        });
+    }
+    if let Some(r) = patch.reject {
+        e.status = "closed".into();
+        e.closed = Some(Closed {
+            at: now.clone(),
+            reason: r,
+            ..Closed::default()
         });
     }
     if patch.reopen {
@@ -318,6 +343,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(closed.status, "closed");
+        let rejected = update(
+            &paths,
+            "blockfield",
+            2,
+            Patch {
+                reject: Some("duplicate of #1".into()),
+                ..Patch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rejected.closed.unwrap().reason, "duplicate of #1");
+        let both = Patch {
+            reject: Some("x".into()),
+            reopen: true,
+            ..Patch::default()
+        };
+        assert!(update(&paths, "blockfield", 2, both).is_err());
         let open = update(
             &paths,
             "blockfield",
