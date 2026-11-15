@@ -1085,6 +1085,10 @@ fn plan_codex_register(home: &Path, exe: &Path, on: bool) -> anyhow::Result<Vec<
         let mut args = toml_edit::Array::new();
         args.push("mcp-server");
         table["args"] = toml_edit::value(args);
+        // Codex forwards only a fixed env set to MCP servers; the thread id keys state_read.
+        let mut env = toml_edit::Array::new();
+        env.push(crate::thread_state::THREAD_ENV);
+        table["env_vars"] = toml_edit::value(env);
         doc["mcp_servers"][SERVER_NAME] = toml_edit::Item::Table(table);
     } else {
         let Some(servers) = doc
@@ -1109,7 +1113,7 @@ fn plan_codex_register(home: &Path, exe: &Path, on: bool) -> anyhow::Result<Vec<
 }
 
 /// Instruction block of the `mcp-server` plugin.
-pub const MCP_BLOCK: &str = "Skills, the shared instructions and agentdeck drift are managed through the `agentdeck` MCP server: `skills_list` (sources, invocation, conflicts), `skill_install` / `skill_remove` (global or one project), `skill_invocation`, `instructions_read` / `instructions_edit`, `drift_list` / `drift_apply` / `drift_resolve`. Use it instead of editing a harness's skill dir, a per-harness instruction file or `~/AGENTS.md` by hand: one call updates every harness, and agentdeck's own blocks stay protected.";
+pub const MCP_BLOCK: &str = "Skills, the shared instructions and agentdeck drift are managed through the `agentdeck` MCP server: `skills_list` (sources, invocation, conflicts), `skill_install` / `skill_remove` (global or one project), `skill_invocation`, `instructions_read` / `instructions_edit`, `drift_list` / `drift_apply` / `drift_resolve`, plus `state_read` / `state_write` for a long session's goal, progress and owner decisions per T3 thread. Use it instead of editing a harness's skill dir, a per-harness instruction file or `~/AGENTS.md` by hand: one call updates every harness, and agentdeck's own blocks stay protected.";
 
 #[cfg(test)]
 mod tests {

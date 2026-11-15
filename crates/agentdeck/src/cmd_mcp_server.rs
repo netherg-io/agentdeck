@@ -1,12 +1,13 @@
 //! `agentdeck mcp-server`: stdio MCP server (plugin `mcp-server`) so a model
 //! manages skills, the shared instructions and drift for every harness at
-//! once instead of patching only its own. Newline-delimited JSON-RPC 2.0.
+//! once instead of patching only its own, and keeps per-T3-thread working
+//! state that survives provider switches. Newline-delimited JSON-RPC 2.0.
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use agentdeck_core::shared::InstructionChoice;
-use agentdeck_core::{Change, Paths, Registry, manage, plugins, sync};
+use agentdeck_core::{Change, Paths, Registry, manage, plugins, sync, thread_state};
 use serde_json::{Value, json};
 
 const PROTOCOL: &str = "2025-06-18";
@@ -15,6 +16,10 @@ fn tools() -> Value {
     let project = json!({
         "type": "string",
         "description": "Absolute path of a repository for a project-only skill (<project>/.agents/skills, linked into .claude/skills). Omit for every harness."
+    });
+    let thread = json!({
+        "type": "string",
+        "description": "T3 thread id. Omit to use this session's thread (T3CODE_THREAD_ID)."
     });
     json!([
         {
@@ -63,6 +68,20 @@ fn tools() -> Value {
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
+            "name": "state_read",
+            "description": "Saved working state of this T3 thread (or the thread it was forked from): the snapshot (goal, scope, done, next) and the owner's verbatim decisions. Read it first after a handoff, compaction, limit pause or \"continue\".",
+            "inputSchema": {"type": "object", "properties": {"thread": thread}}
+        },
+        {
+            "name": "state_write",
+            "description": "Save this T3 thread's working state. `state` replaces the snapshot (first line = the goal; cite issues and files instead of copying them; max 16 KiB). `decision` appends one owner decision or consent verbatim with a timestamp; decisions are never removed.",
+            "inputSchema": {"type": "object", "properties": {
+                "state": {"type": "string"},
+                "decision": {"type": "string"},
+                "thread": thread
+            }}
+        },
+        {
             "name": "drift_resolve",
             "description": "Resolve one instruction-file decision from drift_list: `shared` makes the file a link to the shared instructions (its local text is backed up), `local` makes the file's text the shared instructions.",
             "inputSchema": {"type": "object", "required": ["path", "choice"], "properties": {
@@ -96,6 +115,21 @@ fn project_arg(args: &Value) -> anyhow::Result<Option<PathBuf>> {
             Ok(Some(p))
         }
     }
+}
+
+fn session_thread() -> Option<String> {
+    std::env::var(thread_state::THREAD_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+fn thread_arg(args: &Value) -> anyhow::Result<String> {
+    str_arg(args, "thread")
+        .map(str::to_string)
+        .or_else(session_thread)
+        .ok_or_else(|| {
+            anyhow::anyhow!("no T3 thread: pass `thread` (this session has no T3CODE_THREAD_ID)")
+        })
 }
 
 fn describe(changes: &[Change]) -> Vec<String> {
@@ -228,8 +262,40 @@ fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> {
             agentdeck_core::shared::apply_instruction_resolution(&home, &plan)?;
             Ok(json!({ "diff": plan.diff, "changes": describe(&plan.changes) }))
         }
+        "state_read" => {
+            let id = thread_arg(args)?;
+            let t3 = agentdeck_core::t3::t3_root().ok();
+            match thread_state::read(paths, t3.as_deref(), &id)? {
+                Some(f) => Ok(serde_json::to_value(f)?),
+                None => Ok(json!({ "thread": id, "state": null })),
+            }
+        }
+        "state_write" => {
+            let id = thread_arg(args)?;
+            let t3 = agentdeck_core::t3::t3_root().ok();
+            let s = thread_state::write(
+                paths,
+                t3.as_deref(),
+                &id,
+                args.get("state").and_then(Value::as_str),
+                str_arg(args, "decision"),
+            )?;
+            Ok(json!({ "thread": id, "updated": s.updated, "decisions": s.decisions.len() }))
+        }
         other => anyhow::bail!("unknown tool {other}"),
     }
+}
+
+/// Sent once per session start, so a new provider session after a T3
+/// handoff learns the goal even when the handoff summary dropped it.
+fn init_instructions(paths: &Paths) -> String {
+    let enabled = Registry::load(paths)
+        .is_ok_and(|r| plugins::plugin_enabled(&r, plugins::PLUGIN_MCP_SERVER));
+    let found = session_thread().filter(|_| enabled).and_then(|id| {
+        let t3 = agentdeck_core::t3::t3_root().ok();
+        thread_state::read(paths, t3.as_deref(), &id).ok().flatten()
+    });
+    thread_state::instructions(found.as_ref())
 }
 
 fn handle(paths: &Paths, msg: &Value) -> Option<Value> {
@@ -240,6 +306,7 @@ fn handle(paths: &Paths, msg: &Value) -> Option<Value> {
             "protocolVersion": msg.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL),
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "agentdeck", "version": env!("CARGO_PKG_VERSION") },
+            "instructions": init_instructions(paths),
         }),
         "ping" => json!({}),
         "tools/list" => json!({ "tools": tools() }),
