@@ -3,6 +3,7 @@ pub mod daemon;
 pub mod history;
 pub mod model;
 pub mod providers;
+pub mod t3_refresh;
 pub mod util;
 pub mod visibility;
 
