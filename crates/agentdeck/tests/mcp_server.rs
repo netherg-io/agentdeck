@@ -9,8 +9,15 @@ use std::process::{Command, Stdio};
 use serde_json::{Value, json};
 
 fn session(dir: &Path, requests: &[Value]) -> Vec<Value> {
+    session_env(dir, &[], requests)
+}
+
+fn session_env(dir: &Path, env: &[(&str, &str)], requests: &[Value]) -> Vec<Value> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_agentdeck"))
         .arg("mcp-server")
+        .env_remove("T3CODE_THREAD_ID")
+        .envs(env.iter().copied())
+        .env("AGENTDECK_T3_DIR", dir.join("no-t3"))
         .env("HOME", dir.join("home"))
         .env("AGENTDECK_CONFIG_DIR", dir.join("config"))
         .env("AGENTDECK_STATE_DIR", dir.join("state"))
@@ -122,5 +129,56 @@ fn tools_manage_skills_and_instructions() {
     let replies = session(&dir, &[call(1, "skills_list", json!({}))]);
     assert_eq!(replies[0]["result"]["isError"], true);
     assert!(text(&replies[0]).contains("disabled"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn thread_state_survives_a_new_session() {
+    let dir = std::env::temp_dir().join(format!("agentdeck-mcp-state-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("home")).unwrap();
+    std::fs::create_dir_all(dir.join("config")).unwrap();
+    std::fs::write(
+        dir.join("config/instances.toml"),
+        "version = 1\n\n[plugins]\nmcp-server = true\n",
+    )
+    .unwrap();
+    let env = [("T3CODE_THREAD_ID", "thread-1")];
+    let init = json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}});
+    let first = session_env(
+        &dir,
+        &env,
+        &[
+            init.clone(),
+            call(
+                1,
+                "state_write",
+                json!({"state": "Goal: finish #71\nnext: deploy", "decision": "«Подтверждаю»"}),
+            ),
+        ],
+    );
+    assert!(
+        !first[0]["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("Goal: finish")
+    );
+    assert!(
+        first[1]["result"].get("isError").is_none(),
+        "{}",
+        text(&first[1])
+    );
+
+    // A new provider session (new MCP process) gets the goal at initialize.
+    let second = session_env(&dir, &env, &[init, call(2, "state_read", json!({}))]);
+    let instr = second[0]["result"]["instructions"].as_str().unwrap();
+    assert!(instr.contains("Goal: Goal: finish #71"), "{instr}");
+    let read: Value = serde_json::from_str(&text(&second[1])).unwrap();
+    assert_eq!(read["state"], "Goal: finish #71\nnext: deploy");
+    assert_eq!(read["decisions"][0]["text"], "«Подтверждаю»");
+
+    // Without a T3 thread the tools ask for one instead of guessing.
+    let none = session_env(&dir, &[], &[call(3, "state_read", json!({}))]);
+    assert_eq!(none[0]["result"]["isError"], true);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -13,6 +13,12 @@ skill) cover only their own domain.
 
 ## Setup
 
+- Your state lives in agentdeck, keyed by this T3 thread: `state_read` / `state_write` (agentdeck MCP
+  server). The snapshot's first line is the goal; then scope, done, running taskIds, held PRs and the next
+  step, citing issues and files instead of copying them. A provider switch, T3 handoff summary, compaction
+  or `/goal` can drop any of it; this state survives them and forks inherit it. Call `state_read` before
+  anything else at session start, after a handoff or compaction, after a limit pause and on "continue",
+  and follow it over any summary. Rewrite the snapshot at every checkpoint and before going idle.
 - The backlog is GitHub issues labelled `coordinator-backlog` (plus `next-release` when it ships next)
   in the public coordination repo and in each private repo the project skill names; read them on start.
   An issue body starts with `Coordinator backlog item`, then the report or PR link, closing criterion
@@ -24,14 +30,15 @@ skill) cover only their own domain.
 - Keep a coordination dir outside tracked sources, such as `<project>/.dev/coord-<YYYYMMDD>/plans/<topic>/`
   (ask only when the project has no obvious place):
   - `tasks.txt`: append-only, one line per event (local time, unit, model, taskId, result SHA,
-    decision). After compaction it is the source of truth.
+    decision). The agentdeck state points at it; read only its tail.
   - `<topic>/rules.txt`: rules every brief cites (contract and spec paths, repo rules, build limits,
     DO NOT list, integration protocol, first line `PARTIAL:` or `BLOCKED:` on early stops).
   - `task-<unit>-c<N>.txt`: one brief per unit and round.
-- Ask the owner once per session whether releases, tags and deploys may go out without a separate OK
-  once their gates are green. The answer holds for this session only.
-- Record each owner decision verbatim at once: a comment on its backlog issue, a log line and a memory
-  entry. Search the issues before asking; never ask twice.
+- Ask the owner once per goal whether releases, tags and deploys may go out without a separate OK
+  once their gates are green. Save the answer verbatim with `state_write` `decision`; it holds for this
+  T3 thread across provider switches, handoffs and forks until the owner revokes it or the goal is done.
+- Record each owner decision verbatim at once: `state_write` `decision`, a comment on its backlog issue
+  and a log line. Check the state's decisions and search the issues before asking; never ask twice.
 - Durable notes are dated history: date every claim, pin code claims to `repo@sha` ("2026-11-14: owner
   chose X; true at agentdeck@abc1234"), and never write "currently" about code. A changed fact gets a
   new dated line; the old one is marked superseded, not rewritten.
@@ -93,6 +100,11 @@ skill) cover only their own domain.
 - Dispatch asynchronously, log the taskId, end the turn.
 - Before waiting on a build, CI or deploy, confirm it progresses (a run on the head SHA, a live PID, a
   growing log); never wait out a stale "running" record.
+- A PR T3 watches wakes you on its own; never add a second wait (background command, monitor, poll) on
+  it. A wake that changes nothing you act on (checks still running, review pending, a non-final child
+  update) ends the turn without a message.
+- When an owner-approved write (Telegram or another approver) times out, check whether it applied. If
+  not, send it once more without asking in chat; ask only after the second timeout or a denial.
 
 ## On completion
 
@@ -133,5 +145,6 @@ Each tool call re-reads the whole context; that was about 83% of a coordinator's
 - Pack checks into one Bash call with capped output; never paste whole logs, diffs or `application-one`
   JSON.
 - `t3_thread_read`: `limit` 10 or less, `maxCharsPerItem` 500 or less, tail only.
-- Before going idle, log the state to `tasks.txt`. After compaction, read its tail and the running
-  taskIds, then continue.
+- Every wake re-reads the whole thread, so a long thread costs more per wake. When the thread is very
+  long or a phase ends, write the state and ask the owner to continue in a fresh
+  thread that passes `thread: <this thread id>` to both state tools.

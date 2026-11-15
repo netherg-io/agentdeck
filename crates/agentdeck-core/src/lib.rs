@@ -21,6 +21,7 @@ pub mod settings;
 pub mod shared;
 pub mod sync;
 pub mod t3;
+pub mod thread_state;
 pub mod usage;
 pub mod wrappers;
 

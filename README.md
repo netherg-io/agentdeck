@@ -171,7 +171,12 @@ Built-in, enabled per machine with `agentdeck plugin enable <name>`:
   project), `skill_invocation`, `instructions_read` / `instructions_edit`
   (agentdeck blocks stay protected), `drift_list` / `drift_apply` /
   `drift_resolve`. One call updates every harness instead of only the
-  caller's own. Disable removes the registrations and restores each harness
+  caller's own. `state_read` / `state_write` keep a long session's goal,
+  progress and verbatim owner decisions per T3 thread (`T3CODE_THREAD_ID`)
+  in `~/.local/state/agentdeck/threads/`; they survive provider switches,
+  handoffs and compaction, a fork reads its parent's state, and a new
+  session gets the goal line in the server's `initialize` instructions.
+  Disable removes the registrations and restores each harness
   file byte for byte.
 
 Enable lays out exactly the plugin's files, hooks and instruction block;
