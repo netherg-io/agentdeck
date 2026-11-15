@@ -172,7 +172,7 @@ fn thread_state_survives_a_new_session() {
     // A new provider session (new MCP process) gets the goal at initialize.
     let second = session_env(&dir, &env, &[init, call(2, "state_read", json!({}))]);
     let instr = second[0]["result"]["instructions"].as_str().unwrap();
-    assert!(instr.contains("Goal: Goal: finish #71"), "{instr}");
+    assert!(instr.contains("First line: Goal: finish #71"), "{instr}");
     let read: Value = serde_json::from_str(&text(&second[1])).unwrap();
     assert_eq!(read["state"], "Goal: finish #71\nnext: deploy");
     assert_eq!(read["decisions"][0]["text"], "«Подтверждаю»");

@@ -160,7 +160,7 @@ pub fn instructions(found: Option<&Found>) -> String {
         .take(300)
         .collect();
     format!(
-        "{base}\nThis thread has saved state (updated {}, {} owner decisions{}). Goal: {goal}\n\
+        "{base}\nThis thread has saved state (updated {}, {} owner decisions{}). First line: {goal}\n\
          Call `state_read` before acting after a handoff, compaction, limit pause or \"continue\", \
          and follow it over any summary.",
         f.data.updated,
@@ -255,7 +255,7 @@ mod tests {
         assert_eq!(s.decisions[0].text, "«Подтверждаю» deploys");
         let f = read(&paths, None, "t1").unwrap().unwrap();
         assert!(f.inherited_from.is_none());
-        assert!(instructions(Some(&f)).contains("Goal: Goal: ship #71"));
+        assert!(instructions(Some(&f)).contains("First line: Goal: ship #71"));
         let _ = fs::remove_dir_all(dir);
     }
 
