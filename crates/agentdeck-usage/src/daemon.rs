@@ -6,7 +6,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::task::JoinSet;
@@ -60,6 +60,8 @@ pub struct DaemonPaths {
     pub history: PathBuf,
     /// Single-writer lock file.
     pub lock: PathBuf,
+    /// Bearer token for T3's `server.refreshProviders`, 0600.
+    pub t3_token: PathBuf,
 }
 
 impl DaemonPaths {
@@ -74,6 +76,7 @@ impl DaemonPaths {
             compat_runtime: vec![util::state_file()],
             history: dir.join("history.jsonl"),
             lock: dir.join(LOCK_FILE_NAME),
+            t3_token: dir.join("t3-token"),
         }
     }
 
@@ -281,6 +284,26 @@ fn log_cycle(state: &AppState) {
     eprintln!("[цикл] {summary}");
 }
 
+/// Ask T3 to re-probe providers once a subscription cache is this old. T3
+/// reuses Claude's usage probe for `CAPABILITIES_PROBE_TTL` (5 min), so an
+/// earlier request would return the same Claude limits.
+const T3_KICK_AFTER_SECONDS: i64 = 300;
+/// Minimum gap between refresh requests, so a provider T3 cannot refresh does
+/// not turn every cycle into a full T3 probe.
+const T3_KICK_MIN_GAP: Duration = Duration::from_secs(300);
+const T3_KICK_DEADLINE: Duration = Duration::from_secs(90);
+
+/// True when a T3-backed account shows cached limits older than `after`
+/// seconds. Waiting/error/unauthenticated accounts carry `now` as
+/// `updated_at` and never trigger it.
+fn t3_needs_refresh(state: &AppState, now: i64, after: i64) -> bool {
+    state.accounts.iter().any(|a| {
+        model::is_t3_subscription(&a.provider)
+            && matches!(a.status.as_str(), "ok" | "stale" | "depleted")
+            && now.saturating_sub(a.updated_at) > after
+    })
+}
+
 /// Run the polling loop until SIGTERM/SIGINT. `load` provides fresh
 /// `(accounts, refresh_seconds, stale_seconds)` every cycle.
 /// Holds the single-writer lock for life; refuses while the old service is
@@ -303,10 +326,24 @@ pub async fn run_daemon(
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut consecutive_failures: u32 = 0;
     let mut last_history = None;
+    let mut last_t3_kick: Option<Instant> = None;
     loop {
         let (accounts, refresh_seconds, stale_seconds) = load()?;
         let interval = refresh_seconds.max(crate::config::MIN_REFRESH_SECONDS);
-        let state = refresh_cycle(&accounts, stale_seconds, read_state(paths)).await;
+        let previous = read_state(paths);
+        // Refresh before polling so this cycle already reads the new caches.
+        if previous.as_ref().is_some_and(|prev| {
+            t3_needs_refresh(
+                prev,
+                util::unix_now(),
+                T3_KICK_AFTER_SECONDS.min(stale_seconds / 2),
+            )
+        }) && last_t3_kick.is_none_or(|at| at.elapsed() >= T3_KICK_MIN_GAP)
+        {
+            last_t3_kick = Some(Instant::now());
+            refresh_t3_providers(paths).await;
+        }
+        let state = refresh_cycle(&accounts, stale_seconds, previous).await;
         write_state(paths, &state)?;
         log_cycle(&state);
         // Журнал вторичен: его сбой не должен останавливать обновление панели.
@@ -329,6 +366,25 @@ pub async fn run_daemon(
         }
     }
     Ok(())
+}
+
+async fn refresh_t3_providers(paths: &DaemonPaths) {
+    let t3_root = match agentdeck_core::t3::t3_root() {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!("T3 refresh пропущен: {error:#}");
+            return;
+        }
+    };
+    let refresh = crate::t3_refresh::refresh_providers(&t3_root, &paths.t3_token);
+    match tokio::time::timeout(T3_KICK_DEADLINE, refresh).await {
+        Ok(Ok(())) => eprintln!("[t3] кеши лимитов устарели, T3 обновил провайдеров"),
+        Ok(Err(error)) => eprintln!("[t3] не удалось обновить провайдеров T3: {error:#}"),
+        Err(_) => eprintln!(
+            "[t3] T3 не обновил провайдеров за {} секунд",
+            T3_KICK_DEADLINE.as_secs()
+        ),
+    }
 }
 
 /// One cycle. Refuses against the lock like the daemon, but never against the
@@ -541,6 +597,7 @@ mod tests {
                 compat_runtime: vec![compat.join("run-state.json")],
                 history: usage.join("history.jsonl"),
                 lock: usage.join(LOCK_FILE_NAME),
+                t3_token: usage.join("t3-token"),
             },
             Guard(dir),
         )
@@ -557,6 +614,48 @@ mod tests {
             }]
         });
         serde_json::from_value(raw).unwrap()
+    }
+
+    #[test]
+    fn t3_refresh_triggers_only_on_old_t3_caches() {
+        let now = 1_794_570_000;
+        let account = |provider: &str, status: &str, age: i64| model::AccountState {
+            provider: provider.to_owned(),
+            status: status.to_owned(),
+            updated_at: now - age,
+            ..model::AccountState::error("a", "A", "claude", String::new())
+        };
+        let state = |accounts| AppState {
+            schema_version: model::SCHEMA_VERSION,
+            updated_at: now,
+            accounts,
+        };
+        assert!(t3_needs_refresh(
+            &state(vec![account("claude", "stale", 3_600)]),
+            now,
+            300
+        ));
+        assert!(t3_needs_refresh(
+            &state(vec![account("codex", "ok", 301)]),
+            now,
+            300
+        ));
+        assert!(!t3_needs_refresh(
+            &state(vec![account("codex", "ok", 299)]),
+            now,
+            300
+        ));
+        // Waiting/error states and API-key balances never ask T3 to refresh.
+        assert!(!t3_needs_refresh(
+            &state(vec![account("claude", "waiting", 3_600)]),
+            now,
+            300
+        ));
+        assert!(!t3_needs_refresh(
+            &state(vec![account("openrouter", "stale", 3_600)]),
+            now,
+            300
+        ));
     }
 
     #[test]
