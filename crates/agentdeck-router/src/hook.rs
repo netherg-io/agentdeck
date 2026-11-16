@@ -118,6 +118,17 @@ fn rewrite_args(args: &Value, target: Option<&Value>, hint: &str) -> Value {
     out
 }
 
+fn same_target(a: &Value, b: Option<&Value>) -> bool {
+    let key = |v: Option<&Value>, k: &str| {
+        v.and_then(|v| v.get(k))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    key(Some(a), "providerInstanceId") == key(b, "providerInstanceId")
+        && key(Some(a), "model") == key(b, "model")
+}
+
 /// Allow with rewritten input (Claude PreToolUse envelope).
 fn emit_rewrite(updated: &Value, reason: &str, out: &mut Vec<u8>) {
     let envelope = serde_json::json!({"hookSpecificOutput": {
@@ -1129,11 +1140,16 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
             .get("reason")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        // Reviews keep the deny: the no-review rule overrides validation, and the
+        // router target is not checked against it.
         if !allowed_now
             && !user_choice
             && !workflow_retry
             && can_rewrite(&ctx.harness)
-            && let Some(t) = route.get("target").filter(|t| !t.is_null())
+            && args.get("role").and_then(Value::as_str) != Some("review")
+            && let Some(t) = route
+                .get("target")
+                .filter(|t| !t.is_null() && !same_target(t, target))
         {
             let hint = route
                 .get("briefHint")
@@ -1341,7 +1357,9 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Value, can_rewrite, emit_rewrite, rewrite_args, strip_tags, t3_server};
+    use super::{
+        Value, can_rewrite, emit_rewrite, rewrite_args, same_target, strip_tags, t3_server,
+    };
 
     #[test]
     fn rewrite_replaces_target_appends_hint_once() {
@@ -1360,6 +1378,9 @@ mod tests {
         let again = rewrite_args(&out, None, "HINT");
         assert_eq!(again["task"], "do X\n\nHINT");
         assert!(can_rewrite("claude") && !can_rewrite("codex") && !can_rewrite("agy"));
+        assert!(same_target(&t, Some(&out["target"])));
+        assert!(!same_target(&t, Some(&args["target"])));
+        assert!(!same_target(&t, None));
         let mut buf = Vec::new();
         emit_rewrite(&out, "why", &mut buf);
         let v: Value = serde_json::from_slice(&buf).unwrap();
