@@ -168,7 +168,7 @@ Built-in, enabled per machine with `agentdeck plugin enable <name>`:
   progress items with status, note and links) and `backlog_list` /
   `backlog_add` / `backlog_update` (a per-project backlog in
   `~/.local/state/agentdeck/coordinator/backlog/<project>.json`; closing needs
-  the PR and merged SHA). The GUI's Coordinator page shows every thread's goal,
+  the PR and merged SHA, or `done` with the evidence for work that has no PR). The GUI's Coordinator page shows every thread's goal,
   checklist and the open backlog; the COSMIC applet lists coordinators with
   open work updated in the last day. After upgrading from 0.1.16 with `router`
   on, run `agentdeck plugin enable coordinator` to keep the skill.

@@ -25,6 +25,10 @@ pub struct Closed {
     /// Why it was closed without a fix (obsolete, duplicate, declined).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reason: String,
+    /// Operational item done without a PR (prod config, rotation, a check):
+    /// what was done and how it was verified.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub evidence: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -84,6 +88,8 @@ pub struct Patch {
     pub close: Option<ClosePatch>,
     /// Close without a fix, with the reason.
     pub reject: Option<String>,
+    /// Close an item whose work has no PR, with the evidence.
+    pub done: Option<String>,
     #[serde(default)]
     pub reopen: bool,
 }
@@ -216,16 +222,24 @@ pub fn update(paths: &Paths, project: &str, id: u64, patch: Patch) -> anyhow::Re
     {
         anyhow::bail!("closing needs the PR and the merged SHA (at least 7 hex chars)");
     }
-    if [patch.close.is_some(), patch.reject.is_some(), patch.reopen]
-        .iter()
-        .filter(|b| **b)
-        .count()
+    if [
+        patch.close.is_some(),
+        patch.reject.is_some(),
+        patch.done.is_some(),
+        patch.reopen,
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count()
         > 1
     {
-        anyhow::bail!("pass only one of close, reject and reopen");
+        anyhow::bail!("pass only one of close, reject, done and reopen");
     }
     if patch.reject.as_deref().is_some_and(|r| r.trim().is_empty()) {
         anyhow::bail!("reject needs the reason");
+    }
+    if patch.done.as_deref().is_some_and(|d| d.trim().is_empty()) {
+        anyhow::bail!("done needs the evidence: what was done and how it was verified");
     }
     let (path, _lock) = locked(paths, project)?;
     let mut b = load_file(&path)?;
@@ -260,7 +274,7 @@ pub fn update(paths: &Paths, project: &str, id: u64, patch: Patch) -> anyhow::Re
             at: now.clone(),
             pr: c.pr,
             sha: c.sha,
-            reason: String::new(),
+            ..Closed::default()
         });
     }
     if let Some(r) = patch.reject {
@@ -268,6 +282,14 @@ pub fn update(paths: &Paths, project: &str, id: u64, patch: Patch) -> anyhow::Re
         e.closed = Some(Closed {
             at: now.clone(),
             reason: r,
+            ..Closed::default()
+        });
+    }
+    if let Some(ev) = patch.done {
+        e.status = "closed".into();
+        e.closed = Some(Closed {
+            at: now.clone(),
+            evidence: ev,
             ..Closed::default()
         });
     }
@@ -293,6 +315,40 @@ mod tests {
             dir.clone(),
             Paths::new(dir.join("config"), dir.join("state")),
         )
+    }
+
+    #[test]
+    fn done_closes_without_pr() {
+        let (dir, paths) = fx("done");
+        let ops = add(
+            &paths,
+            "blockfield",
+            NewEntry {
+                title: "rotate a password".into(),
+                ..NewEntry::default()
+            },
+        )
+        .unwrap();
+        let blank = Patch {
+            done: Some("  ".into()),
+            ..Patch::default()
+        };
+        assert!(update(&paths, "blockfield", ops.id, blank).is_err());
+        let done = update(
+            &paths,
+            "blockfield",
+            ops.id,
+            Patch {
+                done: Some("rotated; hash check on the host finds no old value".into()),
+                ..Patch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(done.status, "closed");
+        let closed = done.closed.unwrap();
+        assert!(closed.pr.is_empty() && closed.reason.is_empty());
+        assert!(closed.evidence.starts_with("rotated"));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
