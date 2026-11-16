@@ -125,7 +125,7 @@ fn tools() -> Value {
         },
         {
             "name": "backlog_update",
-            "description": "Change a backlog item: fields replace, `note` appends a dated history line, `close` ({pr, sha}) closes it once the fix is merged with green CI, `reject` (reason) closes it without a fix, `reopen` opens it again.",
+            "description": "Change a backlog item: fields replace, `note` appends a dated history line, `close` ({pr, sha}) closes it once the fix is merged with green CI, `reject` (reason) closes it without a fix, `done` (evidence) closes an item whose work has no PR (prod config, a rotation, a check), `reopen` opens it again.",
             "inputSchema": {"type": "object", "required": ["project", "id"], "properties": {
                 "project": project_name,
                 "id": {"type": "integer"},
@@ -137,6 +137,7 @@ fn tools() -> Value {
                 "note": {"type": "string"},
                 "close": {"type": "object", "required": ["pr", "sha"], "properties": {"pr": {"type": "string"}, "sha": {"type": "string"}}},
                 "reject": {"type": "string", "description": "Close without a fix: the reason (obsolete, duplicate, declined by the owner)"},
+                "done": {"type": "string", "description": "Close work that has no PR: what was done and how it was verified"},
                 "reopen": {"type": "boolean"}
             }}
         },

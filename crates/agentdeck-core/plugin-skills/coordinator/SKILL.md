@@ -27,8 +27,11 @@ skill) cover only their own domain.
   for every finding, follow-up, deferred step or owner decision to act on, never only in chat, memory or
   files. An item has a closing criterion; labels such as `next-release` and `partial` mark release work
   and partly done items. Close it with `backlog_update` `close` ({pr, sha}) once its fix is merged with
-  green CI, not after the release; an item that lost its point closes with `reject` and the reason once
-  the owner agrees. Cite items as `backlog:<project>#<id>`. User-facing bugs and tasks
+  green CI, not after the release; work with no PR (a rotation, a prod config fix, a check) closes with
+  `done` and the evidence; an item that lost its point closes with `reject` and the reason once
+  the owner agrees. A change CI cannot prove (game behaviour, UI, a runtime-only mixin) closes on merge
+  only with a linked `stand` item for its live check; stand checks run as their own units as soon as a
+  stand is free, not at release. Cite items as `backlog:<project>#<id>`. User-facing bugs and tasks
   still go to the product repo's issues.
 - Public issue and PR text carries no secrets, host paths, suffixed app names, account ids, IPs, player
   ids, private repo or submodule URLs, or model ids. Hooks do not check issues, so briefs state this.
@@ -39,6 +42,8 @@ skill) cover only their own domain.
   - `<topic>/rules.txt`: rules every brief cites (contract and spec paths, repo rules, build limits,
     DO NOT list, integration protocol, first line `PARTIAL:` or `BLOCKED:` on early stops).
   - `task-<unit>-c<N>.txt`: one brief per unit and round.
+- Write owner-facing times in the owner's local time as `date` prints it (offset included); never
+  assume an offset.
 - Ask the owner once per goal whether releases, tags and deploys may go out without a separate OK
   once their gates are green. Save the answer verbatim with `state_write` `decision`; it holds for this
   T3 thread across provider switches, handoffs and forks until the owner revokes it or the goal is done.
@@ -58,6 +63,10 @@ skill) cover only their own domain.
 - Never defer work to keep a release base stable. Work held from the next release goes green and
   approved, stays open until needed, and is a `held` checklist item linking the PR; check the held items
   before every merge into a release base.
+- Before ending a turn, start every ready item that does not need the owner; an open owner question
+  blocks only its own items. When nothing you started is still running, schedule a wake: T3
+  `schedule_task` with `{type: "once", runAt: <about 30 minutes ahead>}`, `bindToCurrentThread: true`,
+  prompt `continue`.
 - Serialize only on a real conflict (same files, or one exclusive resource such as a stand or a provider
   limit) and log why. A base that will move is not a conflict.
 
@@ -105,6 +114,8 @@ skill) cover only their own domain.
 - Dispatch asynchronously, log the taskId, end the turn.
 - Before waiting on a build, CI or deploy, confirm it progresses (a run on the head SHA, a live PID, a
   growing log); never wait out a stale "running" record.
+- Start every background command with `run_in_background` and no trailing `&`: an `&` drops the
+  completion notice and dies with the shell, taking child processes such as a pending approval with it.
 - Wait on each PR with babysit-pr's `pr-wait <pr> --repo <owner/name> --until ready --interval 60` as one
   background command (Bash `run_in_background`, timeout 7200000), not `watch_pull_request`: T3's watch
   wakes on every failed check and comment, your own thread replies included, 2-3 times per review round.
@@ -121,7 +132,8 @@ skill) cover only their own domain.
 - Treat the result as claims and verify cheaply: `git fetch`, `rev-parse`, `merge-base --is-ancestor`,
   `diff --stat`, the cited lines, `--porcelain`.
 - Before any merge, read the review bot's summary and inline comments on the head SHA; each [critical]
-  or [major] is fixed or answered. Read risky production diffs yourself. Spot-check one key claim per
+  or [major] is fixed or answered. A release, deploy, migration or prod-config PR also gets a review unit
+  at xhigh before merge; merge on its verdict. Spot-check one key claim per
   research report and tell the owner when it was wrong.
 - A result cut short or ending in "waiting on ..." means the child stopped early or still runs. Check
   outputs and processes and read only the tail of its thread; continue from the pushed branch with a new
@@ -136,8 +148,14 @@ skill) cover only their own domain.
 
 - You decide technical details within the owner's rules and the contract, and write them into the next
   brief. The owner decides scope, product behaviour, cost and releases: ask briefly with options and a
-  recommendation; on an ambiguous answer, act on the literal reading and state it.
+  recommendation; on an ambiguous answer, act on the literal reading and state it, unless that reading cancels,
+  deletes or reverts work or sets a product value: then ask one short question first.
 - Outward actions beyond the session-start release answer need the owner's explicit OK.
+- A prod change runs the project's pre-deploy gate first, changes one app at a time and confirms each
+  is healthy before the next. Start it only while the owner can still approve a rollback.
+- Prod access goes through the project's MCP tools or their CLI runner. Never read owner config or
+  credential files or call a prod API directly; the global redaction rule covers derived values too
+  (lengths, hashes, parsed URLs).
 - Load `unslop` at session start for every text a person reads, and name it in `SKILLS` for children
   that write such text.
 - Report in the owner's language, results first, in 1-3 lines per child result: what changed, what is
@@ -150,8 +168,9 @@ skill) cover only their own domain.
 Each tool call re-reads the whole context; that was about 83% of a coordinator's cost (2026-10-31).
 
 - Read narrowly (`grep -n`, `sed -n a,bp`, `--stat`) and do not re-derive what a log or report states.
-- Do one-command work yourself; anything over about 3 calls, any diagnosis, log reading or diff review
-  goes to a child.
+- Your own commands are merges of ready PRs, backlog and state writes, and single owner-approved
+  writes. Everything else goes to a child, however small: a fix or push to a PR branch, a release
+  step, prod diagnosis, log reading, diff review, anything over about 3 calls.
 - Pack checks into one Bash call with capped output; never paste whole logs, diffs or `application-one`
   JSON.
 - `t3_thread_read`: `limit` 10 or less, `maxCharsPerItem` 500 or less, tail only.
