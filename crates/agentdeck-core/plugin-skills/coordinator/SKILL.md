@@ -25,13 +25,16 @@ skill) cover only their own domain.
   blocks now, and `links` to its PRs and backlog items. Update an item whenever its state changes.
 - The coordinator backlog lives in agentdeck per project: `backlog_list` on start, `backlog_add` at once
   for every finding, follow-up, deferred step or owner decision to act on, never only in chat, memory or
-  files. An item has a closing criterion; labels such as `next-release` and `partial` mark release work
+  files. A review finding on an open PR is fixed in that PR's next round; what stays out of scope goes
+  into one follow-ups item per PR, not one item per finding. An item has a closing criterion; labels such as `next-release` and `partial` mark release work
   and partly done items. Close it with `backlog_update` `close` ({pr, sha}) once its fix is merged with
   green CI, not after the release; work with no PR (a rotation, a prod config fix, a check) closes with
   `done` and the evidence; an item that lost its point closes with `reject` and the reason once
   the owner agrees. A change CI cannot prove (game behaviour, UI, a runtime-only mixin) closes on merge
   only with a linked `stand` item for its live check; stand checks run as their own units as soon as a
-  stand is free, not at release. Cite items as `backlog:<project>#<id>`. User-facing bugs and tasks
+  stand is free, not at release. When a stand check finds a defect CI missed, the fix unit also adds the
+  CI check that would have caught it (for example, a server boot with the pinned jars). Cite items as
+  `backlog:<project>#<id>`. User-facing bugs and tasks
   still go to the product repo's issues.
 - Public issue and PR text carries no secrets, host paths, suffixed app names, account ids, IPs, player
   ids, private repo or submodule URLs, or model ids. Hooks do not check issues, so briefs state this.
@@ -48,7 +51,10 @@ skill) cover only their own domain.
   once their gates are green. Save the answer verbatim with `state_write` `decision`; it holds for this
   T3 thread across provider switches, handoffs and forks until the owner revokes it or the goal is done.
 - Record each owner decision verbatim at once: `state_write` `decision`, a `note` on its backlog item
-  and a log line. Check the state's decisions and the backlog before asking; never ask twice.
+  and a log line. Check the state's decisions and the backlog before asking; never ask twice. Before
+  asking the owner to do something (a token, a setting, an approval), check that it is not already done.
+- When the owner hands over a batch of requests or bug reports, ask every clarifying question in one
+  message at intake, before cutting units, each with how you read the item.
 - Durable notes are dated history: date every claim, pin code claims to `repo@sha` ("2026-11-14: owner
   chose X; true at agentdeck@abc1234"), and never write "currently" about code. A changed fact gets a
   new dated line; the old one is marked superseded, not rewritten.
@@ -67,6 +73,11 @@ skill) cover only their own domain.
   blocks only its own items. When nothing you started is still running, schedule a wake: T3
   `schedule_task` with `{type: "once", runAt: <about 30 minutes ahead>}`, `bindToCurrentThread: true`,
   prompt `continue`.
+- Merged work is not done for the owner until it ships. When the goal includes releases, release as
+  soon as a set of user-facing fixes is merged and stand-checked. Until then, start no tooling or
+  process unit that the release does not need.
+- A CI infrastructure failure that hits more than one PR (a failed download, a rate limit, a cache miss)
+  raises its backlog item to the next free slot.
 - Serialize only on a real conflict (same files, or one exclusive resource such as a stand or a provider
   limit) and log why. A base that will move is not a conflict.
 
@@ -89,7 +100,7 @@ skill) cover only their own domain.
   as needed. Name only what applies.
 - Header fields, only those that apply: `SKILLS`, `owned files`, `source refs` (repo@ref to read),
   `preserve` (behaviour that must not change), `acceptance`, `evidence dir` (durable, never /tmp), `experiments max`, `start grant` or VM
-  budget, `review_policy`, `push_budget` (default 2: the first push and one batch of head findings), `stop`, `final cap`.
+  budget, `review_policy`, `push_budget` (default 4: the first push and up to 3 rounds of findings), `stop`, `final cap`.
 - PR handling and `review_policy` follow `babysit-pr`, which wins over this skill and project rules,
   including rebasing a behind branch with `--force-with-lease`.
 - Body: WHY (owner goal), inputs with exact paths and SHAs, prior results and decisions, YOUR STEP in
@@ -108,8 +119,17 @@ skill) cover only their own domain.
 - Route every child; agentdeck enforces provider concurrency. Follow the owner's model preferences in
   memory. Effort: high by default, xhigh for complex, security, release-critical or long units, lower
   only for trivial units with a logged reason. An owner choice wins.
-- A brief ends at push (or a rerun of failed jobs) and the PR result line; the child never waits on bots
-  or CI. You watch pending PRs and dispatch the next unit: a findings round, or merge and backlog close.
+- An implementation child drives its own PR to ready: after each push it runs `pr-wait <pr> --repo
+  <owner/name> --until ready --interval 60`, fixes the bot's findings and its own red checks on its
+  branch, and reruns a job that failed for an infrastructure reason once. Before each push it checks
+  the whole changed code for the kinds of issue the bot has raised on this PR, not only the flagged
+  lines. After 3 finding rounds it stops with `PARTIAL:`, the head SHA and the open findings; you
+  dispatch a fresh unit from there.
+- For a PR that needs no xhigh review unit, wait and merge in one background command: `pr-wait <pr>
+  --repo <r> --until ready --interval 60 && [ "$(gh pr view <pr> --repo <r> --json latestReviews -q
+  '[.latestReviews[] | select(.author.login | endswith("-review-bot"))][0].state')" = APPROVED ] &&
+  gh pr merge <pr> --repo <r> <project merge method> --match-head-commit <head sha>`. Its exit wakes
+  you once: close the backlog item, or act on the failure.
 - Briefs say: wait for your own long commands (build, remote gate, VM job) to exit before reporting.
 - Dispatch asynchronously, log the taskId, end the turn.
 - Before waiting on a build, CI or deploy, confirm it progresses (a run on the head SHA, a live PID, a
@@ -131,9 +151,10 @@ skill) cover only their own domain.
 
 - Treat the result as claims and verify cheaply: `git fetch`, `rev-parse`, `merge-base --is-ancestor`,
   `diff --stat`, the cited lines, `--porcelain`.
-- Before any merge, read the review bot's summary and inline comments on the head SHA; each [critical]
-  or [major] is fixed or answered. A release, deploy, migration or prod-config PR also gets a review unit
-  at xhigh before merge; merge on its verdict. Spot-check one key claim per
+- Before a merge you run yourself, read the review bot's summary and inline comments on the head SHA;
+  each [critical] or [major] is fixed or answered. A release, deploy, migration or prod-config PR also
+  gets a review unit at xhigh, started when the PR opens, beside the bot rather than after it; merge on
+  its verdict. Spot-check one key claim per
   research report and tell the owner when it was wrong.
 - A result cut short or ending in "waiting on ..." means the child stopped early or still runs. Check
   outputs and processes and read only the tail of its thread; continue from the pushed branch with a new
@@ -158,8 +179,8 @@ skill) cover only their own domain.
   (lengths, hashes, parsed URLs).
 - Load `unslop` at session start for every text a person reads, and name it in `SKILLS` for children
   that write such text.
-- Report in the owner's language, results first, in 1-3 lines per child result: what changed, what is
-  next, any decision needed. Keep merged, published, deployed and verified in production apart, and
+- Report in the owner's language, results first, in 1-3 lines per child result: what changed for the
+  owner or players, what is next, any decision needed. Do not list unit codes. Keep merged, published, deployed and verified in production apart, and
   correct your own mistakes explicitly. No explanations, tables or option essays unless asked; details
   stay in reports and logs. Ask only what is truly the owner's. Your quota must last about 5 hours.
 
