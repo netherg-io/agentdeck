@@ -183,6 +183,75 @@ pub fn write(
     })
 }
 
+/// One status change of a checklist item.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Change {
+    pub title: String,
+    /// Empty for a new item.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub from: String,
+    pub to: String,
+}
+
+/// A progress report: written whenever a checklist update changes a status.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Report {
+    pub at: String,
+    pub thread: String,
+    pub goal: String,
+    pub done: usize,
+    pub total: usize,
+    pub changes: Vec<Change>,
+}
+
+impl Report {
+    /// Two-line text for a desktop notification.
+    pub fn text(&self) -> String {
+        let changes: Vec<String> = self
+            .changes
+            .iter()
+            .map(|c| format!("{}: {}", c.title, c.to))
+            .collect();
+        format!(
+            "{} · {}/{}\n{}",
+            self.goal,
+            self.done,
+            self.total,
+            changes.join("; ")
+        )
+    }
+}
+
+const MAX_REPORTS: usize = 500;
+
+fn reports_file(paths: &Paths) -> PathBuf {
+    paths.state_dir.join("coordinator/reports.jsonl")
+}
+
+fn append_report(paths: &Paths, r: &Report) -> anyhow::Result<()> {
+    let path = reports_file(paths);
+    let mut lines: Vec<String> = fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    lines.push(serde_json::to_string(r)?);
+    let keep = lines.len().saturating_sub(MAX_REPORTS);
+    crate::backlog::save_text(&path, &(lines[keep..].join("\n") + "\n"))
+}
+
+/// Newest reports first.
+pub fn reports(paths: &Paths, limit: usize) -> Vec<Report> {
+    let mut out: Vec<Report> = fs::read_to_string(reports_file(paths))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    out.reverse();
+    out.truncate(limit);
+    out
+}
+
 /// Upsert checklist items by id (new ids need a title and get `todo` unless a
 /// status is given), drop `remove` ids, and optionally bind the backlog project.
 pub fn update_checklist(
@@ -192,7 +261,7 @@ pub fn update_checklist(
     project: Option<&str>,
     items: &[ItemPatch],
     remove: &[String],
-) -> anyhow::Result<ThreadState> {
+) -> anyhow::Result<(ThreadState, Option<Report>)> {
     if let Some(p) = project {
         crate::backlog::check_project(p)?;
     }
@@ -206,7 +275,13 @@ pub fn update_checklist(
             anyhow::bail!("status {st:?} is not one of {}", ITEM_STATUSES.join(", "));
         }
     }
-    mutate(paths, t3_root, id, |data, _| {
+    let mut before = Vec::new();
+    let state = mutate(paths, t3_root, id, |data, _| {
+        before = data
+            .checklist
+            .iter()
+            .map(|i| (i.id.clone(), i.status.clone()))
+            .collect();
         if let Some(p) = project {
             data.project = p.to_string();
         }
@@ -245,7 +320,47 @@ pub fn update_checklist(
             anyhow::bail!("checklist over {MAX_ITEMS} items: group steps");
         }
         Ok(())
-    })
+    })?;
+    let changes: Vec<Change> = state
+        .checklist
+        .iter()
+        .filter_map(|i| {
+            let from = before
+                .iter()
+                .find(|(id, _)| *id == i.id)
+                .map(|(_, s)| s.clone())
+                .unwrap_or_default();
+            (from != i.status).then(|| Change {
+                title: i.title.clone(),
+                from,
+                to: i.status.clone(),
+            })
+        })
+        .collect();
+    if changes.is_empty() {
+        return Ok((state, None));
+    }
+    let (done, total) = state.progress();
+    let report = Report {
+        at: state.updated.clone(),
+        thread: id.to_string(),
+        goal: state
+            .state
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(160)
+            .collect(),
+        done,
+        total,
+        changes,
+    };
+    // A lost report must not fail the checklist write the coordinator relies on.
+    if let Err(e) = append_report(paths, &report) {
+        eprintln!("coordinator report not saved: {e:#}");
+    }
+    Ok((state, Some(report)))
 }
 
 /// Load this thread's state (or seed it from a forked-from ancestor), apply
@@ -465,7 +580,11 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!((s.project.as_str(), s.progress()), ("blockfield", (1, 2)));
+        assert_eq!(
+            (s.0.project.as_str(), s.0.progress()),
+            ("blockfield", (1, 2))
+        );
+        assert_eq!(s.1.unwrap().changes.len(), 3);
         let s = update_checklist(
             &paths,
             None,
@@ -475,8 +594,33 @@ mod tests {
             &["c".into()],
         )
         .unwrap();
-        assert_eq!(s.progress(), (2, 2));
-        assert_eq!(s.checklist[0].title, "A");
+        assert_eq!(s.0.progress(), (2, 2));
+        assert_eq!(s.0.checklist[0].title, "A");
+        let r = s.1.unwrap();
+        assert_eq!(
+            r.changes,
+            vec![Change {
+                title: "A".into(),
+                from: "todo".into(),
+                to: "done".into()
+            }]
+        );
+        assert_eq!((r.done, r.total), (2, 2));
+        // A note-only update is no report.
+        let note = ItemPatch {
+            id: "a".into(),
+            note: Some("merged".into()),
+            ..ItemPatch::default()
+        };
+        assert!(
+            update_checklist(&paths, None, "t", None, &[note], &[])
+                .unwrap()
+                .1
+                .is_none()
+        );
+        let saved = reports(&paths, 10);
+        assert_eq!(saved.len(), 2);
+        assert_eq!(saved[0].changes[0].to, "done");
         write(&paths, None, "t", Some("Goal: x"), None).unwrap();
         let listed = list(&paths);
         assert_eq!(listed.len(), 1);

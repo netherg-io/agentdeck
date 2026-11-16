@@ -122,6 +122,14 @@ pub(crate) fn save_json<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<(
     Ok(())
 }
 
+pub(crate) fn save_text(path: &Path, text: &str) -> anyhow::Result<()> {
+    fs::create_dir_all(path.parent().expect("state file has a dir"))?;
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, text)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn load_file(path: &Path) -> anyhow::Result<Backlog> {
     match fs::read(path) {
         Ok(b) => Ok(serde_json::from_slice(&b)?),

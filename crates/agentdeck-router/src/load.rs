@@ -92,8 +92,17 @@ pub fn read_active_agents(file: &std::path::Path) -> AgentLoad {
 #[derive(Debug, Default)]
 pub struct InstanceFailures {
     pub quota_until: Option<f64>,
+    /// Excluded until then after an error streak or a setting refusal that a retry cannot fix.
+    pub cooldown_until: Option<f64>,
     pub penalty: f64,
 }
+
+/// Two errors in a row, the newest within this window, exclude the instance...
+const STREAK_WINDOW: f64 = 30.0 * 60.0;
+/// ...for this long after the newest one, so parallel dispatches stop landing on it.
+const STREAK_COOLDOWN: f64 = 15.0 * 60.0;
+/// A refusal caused by an account setting stays until the owner changes it; recheck hourly.
+const SETTING_COOLDOWN: f64 = 3600.0;
 
 /// Failed child results carry provider errors that the run/turn projections omit.
 /// A successful child clears the failure streak; cancelled children provide no health signal.
@@ -130,6 +139,8 @@ pub fn read_instance_failures(
     let mut out = std::collections::HashMap::new();
     let mut cleared = std::collections::HashSet::new();
     let mut errors = std::collections::HashMap::<String, usize>::new();
+    // Rows come newest first, so the first error seen per provider is the newest.
+    let mut newest_error = std::collections::HashMap::<String, f64>::new();
     for (provider, status, finished, result) in read().unwrap_or_default() {
         let Some(provider) = provider.filter(|s| !s.is_empty()) else {
             continue;
@@ -163,7 +174,18 @@ pub fn read_instance_failures(
         static QUOTA: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
             regex::Regex::new(r"(?i)(quota|usage[ -]?limit|rate[ -]?limit).*(reach|exceed|exhaust)|(?:reach|exceed|exhaust|insufficient).*(quota|usage[ -]?limit|rate[ -]?limit)|hit your [^\n]*limit").unwrap()
         });
-        if QUOTA.is_match(&header) {
+        static SETTING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"(?i)trains on request data|allow paid endpoints").unwrap()
+        });
+        if SETTING.is_match(&header) {
+            let until = finished + SETTING_COOLDOWN;
+            if until > now {
+                let entry = out
+                    .entry(provider)
+                    .or_insert_with(InstanceFailures::default);
+                entry.cooldown_until = Some(entry.cooldown_until.unwrap_or(until).max(until));
+            }
+        } else if QUOTA.is_match(&header) {
             // shortcut: blocks the whole instance, so Antigravity's Argon (own weekly bucket) waits too; key by model if that matters.
             let until = reset_time(&result, finished).unwrap_or(finished + 15.0 * 60.0);
             if until > now {
@@ -175,14 +197,21 @@ pub fn read_instance_failures(
         } else if now - finished < 2.0 * 3600.0
             && (header.contains("error") || header.starts_with("getaddrinfo "))
         {
+            newest_error.entry(provider.clone()).or_insert(finished);
             *errors.entry(provider).or_default() += 1;
         }
     }
     for (provider, count) in errors {
         if count >= 2 {
-            out.entry(provider)
-                .or_insert_with(InstanceFailures::default)
-                .penalty = 0.1 * (count - 1).min(3) as f64;
+            let entry = out
+                .entry(provider.clone())
+                .or_insert_with(InstanceFailures::default);
+            entry.penalty = 0.1 * (count - 1).min(3) as f64;
+            let newest = newest_error[&provider];
+            if now - newest < STREAK_WINDOW && newest + STREAK_COOLDOWN > now {
+                let until = newest + STREAK_COOLDOWN;
+                entry.cooldown_until = Some(entry.cooldown_until.unwrap_or(until).max(until));
+            }
         }
     }
     out
@@ -633,6 +662,12 @@ mod failure_tests {
         let result = read_instance_failures(&fx.file, time());
         assert_eq!(result["flaky"].penalty, 0.1);
         assert_eq!(result["flaky"].quota_until, None);
+        // Two errors in a row exclude the instance for 15 minutes after the newest.
+        assert_eq!(result["flaky"].cooldown_until, Some(time() + 900.0));
+        assert_eq!(
+            read_instance_failures(&fx.file, time() + 900.0)["flaky"].cooldown_until,
+            None
+        );
         fx.child("c", "flaky", "failed", FINISHED, "Provider stopped this turn because of an error.\n\nLast assistant message before the run failed:\n\nInvestigating usage limit reached; resets in 3 hours.");
         let result = read_instance_failures(&fx.file, time());
         assert_eq!(result["flaky"].penalty, 0.2);
@@ -640,6 +675,17 @@ mod failure_tests {
         assert!(read_instance_failures(&fx.file, time() + 7200.0).is_empty());
         fx.child("d", "flaky", "idle", "2026-11-13T12:01:00Z", "Done");
         assert!(read_instance_failures(&fx.file, time() + 60.0).is_empty());
+    }
+
+    #[test]
+    fn setting_refusal_excludes_for_an_hour() {
+        let fx = Fixture::new();
+        fx.child("a", "opencode", "failed", FINISHED,
+            "This Go model trains on request data. Turn on \"Allow paid endpoints that may train on your data\" in OpenCode settings.");
+        let f = read_instance_failures(&fx.file, time() + 60.0);
+        assert_eq!(f["opencode"].cooldown_until, Some(time() + 3600.0));
+        assert_eq!(f["opencode"].quota_until, None);
+        assert!(read_instance_failures(&fx.file, time() + 3600.0).is_empty());
     }
 
     #[test]

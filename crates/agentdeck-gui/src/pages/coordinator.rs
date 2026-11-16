@@ -2,7 +2,7 @@
 //! open backlog per project. Read-only; coordinators write through MCP.
 
 use agentdeck_core::backlog::Entry;
-use agentdeck_core::thread_state::Item;
+use agentdeck_core::thread_state::{Item, Report};
 use i18n_embed_fl::fl;
 use iced::widget::{column, container, row};
 use iced::{Alignment, Element, Length};
@@ -12,16 +12,46 @@ use crate::data::{CoordRow, Data};
 use crate::i18n::loader;
 use crate::style as st;
 
-fn status_pill<'a>(status: &str) -> Element<'a, Message> {
-    let (key, tone) = match status {
+fn status_key(status: &str) -> (&'static str, st::Tone) {
+    match status {
         "done" => ("coord-status-done", st::Tone::Ok),
         "running" => ("coord-status-running", st::Tone::Accent),
         "review" => ("coord-status-review", st::Tone::Warn),
         "blocked" => ("coord-status-blocked", st::Tone::Danger),
         "held" => ("coord-status-held", st::Tone::Neutral),
         _ => ("coord-status-todo", st::Tone::Neutral),
-    };
+    }
+}
+
+fn status_pill<'a>(status: &str) -> Element<'a, Message> {
+    let (key, tone) = status_key(status);
     st::pill(loader().get(key), tone)
+}
+
+fn reports_card(reports: &[Report]) -> Element<'_, Message> {
+    let mut col = column![st::heading(fl!(loader(), "coord-reports"))].spacing(st::SPACE_S);
+    for r in reports {
+        let changes: Vec<String> = r
+            .changes
+            .iter()
+            .map(|c| format!("{} — {}", c.title, loader().get(status_key(&c.to).0)))
+            .collect();
+        col = col.push(
+            column![
+                row![
+                    container(st::fit(r.goal.as_str(), st::Role::Body, st::Cut::End))
+                        .width(Length::Fill),
+                    st::nowrap(st::caption(format!("{}/{}", r.done, r.total))),
+                    st::nowrap(st::caption(stamp(&r.at))),
+                ]
+                .spacing(st::SPACE_S)
+                .align_y(Alignment::Center),
+                st::fit(changes.join("; "), st::Role::Muted, st::Cut::End),
+            ]
+            .spacing(2),
+        );
+    }
+    st::card(col)
 }
 
 /// `2026-11-16T09:05:00Z` as `2026-11-16 09:05 UTC`.
@@ -116,12 +146,15 @@ fn backlog_card<'a>(project: &'a str, items: &'a [Entry]) -> Element<'a, Message
 
 pub fn view(data: &Data) -> Element<'_, Message> {
     let look = st::look();
-    if data.coordinators.is_empty() && data.backlogs.is_empty() {
+    if data.coordinators.is_empty() && data.backlogs.is_empty() && data.reports.is_empty() {
         return st::card(st::muted(fl!(loader(), "coord-empty")));
     }
     let mut col = column![].spacing(look.gap.max(st::SPACE_S));
     for c in &data.coordinators {
         col = col.push(thread_card(c));
+    }
+    if !data.reports.is_empty() {
+        col = col.push(reports_card(&data.reports));
     }
     for (project, items) in &data.backlogs {
         col = col.push(backlog_card(project, items));

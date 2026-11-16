@@ -364,7 +364,7 @@ fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> {
                 serde_json::from_value(args.get("items").cloned().unwrap_or(json!([])))?;
             let remove: Vec<String> =
                 serde_json::from_value(args.get("remove").cloned().unwrap_or(json!([])))?;
-            let s = thread_state::update_checklist(
+            let (s, report) = thread_state::update_checklist(
                 paths,
                 t3.as_deref(),
                 &id,
@@ -372,6 +372,9 @@ fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> {
                 &items,
                 &remove,
             )?;
+            if let Some(r) = report {
+                crate::sync_watch::notify_send("Координатор".into(), r.text());
+            }
             let (done, total) = s.progress();
             Ok(json!({ "thread": id, "done": done, "total": total, "updated": s.updated }))
         }

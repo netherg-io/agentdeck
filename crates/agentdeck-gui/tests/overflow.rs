@@ -115,6 +115,7 @@ fn data() -> Data {
         auto_apply: true,
         coordinators: Vec::new(),
         backlogs: Vec::new(),
+        reports: Vec::new(),
         processes: vec![
             SessionGroup {
                 kind: GroupKind::Agent {

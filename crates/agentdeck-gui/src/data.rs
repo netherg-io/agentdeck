@@ -91,6 +91,8 @@ pub struct Data {
     pub coordinators: Vec<CoordRow>,
     /// Open backlog items per project.
     pub backlogs: Vec<(String, Vec<agentdeck_core::backlog::Entry>)>,
+    /// Newest progress reports first.
+    pub reports: Vec<agentdeck_core::thread_state::Report>,
 }
 
 fn now_secs() -> i64 {
@@ -224,6 +226,7 @@ pub fn load(paths: &Paths) -> Data {
                 state,
             })
             .collect();
+        data.reports = agentdeck_core::thread_state::reports(paths, 15);
         data.backlogs = agentdeck_core::backlog::projects(paths)
             .into_iter()
             .filter_map(|p| {

@@ -81,6 +81,7 @@ fn coordinator_page_shows_checklist_and_backlog() {
         ],
         &[],
     )
+    .map(|(s, _)| s)
     .unwrap();
     for (title, labels) in [
         ("Flaky RC on cold VMs", vec!["partial"]),
@@ -104,6 +105,17 @@ fn coordinator_page_shows_checklist_and_backlog() {
         serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
     saved["updated"] = "2026-11-16T09:05:00Z".into();
     std::fs::write(&file, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let reports = paths.state_dir.join("coordinator/reports.jsonl");
+    let pinned: String = std::fs::read_to_string(&reports)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+            v["at"] = "2026-11-16T09:05:00Z".into();
+            v.to_string() + "\n"
+        })
+        .collect();
+    std::fs::write(&reports, pinned).unwrap();
     let data = agentdeck_gui::data::load(&paths);
     assert_eq!(data.coordinators.len(), 1);
     assert_eq!(data.backlogs.len(), 1, "{:?}", data.backlogs);
@@ -116,6 +128,7 @@ fn coordinator_page_shows_checklist_and_backlog() {
             .expect("checklist item");
         ui.find("Backlog blockfield · 2 open")
             .expect("backlog heading");
+        ui.find("Reports").expect("reports card");
     }
     std::fs::create_dir_all(SNAPSHOTS).unwrap();
     for lang in ["en", "ru"] {

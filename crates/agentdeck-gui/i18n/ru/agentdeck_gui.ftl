@@ -335,3 +335,4 @@ coord-status-review = На ревью
 coord-status-done = Готово
 coord-status-blocked = Блок
 coord-status-held = Отложено
+coord-reports = Отчёты

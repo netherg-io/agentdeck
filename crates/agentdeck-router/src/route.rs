@@ -1891,6 +1891,14 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                 ))
             });
         }
+        if let Some(until) = failure.and_then(|f| f.cooldown_until) {
+            policy_ban = policy_ban.or_else(|| {
+                Some(format!(
+                    "recent provider errors; retry after {} seconds",
+                    (until - now).ceil() as u64
+                ))
+            });
+        }
         let probs = a.get("probabilities");
         // Jev judges every favorite, including ones without a roster family,
         // on the honest "unprofiled; capability unknown" criterion above; a
