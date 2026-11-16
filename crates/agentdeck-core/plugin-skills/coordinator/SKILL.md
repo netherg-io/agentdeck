@@ -105,9 +105,13 @@ skill) cover only their own domain.
 - Dispatch asynchronously, log the taskId, end the turn.
 - Before waiting on a build, CI or deploy, confirm it progresses (a run on the head SHA, a live PID, a
   growing log); never wait out a stale "running" record.
-- A PR T3 watches wakes you on its own; never add a second wait (background command, monitor, poll) on
-  it. A wake that changes nothing you act on (checks still running, review pending, a non-final child
-  update) ends the turn without a message.
+- Wait on each PR with babysit-pr's `pr-wait <pr> --repo <owner/name> --until ready --interval 60` as one
+  background command (Bash `run_in_background`, timeout 7200000), not `watch_pull_request`: T3's watch
+  wakes on every failed check and comment, your own thread replies included, 2-3 times per review round.
+  `pr-wait` ignores your comments and exits once, 0 when ready or merged, 1 when it needs action. Relaunch
+  it after each push and after a timeout; link the PR with `link_pull_request` so T3 still shows it. A
+  harness without background commands keeps `watch_pull_request`. Never run both on one PR.
+- A wake that changes nothing you act on (a non-final child update) ends the turn without a message.
 - When an owner-approved write (Telegram or another approver) times out, check whether it applied. If
   not, send it once more without asking in chat; ask only after the second timeout or a denial. Root
   batches (`agent-sudo` and the like) are excluded: their timeout is final, as the global rules say.

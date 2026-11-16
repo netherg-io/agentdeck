@@ -20,6 +20,7 @@ mod cmd_sync;
 mod cmd_t3;
 mod cmd_usage;
 mod cmd_wrapper;
+mod coord_notify;
 mod sync_watch;
 
 #[derive(Parser)]

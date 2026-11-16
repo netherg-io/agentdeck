@@ -172,6 +172,10 @@ Built-in, enabled per machine with `agentdeck plugin enable <name>`:
   checklist and the open backlog; the COSMIC applet lists coordinators with
   open work updated in the last day. After upgrading from 0.1.16 with `router`
   on, run `agentdeck plugin enable coordinator` to keep the skill.
+  With `~/.config/agentdeck/telegram.env` (0600: `TELEGRAM_BOT_TOKEN`,
+  `TELEGRAM_CHAT_ID`), `agentdeck daemon` posts one Telegram message per
+  thread whose checklist statuses changed (checked every minute: goal, N/M,
+  running, blocked, just finished); nothing is sent without the file.
 - `mcp-server` — registers `agentdeck mcp-server` (stdio MCP) in every harness
   (Claude profiles, Codex, Antigravity, OpenCode) and adds an instruction block
   telling models to use it. Tools: `skills_list` (origins, invocation and
