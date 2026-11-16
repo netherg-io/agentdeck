@@ -91,6 +91,45 @@ fn emit(harness: &str, allowed: bool, reason: &str, out: &mut Vec<u8>) {
     }
 }
 
+/// Claude Code applies `updatedInput` from a PreToolUse hook, so the hook can
+/// send the routed call itself instead of denying and making the agent retry.
+fn can_rewrite(harness: &str) -> bool {
+    harness == "claude"
+}
+
+/// delegate_task arguments with `target` (when given) replaced, `runtimeMode`
+/// dropped and `hint` appended to the task unless it is already there.
+fn rewrite_args(args: &Value, target: Option<&Value>, hint: &str) -> Value {
+    let mut out = args.clone();
+    if let Some(obj) = out.as_object_mut() {
+        if let Some(t) = target {
+            obj.insert("target".into(), t.clone());
+        }
+        obj.remove("runtimeMode");
+        let task = obj
+            .get("task")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !hint.is_empty() && !task.contains(hint) {
+            obj.insert("task".into(), Value::from(format!("{task}\n\n{hint}")));
+        }
+    }
+    out
+}
+
+/// Allow with rewritten input (Claude PreToolUse envelope).
+fn emit_rewrite(updated: &Value, reason: &str, out: &mut Vec<u8>) {
+    let envelope = serde_json::json!({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "permissionDecisionReason": reason,
+        "updatedInput": updated,
+    }});
+    out.extend_from_slice(envelope.to_string().as_bytes());
+    out.push(b'\n');
+}
+
 fn is_delegate_tool(name: &str) -> bool {
     name.ends_with("delegate_task")
 }
@@ -1014,6 +1053,8 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
             String::new()
         };
         let allowed_now = validation.get("allowed").and_then(Value::as_bool) == Some(true);
+        // Claude only: the hook sends the corrected call instead of a deny + retry.
+        let mut rewritten: Option<Value> = None;
         if allowed_now {
             let catalog = read_catalog(&state_dir()?)?;
             if let Some(invalid) = validate_reasoning(&catalog, target.unwrap_or(&Value::Null))? {
@@ -1047,7 +1088,15 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
                 .get("requestedBriefHint")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if !hint.is_empty() && !str_field(&args, "task").unwrap_or_default().contains(hint) {
+            if !hint.is_empty()
+                && !str_field(&args, "task").unwrap_or_default().contains(hint)
+                && can_rewrite(&ctx.harness)
+                && !workflow_retry
+            {
+                rewritten = Some(rewrite_args(&args, None, hint));
+            } else if !hint.is_empty()
+                && !str_field(&args, "task").unwrap_or_default().contains(hint)
+            {
                 let tail = if workflow_retry {
                     format!(" {retry_hint}")
                 } else {
@@ -1076,8 +1125,26 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
                 return Ok(());
             }
         }
-        if allowed_now {
-            let provider = target
+        let reason_text = validation
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !allowed_now
+            && !user_choice
+            && !workflow_retry
+            && can_rewrite(&ctx.harness)
+            && let Some(t) = route.get("target").filter(|t| !t.is_null())
+        {
+            let hint = route
+                .get("briefHint")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            rewritten = Some(rewrite_args(&args, Some(t), hint));
+        }
+        let effective = rewritten.as_ref().unwrap_or(&args);
+        if allowed_now || rewritten.is_some() {
+            let provider = effective
+                .get("target")
                 .and_then(|t| t.get("providerInstanceId"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
@@ -1088,7 +1155,7 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
                     &state_dir()?,
                     provider,
                     *limit,
-                    str_field(&args, "task").unwrap_or_default(),
+                    str_field(effective, "task").unwrap_or_default(),
                 )
             {
                 let reason = format!("model-route: {error}. Retry after a running task finishes.");
@@ -1103,10 +1170,34 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
                 return Ok(());
             }
         }
-        let reason_text = validation
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        if let Some(updated) = &rewritten {
+            let to = updated.get("target");
+            let why = if allowed_now {
+                "brief hint appended".to_string()
+            } else {
+                format!("requested target refused: {reason_text}")
+            };
+            let reason = format!(
+                "model-route: sent as {}/{} ({why}).{warning}",
+                to.and_then(|t| t.get("providerInstanceId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                to.and_then(|t| t.get("model"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            );
+            record(
+                &ctx.harness,
+                instance.as_deref(),
+                Some(&tool_name),
+                updated,
+                Some(&route),
+                "rewrite:delegate",
+                &reason,
+            );
+            emit_rewrite(updated, &reason, &mut ctx.out);
+            return Ok(());
+        }
         let reason = format!(
             "model-route: {reason_text}.{warning}{choice_warning}{}",
             if !allowed_now {
@@ -1250,7 +1341,31 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_tags, t3_server};
+    use super::{Value, can_rewrite, emit_rewrite, rewrite_args, strip_tags, t3_server};
+
+    #[test]
+    fn rewrite_replaces_target_appends_hint_once() {
+        let args = serde_json::json!({
+            "task": "do X",
+            "target": {"providerInstanceId": "a", "model": "m1"},
+            "runtimeMode": "full-access",
+            "clientRequestId": "c1",
+        });
+        let t = serde_json::json!({"providerInstanceId": "b", "model": "m2"});
+        let out = rewrite_args(&args, Some(&t), "HINT");
+        assert_eq!(out["target"], t);
+        assert_eq!(out["task"], "do X\n\nHINT");
+        assert!(out.get("runtimeMode").is_none());
+        assert_eq!(out["clientRequestId"], "c1");
+        let again = rewrite_args(&out, None, "HINT");
+        assert_eq!(again["task"], "do X\n\nHINT");
+        assert!(can_rewrite("claude") && !can_rewrite("codex") && !can_rewrite("agy"));
+        let mut buf = Vec::new();
+        emit_rewrite(&out, "why", &mut buf);
+        let v: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert_eq!(v["hookSpecificOutput"]["updatedInput"]["target"], t);
+    }
 
     #[test]
     fn native_context_requires_matching_harness_ancestry() {
