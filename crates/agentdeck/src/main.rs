@@ -114,7 +114,7 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Enable or disable built-in plugins (agent-process, ai-usage, router, imagegen, mcp-server).
+    /// Enable or disable built-in plugins (agent-process, ai-usage, router, imagegen, mcp-server, coordinator).
     Plugin {
         #[command(subcommand)]
         cmd: cmd_plugin::PluginCmd,

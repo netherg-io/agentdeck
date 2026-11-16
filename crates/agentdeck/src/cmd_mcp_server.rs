@@ -7,7 +7,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use agentdeck_core::shared::InstructionChoice;
-use agentdeck_core::{Change, Paths, Registry, manage, plugins, sync, thread_state};
+use agentdeck_core::{Change, Paths, Registry, backlog, manage, plugins, sync, thread_state};
 use serde_json::{Value, json};
 
 const PROTOCOL: &str = "2025-06-18";
@@ -16,6 +16,10 @@ fn tools() -> Value {
     let project = json!({
         "type": "string",
         "description": "Absolute path of a repository for a project-only skill (<project>/.agents/skills, linked into .claude/skills). Omit for every harness."
+    });
+    let project_name = json!({
+        "type": "string",
+        "description": "Backlog project slug (a-z, 0-9, '-'), e.g. blockfield"
     });
     let thread = json!({
         "type": "string",
@@ -82,6 +86,61 @@ fn tools() -> Value {
             }}
         },
         {
+            "name": "checklist_update",
+            "description": "The owner's progress checklist for this T3 thread, shown in agentdeck's GUI and applet. Upsert items by `id` (a new id needs `title`; status defaults to todo) and drop `remove` ids. Status: todo, running, review, done, blocked, held. `note` is one line on what runs or blocks now; `links` cite PRs, issues and backlog items. `project` binds the thread to a backlog project. Update it whenever an item changes state.",
+            "inputSchema": {"type": "object", "properties": {
+                "items": {"type": "array", "items": {"type": "object", "required": ["id"], "properties": {
+                    "id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "status": {"type": "string", "enum": ["todo", "running", "review", "done", "blocked", "held"]},
+                    "note": {"type": "string"},
+                    "links": {"type": "array", "items": {"type": "string"}}
+                }}},
+                "remove": {"type": "array", "items": {"type": "string"}},
+                "project": project_name,
+                "thread": thread
+            }}
+        },
+        {
+            "name": "backlog_list",
+            "description": "A project's coordinator backlog (findings, follow-ups, deferred steps, owner decisions to act on). Without `id`: one line per item; with `id`: the full item with history. Status filter: open (default), closed or all; `label` filters by label such as next-release or partial.",
+            "inputSchema": {"type": "object", "required": ["project"], "properties": {
+                "project": project_name,
+                "id": {"type": "integer"},
+                "status": {"type": "string", "enum": ["open", "closed", "all"]},
+                "label": {"type": "string"}
+            }}
+        },
+        {
+            "name": "backlog_add",
+            "description": "Add a backlog item at once for anything unfinished: a finding, follow-up, deferred step or verbatim owner decision to act on. Returns its id; cite it as `backlog:<project>#<id>`.",
+            "inputSchema": {"type": "object", "required": ["project", "title"], "properties": {
+                "project": project_name,
+                "title": {"type": "string"},
+                "body": {"type": "string", "description": "Report, evidence paths, repo@sha"},
+                "close_when": {"type": "string", "description": "Closing criterion"},
+                "labels": {"type": "array", "items": {"type": "string"}},
+                "links": {"type": "array", "items": {"type": "string"}}
+            }}
+        },
+        {
+            "name": "backlog_update",
+            "description": "Change a backlog item: fields replace, `note` appends a dated history line, `close` ({pr, sha}) closes it once the fix is merged with green CI, `reject` (reason) closes it without a fix, `reopen` opens it again.",
+            "inputSchema": {"type": "object", "required": ["project", "id"], "properties": {
+                "project": project_name,
+                "id": {"type": "integer"},
+                "title": {"type": "string"},
+                "body": {"type": "string"},
+                "close_when": {"type": "string"},
+                "labels": {"type": "array", "items": {"type": "string"}},
+                "links": {"type": "array", "items": {"type": "string"}},
+                "note": {"type": "string"},
+                "close": {"type": "object", "required": ["pr", "sha"], "properties": {"pr": {"type": "string"}, "sha": {"type": "string"}}},
+                "reject": {"type": "string", "description": "Close without a fix: the reason (obsolete, duplicate, declined by the owner)"},
+                "reopen": {"type": "boolean"}
+            }}
+        },
+        {
             "name": "drift_resolve",
             "description": "Resolve one instruction-file decision from drift_list: `shared` makes the file a link to the shared instructions (its local text is backed up), `local` makes the file's text the shared instructions.",
             "inputSchema": {"type": "object", "required": ["path", "choice"], "properties": {
@@ -115,6 +174,17 @@ fn project_arg(args: &Value) -> anyhow::Result<Option<PathBuf>> {
             Ok(Some(p))
         }
     }
+}
+
+const COORDINATOR_TOOLS: [&str; 4] = [
+    "checklist_update",
+    "backlog_list",
+    "backlog_add",
+    "backlog_update",
+];
+
+fn coordinator_enabled(paths: &Paths) -> bool {
+    Registry::load(paths).is_ok_and(|r| plugins::plugin_enabled(&r, plugins::PLUGIN_COORDINATOR))
 }
 
 fn session_thread() -> Option<String> {
@@ -282,6 +352,68 @@ fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> {
             )?;
             Ok(json!({ "thread": id, "updated": s.updated, "decisions": s.decisions.len() }))
         }
+        "checklist_update" | "backlog_list" | "backlog_add" | "backlog_update"
+            if !coordinator_enabled(paths) =>
+        {
+            anyhow::bail!("the agentdeck coordinator plugin is disabled")
+        }
+        "checklist_update" => {
+            let id = thread_arg(args)?;
+            let t3 = agentdeck_core::t3::t3_root().ok();
+            let items: Vec<thread_state::ItemPatch> =
+                serde_json::from_value(args.get("items").cloned().unwrap_or(json!([])))?;
+            let remove: Vec<String> =
+                serde_json::from_value(args.get("remove").cloned().unwrap_or(json!([])))?;
+            let s = thread_state::update_checklist(
+                paths,
+                t3.as_deref(),
+                &id,
+                str_arg(args, "project"),
+                &items,
+                &remove,
+            )?;
+            let (done, total) = s.progress();
+            Ok(json!({ "thread": id, "done": done, "total": total, "updated": s.updated }))
+        }
+        "backlog_list" => {
+            let project =
+                str_arg(args, "project").ok_or_else(|| anyhow::anyhow!("project is required"))?;
+            let b = backlog::load(paths, project)?;
+            if let Some(n) = args.get("id").and_then(Value::as_u64) {
+                let e = b.items.into_iter().find(|e| e.id == n);
+                return e
+                    .map(|e| Ok(serde_json::to_value(e)?))
+                    .unwrap_or_else(|| anyhow::bail!("{project} has no backlog item {n}"));
+            }
+            let status = str_arg(args, "status").unwrap_or("open");
+            let label = str_arg(args, "label");
+            let rows: Vec<Value> = b
+                .items
+                .iter()
+                .filter(|e| status == "all" || e.status == status)
+                .filter(|e| label.is_none_or(|l| e.labels.iter().any(|x| x == l)))
+                .map(|e| json!({ "id": e.id, "title": e.title, "status": e.status, "labels": e.labels, "links": e.links, "updated": e.updated }))
+                .collect();
+            Ok(json!({ "project": project, "items": rows }))
+        }
+        "backlog_add" => {
+            let project =
+                str_arg(args, "project").ok_or_else(|| anyhow::anyhow!("project is required"))?;
+            let new: backlog::NewEntry = serde_json::from_value(args.clone())?;
+            let e = backlog::add(paths, project, new)?;
+            Ok(json!({ "id": e.id, "ref": format!("backlog:{project}#{}", e.id) }))
+        }
+        "backlog_update" => {
+            let project =
+                str_arg(args, "project").ok_or_else(|| anyhow::anyhow!("project is required"))?;
+            let id = args
+                .get("id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow::anyhow!("id is required"))?;
+            let patch: backlog::Patch = serde_json::from_value(args.clone())?;
+            let e = backlog::update(paths, project, id, patch)?;
+            Ok(json!({ "id": e.id, "status": e.status, "updated": e.updated }))
+        }
         other => anyhow::bail!("unknown tool {other}"),
     }
 }
@@ -309,7 +441,17 @@ fn handle(paths: &Paths, msg: &Value) -> Option<Value> {
             "instructions": init_instructions(paths),
         }),
         "ping" => json!({}),
-        "tools/list" => json!({ "tools": tools() }),
+        "tools/list" => {
+            let on = coordinator_enabled(paths);
+            let list: Vec<Value> = tools()
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|t| on || !COORDINATOR_TOOLS.contains(&t["name"].as_str().unwrap_or("")))
+                .collect();
+            json!({ "tools": list })
+        }
         "tools/call" => {
             let name = msg
                 .pointer("/params/name")

@@ -19,12 +19,17 @@ skill) cover only their own domain.
   or `/goal` can drop any of it; this state survives them and forks inherit it. Call `state_read` before
   anything else at session start, after a handoff or compaction, after a limit pause and on "continue",
   and follow it over any summary. Rewrite the snapshot at every checkpoint and before going idle.
-- The backlog is GitHub issues labelled `coordinator-backlog` (plus `next-release` when it ships next)
-  in the public coordination repo and in each private repo the project skill names; read them on start.
-  An issue body starts with `Coordinator backlog item`, then the report or PR link, closing criterion
-  and status. A mixed item is a neutral public issue citing the private issue number; details stay
-  private. Close an issue once its fix is merged with green CI, not after the release, with a comment giving the
-  PR and SHA. The status file in git cites issue numbers.
+- The owner follows progress in agentdeck's GUI and applet through `checklist_update`. Bind the thread
+  to its project (`project`, the slug the project skill names) and keep one item per deliverable of the
+  goal, with status (todo, running, review, done, blocked, held), a one-line `note` on what runs or
+  blocks now, and `links` to its PRs and backlog items. Update an item whenever its state changes.
+- The coordinator backlog lives in agentdeck per project: `backlog_list` on start, `backlog_add` at once
+  for every finding, follow-up, deferred step or owner decision to act on, never only in chat, memory or
+  files. An item has a closing criterion; labels such as `next-release` and `partial` mark release work
+  and partly done items. Close it with `backlog_update` `close` ({pr, sha}) once its fix is merged with
+  green CI, not after the release; an item that lost its point closes with `reject` and the reason once
+  the owner agrees. Cite items as `backlog:<project>#<id>`. User-facing bugs and tasks
+  still go to the product repo's issues.
 - Public issue and PR text carries no secrets, host paths, suffixed app names, account ids, IPs, player
   ids, private repo or submodule URLs, or model ids. Hooks do not check issues, so briefs state this.
 - Keep a coordination dir outside tracked sources, such as `<project>/.dev/coord-<YYYYMMDD>/plans/<topic>/`
@@ -37,13 +42,13 @@ skill) cover only their own domain.
 - Ask the owner once per goal whether releases, tags and deploys may go out without a separate OK
   once their gates are green. Save the answer verbatim with `state_write` `decision`; it holds for this
   T3 thread across provider switches, handoffs and forks until the owner revokes it or the goal is done.
-- Record each owner decision verbatim at once: `state_write` `decision`, a comment on its backlog issue
-  and a log line. Check the state's decisions and search the issues before asking; never ask twice.
+- Record each owner decision verbatim at once: `state_write` `decision`, a `note` on its backlog item
+  and a log line. Check the state's decisions and the backlog before asking; never ask twice.
 - Durable notes are dated history: date every claim, pin code claims to `repo@sha` ("2026-11-14: owner
   chose X; true at agentdeck@abc1234"), and never write "currently" about code. A changed fact gets a
   new dated line; the old one is marked superseded, not rewritten.
 - If the way to the goal is too unclear to cut units, ask the owner to run `/wayfinder` first and link
-  its finished map from the backlog issue.
+  its finished map from the backlog item.
 
 ## Parallel by default
 
@@ -51,7 +56,7 @@ skill) cover only their own domain.
   with a ready plan has a running child. Release work and review rounds run beside the backlog, and the
   owner's top item never waits for a release.
 - Never defer work to keep a release base stable. Work held from the next release goes green and
-  approved, stays open until needed, and is listed in a held-PRs checklist on the backlog issue; check that list
+  approved, stays open until needed, and is a `held` checklist item linking the PR; check the held items
   before every merge into a release base.
 - Serialize only on a real conflict (same files, or one exclusive resource such as a stand or a provider
   limit) and log why. A base that will move is not a conflict.
@@ -95,7 +100,7 @@ skill) cover only their own domain.
   memory. Effort: high by default, xhigh for complex, security, release-critical or long units, lower
   only for trivial units with a logged reason. An owner choice wins.
 - A brief ends at push (or a rerun of failed jobs) and the PR result line; the child never waits on bots
-  or CI. You watch pending PRs and dispatch the next unit: a findings round, or merge and issue close.
+  or CI. You watch pending PRs and dispatch the next unit: a findings round, or merge and backlog close.
 - Briefs say: wait for your own long commands (build, remote gate, VM job) to exit before reporting.
 - Dispatch asynchronously, log the taskId, end the turn.
 - Before waiting on a build, CI or deploy, confirm it progresses (a run on the head SHA, a live PID, a
@@ -121,7 +126,7 @@ skill) cover only their own domain.
   gain; otherwise park it and note when to re-measure.
 - Clean up children's temp worktrees and scratch files once evidence is saved.
 - Retro about one child in five, failed ones first: read `~/.agents/skills/retro/SKILL.md` and apply it
-  to that thread, skipping its last step; turn worthwhile candidates into units or issues.
+  to that thread, skipping its last step; turn worthwhile candidates into units or backlog items.
 
 ## Owner
 

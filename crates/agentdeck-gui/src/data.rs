@@ -66,6 +66,15 @@ pub struct PluginRow {
     pub detail: Vec<String>,
 }
 
+/// One coordinator thread with saved state, for the Coordinator page.
+#[derive(Debug, Clone, Default)]
+pub struct CoordRow {
+    pub thread: String,
+    /// T3's thread title, when T3 knows the thread.
+    pub title: Option<String>,
+    pub state: agentdeck_core::thread_state::ThreadState,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Data {
     /// False until the first load finished, so the UI never claims "empty" while reading.
@@ -78,6 +87,10 @@ pub struct Data {
     pub processes: Vec<processes::SessionGroup>,
     /// `[sync] auto_apply`: background sync applies additive drift itself.
     pub auto_apply: bool,
+    /// Coordinator threads, newest update first (coordinator plugin on).
+    pub coordinators: Vec<CoordRow>,
+    /// Open backlog items per project.
+    pub backlogs: Vec<(String, Vec<agentdeck_core::backlog::Entry>)>,
 }
 
 fn now_secs() -> i64 {
@@ -201,6 +214,29 @@ pub fn load(paths: &Paths) -> Data {
     // Read-only /proc snapshot; gaps become dashes, never an error.
     data.processes = processes::snapshot().groups;
     data.auto_apply = agentdeck_core::sync::auto_apply_enabled(paths);
+    if plugins::plugin_enabled(&registry, plugins::PLUGIN_COORDINATOR) {
+        let root = t3::t3_root().ok();
+        data.coordinators = agentdeck_core::thread_state::list(paths)
+            .into_iter()
+            .map(|(thread, state)| CoordRow {
+                title: agentdeck_core::thread_state::thread_title(root.as_deref(), &thread),
+                thread,
+                state,
+            })
+            .collect();
+        data.backlogs = agentdeck_core::backlog::projects(paths)
+            .into_iter()
+            .filter_map(|p| {
+                let items: Vec<_> = agentdeck_core::backlog::load(paths, &p)
+                    .ok()?
+                    .items
+                    .into_iter()
+                    .filter(|e| e.status == "open")
+                    .collect();
+                Some((p, items))
+            })
+            .collect();
+    }
     data
 }
 

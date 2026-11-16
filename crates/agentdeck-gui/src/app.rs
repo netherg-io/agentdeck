@@ -29,6 +29,7 @@ pub enum Page {
     ImagegenSettings,
     Modules,
     Processes,
+    Coordinator,
     Pool,
     Shared,
     Harnesses,
@@ -48,6 +49,7 @@ impl Page {
             Self::ImagegenSettings => fl!(loader(), "nav-imagegen-settings"),
             Self::Modules => fl!(loader(), "nav-modules"),
             Self::Processes => fl!(loader(), "nav-processes"),
+            Self::Coordinator => fl!(loader(), "nav-coordinator"),
             Self::Pool => fl!(loader(), "nav-pool"),
             Self::Shared => fl!(loader(), "nav-shared"),
             Self::Harnesses => fl!(loader(), "nav-harnesses"),
@@ -973,6 +975,7 @@ fn modal(state: &State) -> Option<Modal<'_, Message>> {
         | Page::UsagePoll
         | Page::RouterSettings
         | Page::ImagegenSettings
+        | Page::Coordinator
         | Page::Modules => None,
     }
 }
@@ -1070,6 +1073,11 @@ fn sidebar(state: &State) -> Element<'_, Message> {
             &[(Page::ImagegenSettings, st::Icon::Image)],
         ),
         module(
+            fl!(loader(), "nav-group-coordinator"),
+            agentdeck_core::plugins::PLUGIN_COORDINATOR,
+            &[(Page::Coordinator, st::Icon::CircleCheck)],
+        ),
+        module(
             fl!(loader(), "nav-group-agents"),
             agentdeck_core::plugins::PLUGIN_AGENT_PROCESS,
             &[(Page::Processes, st::Icon::Terminal)],
@@ -1163,6 +1171,7 @@ fn header(state: &State) -> Element<'_, Message> {
         ),
         Page::Shared => (t("shared-title"), None),
         Page::Harnesses => (t("harness-title"), None),
+        Page::Coordinator => (t("nav-group-coordinator"), None),
         Page::Processes => (
             t("processes-title"),
             Some(pages::processes::filter_input(&state.proc_ui)),
@@ -1185,6 +1194,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
         Page::ImagegenSettings => imagegen::view(&state.imagegen).map(Message::Imagegen),
         Page::Modules => pages::plugins::view(&state.data, &state.plugin_open),
         Page::Processes => pages::processes::view(&state.data, &state.proc_ui),
+        Page::Coordinator => pages::coordinator::view(&state.data),
         Page::Pool => pool::view(&state.pool).map(Message::Pool),
         Page::Shared => shared::view(&state.shared).map(Message::Shared),
         Page::Harnesses => harnesses::view(&state.harnesses).map(Message::Harnesses),

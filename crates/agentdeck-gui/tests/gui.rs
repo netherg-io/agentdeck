@@ -634,7 +634,7 @@ fn module_switch_preview_cancel_and_snapshots() {
         std::env::set_var("AGENTDECK_SYSTEMCTL", "/bin/false");
     }
     let (data, paths, _guard) = load_with_fixtures("plugins", &env);
-    assert_eq!(data.plugins.len(), 5);
+    assert_eq!(data.plugins.len(), 6);
     std::fs::create_dir_all(SNAPSHOTS).unwrap();
     let home = fakehome;
 

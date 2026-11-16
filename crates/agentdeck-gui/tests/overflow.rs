@@ -113,6 +113,8 @@ fn data() -> Data {
         ],
         error: None,
         auto_apply: true,
+        coordinators: Vec::new(),
+        backlogs: Vec::new(),
         processes: vec![
             SessionGroup {
                 kind: GroupKind::Agent {

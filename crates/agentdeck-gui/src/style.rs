@@ -437,6 +437,23 @@ pub fn quota_bar(percent: f32) -> progress_bar::ProgressBar<'static> {
         })
 }
 
+/// Task progress: accent while open, ok once complete (no quota warning tint).
+pub fn progress<'a>(percent: f32) -> progress_bar::ProgressBar<'a> {
+    progress_bar(0.0..=100.0, percent)
+        .girth(Length::Fixed(look().bar))
+        .style(move |t: &Theme| {
+            let c = colors(t);
+            progress_bar::Style {
+                background: c.track.into(),
+                bar: if percent >= 100.0 { c.ok } else { c.accent }.into(),
+                border: Border {
+                    radius: (look().bar / 2.0).into(),
+                    ..Border::default()
+                },
+            }
+        })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Btn {
     Primary,

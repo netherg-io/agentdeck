@@ -1,5 +1,6 @@
 //! Built-in plugins: the `agent-process` launcher, the `ai-usage` T3 quota/balance daemon unit,
-//! the `router` (model-route copy) and `imagegen` (gateway image skill). Plugin state lives in `instances.toml`
+//! the `router` (model-route copy), `imagegen` (gateway image skill) and `coordinator`
+//! (coordinator skill, checklist and backlog tools). Plugin state lives in `instances.toml`
 //! under `[plugins]` (absent table = nothing enabled, so old files stay
 //! valid). Enabling a plugin lays out its files and instruction block;
 //! disabling removes them; plugin data is kept.
@@ -16,12 +17,14 @@ pub const PLUGIN_AI_USAGE: &str = "ai-usage";
 pub const PLUGIN_ROUTER: &str = "router";
 pub const PLUGIN_IMAGEGEN: &str = "imagegen";
 pub const PLUGIN_MCP_SERVER: &str = "mcp-server";
-pub const PLUGINS: [&str; 5] = [
+pub const PLUGIN_COORDINATOR: &str = "coordinator";
+pub const PLUGINS: [&str; 6] = [
     PLUGIN_AGENT_PROCESS,
     PLUGIN_AI_USAGE,
     PLUGIN_ROUTER,
     PLUGIN_IMAGEGEN,
     PLUGIN_MCP_SERVER,
+    PLUGIN_COORDINATOR,
 ];
 
 /// agent-process instruction block. Every mention of the launcher lives here
@@ -39,7 +42,7 @@ pub fn is_known(name: &str) -> bool {
 fn check_name(name: &str) -> anyhow::Result<()> {
     if !is_known(name) {
         anyhow::bail!(
-            "unknown plugin {name:?}: expected agent-process, ai-usage, router, imagegen or mcp-server"
+            "unknown plugin {name:?}: expected agent-process, ai-usage, router, imagegen, mcp-server or coordinator"
         );
     }
     Ok(())
@@ -326,14 +329,6 @@ pub fn plan_managed_blocks(
 /// every harness by the shared skill sync like any other skill.
 const ROUTER_SKILLS: &[(&str, &str)] = &[
     (
-        "coordinator/SKILL.md",
-        include_str!("../plugin-skills/coordinator/SKILL.md"),
-    ),
-    (
-        "coordinator/agents/openai.yaml",
-        include_str!("../plugin-skills/coordinator/agents/openai.yaml"),
-    ),
-    (
         "t3-routed-workflow/SKILL.md",
         include_str!("../plugin-skills/t3-routed-workflow/SKILL.md"),
     ),
@@ -350,16 +345,28 @@ const IMAGEGEN_SKILLS: &[(&str, &str)] = &[(
     include_str!("../plugin-skills/imagegen-gateway/SKILL.md"),
 )];
 
-const PLUGIN_SKILLS: [(&str, &[(&str, &str)]); 2] = [
+const COORDINATOR_SKILLS: &[(&str, &str)] = &[
+    (
+        "coordinator/SKILL.md",
+        include_str!("../plugin-skills/coordinator/SKILL.md"),
+    ),
+    (
+        "coordinator/agents/openai.yaml",
+        include_str!("../plugin-skills/coordinator/agents/openai.yaml"),
+    ),
+];
+
+const PLUGIN_SKILLS: [(&str, &[(&str, &str)]); 3] = [
     (PLUGIN_ROUTER, ROUTER_SKILLS),
     (PLUGIN_IMAGEGEN, IMAGEGEN_SKILLS),
+    (PLUGIN_COORDINATOR, COORDINATOR_SKILLS),
 ];
 
 /// Revision of the shipped skill files; bump it with every change to them
 /// (`shipped_skills_revision_is_bumped` pins the content hash). A build never
 /// rewrites skills that a build with a higher revision wrote, so a stale
 /// daemon or MCP server left running after an upgrade cannot roll them back.
-pub const PLUGIN_SKILLS_REV: u64 = 3;
+pub const PLUGIN_SKILLS_REV: u64 = 4;
 const PLUGIN_SKILLS_REV_FILE: &str = ".rev";
 
 fn stored_plugin_skills_rev(dir: &Path) -> u64 {
@@ -896,6 +903,21 @@ pub fn status(paths: &Paths, home: &Path, exe: &Path) -> Vec<PluginStatus> {
             format!("key: {}", if key { "found" } else { "missing" }),
         ],
     });
+    let threads = crate::thread_state::list(paths);
+    let open: usize = crate::backlog::projects(paths)
+        .iter()
+        .filter_map(|p| crate::backlog::load(paths, p).ok())
+        .map(|b| b.items.iter().filter(|e| e.status == "open").count())
+        .sum();
+    out.push(PluginStatus {
+        name: PLUGIN_COORDINATOR,
+        enabled: plugin_enabled(&reg, PLUGIN_COORDINATOR),
+        available: true,
+        detail: vec![
+            format!("threads with state: {}", threads.len()),
+            format!("open backlog items: {open}"),
+        ],
+    });
     out.push(PluginStatus {
         name: PLUGIN_MCP_SERVER,
         enabled: plugin_enabled(&reg, PLUGIN_MCP_SERVER),
@@ -1072,7 +1094,7 @@ pub fn plan_enable(
         PLUGIN_AI_USAGE => plan_enable_ai_usage(paths, home)?,
         PLUGIN_ROUTER => plan_enable_router(paths, home, files, exe, replace)?,
         // Only the flag and its skill (synced after apply).
-        PLUGIN_IMAGEGEN => Vec::new(),
+        PLUGIN_IMAGEGEN | PLUGIN_COORDINATOR => Vec::new(),
         PLUGIN_MCP_SERVER => {
             let mut c = crate::manage::plan_register(paths, home, exe, true)?.0;
             c.extend(plan_marker_files(
@@ -1117,7 +1139,7 @@ pub fn plan_disable(
         PLUGIN_AGENT_PROCESS => plan_disable_agent_process(home, files, exe, &paths.state_dir)?,
         PLUGIN_AI_USAGE => plan_disable_ai_usage(paths, home)?,
         PLUGIN_ROUTER => plan_disable_router(paths, home, files, exe)?,
-        PLUGIN_IMAGEGEN => Vec::new(),
+        PLUGIN_IMAGEGEN | PLUGIN_COORDINATOR => Vec::new(),
         PLUGIN_MCP_SERVER => {
             let mut c = crate::manage::plan_register(paths, home, exe, false)?.0;
             c.extend(plan_marker_files(
@@ -1231,12 +1253,17 @@ mod tests {
         assert!(dir.join("imagegen-gateway/SKILL.md").is_file());
         assert!(!dir.join("coordinator").exists());
         set(PLUGIN_ROUTER, true);
+        assert!(dir.join("t3-routed-workflow/SKILL.md").is_file());
+        assert!(!dir.join("coordinator").exists());
+        set(PLUGIN_COORDINATOR, true);
         assert!(dir.join("coordinator/SKILL.md").is_file());
         // Disabling one plugin removes only its skills.
         set(PLUGIN_IMAGEGEN, false);
         assert!(!dir.join("imagegen-gateway").exists());
         assert!(dir.join("coordinator/SKILL.md").is_file());
         set(PLUGIN_ROUTER, false);
+        assert!(dir.join("coordinator/SKILL.md").is_file());
+        set(PLUGIN_COORDINATOR, false);
         assert!(!dir.exists());
         let reg = Registry::load(&paths).unwrap();
         assert!(plan_plugin_skills(&reg, &paths).is_empty());
@@ -1247,7 +1274,7 @@ mod tests {
         let _env = test_env_lock();
         let (_g, _home, paths, _files, _exe) = setup("plugin-skills-rev");
         Registry::update(&paths, |r| {
-            r.plugins.insert(PLUGIN_ROUTER.into(), true);
+            r.plugins.insert(PLUGIN_COORDINATOR.into(), true);
             Ok(())
         })
         .unwrap();
@@ -1283,7 +1310,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!((PLUGIN_SKILLS_REV, hash), (3, 0xcb88_f6d8_9859_6824));
+        assert_eq!((PLUGIN_SKILLS_REV, hash), (4, 0x3d66_6396_367c_5524));
     }
 
     /// Every file, link and dir under `root` except agentdeck's own config

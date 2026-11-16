@@ -316,3 +316,15 @@ drift-instr-resolved = Instruction file resolved.
 drift-instr-compare = Compare instructions
 drift-instr-confirm-shared = Link to shared file
 drift-instr-confirm-local = Replace shared file
+
+nav-group-coordinator = Coordinator
+nav-coordinator = Progress
+coord-empty = No coordinator has saved a goal or a backlog yet.
+coord-no-checklist = No checklist yet.
+coord-backlog = Backlog { $project } · { $count } open
+coord-status-todo = To do
+coord-status-running = Running
+coord-status-review = In review
+coord-status-done = Done
+coord-status-blocked = Blocked
+coord-status-held = Held

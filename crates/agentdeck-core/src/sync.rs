@@ -698,9 +698,10 @@ mod tests {
         assert_eq!(block_items().len(), 2);
         assert!(block_items().iter().all(|i| i.kind == ItemKind::Additive));
         restore_blocks(&fx.paths, &fx.home).unwrap();
-        let skill = crate::plugins::plugin_skills_dir(&fx.paths).join("coordinator/SKILL.md");
+        let skill =
+            crate::plugins::plugin_skills_dir(&fx.paths).join("t3-routed-workflow/SKILL.md");
         let shipped = fs::read_to_string(&skill).unwrap();
-        let link = fx.home.join(".claude/skills/coordinator");
+        let link = fx.home.join(".claude/skills/t3-routed-workflow");
         assert_eq!(fs::read_link(&link).unwrap(), skill.parent().unwrap());
         let fresh = fs::read_to_string(&agents).unwrap();
         assert!(

@@ -163,6 +163,15 @@ Built-in, enabled per machine with `agentdeck plugin enable <name>`:
   `/images/edits`); Gemini/GPT image models go through chat completions.
   Gateway, models and key are set in the GUI under Image generation → Settings;
   **Check** verifies both models on the gateway's public model list for free.
+- `coordinator` — the `coordinator` skill (moved here from `router`) and the
+  coordinator tools of `agentdeck mcp-server`: `checklist_update` (per-T3-thread
+  progress items with status, note and links) and `backlog_list` /
+  `backlog_add` / `backlog_update` (a per-project backlog in
+  `~/.local/state/agentdeck/coordinator/backlog/<project>.json`; closing needs
+  the PR and merged SHA). The GUI's Coordinator page shows every thread's goal,
+  checklist and the open backlog; the COSMIC applet lists coordinators with
+  open work updated in the last day. After upgrading from 0.1.16 with `router`
+  on, run `agentdeck plugin enable coordinator` to keep the skill.
 - `mcp-server` — registers `agentdeck mcp-server` (stdio MCP) in every harness
   (Claude profiles, Codex, Antigravity, OpenCode) and adds an instruction block
   telling models to use it. Tools: `skills_list` (origins, invocation and

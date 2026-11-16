@@ -13,7 +13,7 @@ pub enum PluginCmd {
     List,
     /// Enable a plugin (files + unit + registry flag).
     Enable {
-        /// Plugin name (agent-process, ai-usage, router, imagegen).
+        /// Plugin name (agent-process, ai-usage, router, imagegen, mcp-server, coordinator).
         name: String,
         /// Back up a foreign file at the launcher path instead of refusing.
         #[arg(long)]
@@ -23,7 +23,7 @@ pub enum PluginCmd {
     },
     /// Disable a plugin (removes its files; data is kept).
     Disable {
-        /// Plugin name (agent-process, ai-usage, router, imagegen).
+        /// Plugin name (agent-process, ai-usage, router, imagegen, mcp-server, coordinator).
         name: String,
         #[arg(long)]
         dry_run: bool,
@@ -115,6 +115,7 @@ pub fn uninstall(paths: &Paths, dry_run: bool) -> anyhow::Result<()> {
         plugins::PLUGIN_AI_USAGE,
         plugins::PLUGIN_ROUTER,
         plugins::PLUGIN_IMAGEGEN,
+        plugins::PLUGIN_COORDINATOR,
         plugins::PLUGIN_MCP_SERVER,
         plugins::PLUGIN_AGENT_PROCESS,
     ] {
