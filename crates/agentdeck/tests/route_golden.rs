@@ -1034,7 +1034,7 @@ fn recent_quota_failure_blocks_instance_until_reset() {
 }
 
 #[test]
-fn repeated_provider_errors_lower_rank_without_exclusion() {
+fn repeated_provider_errors_exclude_for_a_cooldown() {
     let fx = Fixture::new(&[SOL, OPUS]);
     let db = rusqlite::Connection::open(fx.dir.join(".t3/userdata/statev2.sqlite")).unwrap();
     db.execute_batch(
@@ -1082,7 +1082,13 @@ fn repeated_provider_errors_lower_rank_without_exclusion() {
         .iter()
         .find(|r| r["provider"] == SOL.0)
         .unwrap();
-    assert_eq!(failed["eligible"], true);
+    // Two errors in a row just now: excluded for the cooldown, not only ranked lower.
+    assert_eq!(failed["eligible"], false);
     assert_eq!(failed["failurePenalty"], 0.1);
-    assert!(failed.get("policyBan").is_none());
+    assert!(
+        failed["policyBan"]
+            .as_str()
+            .is_some_and(|b| b.starts_with("recent provider errors")),
+        "{failed}"
+    );
 }
