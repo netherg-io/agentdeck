@@ -328,3 +328,4 @@ coord-status-review = In review
 coord-status-done = Done
 coord-status-blocked = Blocked
 coord-status-held = Held
+coord-reports = Reports

@@ -34,7 +34,6 @@ pub async fn run(paths: &Paths, args: DaemonArgs) -> anyhow::Result<()> {
     // Background sync watches beside quota polling; its failure is logged
     // inside the task and never stops the poller.
     let sync_task = tokio::spawn(sync_watch::run(paths.clone()));
-    let notify_task = tokio::spawn(crate::coord_notify::run(paths.clone()));
     // Sources are re-read every cycle so GUI/CLI edits apply without a restart;
     // a broken registry keeps the last good list instead of stopping polling.
     let mut accounts = accounts;
@@ -60,6 +59,5 @@ pub async fn run(paths: &Paths, args: DaemonArgs) -> anyhow::Result<()> {
     })
     .await;
     sync_task.abort();
-    notify_task.abort();
     result
 }
