@@ -131,7 +131,7 @@ pub fn uninstall(paths: &Paths, dry_run: bool) -> anyhow::Result<()> {
         }
     }
     reg.plugins.clear();
-    let blocks = plugins::plan_managed_blocks(&reg, &home, &exe, &paths.state_dir)?;
+    let blocks = plugins::plan_managed_blocks(&reg, &home, &paths.state_dir)?;
     for c in &blocks {
         println!("{}", c.describe());
     }

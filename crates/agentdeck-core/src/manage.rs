@@ -1113,7 +1113,7 @@ fn plan_codex_register(home: &Path, exe: &Path, on: bool) -> anyhow::Result<Vec<
 }
 
 /// Instruction block of the `mcp-server` plugin.
-pub const MCP_BLOCK: &str = "Skills, the shared instructions and agentdeck drift are managed through the `agentdeck` MCP server: `skills_list` (sources, invocation, conflicts), `skill_install` / `skill_remove` (global or one project), `skill_invocation`, `instructions_read` / `instructions_edit`, `drift_list` / `drift_apply` / `drift_resolve`, plus `state_read` / `state_write` for a long session's goal, progress and owner decisions per T3 thread. Use it instead of editing a harness's skill dir, a per-harness instruction file or `~/AGENTS.md` by hand: one call updates every harness, and agentdeck's own blocks stay protected.";
+pub const MCP_BLOCK: &str = "Change skills and the shared instructions only through the `agentdeck` MCP server, never by hand: one call updates every harness and keeps agentdeck's blocks intact.";
 
 #[cfg(test)]
 mod tests {

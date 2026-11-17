@@ -350,23 +350,13 @@ pub fn plan_remove_router_files(paths: &Paths) -> Vec<Change> {
     changes
 }
 
-/// Instruction body: the Delegation routing section (routed through this
-/// binary) plus the roster `briefHint` verbatim.
-pub fn router_block(exe: &Path) -> String {
-    let route = format!("{} route", exe.display());
-    format!(
-        "## Delegation routing (agentdeck router)\n\n\
-        - Route every `delegate_task` target first on its complete task text: write the task to a file, then \
-        `{route} - < task.txt` (the launch hook judges the same full text, so a short goal can get a different verdict; \
-        add `--source <provider instance>` when the source is unknown; `--effort medium|high|xhigh` overrides the reasoning level). Only exact active pool entries are candidates; \
-        never restore removed entries under another id. Before routing, call T3 `orchestrator_capabilities` and pipe its \
-        `structuredContent` JSON to `{route} --catalog`; refresh after provider/model changes. Pass the complete returned \
-        `target` (including `options`) as the `delegate_task` target; append a returned `briefHint` verbatim. \
-        `jevConfidence` < 0.4: compare quality and quota penalties of the top two eligible candidates. `target: null`: \
-        split the work or do it yourself. A denied target: use the next `eligible` model in `ranking`.\n\
-        - When the user explicitly asks for a specific model, start the task with `[route:user-choice]`: the router then allows any catalog model and only warns.\n\
-        - Never set `runtimeMode` unless asked.\n"
-    )
+/// Instruction body of the Delegation routing section. The launch hook does the
+/// routing and its denials carry the target, brief hint and catalog refresh, so
+/// the always-loaded text stays minimal.
+pub fn router_block() -> String {
+    "## Delegation routing (agentdeck router)\n\n\
+    - The agentdeck launch hook routes every `Agent`/`delegate_task` launch on its full task text; when it denies one, relaunch exactly as its message says. A user-chosen model: start the task with `[route:user-choice]`. Never set `runtimeMode` unless asked.\n"
+        .to_string()
 }
 
 /// Plan the `<!-- model-route:begin -->` block across `files` (same dedupe
