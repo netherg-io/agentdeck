@@ -30,10 +30,7 @@ pub const PLUGINS: [&str; 6] = [
 /// agent-process instruction block. Every mention of the launcher lives here
 /// so disabling the plugin or uninstalling agentdeck leaves no stale rules;
 /// the general process-ownership policy stays hand-written.
-pub const AGENT_PROCESS_BLOCK: &str = "Start agent-owned long-running processes (dev/preview/watch servers, browser and other daemons) only with `agent-process start --name <name> --cwd <project> -- <command>` (`~/.local/bin/agent-process` on bash/zsh `PATH`). It tags the environment, creates a separate process group and records PID, birth time, command, cwd, log and agent-session owner in `$XDG_RUNTIME_DIR/ai-agent-processes`; that record is the launch proof for the process-ownership rules.\n\
-    - Inspect ownership with `agent-process list` / `agent-process status <id>`.\n\
-    - Stop your own or your delegated child's servers with `agent-process stop <id>`; signal the exact process group only when no record exists.\n\
-    - Other sessions' servers may be reused; stopping them requires explicit user approval, the only permitted use of `--force`.";
+pub const AGENT_PROCESS_BLOCK: &str = "Start long-running processes (dev/preview/watch servers, daemons) only with `agent-process start --name <name> --cwd <project> -- <command>`; its record is the launch proof for the process rules. Inspect with `agent-process list` / `status <id>`, stop your own or your child's with `agent-process stop <id>`; `--force` on another session's process only with explicit user approval.";
 
 pub fn is_known(name: &str) -> bool {
     PLUGINS.contains(&name)
@@ -277,10 +274,9 @@ fn file_name(path: &Path) -> &str {
 pub fn plan_managed_blocks(
     reg: &Registry,
     home: &Path,
-    exe: &Path,
     state_dir: &Path,
 ) -> anyhow::Result<Vec<Change>> {
-    let router = plugin_enabled(reg, PLUGIN_ROUTER).then(|| crate::router::router_block(exe));
+    let router = plugin_enabled(reg, PLUGIN_ROUTER).then(crate::router::router_block);
     let blocks = [
         (
             PLUGIN_AGENT_PROCESS,
@@ -1017,7 +1013,7 @@ fn plan_enable_router(
     )?);
     changes.extend(crate::router::plan_router_marker(
         files,
-        Some(&crate::router::router_block(exe)),
+        Some(&crate::router::router_block()),
         &paths.state_dir,
     )?);
     Ok(changes)
