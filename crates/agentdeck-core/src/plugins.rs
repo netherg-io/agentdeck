@@ -1831,7 +1831,7 @@ mod tests {
         );
         let text = fs::read_to_string(&files[0]).unwrap();
         assert!(text.contains("<!-- model-route:begin -->"));
-        assert!(text.contains("route - < task.txt"), "{text}");
+        assert!(text.contains("agentdeck launch hook routes"), "{text}");
         assert!(
             plan_enable(&paths, &home, &files, &exe, PLUGIN_ROUTER, false)
                 .unwrap()
