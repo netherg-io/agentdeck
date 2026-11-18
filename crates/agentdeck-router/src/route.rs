@@ -1883,7 +1883,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
             policy_ban = Some("excluded: account hit a usage limit".to_string());
         }
         let failure = failures.get(provider);
-        if let Some(until) = failure.and_then(|f| f.quota_until) {
+        if let Some(until) = failure.and_then(|f| f.quota_for(model)) {
             policy_ban = policy_ban.or_else(|| {
                 Some(format!(
                     "recent quota failure; retry after {} seconds",
