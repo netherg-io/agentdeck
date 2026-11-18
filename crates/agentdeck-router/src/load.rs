@@ -91,10 +91,24 @@ pub fn read_active_agents(file: &std::path::Path) -> AgentLoad {
 
 #[derive(Debug, Default)]
 pub struct InstanceFailures {
+    /// Provider-wide quota block, for failures that do not name their model.
     pub quota_until: Option<f64>,
+    /// Quota blocks per model: Antigravity keeps separate buckets (Argon week vs Gemini week).
+    pub model_quota_until: std::collections::HashMap<String, f64>,
     /// Excluded until then after an error streak or a setting refusal that a retry cannot fix.
     pub cooldown_until: Option<f64>,
     pub penalty: f64,
+}
+
+impl InstanceFailures {
+    /// When `model` becomes routable again after a quota failure, if it is blocked now.
+    pub fn quota_for(&self, model: &str) -> Option<f64> {
+        let own = self.model_quota_until.get(model).copied();
+        match (self.quota_until, own) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
 }
 
 /// Two errors in a row, the newest within this window, exclude the instance...
@@ -117,13 +131,14 @@ pub fn read_instance_failures(
             "WITH recent AS (
                 SELECT COALESCE(provider_instance_id, json_extract(payload_json, '$.providerInstanceId')) AS provider,
                     status, COALESCE(completed_at, updated_at) AS finished,
+                    json_extract(payload_json, '$.model') AS model,
                     substr(json_extract(payload_json, '$.result'), 1, 8192) AS result,
                     ROW_NUMBER() OVER (
                         PARTITION BY COALESCE(provider_instance_id, json_extract(payload_json, '$.providerInstanceId'))
                         ORDER BY COALESCE(completed_at, updated_at) DESC, subagent_id DESC) AS position
                 FROM orchestration_v2_projection_subagents
                 WHERE status IN ('failed', 'completed', 'idle')
-            ) SELECT provider, status, finished, result FROM recent WHERE position <= 10
+            ) SELECT provider, status, finished, result, model FROM recent WHERE position <= 10
                 ORDER BY provider, position",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -132,20 +147,29 @@ pub fn read_instance_failures(
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>()
     };
     let mut out = std::collections::HashMap::new();
     let mut cleared = std::collections::HashSet::new();
+    // A success clears the quota block of its own model only; other models keep theirs.
+    let mut cleared_models = std::collections::HashSet::<(String, String)>::new();
     let mut errors = std::collections::HashMap::<String, usize>::new();
     // Rows come newest first, so the first error seen per provider is the newest.
     let mut newest_error = std::collections::HashMap::<String, f64>::new();
-    for (provider, status, finished, result) in read().unwrap_or_default() {
+    for (provider, status, finished, result, model) in read().unwrap_or_default() {
         let Some(provider) = provider.filter(|s| !s.is_empty()) else {
             continue;
         };
-        if cleared.contains(&provider) {
+        let model = model.filter(|s| !s.is_empty());
+        let model_key = model.clone().map(|m| (provider.clone(), m));
+        if model_key
+            .as_ref()
+            .is_some_and(|k| cleared_models.contains(k))
+            || (model_key.is_none() && cleared.contains(&provider))
+        {
             continue;
         }
         let Some(finished) = crate::parse_time_ms(&finished).map(|t| t / 1000.0) else {
@@ -155,9 +179,12 @@ pub fn read_instance_failures(
             continue;
         }
         if status != "failed" {
+            cleared_models.extend(model_key);
             cleared.insert(provider);
             continue;
         }
+        // After a newer success only per-model quota blocks still count.
+        let provider_cleared = cleared.contains(&provider);
         let result = result.unwrap_or_default();
         // The appended assistant transcript can discuss errors without being the cause of failure;
         // only a leading harness banner ("⚠ Individual quota reached…", Antigravity) counts from it.
@@ -177,7 +204,11 @@ pub fn read_instance_failures(
         static SETTING: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
             regex::Regex::new(r"(?i)trains on request data|allow paid endpoints").unwrap()
         });
-        if SETTING.is_match(&header) {
+        if provider_cleared {
+            if !QUOTA.is_match(&header) {
+                continue;
+            }
+        } else if SETTING.is_match(&header) {
             let until = finished + SETTING_COOLDOWN;
             if until > now {
                 let entry = out
@@ -185,14 +216,21 @@ pub fn read_instance_failures(
                     .or_insert_with(InstanceFailures::default);
                 entry.cooldown_until = Some(entry.cooldown_until.unwrap_or(until).max(until));
             }
-        } else if QUOTA.is_match(&header) {
-            // shortcut: blocks the whole instance, so Antigravity's Argon (own weekly bucket) waits too; key by model if that matters.
+            continue;
+        }
+        if QUOTA.is_match(&header) {
             let until = reset_time(&result, finished).unwrap_or(finished + 15.0 * 60.0);
             if until > now {
                 let entry = out
                     .entry(provider)
                     .or_insert_with(InstanceFailures::default);
-                entry.quota_until = Some(entry.quota_until.unwrap_or(until).max(until));
+                match model {
+                    Some(m) => {
+                        let slot = entry.model_quota_until.entry(m).or_insert(until);
+                        *slot = slot.max(until);
+                    }
+                    None => entry.quota_until = Some(entry.quota_until.unwrap_or(until).max(until)),
+                }
             }
         } else if now - finished < 2.0 * 3600.0
             && (header.contains("error") || header.starts_with("getaddrinfo "))
@@ -555,10 +593,22 @@ mod failure_tests {
         }
 
         fn child(&self, id: &str, provider: &str, status: &str, time: &str, result: &str) {
+            self.model_child(id, provider, None, status, time, result);
+        }
+
+        fn model_child(
+            &self,
+            id: &str,
+            provider: &str,
+            model: Option<&str>,
+            status: &str,
+            time: &str,
+            result: &str,
+        ) {
             self.db.execute("INSERT INTO orchestration_v2_projection_subagents
                 (subagent_id, thread_id, parent_node_id, provider, origin, status, completed_at, updated_at, payload_json, provider_instance_id)
                 VALUES (?1, 'thread', 'parent', 'test', 'delegated', ?2, ?3, ?3, ?4, ?5)",
-                rusqlite::params![id, status, time, serde_json::json!({"result":result}).to_string(), provider]).unwrap();
+                rusqlite::params![id, status, time, serde_json::json!({"result":result,"model":model}).to_string(), provider]).unwrap();
         }
     }
 
@@ -622,6 +672,44 @@ mod failure_tests {
                 .and_then(|f| f.quota_until),
             None
         );
+    }
+
+    #[test]
+    fn model_quota_failure_blocks_only_that_model() {
+        let fx = Fixture::new();
+        // An older Argon quota failure, then a newer Hydrogen success: Argon stays blocked.
+        fx.model_child("a", "antigravity", Some("gemini-4-argon"), "failed", FINISHED,
+            "Antigravity stopped this turn because of an error.\n\nLast assistant message before the run failed:\n\n\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 154h57m4s.");
+        let reset = time() + 154.0 * 3600.0 + 57.0 * 60.0 + 4.0;
+        let f = read_instance_failures(&fx.file, time() + 60.0);
+        let ag = &f["antigravity"];
+        assert_eq!(ag.quota_for("gemini-4-argon"), Some(reset));
+        assert_eq!(ag.quota_for("gemini-4-hydrogen"), None);
+        assert_eq!(ag.quota_for("claude-sonnet-5-5"), None);
+        assert_eq!(ag.quota_until, None);
+        fx.model_child(
+            "b",
+            "antigravity",
+            Some("gemini-4-hydrogen"),
+            "completed",
+            "2026-11-13T12:01:00Z",
+            "Done",
+        );
+        let f = read_instance_failures(&fx.file, time() + 120.0);
+        assert_eq!(f["antigravity"].quota_for("gemini-4-argon"), Some(reset));
+        assert_eq!(f["antigravity"].quota_for("gemini-4-hydrogen"), None);
+        // The block ends at the reported reset, no later.
+        assert!(read_instance_failures(&fx.file, reset).is_empty());
+        // An Argon success clears its own block.
+        fx.model_child(
+            "c",
+            "antigravity",
+            Some("gemini-4-argon"),
+            "completed",
+            "2026-11-13T12:02:00Z",
+            "Done",
+        );
+        assert!(read_instance_failures(&fx.file, time() + 180.0).is_empty());
     }
 
     #[test]
