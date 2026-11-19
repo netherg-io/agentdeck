@@ -659,13 +659,9 @@ pub fn budget_allowed(
     [0, 1, 2, 3].map(|size| {
         windows.iter().all(|w| {
             let estimate = weekly[size] * window_factor(w);
-            // Subpercent burn estimates cannot safely fund a fresh launch near a short-window limit.
-            let required = if w.duration_mins >= 10080.0 {
-                estimate
-            } else {
-                estimate.max(1.0)
-            };
-            headroom(w, reserve_percent, now) > required
+            // Subpercent burn estimates cannot fund a launch near any limit: Antigravity refused
+            // Gemini with 0.3% of its weekly window left (2026-11-19).
+            headroom(w, reserve_percent, now) > estimate.max(1.0)
         }) && balances.iter().all(|b| *b > USD_COST[size] * burn)
     })
 }
@@ -1557,7 +1553,7 @@ mod legacy_suite_edges {
                 expected
             );
         }
-        // Larger estimates still require their full cost; weekly admission is unchanged.
+        // Larger estimates still require their full cost.
         for (remaining, expected) in [(7.499, false), (7.5, false), (7.501, true)] {
             let windows = [w("session", remaining, 300.0, None, None)];
             assert_eq!(
@@ -1565,7 +1561,10 @@ mod legacy_suite_edges {
                 expected
             );
         }
+        // The same floor holds for weekly windows.
         let weekly_window = [w("week", 0.4, 10080.0, None, None)];
+        assert!(!budget_allowed(&weekly_window, &[], &weekly, 0.05, 0.0, 0.0)[2]);
+        let weekly_window = [w("week", 1.5, 10080.0, None, None)];
         assert!(budget_allowed(&weekly_window, &[], &weekly, 0.05, 0.0, 0.0)[2]);
         let healthy = [w("session", 20.0, 300.0, None, None)];
         assert_eq!(
