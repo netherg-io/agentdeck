@@ -8,7 +8,7 @@ use agentdeck_core::settings::UserRules;
 
 pub const MIN_FIT: f64 = 0.7;
 pub const TARGET_MARGIN: f64 = 0.02;
-pub type CostsOf<'a> = dyn Fn(&str, Option<&str>) -> ([f64; 4], f64) + 'a;
+pub type CostsOf<'a> = dyn Fn(&str, Option<&str>) -> ModelCost + 'a;
 pub const NO_REVIEW_BAN: &str = "never for audits or reviews (user rule 2026-10-17)";
 
 const ROSTER_JSON: &str = include_str!("../../../crates/agentdeck-core/assets/router/roster.json");
@@ -561,12 +561,25 @@ pub fn quota_windows(provider: &str, model: &str, windows: &[QuotaWindow]) -> Ve
         .collect()
 }
 
-#[derive(Clone, Debug)]
-pub struct AgentCost {
-    pub provider: String,
-    pub model: Option<String>,
+pub struct ModelCost {
     pub weekly: [f64; 4],
     pub burn: f64,
+    pub third_party_short_factor: Option<f64>,
+}
+
+impl ModelCost {
+    fn window_percent(&self, w: &QuotaWindow, size: usize) -> f64 {
+        let factor = if w.duration_mins >= 10080.0 {
+            1.0
+        } else if w.duration_mins == 300.0 && w.key == "3p-5h" {
+            self.third_party_short_factor
+                .or(w.cost_factor)
+                .unwrap_or(5.0)
+        } else {
+            w.cost_factor.unwrap_or(5.0)
+        };
+        self.weekly[size] * factor
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -579,21 +592,13 @@ pub struct ReservedQuota {
 
 const USD_COST: [f64; 4] = [0.05, 0.3, 1.0, 3.0];
 
-fn window_factor(w: &QuotaWindow) -> f64 {
-    if w.duration_mins >= 10080.0 {
-        1.0
-    } else {
-        w.cost_factor.unwrap_or(5.0)
-    }
-}
-
 pub fn reserve_active_quota(
     cfg: &RouterConfig,
     account: &UsageSnapshot,
     agents: &[ActiveAgent],
     costs_of: &CostsOf<'_>,
 ) -> ReservedQuota {
-    let active: Vec<AgentCost> = agents
+    let active: Vec<_> = agents
         .iter()
         .filter(|a| {
             owns_usage(
@@ -607,13 +612,10 @@ pub fn reserve_active_quota(
             )
         })
         .map(|a| {
-            let (weekly, burn) = costs_of(&a.provider, a.model.as_deref());
-            AgentCost {
-                provider: a.provider.clone(),
-                model: a.model.clone(),
-                weekly,
-                burn,
-            }
+            (
+                a.model.as_deref(),
+                costs_of(&a.provider, a.model.as_deref()),
+            )
         })
         .collect();
     let windows = account
@@ -622,16 +624,12 @@ pub fn reserve_active_quota(
         .map(|w| {
             let pending = active
                 .iter()
-                .filter(|a| {
-                    a.model.is_none()
-                        || !quota_windows(
-                            &a.provider,
-                            a.model.as_deref().unwrap_or(""),
-                            std::slice::from_ref(w),
-                        )
-                        .is_empty()
+                .filter(|(model, _)| {
+                    model.is_none_or(|model| {
+                        !quota_windows(&account.provider, model, std::slice::from_ref(w)).is_empty()
+                    })
                 })
-                .map(|a| (0.1_f64).max(a.weekly[1] * window_factor(w)))
+                .map(|(_, cost)| cost.window_percent(w, 1).max(0.1))
                 .sum::<f64>();
             let mut w = w.clone();
             w.pending = pending;
@@ -639,7 +637,7 @@ pub fn reserve_active_quota(
             w
         })
         .collect();
-    let pending_dollars: f64 = active.iter().map(|a| USD_COST[1] * a.burn).sum();
+    let pending_dollars: f64 = active.iter().map(|(_, cost)| USD_COST[1] * cost.burn).sum();
     let balances: Vec<f64> = account
         .balances
         .iter()
@@ -691,18 +689,17 @@ fn headroom(w: &QuotaWindow, reserve_percent: f64, now: f64) -> f64 {
 pub fn budget_allowed(
     windows: &[QuotaWindow],
     balances: &[f64],
-    weekly: &[f64; 4],
-    burn: f64,
+    cost: &ModelCost,
     reserve_percent: f64,
     now: f64,
 ) -> [bool; 4] {
     [0, 1, 2, 3].map(|size| {
         windows.iter().all(|w| {
-            let estimate = weekly[size] * window_factor(w);
+            let estimate = cost.window_percent(w, size);
             // Subpercent burn estimates cannot fund a launch near any limit: Antigravity refused
             // Gemini with 0.3% of its weekly window left (2026-11-19).
             headroom(w, reserve_percent, now) > estimate.max(1.0)
-        }) && balances.iter().all(|b| *b > USD_COST[size] * burn)
+        }) && balances.iter().all(|b| *b > USD_COST[size] * cost.burn)
     })
 }
 
@@ -710,8 +707,7 @@ pub fn budget_allowed(
 pub fn budget_cost_full(
     windows: &[QuotaWindow],
     balances: &[f64],
-    weekly: &[f64; 4],
-    burn: f64,
+    cost: &ModelCost,
     reserve_percent: f64,
     now: f64,
 ) -> Option<[f64; 4]> {
@@ -722,12 +718,12 @@ pub fn budget_cost_full(
         let mut m = f64::NEG_INFINITY;
         for w in windows {
             m = m.max(
-                (0.1_f64).max(weekly[size] * window_factor(w))
+                cost.window_percent(w, size).max(0.1)
                     / (0.001_f64).max(headroom(w, reserve_percent, now)),
             );
         }
         for b in balances {
-            m = m.max(USD_COST[size] * burn / (0.001_f64).max(*b));
+            m = m.max(USD_COST[size] * cost.burn / (0.001_f64).max(*b));
         }
         m
     }))
@@ -1402,7 +1398,15 @@ mod legacy_suite_edges {
         now: f64,
         size: usize,
     ) -> bool {
-        budget_allowed(windows, balances, &weekly, burn, 5.0, now)[size]
+        budget_allowed(windows, balances, &cost(weekly, burn), 5.0, now)[size]
+    }
+
+    fn cost(weekly: [f64; 4], burn: f64) -> ModelCost {
+        ModelCost {
+            weekly,
+            burn,
+            third_party_short_factor: None,
+        }
     }
 
     fn cfg(accounts: &[(&str, &str)]) -> RouterConfig {
@@ -1570,7 +1574,10 @@ mod legacy_suite_edges {
         ));
         assert!(allowed(&[], weekly, 1.0, &[3.8], 0.0, 3));
         assert!(!allowed(&[], weekly, 3.0, &[3.8], 0.0, 3));
-        assert_eq!(budget_cost_full(&[], &[], &weekly, 1.0, 5.0, 0.0), None);
+        assert_eq!(
+            budget_cost_full(&[], &[], &cost(weekly, 1.0), 5.0, 0.0),
+            None
+        );
         // Near reset the reserve is released; an expired snapshot implies no budget.
         let now = 1000.0;
         let timed = |remaining: f64, hours: f64| {
@@ -1585,41 +1592,36 @@ mod legacy_suite_edges {
 
     #[test]
     fn short_window_launch_floor_and_estimate_boundaries() {
-        let weekly = [0.01, 0.03, 0.075, 0.2];
+        let cheap = cost([0.01, 0.03, 0.075, 0.2], 0.05);
         for (remaining, expected) in [(0.4, false), (0.999, false), (1.0, false), (1.001, true)] {
             let windows = [w("session", remaining, 300.0, None, None)];
-            assert_eq!(
-                budget_allowed(&windows, &[], &weekly, 0.05, 0.0, 0.0)[2],
-                expected
-            );
+            assert_eq!(budget_allowed(&windows, &[], &cheap, 0.0, 0.0)[2], expected);
         }
         // Larger estimates still require their full cost.
+        let regular = cost([0.2, 0.6, 1.5, 4.0], 1.0);
         for (remaining, expected) in [(7.499, false), (7.5, false), (7.501, true)] {
             let windows = [w("session", remaining, 300.0, None, None)];
             assert_eq!(
-                budget_allowed(&windows, &[], &[0.2, 0.6, 1.5, 4.0], 1.0, 0.0, 0.0)[2],
+                budget_allowed(&windows, &[], &regular, 0.0, 0.0)[2],
                 expected
             );
         }
         // The same floor holds for weekly windows.
         let weekly_window = [w("week", 0.4, 10080.0, None, None)];
-        assert!(!budget_allowed(&weekly_window, &[], &weekly, 0.05, 0.0, 0.0)[2]);
+        assert!(!budget_allowed(&weekly_window, &[], &cheap, 0.0, 0.0)[2]);
         let weekly_window = [w("week", 1.5, 10080.0, None, None)];
-        assert!(budget_allowed(&weekly_window, &[], &weekly, 0.05, 0.0, 0.0)[2]);
+        assert!(budget_allowed(&weekly_window, &[], &cheap, 0.0, 0.0)[2]);
         let healthy = [w("session", 20.0, 300.0, None, None)];
-        assert_eq!(
-            budget_allowed(&healthy, &[], &weekly, 0.05, 0.0, 0.0),
-            [true; 4]
-        );
+        assert_eq!(budget_allowed(&healthy, &[], &cheap, 0.0, 0.0), [true; 4]);
     }
 
     #[test]
     fn active_quota_reserve_never_mutates_the_live_snapshot() {
         let costs = |_: &str, m: Option<&str>| {
             if m.is_some_and(|m| m.contains("fable")) {
-                ([1.5, 6.0, 18.0, 45.0], 3.0)
+                cost([1.5, 6.0, 18.0, 45.0], 3.0)
             } else {
-                ([0.5, 2.0, 6.0, 15.0], 1.0)
+                cost([0.5, 2.0, 6.0, 15.0], 1.0)
             }
         };
         let account = UsageSnapshot {
@@ -1672,7 +1674,7 @@ mod legacy_suite_edges {
             &cfg,
             &account,
             &[agents(None)],
-            &|_: &str, _: Option<&str>| ([1.5, 6.0, 18.0, 45.0], 3.0),
+            &|_: &str, _: Option<&str>| cost([1.5, 6.0, 18.0, 45.0], 3.0),
         );
         assert_eq!(unknown.windows[0].remaining_percent, 8.0);
         assert_eq!(unknown.windows[1].remaining_percent, 85.0);
