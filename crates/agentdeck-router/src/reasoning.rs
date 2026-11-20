@@ -263,6 +263,114 @@ pub fn read_catalog(state_home: &std::path::Path) -> anyhow::Result<Value> {
     Ok(data)
 }
 
+fn cached_provider(
+    root: &std::path::Path,
+    id: &str,
+    instance: &Value,
+    saved: &Value,
+) -> Option<Value> {
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    {
+        return None;
+    }
+    let cache: Value =
+        serde_json::from_slice(&std::fs::read(agentdeck_core::t3::cache_file(root, id)).ok()?)
+            .ok()?;
+    let driver = cache["driver"].as_str().filter(|d| !d.is_empty())?;
+    if cache["instanceId"] != id
+        || instance["driver"]
+            .as_str()
+            .or_else(|| saved["driverKind"].as_str())
+            .is_some_and(|expected| expected != driver)
+    {
+        return None;
+    }
+    let models = cache["models"].as_array()?;
+    let models = if cache["enabled"] == false {
+        Vec::new()
+    } else {
+        if models.is_empty() && cache["status"] != "ready" {
+            return None;
+        }
+        models
+            .iter()
+            .map(|model| {
+                let slug = model["slug"].as_str().filter(|s| !s.is_empty())?;
+                let options = match model.pointer("/capabilities/optionDescriptors") {
+                    None | Some(Value::Null) => saved["models"]
+                        .as_array()
+                        .and_then(|models| models.iter().find(|m| m["id"] == slug))
+                        .and_then(|m| m.get("options"))
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
+                    Some(descriptors) => {
+                        let options: Vec<_> = descriptors
+                            .as_array()?
+                            .iter()
+                            .cloned()
+                            .map(normalize_descriptor)
+                            .collect();
+                        if !options.iter().all(valid_descriptor) {
+                            return None;
+                        }
+                        Value::Array(options)
+                    }
+                };
+                Some(serde_json::json!({"id": slug, "options": options}))
+            })
+            .collect::<Option<Vec<_>>>()?
+    };
+    Some(serde_json::json!({"providerInstanceId": id, "driverKind": driver, "models": models}))
+}
+
+/// Read T3's provider caches when routing. The imported MCP catalog covers
+/// providers without a usable T3 cache and older caches without descriptors.
+pub fn read_live_catalog(state_home: &std::path::Path) -> anyhow::Result<Value> {
+    let imported = read_catalog(state_home);
+    let Ok(root) = agentdeck_core::t3::t3_root() else {
+        return imported;
+    };
+    let settings: Value = std::fs::read(agentdeck_core::t3::settings_file(&root))
+        .ok()
+        .and_then(|data| serde_json::from_slice(&data).ok())
+        .unwrap_or_default();
+    let instances = settings["providerInstances"].as_object();
+    let saved = imported
+        .as_ref()
+        .ok()
+        .and_then(|c| c["providers"].as_array());
+    let ids: std::collections::BTreeSet<_> = instances
+        .into_iter()
+        .flatten()
+        .map(|(id, _)| id.as_str())
+        .chain(
+            saved
+                .into_iter()
+                .flatten()
+                .filter_map(|p| p["providerInstanceId"].as_str()),
+        )
+        .collect();
+    let providers: Vec<_> = ids
+        .into_iter()
+        .filter_map(|id| {
+            let instance = &settings["providerInstances"][id];
+            if instance["enabled"] == false {
+                return None;
+            }
+            let old = saved.and_then(|ps| ps.iter().find(|p| p["providerInstanceId"] == id));
+            cached_provider(&root, id, instance, old.unwrap_or(&Value::Null))
+                .or_else(|| old.cloned())
+        })
+        .collect();
+    if imported.is_err() && providers.is_empty() {
+        return imported;
+    }
+    Ok(serde_json::json!({"providers": providers}))
+}
+
 fn find_model<'a>(catalog: &'a Value, provider: &str, model: &str) -> Option<&'a Value> {
     catalog
         .get("providers")?

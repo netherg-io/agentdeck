@@ -180,7 +180,8 @@ fn run_rust(
     cmd.arg("route")
         .args(args)
         .current_dir(&fx.dir)
-        .envs(fx.env("rt-rust"));
+        .envs(fx.env("rt-rust"))
+        .env_remove("AGENTDECK_T3_DIR");
     cmd.env("AGENTDECK_ROUTE_MOCK_JEV", mock);
     if stdin.is_some() {
         cmd.stdin(Stdio::piped());
@@ -851,6 +852,61 @@ fn catalog_save_contract() {
     let (code, _, _) = run("{}");
     assert_ne!(code, 0);
     assert_eq!(std::fs::read(&catalog_path).unwrap(), before);
+}
+
+#[test]
+fn t3_cache_overlay_resolves_new_models() {
+    use serde_json::{Value, json};
+
+    let fx = Fixture::new(&[("codex", "gpt-6.2-sol")]);
+    let args = [
+        "--source",
+        "codex",
+        "--validate-target",
+        "codex",
+        "gpt-6.2-sol",
+        "Fix the typo",
+    ];
+    let mock = write_mock(
+        &fx,
+        &answers_for(&[("codex_gpt_6_2_sol", level(2.4, 0.95))], 0.0, 1.0),
+    );
+    let run = || {
+        let (code, out, err) = run_rust(&fx, &args, &mock, None);
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        serde_json::from_slice::<Value>(&out).unwrap()
+    };
+    assert_eq!(run()["validation"]["allowed"], false);
+
+    let t3 = fx.dir.join(".t3");
+    let settings = json!({"providerInstances": {"codex": {"driver": "codex", "enabled": true}}});
+    std::fs::write(t3.join("userdata/settings.json"), settings.to_string()).unwrap();
+    std::fs::create_dir(t3.join("caches")).unwrap();
+    let file = t3.join("caches/codex.json");
+    let mut cache = json!({
+        "instanceId": "codex_second", "driver": "codex", "enabled": true, "status": "ready",
+        "models": [{"slug": "gpt-6.2-sol", "capabilities": {"optionDescriptors": [
+            {"id": "reasoningEffort", "type": "select", "options": [{"id": "medium"}, {"id": "high"}]}
+        ]}}]
+    });
+    std::fs::write(&file, cache.to_string()).unwrap();
+    assert_eq!(run()["validation"]["allowed"], false);
+
+    cache["instanceId"] = json!("codex");
+    std::fs::write(&file, cache.to_string()).unwrap();
+    let route = run();
+    assert_eq!(route["validation"]["allowed"], true, "{route}");
+    assert_eq!(
+        route["requestedTarget"]["options"]["reasoningEffort"],
+        "high"
+    );
+
+    let imported = fx.dir.join(".local/state/model-route/catalog.json");
+    std::fs::remove_file(imported).unwrap();
+    assert_eq!(
+        run()["requestedTarget"]["options"]["reasoningEffort"],
+        "high"
+    );
 }
 
 #[test]
