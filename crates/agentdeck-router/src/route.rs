@@ -11,7 +11,7 @@ use crate::policy::{
     rank_candidates, reserve_active_quota, router_config, routing_weights, valid_answer,
     validate_target,
 };
-use crate::reasoning::{read_catalog, reasoning_target, save_catalog};
+use crate::reasoning::{read_live_catalog, reasoning_target, save_catalog};
 use crate::{home_dir, js_num, parse_time_ms, round2, round3, runtime_dir, state_home};
 
 const SIZES: [&str; 4] = [
@@ -1434,7 +1434,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         .iter()
         .any(|f| f.get("provider").and_then(Value::as_str) == Some("opencode"))
     {
-        let catalog = read_catalog(&env.state_home).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let catalog = read_live_catalog(&env.state_home)?;
         catalog
             .get("providers")
             .and_then(Value::as_array)
@@ -1809,7 +1809,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
             Err(e) => capacity_error = Some(format!("cannot check instance limit: {e}")),
         }
     }
-    let catalog = read_catalog(&env.state_home).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let catalog = read_live_catalog(&env.state_home)?;
 
     let size = (answers
         .get("size")
@@ -2699,8 +2699,9 @@ mod live_quota_shape_tests {
                  "resets_at": NOW + 124_000.0, "scope": "Fable"}]}
         ]});
         let path = std::env::temp_dir().join(format!(
-            "agentdeck-live-quota-{}-{gemini_5h_resets}.json",
-            std::process::id()
+            "agentdeck-live-quota-{}-{}-{gemini_5h_resets}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
         ));
         std::fs::write(&path, state.to_string()).unwrap();
         let parsed = parse_usage_state(&path).unwrap();

@@ -9,7 +9,7 @@ account id (`codex-main`, `codex-second`), so each sees and reserves only its ow
 same way: `claudeAgent`, `claude_second`, `claude_third` and `claude_fourth` match `claude-main`, `claude-second`, `claude-third` and `claude-fourth`.
 
 - `agentdeck route - < task.txt`: route the complete `delegate_task` task text (what the launch hook judges); a quoted short goal is accepted but may get a different verdict. JSON with `target` for `delegate_task`, `ranking`, `blocked`, `unprofiled`.
-- Before routing in a task, call T3 `orchestrator_capabilities` and pass its `structuredContent` JSON on stdin to `agentdeck route --catalog`. Refresh after provider/model settings change or a catalog mismatch. A provider listed with no models (a searched `orchestrator_capabilities`) or missing keeps its saved models. Only model IDs and option descriptors are saved in `~/.local/state/model-route/catalog.json`; T3 settings stay app-owned.
+- Routing reads model IDs and option descriptors from T3's local provider caches (`~/.t3/caches/<instance>.json`). The imported catalog is a fallback for unavailable or unusable caches. To import it, pass T3 `orchestrator_capabilities` structured content on stdin to `agentdeck route --catalog`.
 - Every target's `briefHint` combines the shared delegated-agent policy with any family hint, in that order separated by a blank line. Append the entire string verbatim; hooks require it. The shared policy text lives only in `roster.json` (`briefHint`): no nesting, scope, verification, report format and the `BLOCKED:` contract. Children hand pending PR checks/reviews/merges to the coordinator without polling or watching, ending with `PR <url>, head <sha>, checks and reviews <state>`. Local command waits remain allowed; pending PRs are a normal completed handoff, not `BLOCKED:`.
 - `agentdeck route --source claudeAgent "<task>"`: explicitly identify the orchestrator; otherwise detected from executable names in the process chain. Other sources: `codex`, `codex_second`, `antigravity`, `opencode`, `claudeAgent_openrouter`. Codex shadow homes identify separate accounts. Unknown source is reported and cannot receive shared-quota protection.
 - `agentdeck route --source codex --validate-target PROVIDER MODEL -`: read the complete task from stdin and validate an already selected target. Output includes `validation.allowed` and its reason. A denied target exits 0; malformed input or router failure exits nonzero.
@@ -85,7 +85,7 @@ Selection policy:
   agents. Only projection metadata is read, never conversation bodies; no app database writes or cleanup.
   Missing/incompatible metadata is explicitly flagged rather than claiming there are no active agents. The quota/load snapshots are refreshed after Jev and before ranking.
 - Only exact active favorites are candidates. Removed OpenCode providers can leave hidden stale entries in
-  settings: entries absent from the saved T3 catalog are excluded, never remapped to another provider. Removing a
+  settings: entries absent from the live T3 catalog are excluded, never remapped to another provider. Removing a
   favorite must not silently reintroduce that model. Disabled provider instances are excluded; an explicit
   instance setting overrides the legacy provider setting. `opencode models` is not used: a cold OpenCode
   location returns an empty or unsettled list (Zen, no `opencode-go`, unfiltered OpenRouter).
@@ -96,7 +96,7 @@ Selection policy:
   `jevConfidence` is the lowest size, difficulty and selected-model confidence. Below 0.4, output includes a
   warning and the top two eligible candidates with their quality and penalties.
   Target validation requires an exact active favorite with quota and fit, either the winner or
-  within 0.02 of its score with no higher task cost. A favorite absent from the saved T3 catalog fails
+  within 0.02 of its score with no higher task cost. A favorite absent from the live T3 catalog fails
   closed (no reasoning target), as does a model outside the active pool. The tolerance never restores an expensive near-equal choice.
   Valid Jev answers are cached for ten minutes by source, full task and judgment context; a trailing known
   `briefHint` is stripped before judging, so `prepare` (bare brief) and validation (brief + hint) share one entry. Target validation

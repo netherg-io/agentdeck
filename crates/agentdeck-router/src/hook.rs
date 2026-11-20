@@ -9,7 +9,7 @@
 use serde_json::{Map, Value};
 
 use crate::load::is_delegated_child;
-use crate::reasoning::{read_catalog, repair_reasoning, validate_reasoning};
+use crate::reasoning::{read_catalog, read_live_catalog, repair_reasoning, validate_reasoning};
 
 const ROUTE_TIMEOUT_SECS: u64 = 55;
 const ROUTE_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -1067,7 +1067,7 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
         // Claude only: the hook sends the corrected call instead of a deny + retry.
         let mut rewritten: Option<Value> = None;
         if allowed_now {
-            let catalog = read_catalog(&state_dir()?)?;
+            let catalog = read_live_catalog(&state_dir()?)?;
             if let Some(invalid) = validate_reasoning(&catalog, target.unwrap_or(&Value::Null))? {
                 let recommended = route
                     .get("requestedTarget")
