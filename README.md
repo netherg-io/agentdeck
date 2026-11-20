@@ -43,6 +43,15 @@ cargo install --locked --path crates/agentdeck-applet
 Then add **agentdeck** in the COSMIC panel settings. The applet reads the same
 `state.json` the daemon publishes; no network calls, no credentials.
 
+After installing a new build, running processes keep the old binary:
+
+- Daemon (usage polling, window mapping): `systemctl --user restart agentdeck-daemon`.
+- Applet: restart the panel, not the applet. COSMIC does not respawn a
+  stopped panel applet, so killing `agentdeck-applet` alone leaves it gone
+  until the panel restarts. Kill the `cosmic-panel` process by its PID; the
+  COSMIC session restarts the panel with all its applets.
+- Router hook: nothing to restart, each launch runs the installed binary.
+
 Subscription quotas (`claude`, `codex`, `antigravity`) require
 T3 Code with the corresponding provider instance enabled. In T3 **Settings →
 Providers → Health check interval**, choose a nonzero interval
