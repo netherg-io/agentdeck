@@ -1,4 +1,10 @@
 use cosmic::iced::core::text::{Ellipsize, EllipsizeHeightLimit};
+use cosmic::iced::core::{
+    Clipboard, Layout, Shell, Size, Vector, Widget,
+    event::{Event, Status},
+    layout, mouse, overlay, renderer,
+    widget::{Operation, Tree},
+};
 use cosmic::iced::platform_specific::shell::wayland::commands::popup::destroy_popup;
 use cosmic::iced::{Alignment, Length, Rectangle, Subscription, window};
 use cosmic::{Element, Task, app, widget};
@@ -14,6 +20,203 @@ use agentdeck_usage::model::{self, AccountState, AppState, QuotaWindow};
 use agentdeck_usage::visibility::Prefs;
 
 static AUTOSIZE: LazyLock<widget::Id> = LazyLock::new(widget::Id::unique);
+static SCROLL_ID: LazyLock<widget::Id> = LazyLock::new(widget::Id::unique);
+
+/// Gain for touchpad `Pixels` deltas: libcosmic's sctk backend forwards raw
+/// logical Wayland axis units 1:1 (unlike winit's HiDPI-scaled deltas and
+/// unlike mouse-wheel `Lines`, which scroll 60px/notch).
+const TOUCHPAD_PIXEL_MULTIPLIER: f32 = 2.0;
+
+/// Scale touchpad `Pixels` deltas in-place; mouse-wheel `Lines` stay 1x.
+fn scale_wheel_delta(delta: mouse::ScrollDelta) -> mouse::ScrollDelta {
+    match delta {
+        mouse::ScrollDelta::Pixels { x, y } => mouse::ScrollDelta::Pixels {
+            x: x * TOUCHPAD_PIXEL_MULTIPLIER,
+            y: y * TOUCHPAD_PIXEL_MULTIPLIER,
+        },
+        mouse::ScrollDelta::Lines { .. } => delta,
+    }
+}
+
+/// Vertical scroll offset for `scrollable::scroll_by` when a wheel event lands
+/// on the panel icon surface instead of the popup (positive scrolls DOWN).
+fn panel_scroll_offset(delta: mouse::ScrollDelta) -> Option<f32> {
+    match scale_wheel_delta(delta) {
+        mouse::ScrollDelta::Lines { y, .. } if y != 0.0 => Some(-y * 60.0),
+        mouse::ScrollDelta::Pixels { y, .. } if y != 0.0 => Some(-y),
+        _ => None,
+    }
+}
+
+/// Only forward unhandled wheel events (e.g. from the panel icon surface while
+/// the popup is open); popup-surface scrolling is handled directly by
+/// [`SmoothScroll`] without emitting a message or rebuilding `view()`.
+fn applet_events(event: Event, status: Status, window_id: window::Id) -> Option<Message> {
+    if status != Status::Ignored {
+        return None;
+    }
+    match event {
+        Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+            Some(Message::PanelWheel(window_id, delta))
+        }
+        _ => None,
+    }
+}
+
+/// Wraps the popup `Scrollable` to scale touchpad `Pixels` deltas in a single
+/// pass (zero `Message`s, zero `view()` rebuilds, zero two-phase stutter) and
+/// accept wheel events even while the pointer is parked outside the popup.
+struct SmoothScroll<'a, Message> {
+    content: Element<'a, Message>,
+}
+
+impl<'a, Message> SmoothScroll<'a, Message> {
+    fn new(content: impl Into<Element<'a, Message>>) -> Self {
+        Self {
+            content: content.into(),
+        }
+    }
+}
+
+impl<Message> Widget<Message, cosmic::Theme, cosmic::Renderer> for SmoothScroll<'_, Message> {
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn size_hint(&self) -> Size<Length> {
+        self.content.as_widget().size_hint()
+    }
+
+    fn tag(&self) -> cosmic::iced::core::widget::tree::Tag {
+        self.content.as_widget().tag()
+    }
+
+    fn state(&self) -> cosmic::iced::core::widget::tree::State {
+        self.content.as_widget().state()
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        self.content.as_widget().children()
+    }
+
+    fn diff(&mut self, tree: &mut Tree) {
+        self.content.as_widget_mut().diff(tree);
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &cosmic::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content.as_widget_mut().layout(tree, renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &cosmic::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(tree, layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &cosmic::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        if let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event {
+            let scaled = Event::Mouse(mouse::Event::WheelScrolled {
+                delta: scale_wheel_delta(*delta),
+            });
+            let bounds = layout.bounds();
+            let effective_cursor = if cursor.position_over(bounds).is_some() {
+                cursor
+            } else {
+                mouse::Cursor::Available(bounds.center())
+            };
+            self.content.as_widget_mut().update(
+                tree,
+                &scaled,
+                layout,
+                effective_cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+            return;
+        }
+        self.content.as_widget_mut().update(
+            tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &cosmic::Renderer,
+    ) -> mouse::Interaction {
+        self.content
+            .as_widget()
+            .mouse_interaction(tree, layout, cursor, viewport, renderer)
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut cosmic::Renderer,
+        theme: &cosmic::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content
+            .as_widget()
+            .draw(tree, renderer, theme, style, layout, cursor, viewport);
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &cosmic::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, cosmic::Theme, cosmic::Renderer>> {
+        self.content
+            .as_widget_mut()
+            .overlay(tree, layout, renderer, viewport, translation)
+    }
+
+    fn id(&self) -> Option<widget::Id> {
+        self.content.as_widget().id()
+    }
+
+    fn set_id(&mut self, id: widget::Id) {
+        self.content.as_widget_mut().set_id(id);
+    }
+}
+
+impl<'a, Message: 'a> From<SmoothScroll<'a, Message>> for Element<'a, Message> {
+    fn from(wrapper: SmoothScroll<'a, Message>) -> Self {
+        Element::new(wrapper)
+    }
+}
 
 fn now() -> i64 {
     SystemTime::now()
@@ -240,84 +443,8 @@ fn read_state() -> Result<AppState, String> {
     Ok(state)
 }
 
-/// Fields of agentdeck's per-thread coordinator state the popup shows
-/// (`agentdeck_core::thread_state`; read directly to keep the applet light).
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-struct CoordItem {
-    title: String,
-    status: String,
-}
-
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-struct CoordState {
-    #[serde(default)]
-    state: String,
-    #[serde(default)]
-    updated: String,
-    #[serde(default)]
-    checklist: Vec<CoordItem>,
-}
-
-fn coord_dir() -> Option<PathBuf> {
-    std::env::var_os("AGENTDECK_STATE_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("XDG_STATE_HOME").map(|d| PathBuf::from(d).join("agentdeck")))
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state/agentdeck"))
-        })
-        .map(|d| d.join("threads"))
-}
-
-/// `YYYY-MM-DDTHH:MM:SSZ` to unix seconds (0 when malformed).
-fn parse_utc(s: &str) -> i64 {
-    let n = |r: std::ops::Range<usize>| s.get(r).and_then(|v| v.parse::<i64>().ok());
-    let (Some(y), Some(m), Some(d), Some(hh), Some(mm)) =
-        (n(0..4), n(5..7), n(8..10), n(11..13), n(14..16))
-    else {
-        return 0;
-    };
-    // Days from civil (H. Hinnant).
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    (era * 146_097 + doe - 719_468) * 86_400 + hh * 3600 + mm * 60
-}
-
-/// Coordinators with open checklist work updated in the last day, newest first.
-fn active_coordinators(dir: Option<PathBuf>, timestamp: i64) -> Vec<CoordState> {
-    let mut out: Vec<CoordState> = dir
-        .and_then(|d| std::fs::read_dir(d).ok())
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-        .filter_map(|e| serde_json::from_slice::<CoordState>(&std::fs::read(e.path()).ok()?).ok())
-        .filter(|c| {
-            c.checklist
-                .iter()
-                .any(|i| i.status != "done" && i.status != "held")
-        })
-        .filter(|c| timestamp - parse_utc(&c.updated) < 86_400)
-        .collect();
-    out.sort_by(|a, b| b.updated.cmp(&a.updated));
-    out
-}
-
-/// "5/8 · сейчас: <first running item>" (held items are not open work).
-fn coord_line(c: &CoordState) -> String {
-    let total = c.checklist.iter().filter(|i| i.status != "held").count();
-    let done = c.checklist.iter().filter(|i| i.status == "done").count();
-    match c.checklist.iter().find(|i| i.status == "running") {
-        Some(i) => format!("{done}/{total} · сейчас: {}", i.title),
-        None => format!("{done}/{total}"),
-    }
-}
-
 struct App {
     core: app::Core,
-    coordinators: Vec<CoordState>,
     state: Result<AppState, String>,
     popup: Option<window::Id>,
     revealed: HashSet<String>,
@@ -331,6 +458,7 @@ enum Message {
     TogglePopup(Rectangle<i32>),
     CloseRequested(window::Id),
     Reveal(String),
+    PanelWheel(window::Id, mouse::ScrollDelta),
 }
 
 impl App {
@@ -361,7 +489,6 @@ impl cosmic::Application for App {
         let mut app = Self {
             core,
             state: read_state(),
-            coordinators: active_coordinators(coord_dir(), now()),
             popup: None,
             revealed: HashSet::new(),
             prefs: Prefs::default(),
@@ -374,13 +501,17 @@ impl cosmic::Application for App {
         Some(cosmic::applet::style())
     }
     fn subscription(&self) -> Subscription<Message> {
-        cosmic::iced::time::every(Duration::from_secs(5)).map(|_| Message::Tick)
+        let tick = cosmic::iced::time::every(Duration::from_secs(5)).map(|_| Message::Tick);
+        if self.popup.is_some() {
+            Subscription::batch([tick, cosmic::iced::event::listen_with(applet_events)])
+        } else {
+            tick
+        }
     }
     fn update(&mut self, message: Message) -> app::Task<Message> {
         match message {
             Message::Tick => {
                 self.state = read_state();
-                self.coordinators = active_coordinators(coord_dir(), now());
                 self.reload_visibility();
             }
             Message::Reveal(id) => {
@@ -392,6 +523,16 @@ impl cosmic::Application for App {
                 if self.popup == Some(id) {
                     self.popup = None;
                     self.revealed.clear();
+                }
+            }
+            Message::PanelWheel(window_id, delta) => {
+                if self.popup.is_some_and(|p| p != window_id)
+                    && let Some(y) = panel_scroll_offset(delta)
+                {
+                    return cosmic::iced::widget::scrollable::scroll_by(
+                        SCROLL_ID.clone(),
+                        cosmic::iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
+                    );
                 }
             }
             Message::TogglePopup(rectangle) => {
@@ -465,27 +606,6 @@ impl cosmic::Application for App {
             .padding(12)
             .width(Length::Fill)
             .push(widget::text::title4("AI Usage"));
-        if !self.coordinators.is_empty() {
-            content = content.push(widget::text::heading("Координатор"));
-            for c in &self.coordinators {
-                let goal = c.state.lines().next().unwrap_or_default();
-                content = content.push(
-                    widget::column(vec![])
-                        .spacing(2)
-                        .push(
-                            widget::text(goal.to_string())
-                                .size(14)
-                                .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1))),
-                        )
-                        .push(
-                            widget::text(coord_line(c))
-                                .size(13)
-                                .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1))),
-                        ),
-                );
-            }
-            content = content.push(widget::divider::horizontal::default());
-        }
         match &self.state {
             Err(error) => content = content.push(widget::text(error)),
             Ok(state) if state.accounts.is_empty() => {
@@ -569,14 +689,15 @@ impl cosmic::Application for App {
         self.core
             .applet
             .popup_container(
-                widget::container(
+                widget::container(SmoothScroll::new(
                     widget::scrollable(content)
+                        .id(SCROLL_ID.clone())
                         .scroller_width(4.0)
                         .scrollbar_width(8.0)
                         .height(Length::Shrink),
-                )
-                .width(380)
-                .max_height(480),
+                ))
+                .width(360)
+                .max_height(600),
             )
             .into()
     }
@@ -646,38 +767,34 @@ mod tests {
     }
 
     #[test]
-    fn coordinators_show_open_recent_work_only() {
-        let dir =
-            std::env::temp_dir().join(format!("agentdeck-applet-coord-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let write = |name: &str, updated: &str, items: &str| {
-            std::fs::write(
-                dir.join(name),
-                format!(r#"{{"state":"Goal {name}\nmore","updated":"{updated}","decisions":[],"checklist":[{items}]}}"#),
-            )
-            .unwrap();
-        };
-        let now = parse_utc("2026-11-16T12:00:00Z");
-        assert_eq!(parse_utc("1970-01-02T00:00:00Z"), 86_400);
-        write(
-            "a.json",
-            "2026-11-16T11:00:00Z",
-            r#"{"id":"1","title":"Cutover","status":"running"},{"id":"2","title":"Tags","status":"done"},{"id":"3","title":"Later","status":"held"}"#,
+    fn wheel_scaling_boosts_touchpad_pixels_and_preserves_mouse_lines() {
+        assert_eq!(
+            scale_wheel_delta(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }),
+            mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }
         );
-        write(
-            "b.json",
-            "2026-11-16T10:00:00Z",
-            r#"{"id":"1","title":"All done","status":"done"}"#,
+        assert_eq!(
+            scale_wheel_delta(mouse::ScrollDelta::Pixels { x: 2.0, y: -10.0 }),
+            mouse::ScrollDelta::Pixels {
+                x: 2.0 * TOUCHPAD_PIXEL_MULTIPLIER,
+                y: -10.0 * TOUCHPAD_PIXEL_MULTIPLIER,
+            }
         );
-        write(
-            "c.json",
-            "2026-11-14T10:00:00Z",
-            r#"{"id":"1","title":"Old","status":"todo"}"#,
+        assert_eq!(
+            panel_scroll_offset(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }),
+            Some(60.0)
         );
-        let active = active_coordinators(Some(dir.clone()), now);
-        assert_eq!(active.len(), 1);
-        assert_eq!(coord_line(&active[0]), "1/2 · сейчас: Cutover");
-        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            panel_scroll_offset(mouse::ScrollDelta::Pixels { x: 0.0, y: -10.0 }),
+            Some(10.0 * TOUCHPAD_PIXEL_MULTIPLIER)
+        );
+        assert_eq!(
+            panel_scroll_offset(mouse::ScrollDelta::Lines { x: 0.0, y: 0.0 }),
+            None
+        );
+        assert_eq!(
+            panel_scroll_offset(mouse::ScrollDelta::Pixels { x: 0.0, y: 0.0 }),
+            None
+        );
     }
 
     #[test]

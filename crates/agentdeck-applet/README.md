@@ -1,6 +1,6 @@
 # COSMIC panel applet
 
-Native COSMIC 1.8 frontend for the `agentdeck-daemon.service` usage state. Displays remaining quota percentages or balances on the panel and all quota windows, reset times and errors in its popup. Account email addresses are masked; click an account header to reveal one until the popup closes. The popup anchors to the actual panel button bounds, has a 480 px height cap, and uses a 4 px scroll thumb within an 8 px track. `~` marks stale data. No additional network requests or credentials.
+Native COSMIC 1.8 frontend for the `agentdeck-daemon.service` usage state. Displays remaining quota percentages or balances on the panel and all quota windows, reset times and errors in its popup. Account email addresses are masked; click an account header to reveal one until the popup closes. The popup anchors to the actual panel button bounds, has a 600 px height cap, and uses a 4 px scroll thumb within an 8 px track. `~` marks stale data. No additional network requests or credentials.
 
 Choose which providers the panel and popup show in agentdeck under **Quotas → Panel**.
 The choice is saved in `~/.config/agentdeck/ai-usage-visibility.json` (respecting

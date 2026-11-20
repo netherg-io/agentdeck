@@ -683,11 +683,35 @@ pub struct Imported {
     pub harness: Harness,
     pub display_name: String,
     pub home: String,
+    /// `[[usage]]` id created with the instance (claude/codex/antigravity).
+    pub usage_id: Option<String>,
 }
 
-/// Add T3 claudeAgent/codex instances missing from the registry into it
-/// (id, harness, display_name, home from config; t3 = true).
+/// Add T3 instances (`claudeAgent`, `codex`, `opencode`, `antigravity`)
+/// missing from the registry into it (id, harness, display_name, home from
+/// config; t3 = true). Claude/Codex/Antigravity instances also get a
+/// `[[usage]]` entry unless one already binds them; `[[pool]]` is never
+/// touched. `router.json` is refreshed when the router plugin is on.
 pub fn import_t3(paths: &Paths, t3_root: &Path, dry_run: bool) -> anyhow::Result<Vec<Imported>> {
+    Ok(import(paths, t3_root, dry_run, false)?.0)
+}
+
+/// Background variant of [`import_t3`]: only instances enabled in T3, so
+/// unused disabled providers stay out. Returns the files it changed.
+pub fn import_t3_enabled(
+    paths: &Paths,
+    t3_root: &Path,
+    dry_run: bool,
+) -> anyhow::Result<(Vec<Imported>, Vec<crate::Change>)> {
+    import(paths, t3_root, dry_run, true)
+}
+
+fn import(
+    paths: &Paths,
+    t3_root: &Path,
+    dry_run: bool,
+    only_enabled: bool,
+) -> anyhow::Result<(Vec<Imported>, Vec<crate::Change>)> {
     let raw = fs::read(settings_file(t3_root))
         .map_err(|e| anyhow::anyhow!("cannot read settings.json: {e}"))?;
     let settings = parse_settings_strict(&raw)?;
@@ -695,21 +719,68 @@ pub fn import_t3(paths: &Paths, t3_root: &Path, dry_run: bool) -> anyhow::Result
         .get("providerInstances")
         .and_then(|v| v.as_object())
         .ok_or_else(|| anyhow::anyhow!("settings.json has no providerInstances object"))?;
+    // Preview first: with nothing to import the registry file is not rewritten.
+    let mut found = add_missing(&mut Registry::load(paths)?, pi, only_enabled)?;
+    if dry_run || found.is_empty() {
+        found.sort_by(|a, b| a.id.cmp(&b.id));
+        return Ok((found, Vec::new()));
+    }
+    let old = fs::read(paths.registry_file()).ok();
+    Registry::update(paths, |r| {
+        found = add_missing(r, pi, only_enabled)?;
+        if crate::plugins::plugin_enabled(r, crate::plugins::PLUGIN_ROUTER) {
+            // Validate router JSON before committing so a conflict never half-applies.
+            crate::router::router_json_value(r)?;
+        }
+        Ok(())
+    })?;
+    found.sort_by(|a, b| a.id.cmp(&b.id));
+    let new = fs::read(paths.registry_file())?;
+    let mut changes: Vec<crate::Change> =
+        crate::changes::plan_write_file(paths.registry_file(), old.as_deref(), &new)
+            .into_iter()
+            .collect();
     let reg = Registry::load(paths)?;
+    if crate::plugins::plugin_enabled(&reg, crate::plugins::PLUGIN_ROUTER) {
+        let router = crate::router::plan_router_files(paths, &reg)?;
+        crate::apply_changes(&router)?;
+        changes.extend(router);
+    }
+    Ok((found, changes))
+}
+
+fn add_missing(
+    r: &mut Registry,
+    pi: &Map<String, Value>,
+    only_enabled: bool,
+) -> anyhow::Result<Vec<Imported>> {
+    use crate::registry::AddSpec;
+    use crate::usage::{UsageEntry, UsageKind};
     let mut found = Vec::new();
     for (id, env) in pi {
-        if reg.get(id).is_some() {
+        if r.get(id).is_some() {
             continue;
         }
         let driver = env.get("driver").and_then(Value::as_str).unwrap_or("");
-        let harness = match driver {
-            "claudeAgent" => Harness::Claude,
-            "codex" => Harness::Codex,
-            "opencode" => Harness::Opencode,
-            "antigravity" => Harness::Agy,
+        let (harness, kind) = match driver {
+            "claudeAgent" => (Harness::Claude, Some(UsageKind::Claude)),
+            "codex" => (Harness::Codex, Some(UsageKind::Codex)),
+            // No usage: the optional `opencode-go` entry already defaults to
+            // the `opencode` instance.
+            "opencode" => (Harness::Opencode, None),
+            "antigravity" => (Harness::Agy, Some(UsageKind::Antigravity)),
             _ => continue,
         };
-        check_t3_slug(id)?;
+        let enabled = env.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+        if only_enabled && !enabled {
+            continue;
+        }
+        if let Err(err) = check_t3_slug(id) {
+            if only_enabled {
+                continue;
+            }
+            return Err(err);
+        }
         let cfg = env.get("config").and_then(Value::as_object);
         let str_field = |k: &str| {
             cfg.and_then(|c| c.get(k))
@@ -747,33 +818,60 @@ pub fn import_t3(paths: &Paths, t3_root: &Path, dry_run: bool) -> anyhow::Result
             .filter(|s| !s.is_empty())
             .unwrap_or(id)
             .to_string();
-        let enabled = env.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+        r.add(AddSpec {
+            id: id.clone(),
+            harness,
+            display_name: Some(display_name.clone()),
+            home: home.clone(),
+            binary: None,
+            no_t3: false,
+        })?;
+        r.set_enabled(id, enabled)?;
+        let usage_id = match kind {
+            Some(kind) => {
+                let uid = free_usage_id(&r.usage, id);
+                r.add_usage(UsageEntry {
+                    id: uid.clone(),
+                    kind,
+                    instance: Some(id.clone()),
+                    display: display_name.clone(),
+                    api_key_env: None,
+                    db_file: None,
+                    extra: Default::default(),
+                })?;
+                Some(uid)
+            }
+            None => None,
+        };
         found.push(Imported {
             id: id.clone(),
             harness,
-            display_name: display_name.clone(),
-            home: home.clone(),
+            display_name,
+            home,
+            usage_id,
         });
-        if !dry_run {
-            let (id_c, harness_c, name_c, home_c) =
-                (id.clone(), harness, display_name.clone(), home.clone());
-            Registry::update(paths, |r| {
-                use crate::registry::AddSpec;
-                r.add(AddSpec {
-                    id: id_c.clone(),
-                    harness: harness_c,
-                    display_name: Some(name_c.clone()),
-                    home: home_c.clone(),
-                    binary: None,
-                    no_t3: false,
-                })?;
-                r.set_enabled(&id_c, enabled)?;
-                Ok(())
-            })?;
-        }
     }
-    found.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(found)
+}
+
+fn free_usage_id(existing: &[crate::usage::UsageEntry], instance_id: &str) -> String {
+    let base = instance_id.replace('_', "-");
+    let mut n = 1u32;
+    loop {
+        let candidate = if n == 1 {
+            base.clone()
+        } else {
+            format!("{base}-{n}")
+        };
+        let key = crate::router::account_key(&candidate);
+        let taken = existing
+            .iter()
+            .any(|u| u.id == candidate || crate::router::account_key(&u.id) == key);
+        if !taken {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Outcome of [`reenable`]. Exit codes map as 0 = Recovered or DryRun,
@@ -1266,6 +1364,168 @@ mod tests {
         assert!(cs.t3);
         // Second import is a no-op.
         assert!(import_t3(&paths, &t3, false).unwrap().is_empty());
+    }
+
+    const ALL_DRIVERS: &str = r##"{
+  "providerInstances": {
+    "antigravity": {"driver": "antigravity", "enabled": true, "config": {}},
+    "antigravity_2": {"driver": "antigravity", "displayName": "Agy 2", "enabled": true, "config": {}},
+    "claudeAgent": {"driver": "claudeAgent", "enabled": true, "config": {"homePath": ""}},
+    "codex": {"driver": "codex", "enabled": true, "config": {"homePath": ""}},
+    "opencode": {"driver": "opencode", "enabled": false, "config": {}}
+  }
+}
+"##;
+
+    #[test]
+    fn import_covers_every_driver_with_usage_and_router() {
+        use crate::pool::PoolEntry;
+        use crate::usage::{UsageEntry, UsageKind};
+        let (paths, t3, _g) = setup("import-all", ALL_DRIVERS);
+        // A usage id squatting on the derived `antigravity-2` (bound to an
+        // unrelated instance) forces the `-2` suffix; the pool stays as is.
+        Registry::update(&paths, |r| {
+            r.add(AddSpec {
+                id: "old".into(),
+                harness: Harness::Agy,
+                display_name: None,
+                home: "~".into(),
+                binary: None,
+                no_t3: false,
+            })?;
+            r.add_usage(UsageEntry {
+                id: "antigravity-2".into(),
+                kind: UsageKind::Antigravity,
+                instance: Some("old".into()),
+                display: String::new(),
+                api_key_env: None,
+                db_file: None,
+                extra: Default::default(),
+            })?;
+            r.add_pool(PoolEntry {
+                instance: "old".into(),
+                model: "gemini-x".into(),
+                options: Default::default(),
+                enabled: true,
+            })?;
+            r.plugins.insert(crate::plugins::PLUGIN_ROUTER.into(), true);
+            Ok(())
+        })
+        .unwrap();
+        let before = Registry::load(&paths).unwrap();
+
+        let dry = import_t3(&paths, &t3, true).unwrap();
+        assert_eq!(dry.len(), 5);
+        assert_eq!(
+            Registry::load(&paths).unwrap().render().unwrap(),
+            before.render().unwrap()
+        );
+        assert!(!crate::router::router_json_path(&paths).exists());
+
+        let found = import_t3(&paths, &t3, false).unwrap();
+        let usage: Vec<_> = found
+            .iter()
+            .map(|f| (f.id.as_str(), f.usage_id.as_deref()))
+            .collect();
+        assert_eq!(
+            usage,
+            [
+                ("antigravity", Some("antigravity")),
+                ("antigravity_2", Some("antigravity-2-2")),
+                ("claudeAgent", Some("claudeAgent")),
+                ("codex", Some("codex")),
+                ("opencode", None),
+            ]
+        );
+        let reg = Registry::load(&paths).unwrap();
+        let a2 = reg.get("antigravity_2").unwrap();
+        assert!(matches!(a2.harness, Harness::Agy));
+        assert_eq!(a2.display_name, "Agy 2");
+        assert!(a2.t3 && a2.enabled);
+        assert!(!reg.get("opencode").unwrap().enabled);
+        let u = reg
+            .usage
+            .iter()
+            .find(|u| u.id == "antigravity-2-2")
+            .unwrap();
+        assert_eq!(u.kind, UsageKind::Antigravity);
+        assert_eq!(u.instance.as_deref(), Some("antigravity_2"));
+        assert_eq!(u.display, "Agy 2");
+        assert!(
+            reg.usage
+                .iter()
+                .all(|u| u.instance.as_deref() != Some("opencode"))
+        );
+        assert_eq!(reg.pool.len(), 1);
+        assert_eq!(reg.pool[0].instance, "old");
+        let json: Value = serde_json::from_str(
+            &fs::read_to_string(crate::router::router_json_path(&paths)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            json["accounts"]["antigravity_2_2"]["usageId"],
+            "antigravity-2-2"
+        );
+        assert_eq!(
+            json["accounts"]["antigravity_2_2"]["instances"][0],
+            "antigravity_2"
+        );
+        // Idempotent; T3 settings are only read.
+        assert!(import_t3(&paths, &t3, false).unwrap().is_empty());
+        assert_eq!(fs::read_to_string(settings_file(&t3)).unwrap(), ALL_DRIVERS);
+    }
+
+    #[test]
+    fn background_import_skips_disabled_and_router_off() {
+        let (paths, t3, _g) = setup("import-enabled", ALL_DRIVERS);
+        let (found, changes) = import_t3_enabled(&paths, &t3, false).unwrap();
+        assert_eq!(found.len(), 4);
+        assert!(Registry::load(&paths).unwrap().get("opencode").is_none());
+        // Router plugin off: only the registry was written.
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(!crate::router::router_json_path(&paths).exists());
+        let (found, changes) = import_t3_enabled(&paths, &t3, false).unwrap();
+        assert!(found.is_empty() && changes.is_empty());
+    }
+
+    #[test]
+    fn background_import_skips_bad_slugs_and_avoids_account_key_collision() {
+        let json = r#"{
+          "providerInstances": {
+            "bad slug!": {"driver": "antigravity", "enabled": true, "config": {}},
+            "codex_main": {"driver": "codex", "enabled": true, "config": {}}
+          }
+        }"#;
+        let (paths, t3, _g) = setup("import-collision", json);
+        Registry::update(&paths, |r| {
+            r.add(crate::AddSpec {
+                id: "codex".into(),
+                harness: Harness::Codex,
+                display_name: None,
+                home: "~/.codex".into(),
+                binary: None,
+                no_t3: false,
+            })?;
+            r.add_usage(crate::usage::UsageEntry {
+                id: "codex".into(),
+                kind: crate::usage::UsageKind::Codex,
+                instance: Some("codex".into()),
+                display: "Codex".into(),
+                api_key_env: None,
+                db_file: None,
+                extra: Default::default(),
+            })?;
+            r.plugins.insert(crate::plugins::PLUGIN_ROUTER.into(), true);
+            Ok(())
+        })
+        .unwrap();
+        let (found, _) = import_t3_enabled(&paths, &t3, false).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "codex_main");
+        // `codex-main` would collide with `codex` under `account_key`, so `-2` is chosen.
+        assert_eq!(found[0].usage_id.as_deref(), Some("codex-main-2"));
+        let reg = Registry::load(&paths).unwrap();
+        assert!(crate::router::router_json_value(&reg).is_ok());
     }
 
     #[test]

@@ -127,14 +127,14 @@ pub const WORKER_AGENT: &str = "agentdeck-worker";
 
 /// Account key from a usage id: `claude-main` -> `claude`,
 /// `codex-second` -> `codex_second`.
-fn account_key(id: &str) -> String {
+pub(crate) fn account_key(id: &str) -> String {
     id.strip_suffix("-main").unwrap_or(id).replace('-', "_")
 }
 
 /// Build the router JSON from `[[pool]]` + `[[usage]]`.
 ///
 /// Pool entries map 1:1. Each usage entry with a linked instance becomes one
-/// account (`usageId` for the per-login claude/codex kinds). Instance-less
+/// account (`usageId` for the per-login claude/codex/antigravity kinds). Instance-less
 /// entries take the still-unclaimed pool instances (unambiguous with a single
 /// such entry); the shared opencode-go account only matches models under
 /// `opencode-go/` on the already-mapped `opencode` instance.
@@ -185,7 +185,10 @@ pub fn router_json_value(reg: &Registry) -> anyhow::Result<Value> {
                 "usageProvider".into(),
                 Value::String(u.kind.as_str().to_string()),
             );
-            if matches!(u.kind, UsageKind::Claude | UsageKind::Codex) {
+            if matches!(
+                u.kind,
+                UsageKind::Claude | UsageKind::Codex | UsageKind::Antigravity
+            ) {
                 o.insert("usageId".into(), Value::String(u.id.clone()));
             }
             if matches!(u.kind, UsageKind::OpencodeGo) {
@@ -198,7 +201,13 @@ pub fn router_json_value(reg: &Registry) -> anyhow::Result<Value> {
                 );
             }
             mapped.insert(inst.clone());
-            accounts.insert(account_key(&u.id), Value::Object(o));
+            let key = account_key(&u.id);
+            if accounts.insert(key.clone(), Value::Object(o)).is_some() {
+                anyhow::bail!(
+                    "usage {:?} collides with another router account key {key:?}",
+                    u.id
+                );
+            }
         }
     }
     let mut uncovered: Vec<String> = reg
@@ -237,11 +246,20 @@ pub fn router_json_value(reg: &Registry) -> anyhow::Result<Value> {
             "usageProvider".into(),
             Value::String(u.kind.as_str().to_string()),
         );
+        if matches!(u.kind, UsageKind::Antigravity) && take.len() == 1 {
+            o.insert("usageId".into(), Value::String(u.id.clone()));
+        }
         uncovered.retain(|i| !take.contains(i));
         for i in &take {
             mapped.insert(i.clone());
         }
-        accounts.insert(account_key(&u.id), Value::Object(o));
+        let key = account_key(&u.id);
+        if accounts.insert(key.clone(), Value::Object(o)).is_some() {
+            anyhow::bail!(
+                "usage {:?} collides with another router account key {key:?}",
+                u.id
+            );
+        }
     }
     if mapped.contains("opencode")
         && reg
@@ -1330,6 +1348,47 @@ mod tests {
         // Refresh is idempotent.
         let reg = Registry::load(&paths).unwrap();
         assert!(plan_router_files(&paths, &reg).unwrap().is_empty());
+    }
+
+    #[test]
+    fn antigravity_accounts_carry_their_usage_id() {
+        let mut reg = Registry::empty();
+        for id in ["antigravity", "antigravity_2"] {
+            reg.add(AddSpec {
+                harness: Harness::Agy,
+                ..spec(id)
+            })
+            .unwrap();
+        }
+        reg.add_usage(usage(
+            "agy-main",
+            UsageKind::Antigravity,
+            Some("antigravity"),
+        ))
+        .unwrap();
+        reg.add_usage(usage(
+            "antigravity-2",
+            UsageKind::Antigravity,
+            Some("antigravity_2"),
+        ))
+        .unwrap();
+        let acc = &router_json_value(&reg).unwrap()["accounts"];
+        assert_eq!(acc["agy"]["usageId"], "agy-main");
+        assert_eq!(acc["antigravity_2"]["usageId"], "antigravity-2");
+        assert_eq!(acc["antigravity_2"]["instances"][0], "antigravity_2");
+    }
+
+    #[test]
+    fn colliding_account_keys_are_rejected() {
+        let mut reg = Registry::empty();
+        reg.add(spec("codex")).unwrap();
+        reg.add(spec("codex_main")).unwrap();
+        reg.add_usage(usage("codex", UsageKind::Codex, Some("codex")))
+            .unwrap();
+        reg.add_usage(usage("codex-main", UsageKind::Codex, Some("codex_main")))
+            .unwrap();
+        let err = router_json_value(&reg).unwrap_err().to_string();
+        assert!(err.contains("collides"), "{err}");
     }
 
     #[test]

@@ -18,8 +18,10 @@ pub const RESCAN: Duration = Duration::from_secs(10 * 60);
 /// and `.claude.json` parents, global instructions, Codex shadow homes. Non-recursive: link-
 /// level drift lives at the top level; the rescan covers deeper entries
 /// (`.hook-trust` records, sessions churn would otherwise rescan constantly).
-fn watch_roots(paths: &Paths, home: &Path) -> Vec<PathBuf> {
+/// T3 `userdata` is watched so a new T3 account is imported within seconds.
+fn watch_roots(paths: &Paths, home: &Path, t3_root: Option<&Path>) -> Vec<PathBuf> {
     let mut roots = vec![paths.config_dir.clone(), home.to_path_buf()];
+    roots.extend(t3_root.map(|r| r.join("userdata")));
     roots.extend(
         agentdeck_core::shared::instruction_targets(home)
             .into_iter()
@@ -39,6 +41,12 @@ fn watch_roots(paths: &Paths, home: &Path) -> Vec<PathBuf> {
     roots.sort();
     roots.dedup();
     roots.into_iter().filter(|p| p.is_dir()).collect()
+}
+
+/// T3 `userdata` churns (sqlite journals, logs); only its `settings.json`
+/// is a sync input.
+fn relevant(path: &Path, t3_userdata: Option<&Path>) -> bool {
+    t3_userdata.is_none_or(|u| path.parent() != Some(u) || path.ends_with("settings.json"))
 }
 
 fn sync_expand(value: &str, home: &Path) -> PathBuf {
@@ -151,16 +159,22 @@ pub async fn run(paths: Paths) -> anyhow::Result<()> {
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("cannot resolve home: HOME is not set"))?;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(16);
+    let t3_root = agentdeck_core::t3::t3_root().ok();
+    let t3_userdata = t3_root.as_ref().map(|r| r.join("userdata"));
     let mut debouncer = notify_debouncer_mini::new_debouncer(
         DEBOUNCE,
         move |res: notify_debouncer_mini::DebounceEventResult| {
-            if res.is_ok() {
+            if res.is_ok_and(|events| {
+                events
+                    .iter()
+                    .any(|e| relevant(&e.path, t3_userdata.as_deref()))
+            }) {
                 let _ = tx.try_send(());
             }
         },
     )
     .map_err(|e| anyhow::anyhow!("sync watcher failed to start: {e}"))?;
-    for root in watch_roots(&paths, &home) {
+    for root in watch_roots(&paths, &home, t3_root.as_deref()) {
         if let Err(e) = debouncer
             .watcher()
             .watch(&root, notify::RecursiveMode::NonRecursive)
@@ -258,7 +272,7 @@ mod tests {
             let _ = fs::remove_file(&path);
             fs::write(&path, "private client rules\n").unwrap();
         }
-        let roots = watch_roots(&paths, &home);
+        let roots = watch_roots(&paths, &home, None);
         for (path, _) in agentdeck_core::shared::instruction_targets(&home) {
             assert!(roots.contains(&path.parent().unwrap().to_path_buf()));
         }
@@ -273,6 +287,20 @@ mod tests {
         for (path, _) in agentdeck_core::shared::instruction_targets(&home) {
             assert_eq!(fs::read_to_string(path).unwrap(), "private client rules\n");
         }
+    }
+
+    #[test]
+    fn t3_userdata_is_watched_for_settings_only() {
+        let (_g, paths, home) = fixture();
+        let t3 = home.parent().unwrap().join("t3");
+        assert!(!watch_roots(&paths, &home, Some(&t3)).contains(&t3.join("userdata")));
+        fs::create_dir_all(t3.join("userdata")).unwrap();
+        assert!(watch_roots(&paths, &home, Some(&t3)).contains(&t3.join("userdata")));
+        let ud = t3.join("userdata");
+        assert!(relevant(&ud.join("settings.json"), Some(&ud)));
+        assert!(!relevant(&ud.join("statev2.sqlite-wal"), Some(&ud)));
+        assert!(relevant(&home.join(".claude.json"), Some(&ud)));
+        assert!(relevant(&ud.join("x"), None));
     }
 
     #[test]
