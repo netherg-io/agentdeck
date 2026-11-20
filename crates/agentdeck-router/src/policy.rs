@@ -1840,11 +1840,11 @@ mod legacy_suite_edges {
             ),
             "claude-sonnet-5-5"
         );
-        // Owner bonus (roster: Hydrogen +0.15) beats Muse's quality and cheap edge.
+        // Owner bonus (roster: Hydrogen +0.19) beats Muse's quality and cheap edge.
         assert_eq!(
             pick(
                 cheap("opencode-go/muse-spark-1.3-contributor", 0.1, 0.81),
-                cheap("gemini-4-hydrogen-high", 0.05, 0.725),
+                cheap("gemini-4-hydrogen-high", 0.34, 0.725),
                 0
             ),
             "gemini-4-hydrogen-high"
@@ -2017,6 +2017,26 @@ mod antigravity_source_tests {
         assert_eq!(
             antigravity_instance(&settings(), &[format!("GEMINI_HOME=/{codex}")], &[]),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod neon_family_tests {
+    use super::family_of;
+
+    #[test]
+    fn neon_is_opus_class_except_3d() {
+        let f = family_of("gemini-4-neon-high").expect("neon family");
+        assert_eq!(f.burn, 1.7); // measured 2026-11-20: size-1 task took 1.0% weekly vs 0.6% at burn 1
+        assert!(f.profile.as_deref().unwrap().contains("except 3D"));
+        assert!(f.brief_hint.is_some());
+        // orchestrator variants are not Neon proper
+        assert!(
+            !family_of("gemini-pro-orchestrator-neon")
+                .and_then(|f| f.profile)
+                .unwrap_or_default()
+                .contains("Neon")
         );
     }
 }
