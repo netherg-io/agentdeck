@@ -457,6 +457,46 @@ pub fn owns_usage(cfg: &RouterConfig, account: &UsageAccount, instance: &str, mo
     account.provider == provider
 }
 
+/// T3 gives each Antigravity instance its own data dir,
+/// `.../providers/antigravity/<sha256(providerInstanceId)>`, through
+/// `--gemini-dir`, `GEMINI_HOME` or `ANTIGRAVITY_APP_DATA_DIR`. `environ` holds
+/// `KEY=VALUE` entries, `argv` a process command line. `None` when no path
+/// matches an `antigravity` entry of `settings.providerInstances`.
+pub fn antigravity_instance(
+    settings: &Value,
+    environ: &[String],
+    argv: &[String],
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let from_env = environ.iter().filter_map(|e| {
+        e.strip_prefix("GEMINI_HOME=")
+            .or_else(|| e.strip_prefix("ANTIGRAVITY_APP_DATA_DIR="))
+    });
+    let from_argv = argv.iter().enumerate().filter_map(|(i, a)| {
+        a.strip_prefix("--gemini-dir=").or_else(|| {
+            (a == "--gemini-dir")
+                .then(|| argv.get(i + 1).map(String::as_str))
+                .flatten()
+        })
+    });
+    let hashes: Vec<&str> = from_env
+        .chain(from_argv)
+        .filter_map(|p| p.split("/providers/antigravity/").nth(1)?.split('/').next())
+        .filter(|h| !h.is_empty())
+        .collect();
+    settings
+        .get("providerInstances")?
+        .as_object()?
+        .iter()
+        .find(|(id, v)| {
+            v.get("driver").and_then(Value::as_str) == Some("antigravity") && {
+                let want = format!("{:x}", Sha256::digest(id.as_bytes()));
+                hashes.iter().any(|h| h.eq_ignore_ascii_case(&want))
+            }
+        })
+        .map(|(id, _)| id.clone())
+}
+
 pub fn enabled_favorites(favorites: Vec<Value>, settings: &Value) -> Vec<Value> {
     favorites
         .into_iter()
@@ -1904,6 +1944,79 @@ mod legacy_suite_edges {
         assert_eq!(
             validate_target(&ranked, "codex", "gpt-other").reason,
             "not an exact active favorite"
+        );
+    }
+}
+
+#[cfg(test)]
+mod antigravity_source_tests {
+    use super::antigravity_instance;
+
+    const AGY: &str = "ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32";
+    const AGY2: &str = "7be9b928ae8cba283f02640839db79b9ad29c4740201527659e873129d9e1991";
+
+    fn settings() -> serde_json::Value {
+        serde_json::json!({"providerInstances": {
+            "antigravity": {"driver": "antigravity"},
+            "antigravity_2": {"driver": "antigravity"},
+            "codex": {"driver": "codex"}
+        }})
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn matches_each_t3_data_dir_form() {
+        let base = "/home/u/.t3/userdata/providers/antigravity";
+        let env = |e: String| antigravity_instance(&settings(), &[e], &[]);
+        assert_eq!(
+            env(format!("GEMINI_HOME={base}/{AGY}")).as_deref(),
+            Some("antigravity")
+        );
+        assert_eq!(
+            env(format!("GEMINI_HOME={base}/{AGY2}")).as_deref(),
+            Some("antigravity_2")
+        );
+        assert_eq!(
+            env(format!(
+                "ANTIGRAVITY_APP_DATA_DIR={base}/{}/antigravity-acp",
+                AGY2.to_uppercase()
+            ))
+            .as_deref(),
+            Some("antigravity_2")
+        );
+        let dir = format!("{base}/{AGY2}");
+        let argv = s(&["/x/.t3/tools/antigravity-acp/bin", "--gemini-dir", &dir]);
+        assert_eq!(
+            antigravity_instance(&settings(), &[], &argv).as_deref(),
+            Some("antigravity_2")
+        );
+        let argv = s(&["acp", &format!("--gemini-dir={base}/{AGY}")]);
+        assert_eq!(
+            antigravity_instance(&settings(), &[], &argv).as_deref(),
+            Some("antigravity")
+        );
+    }
+
+    #[test]
+    fn unknown_dir_or_missing_settings_is_none() {
+        let env = s(&["GEMINI_HOME=/home/u/.gemini", "PATH=/bin"]);
+        assert_eq!(antigravity_instance(&settings(), &env, &[]), None);
+        let env = s(&["GEMINI_HOME=/p/providers/antigravity/deadbeef"]);
+        assert_eq!(antigravity_instance(&settings(), &env, &[]), None);
+        let env = [format!("GEMINI_HOME=/p/providers/antigravity/{AGY}")];
+        assert_eq!(
+            antigravity_instance(&serde_json::json!({}), &env, &[]),
+            None
+        );
+        // A hash of a non-antigravity instance never matches.
+        let codex = "providers/antigravity/".to_string()
+            + &format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(b"codex"));
+        assert_eq!(
+            antigravity_instance(&settings(), &[format!("GEMINI_HOME=/{codex}")], &[]),
+            None
         );
     }
 }

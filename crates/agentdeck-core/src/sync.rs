@@ -349,14 +349,17 @@ fn classify_codex(id: &str, drift: &codex::Drift) -> SyncItem {
 /// drift through the existing planners. Profile instances with any
 /// DECISION item are skipped whole (their planners would touch decided
 /// content). Each applied instance is re-checked right before planning, so a
-/// concurrent harness edit cannot slip a decision through. Idempotent: a
-/// clean tree applies nothing.
+/// concurrent harness edit cannot slip a decision through. With a T3 root,
+/// newly added enabled T3 instances are imported too (registry, `[[usage]]`,
+/// `router.json`; T3 `settings.json` is only read). Idempotent: a clean tree
+/// applies nothing.
 pub fn apply_additive(
     paths: &Paths,
     home: &Path,
     t3_root: Option<&Path>,
 ) -> anyhow::Result<Vec<Change>> {
-    let _ = t3_root; // T3 envelopes are out of Drift scope (see `gather`).
+    // T3 envelopes are out of Drift scope (see `gather`); new enabled T3
+    // instances are imported below, settings.json itself is never written.
     let reg = Registry::load(paths)?;
     let primary = home.join(".claude");
     let primary_json = home.join(".claude.json");
@@ -417,6 +420,11 @@ pub fn apply_additive(
             }
             crate::Harness::Opencode | crate::Harness::Agy => {}
         }
+    }
+    if let Some(root) = t3_root
+        && crate::t3::settings_file(root).is_file()
+    {
+        applied.extend(crate::t3::import_t3_enabled(paths, root, false)?.1);
     }
     Ok(applied)
 }
@@ -898,6 +906,39 @@ mod tests {
         let before = fs::read(&settings).unwrap();
         apply_additive(&fx.paths, &fx.home, Some(&t3_root)).unwrap();
         assert_eq!(fs::read(&settings).unwrap(), before);
+    }
+
+    #[test]
+    fn additive_apply_imports_new_enabled_t3_instances() {
+        let fx = fixture();
+        apply_additive(&fx.paths, &fx.home, None).unwrap();
+        let t3_root = fx.dir.join("t3");
+        fs::create_dir_all(t3_root.join("userdata")).unwrap();
+        let settings = t3_root.join("userdata/settings.json");
+        let raw = r#"{"providerInstances": {
+            "antigravity_2": {"driver": "antigravity", "enabled": true, "config": {}},
+            "codex_old": {"driver": "codex", "enabled": false, "config": {}}
+        }}"#;
+        fs::write(&settings, raw).unwrap();
+        let applied = apply_additive(&fx.paths, &fx.home, Some(&t3_root)).unwrap();
+        assert!(
+            applied
+                .iter()
+                .any(|c| matches!(c, Change::WriteFile { path, .. }
+                if *path == fx.paths.registry_file())),
+            "{applied:?}"
+        );
+        let reg = Registry::load(&fx.paths).unwrap();
+        assert!(reg.get("antigravity_2").is_some_and(|i| i.t3));
+        assert!(reg.get("codex_old").is_none());
+        let u = reg.usage.iter().find(|u| u.id == "antigravity-2").unwrap();
+        assert_eq!(u.instance.as_deref(), Some("antigravity_2"));
+        assert_eq!(fs::read_to_string(&settings).unwrap(), raw);
+        assert!(
+            apply_additive(&fx.paths, &fx.home, Some(&t3_root))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -16,7 +16,8 @@ pub enum T3Cmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Add T3 claudeAgent/codex instances missing from the registry into it.
+    /// Add T3 claudeAgent/codex/opencode/antigravity instances missing from the
+    /// registry into it, with a `[[usage]]` entry for claude/codex/antigravity.
     Import {
         #[arg(long)]
         dry_run: bool,
@@ -98,7 +99,11 @@ pub fn run_t3(paths: &Paths, cmd: T3Cmd) -> anyhow::Result<()> {
         T3Cmd::Import { dry_run } => {
             let found = t3::import_t3(paths, &root, dry_run)?;
             for f in &found {
-                println!("{} {} {} t3=true", f.id, f.harness.as_str(), f.home);
+                let usage = f
+                    .usage_id
+                    .as_ref()
+                    .map_or(String::new(), |u| format!(" usage={u}"));
+                println!("{} {} {} t3=true{usage}", f.id, f.harness.as_str(), f.home);
             }
             if found.is_empty() {
                 println!("nothing to import");

@@ -134,7 +134,7 @@ fn account_key(id: &str) -> String {
 /// Build the router JSON from `[[pool]]` + `[[usage]]`.
 ///
 /// Pool entries map 1:1. Each usage entry with a linked instance becomes one
-/// account (`usageId` for the per-login claude/codex kinds). Instance-less
+/// account (`usageId` for the per-login claude/codex/antigravity kinds). Instance-less
 /// entries take the still-unclaimed pool instances (unambiguous with a single
 /// such entry); the shared opencode-go account only matches models under
 /// `opencode-go/` on the already-mapped `opencode` instance.
@@ -185,7 +185,10 @@ pub fn router_json_value(reg: &Registry) -> anyhow::Result<Value> {
                 "usageProvider".into(),
                 Value::String(u.kind.as_str().to_string()),
             );
-            if matches!(u.kind, UsageKind::Claude | UsageKind::Codex) {
+            if matches!(
+                u.kind,
+                UsageKind::Claude | UsageKind::Codex | UsageKind::Antigravity
+            ) {
                 o.insert("usageId".into(), Value::String(u.id.clone()));
             }
             if matches!(u.kind, UsageKind::OpencodeGo) {
@@ -1330,6 +1333,34 @@ mod tests {
         // Refresh is idempotent.
         let reg = Registry::load(&paths).unwrap();
         assert!(plan_router_files(&paths, &reg).unwrap().is_empty());
+    }
+
+    #[test]
+    fn antigravity_accounts_carry_their_usage_id() {
+        let mut reg = Registry::empty();
+        for id in ["antigravity", "antigravity_2"] {
+            reg.add(AddSpec {
+                harness: Harness::Agy,
+                ..spec(id)
+            })
+            .unwrap();
+        }
+        reg.add_usage(usage(
+            "agy-main",
+            UsageKind::Antigravity,
+            Some("antigravity"),
+        ))
+        .unwrap();
+        reg.add_usage(usage(
+            "antigravity-2",
+            UsageKind::Antigravity,
+            Some("antigravity_2"),
+        ))
+        .unwrap();
+        let acc = &router_json_value(&reg).unwrap()["accounts"];
+        assert_eq!(acc["agy"]["usageId"], "agy-main");
+        assert_eq!(acc["antigravity_2"]["usageId"], "antigravity-2");
+        assert_eq!(acc["antigravity_2"]["instances"][0], "antigravity_2");
     }
 
     #[test]

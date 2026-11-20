@@ -994,7 +994,16 @@ fn detect_source(settings: &Value) -> Option<String> {
                 .first()
                 .is_some_and(|c| c.contains("/.t3/tools/antigravity-acp/"))
         {
-            return Some("antigravity".into());
+            let env: Vec<String> = std::fs::read(format!("/proc/{pid}/environ"))
+                .unwrap_or_default()
+                .split(|b| *b == 0)
+                .map(|e| String::from_utf8_lossy(e).into_owned())
+                .collect();
+            let argv: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
+            return Some(
+                crate::policy::antigravity_instance(settings, &env, &argv)
+                    .unwrap_or_else(|| "antigravity".into()),
+            );
         }
         pid = proc_stat_ppid(pid)?;
     }
@@ -2760,6 +2769,78 @@ mod live_quota_shape_tests {
         )
         .note;
         assert!(!note.contains("no ai-usage account"), "{note}");
+    }
+
+    #[test]
+    fn two_antigravity_accounts_use_their_own_quota() {
+        use agentdeck_core::{AddSpec, Harness, Registry, UsageEntry, UsageKind};
+        let mut reg = Registry::empty();
+        for (inst, uid) in [
+            ("antigravity", "agy-main"),
+            ("antigravity_2", "antigravity-2"),
+        ] {
+            reg.add(AddSpec {
+                id: inst.into(),
+                harness: Harness::Agy,
+                display_name: None,
+                home: "~".into(),
+                binary: None,
+                no_t3: false,
+            })
+            .unwrap();
+            reg.add_usage(UsageEntry {
+                id: uid.into(),
+                kind: UsageKind::Antigravity,
+                instance: Some(inst.into()),
+                display: String::new(),
+                api_key_env: None,
+                db_file: None,
+                extra: Default::default(),
+            })
+            .unwrap();
+        }
+        let cfg = crate::policy::parse_router_config(
+            agentdeck_core::router::router_json_value(&reg).unwrap(),
+            "test",
+        )
+        .unwrap();
+        let window = |remaining: f64| {
+            serde_json::json!([{"key": "gemini-weekly", "used_percent": 100.0 - remaining,
+                "remaining_percent": remaining, "duration_mins": 10080,
+                "resets_at": NOW + 300_000.0, "scope": null}])
+        };
+        // The exhausted account is listed first: a provider-only match would
+        // charge both instances to it.
+        let state = serde_json::json!({"accounts": [
+            {"id": "agy-main", "provider": "antigravity", "status": "ok", "plan": "Google AI Pro",
+             "updated_at": NOW - 40.0, "balances": [], "windows": window(0.0)},
+            {"id": "antigravity-2", "provider": "antigravity", "status": "ok", "plan": "Google AI Pro",
+             "updated_at": NOW - 40.0, "balances": [], "windows": window(100.0)}
+        ]});
+        let path =
+            std::env::temp_dir().join(format!("agentdeck-two-agy-{}.json", std::process::id()));
+        std::fs::write(&path, state.to_string()).unwrap();
+        let u = parse_usage_state(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let load = AgentLoad {
+            known: true,
+            agents: vec![],
+            note: None,
+        };
+        let q = |inst: &str| {
+            quota(
+                &cfg,
+                &Measured::default(),
+                &u,
+                &load,
+                inst,
+                "gemini-4-hydrogen-high",
+                NOW,
+            )
+            .allowed
+        };
+        assert_eq!(q("antigravity"), [false; 4]);
+        assert!(q("antigravity_2")[1], "{:?}", q("antigravity_2"));
     }
 
     #[test]

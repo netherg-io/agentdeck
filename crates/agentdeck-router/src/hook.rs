@@ -834,6 +834,20 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
             instance = Some(id);
         }
     }
+    if harness == "agy" {
+        // Missing or unreadable settings keep the `antigravity` default.
+        let settings = std::fs::read_to_string(home.join(".t3/userdata/settings.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+        let environ: Vec<String> = std::env::vars_os()
+            .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
+            .collect();
+        if let Some(id) = settings
+            .and_then(|s| crate::policy::antigravity_instance(&s, &environ, &chain.concat()))
+        {
+            instance = Some(id);
+        }
+    }
     if harness == "shell" {
         let source = str_field(&input, "source").unwrap_or_default();
         instance = Some(source.to_string());
