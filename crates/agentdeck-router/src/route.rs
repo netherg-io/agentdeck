@@ -5,11 +5,11 @@ use sha2::{Digest, Sha256};
 
 use crate::load::{AgentLoad, read_active_agents, read_instance_failures};
 use crate::policy::{
-    Candidate, MIN_FIT, NO_REVIEW_BAN, QuotaProvenance, QuotaWindow, QuotaWindowEstimate, Ranked,
-    RouterConfig, UsageAccount, UsageSnapshot, budget_allowed, budget_cost_full, enabled_favorites,
-    family_of, hint_of, is_review_task, load_router_json, max_burn, owns_usage, quota_windows,
-    rank_candidates, reserve_active_quota, router_config, routing_weights, valid_answer,
-    validate_target,
+    Candidate, MIN_FIT, ModelCost, NO_REVIEW_BAN, QuotaProvenance, QuotaWindow,
+    QuotaWindowEstimate, Ranked, RouterConfig, UsageAccount, UsageSnapshot, budget_allowed,
+    budget_cost_full, enabled_favorites, family_of, hint_of, is_review_task, load_router_json,
+    max_burn, owns_usage, quota_windows, rank_candidates, reserve_active_quota, router_config,
+    routing_weights, valid_answer, validate_target,
 };
 use crate::reasoning::{read_live_catalog, reasoning_target, save_catalog};
 use crate::{home_dir, js_num, parse_time_ms, round2, round3, runtime_dir, state_home};
@@ -584,6 +584,7 @@ fn compute_codex_costs(env: &Env) -> Measured {
 // --- quota -----------------------------------------------------------------
 
 struct QuotaResult {
+    burn: Option<f64>,
     weekly: Option<[f64; 4]>,
     basis: Option<String>,
     estimate_basis: &'static str,
@@ -601,6 +602,7 @@ struct QuotaResult {
 
 fn unknown_quota(err: &str, load_unknown: bool, stale_minutes: Option<i64>) -> QuotaResult {
     QuotaResult {
+        burn: None,
         weekly: None,
         basis: None,
         estimate_basis: "unknown",
@@ -625,19 +627,28 @@ fn stale_minutes(updated_at: f64, now: f64) -> Option<i64> {
 }
 
 fn model_costs(
-    _cfg: &RouterConfig,
     measured: &Measured,
     acc: &UsageAccountFull,
     provider: &str,
     model: &str,
-) -> ([f64; 4], f64, String, Option<usize>) {
+) -> (ModelCost, String, Option<usize>) {
     let normalized = if ["opus", "sonnet", "haiku", "fable"].contains(&model) {
         format!("claude-{model}")
     } else {
         model.to_string()
     };
     let fam = family_of(&normalized);
-    let burn = fam.as_ref().map(|f| f.burn).unwrap_or_else(max_burn);
+    // Two size-2 Sonnet 5.5 high-thinking reviews on separate Google AI Pro accounts
+    // (2026-11-20) used 31.9/33.8% weekly and 62.0/67.3% in the third-party 5h window.
+    // Round up to 34.5% weekly (1.5 × 23); extrapolate other sizes with the plan curve.
+    let antigravity_sonnet = acc.provider == "antigravity"
+        && acc.plan.eq_ignore_ascii_case("Google AI Pro")
+        && normalized.to_ascii_lowercase().starts_with("claude-sonnet");
+    let burn = if antigravity_sonnet {
+        23.0
+    } else {
+        fam.as_ref().map(|f| f.burn).unwrap_or_else(max_burn)
+    };
     let plan_key = if provider == "codex" {
         crate::policy::roster()["codexPlanTypes"]
             .get(&acc.plan)
@@ -686,7 +697,11 @@ fn model_costs(
         ),
         (None, Some(c)) => (
             c.map(|x| x * burn),
-            format!("{} estimate × burn {burn}", acc.plan),
+            if antigravity_sonnet {
+                format!("{} Sonnet estimate × burn {burn} (3p 5h ×2)", acc.plan)
+            } else {
+                format!("{} estimate × burn {burn}", acc.plan)
+            },
             None,
         ),
         (None, None) => (
@@ -695,7 +710,15 @@ fn model_costs(
             None,
         ),
     };
-    (weekly, burn, basis, sample)
+    (
+        ModelCost {
+            weekly,
+            burn,
+            third_party_short_factor: antigravity_sonnet.then_some(2.0),
+        },
+        basis,
+        sample,
+    )
 }
 
 fn quota(
@@ -758,7 +781,7 @@ fn quota(
             stale_minutes(acc.updated_at, now),
         );
     }
-    let (weekly, burn, basis, sample) = model_costs(cfg, measured, &acc, provider, model);
+    let (model_cost, basis, sample) = model_costs(measured, &acc, provider, model);
     let (_, _, _, reserve_default) = routing_weights();
     let reserve_percent = if family_of(model).is_some_and(|f| f.spend_to_zero) {
         0.0
@@ -774,25 +797,20 @@ fn quota(
             balances: acc.balances.clone(),
         },
         &load.agents,
-        &|p, m| {
-            let (w, b, _, _) = model_costs(cfg, measured, &acc, p, m.unwrap_or(""));
-            (w, b)
-        },
+        &|p, m| model_costs(measured, &acc, p, m.unwrap_or("")).0,
     );
-    let windows = quota_windows(provider, model, &reserved.windows);
+    let windows = quota_windows(&acc.provider, model, &reserved.windows);
     let allowed = budget_allowed(
         &windows,
         &reserved.balances,
-        &weekly,
-        burn,
+        &model_cost,
         reserve_percent,
         now,
     );
     let cost = budget_cost_full(
         &windows,
         &reserved.balances,
-        &weekly,
-        burn,
+        &model_cost,
         reserve_percent,
         now,
     );
@@ -848,10 +866,11 @@ fn quota(
         note += &format!(" (ai-usage stale {stale_min} min)");
     }
     QuotaResult {
+        burn: Some(model_cost.burn),
         weekly: if windows.is_empty() {
             None
         } else {
-            Some(weekly)
+            Some(model_cost.weekly)
         },
         basis: if windows.is_empty() {
             None
@@ -1932,7 +1951,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
             provider: provider.clone(),
             model: model.clone(),
             profiled: profile.is_some(),
-            burn: fam.as_ref().map(|f| f.burn),
+            burn: fam.as_ref().map(|f| q.burn.unwrap_or(f.burn)),
             target,
             reasoning_error,
             no_review,
@@ -2477,13 +2496,78 @@ mod quota_estimate_tests {
     }
 
     #[test]
+    fn antigravity_sonnet_uses_calibrated_admission_and_reservations() {
+        let instance = "antigravity_4";
+        let model = "claude-sonnet-5-5";
+        let mut cfg = test_cfg();
+        cfg.account.insert(instance.into(), "antigravity".into());
+        cfg.account.insert("claudeAgent".into(), "claude".into());
+        let measured = Measured::default();
+        let mut acc = codex_acc("Google AI Pro", 0.0);
+        acc.id = None;
+        acc.provider = "antigravity".into();
+        acc.windows[0].key = "3p-weekly".into();
+        acc.windows[0].scope = Some("Third-party models".into());
+        acc.windows.push(QuotaWindow {
+            key: "3p-5h".into(),
+            duration_mins: 300.0,
+            ..acc.windows[0].clone()
+        });
+        acc.windows.push(QuotaWindow {
+            key: "gemini-weekly".into(),
+            scope: None,
+            remaining_percent: 0.0,
+            ..acc.windows[0].clone()
+        });
+        let mut load = load_known();
+        let q = quota(&cfg, &measured, &[acc.clone()], &load, instance, model, NOW);
+        assert_eq!(q.weekly.unwrap().map(round2), [4.6, 13.8, 34.5, 92.0]);
+        assert_eq!(q.burn, Some(23.0));
+        assert_eq!(q.estimate_basis, "estimate");
+        assert_eq!(q.allowed, [true, true, true, false]);
+        assert_eq!(q.estimate_windows.len(), 2);
+        load.agents.push(crate::policy::ActiveAgent {
+            id: "active-sonnet".into(),
+            provider: instance.into(),
+            model: Some(model.into()),
+        });
+        let q = quota(&cfg, &measured, &[acc.clone()], &load, instance, model, NOW);
+        assert_eq!(q.allowed, [true, true, false, false]);
+        assert_eq!(round2(q.estimate_windows[0].remaining_percent), 66.2);
+        assert_eq!(round2(q.estimate_windows[1].remaining_percent), 52.4);
+
+        let q = quota(
+            &cfg,
+            &measured,
+            &[acc.clone()],
+            &load,
+            instance,
+            "claude-opus-5-5",
+            NOW,
+        );
+        assert_eq!(q.weekly.unwrap(), [0.2, 0.6, 1.5, 4.0]);
+        assert_eq!(round2(q.estimate_windows[1].remaining_percent), 52.4);
+
+        acc.provider = "claude".into();
+        acc.plan = "Pro".into();
+        acc.windows.pop();
+        acc.windows[0].key = "weekly_all".into();
+        acc.windows[0].scope = None;
+        acc.windows[1].key = "session".into();
+        acc.windows[1].scope = None;
+        let q = quota(&cfg, &measured, &[acc], &load, "claudeAgent", model, NOW);
+        assert_eq!(q.weekly.unwrap().map(round2), [0.24, 0.96, 3.0, 7.2]);
+        assert_eq!(q.allowed, [true; 4]);
+    }
+
+    #[test]
     fn measured_basis_reports_sample_count() {
         let cfg = test_cfg();
         // "Pro 5x" maps via codexPlanTypes to raw plan "prolite".
         let m = measured_for("prolite|gpt-6.1-sol", 12);
         let acc = codex_acc("Pro 5x", 60.0);
-        let (weekly, _burn, basis, sample) = model_costs(&cfg, &m, &acc, "codex", "gpt-6.1-sol");
-        assert_eq!(weekly, [0.4, 1.6, 5.0, 12.0]);
+        let (cost, basis, sample) = model_costs(&m, &acc, "codex", "gpt-6.1-sol");
+        assert_eq!(cost.weekly, [0.4, 1.6, 5.0, 12.0]);
         assert_eq!(sample, Some(12));
         assert!(basis.contains("measured over 12 sessions"), "{basis}");
         let q = quota(&cfg, &m, &[acc], &load_known(), "codex", "gpt-6.1-sol", NOW);
@@ -2500,7 +2584,7 @@ mod quota_estimate_tests {
         let cfg = test_cfg();
         let m = Measured::default(); // no session data at all
         let acc = codex_acc("Pro 5x", 60.0);
-        let (_w, _b, basis, sample) = model_costs(&cfg, &m, &acc, "codex", "gpt-6.1-sol");
+        let (_, basis, sample) = model_costs(&m, &acc, "codex", "gpt-6.1-sol");
         assert_eq!(sample, None);
         assert!(basis.contains("estimate"), "{basis}");
         let q = quota(&cfg, &m, &[acc], &load_known(), "codex", "gpt-6.1-sol", NOW);
@@ -2512,10 +2596,9 @@ mod quota_estimate_tests {
 
     #[test]
     fn unknown_plan_is_conservative_estimate() {
-        let cfg = test_cfg();
         let m = Measured::default();
         let acc = codex_acc("NoSuchPlan", 60.0);
-        let (_w, _b, basis, sample) = model_costs(&cfg, &m, &acc, "codex", "gpt-6.1-sol");
+        let (_, basis, sample) = model_costs(&m, &acc, "codex", "gpt-6.1-sol");
         assert_eq!(sample, None);
         assert!(basis.contains("conservative estimate"), "{basis}");
     }
@@ -2527,8 +2610,8 @@ mod quota_estimate_tests {
         let acc = codex_acc("Pro 5x", 60.0);
         // No roster family: quota reserves the highest profiled burn and says
         // so, instead of faking a cheap observed cost.
-        let (_weekly, burn, basis, sample) =
-            model_costs(&cfg, &m, &acc, "codex", "some-new-model-9");
+        let (cost, basis, sample) = model_costs(&m, &acc, "codex", "some-new-model-9");
+        let burn = cost.burn;
         assert_eq!(burn, crate::policy::max_burn());
         assert_eq!(sample, None);
         assert!(basis.contains("estimate"), "{basis}");
