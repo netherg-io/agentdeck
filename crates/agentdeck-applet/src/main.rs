@@ -1,4 +1,5 @@
 use cosmic::iced::core::text::{Ellipsize, EllipsizeHeightLimit};
+use cosmic::iced::core::{event::Event, mouse};
 use cosmic::iced::platform_specific::shell::wayland::commands::popup::destroy_popup;
 use cosmic::iced::{Alignment, Length, Rectangle, Subscription, window};
 use cosmic::{Element, Task, app, widget};
@@ -14,6 +15,58 @@ use agentdeck_usage::model::{self, AccountState, AppState, QuotaWindow};
 use agentdeck_usage::visibility::Prefs;
 
 static AUTOSIZE: LazyLock<widget::Id> = LazyLock::new(widget::Id::unique);
+static SCROLL_ID: LazyLock<widget::Id> = LazyLock::new(widget::Id::unique);
+
+/// Extra gain for touchpad `Pixels` deltas: libcosmic forwards raw Wayland
+/// axis values 1:1 while a mouse-wheel notch scrolls 60px.
+const TOUCHPAD_PIXEL_MULTIPLIER: f32 = 2.5;
+
+/// Vertical scroll offset for `scrollable::scroll_by` (positive scrolls DOWN,
+/// matching `Scrollable::update`: `-y * 60.0` for `Lines`, `-y` for `Pixels`).
+/// `None` means the widget already handled the event itself.
+fn popup_scroll_offset(delta: mouse::ScrollDelta, popup_hovered: bool) -> Option<f32> {
+    match delta {
+        mouse::ScrollDelta::Lines { y, .. } => {
+            if y == 0.0 || popup_hovered {
+                None
+            } else {
+                Some(-y * 60.0)
+            }
+        }
+        mouse::ScrollDelta::Pixels { y, .. } => {
+            if y == 0.0 {
+                None
+            } else if popup_hovered {
+                // Widget applied 1x itself; top up to the full multiplier.
+                Some(-y * (TOUCHPAD_PIXEL_MULTIPLIER - 1.0))
+            } else {
+                Some(-y * TOUCHPAD_PIXEL_MULTIPLIER)
+            }
+        }
+    }
+}
+
+/// `listen_with` takes a plain `fn`, so tag events with their window id and
+/// filter against `self.popup` in `update`.
+fn applet_events(
+    event: Event,
+    _status: cosmic::iced::core::event::Status,
+    window_id: window::Id,
+) -> Option<Message> {
+    match event {
+        Event::Mouse(mouse::Event::CursorEntered) => {
+            Some(Message::PopupHovered(window_id, true))
+        }
+        Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+            Some(Message::PopupHovered(window_id, true))
+        }
+        Event::Mouse(mouse::Event::CursorLeft) => Some(Message::PopupHovered(window_id, false)),
+        Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+            Some(Message::PopupWheel(window_id, delta))
+        }
+        _ => None,
+    }
+}
 
 fn now() -> i64 {
     SystemTime::now()
@@ -244,6 +297,7 @@ struct App {
     core: app::Core,
     state: Result<AppState, String>,
     popup: Option<window::Id>,
+    popup_hovered: bool,
     revealed: HashSet<String>,
     prefs: Prefs,
     prefs_error: Option<String>,
@@ -255,6 +309,8 @@ enum Message {
     TogglePopup(Rectangle<i32>),
     CloseRequested(window::Id),
     Reveal(String),
+    PopupHovered(window::Id, bool),
+    PopupWheel(window::Id, mouse::ScrollDelta),
 }
 
 impl App {
@@ -286,6 +342,7 @@ impl cosmic::Application for App {
             core,
             state: read_state(),
             popup: None,
+            popup_hovered: false,
             revealed: HashSet::new(),
             prefs: Prefs::default(),
             prefs_error: None,
@@ -297,7 +354,10 @@ impl cosmic::Application for App {
         Some(cosmic::applet::style())
     }
     fn subscription(&self) -> Subscription<Message> {
-        cosmic::iced::time::every(Duration::from_secs(5)).map(|_| Message::Tick)
+        Subscription::batch([
+            cosmic::iced::time::every(Duration::from_secs(5)).map(|_| Message::Tick),
+            cosmic::iced::event::listen_with(applet_events),
+        ])
     }
     fn update(&mut self, message: Message) -> app::Task<Message> {
         match message {
@@ -313,11 +373,30 @@ impl cosmic::Application for App {
             Message::CloseRequested(id) => {
                 if self.popup == Some(id) {
                     self.popup = None;
+                    self.popup_hovered = false;
                     self.revealed.clear();
+                }
+            }
+            Message::PopupHovered(id, hovered) => {
+                if self.popup == Some(id) {
+                    self.popup_hovered = hovered;
+                }
+            }
+            Message::PopupWheel(_id, delta) => {
+                // One Wayland axis frame reaches a single surface, so act
+                // whenever the popup is open (pointer on icon or in popup).
+                if self.popup.is_some()
+                    && let Some(y) = popup_scroll_offset(delta, self.popup_hovered)
+                {
+                    return cosmic::iced::widget::scrollable::scroll_by(
+                        SCROLL_ID.clone(),
+                        cosmic::iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
+                    );
                 }
             }
             Message::TogglePopup(rectangle) => {
                 self.revealed.clear();
+                self.popup_hovered = false;
                 if let Some(id) = self.popup.take() {
                     return destroy_popup(id);
                 }
@@ -472,12 +551,13 @@ impl cosmic::Application for App {
             .popup_container(
                 widget::container(
                     widget::scrollable(content)
+                        .id(SCROLL_ID.clone())
                         .scroller_width(4.0)
                         .scrollbar_width(8.0)
                         .height(Length::Shrink),
                 )
-                .width(380)
-                .max_height(480),
+                .width(360)
+                .max_height(600),
             )
             .into()
     }
@@ -544,6 +624,49 @@ mod tests {
 
     fn test_account(id: &str, provider: &str) -> AccountState {
         AccountState::error(id, id, provider, "")
+    }
+
+    #[test]
+    fn popup_scroll_offset_outside_popup_scrolls_full_speed() {
+        // One mouse-wheel notch down scrolls 60px, matching iced.
+        assert_eq!(
+            popup_scroll_offset(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }, false),
+            Some(60.0)
+        );
+        // Touchpad pixels get the full multiplier when the widget ignores
+        // the event (pointer outside the popup).
+        assert_eq!(
+            popup_scroll_offset(mouse::ScrollDelta::Pixels { x: 0.0, y: -10.0 }, false),
+            Some(10.0 * TOUCHPAD_PIXEL_MULTIPLIER)
+        );
+    }
+
+    #[test]
+    fn popup_scroll_offset_inside_popup_only_boosts_touchpad() {
+        // Mouse wheel is already handled by the widget: no double-scroll.
+        assert_eq!(
+            popup_scroll_offset(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }, true),
+            None
+        );
+        // Touchpad already scrolled 1x in the widget; top up the remainder.
+        assert_eq!(
+            popup_scroll_offset(mouse::ScrollDelta::Pixels { x: 0.0, y: -10.0 }, true),
+            Some(10.0 * (TOUCHPAD_PIXEL_MULTIPLIER - 1.0))
+        );
+    }
+
+    #[test]
+    fn popup_scroll_offset_ignores_zero_deltas() {
+        for hovered in [false, true] {
+            assert_eq!(
+                popup_scroll_offset(mouse::ScrollDelta::Lines { x: 0.0, y: 0.0 }, hovered),
+                None
+            );
+            assert_eq!(
+                popup_scroll_offset(mouse::ScrollDelta::Pixels { x: 0.0, y: 0.0 }, hovered),
+                None
+            );
+        }
     }
 
     #[test]
