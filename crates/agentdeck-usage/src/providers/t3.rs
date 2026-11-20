@@ -416,6 +416,35 @@ fn map_windows(provider: &str, raw: Vec<T3UsageWindow>) -> Vec<QuotaWindow> {
             });
         }
         "antigravity" => {
+            // Google reports 5-hour and weekly buckets separately; a fresh 5-hour
+            // bucket is unusable while its family's weekly one is exhausted.
+            let caps: Vec<(String, u64, f64, Option<i64>)> = windows
+                .iter()
+                .filter_map(|w| {
+                    Some((
+                        family_for_key(&w.key),
+                        w.duration_mins?,
+                        w.used_percent,
+                        w.resets_at,
+                    ))
+                })
+                .collect();
+            for w in &mut windows {
+                let Some(own) = w.duration_mins else { continue };
+                let family = family_for_key(&w.key);
+                for (f, d, used, resets) in &caps {
+                    if *f == family && *d > own && *used > w.used_percent {
+                        *w = QuotaWindow::new(
+                            w.key.clone(),
+                            w.label.clone(),
+                            *used,
+                            w.duration_mins,
+                            *resets,
+                        )
+                        .with_scope(w.scope.clone());
+                    }
+                }
+            }
             windows.sort_by(|a, b| {
                 let pa = u8::from(family_for_key(&a.key) != "gemini");
                 let pb = u8::from(family_for_key(&b.key) != "gemini");
@@ -924,6 +953,43 @@ mod tests {
         assert_eq!(st.windows[3].scope, None);
         assert_eq!(st.windows[3].label, "Claude Quota");
         assert_eq!(st.windows[3].duration_mins, None);
+    }
+
+    #[test]
+    fn antigravity_session_window_never_shows_more_than_its_weekly_window() {
+        let (t3, _g) = setup("agy-cap", SETTINGS_ALL);
+        write_cache(
+            &t3,
+            "antigravity",
+            &format!(
+                r#"{{
+  "enabled": true,
+  "status": "ready",
+  "auth": {{ "status": "authenticated", "type": "oauth-personal", "label": "Google account" }},
+  "usageLimits": {{
+    "checkedAt": "{CHECKED_RECENT}",
+    "windows": [
+      {{ "id": "gemini-5h", "kind": "session", "windowDurationMins": 300, "usedPercent": 0 }},
+      {{ "id": "gemini-weekly", "kind": "weekly", "windowDurationMins": 10080, "usedPercent": 100, "resetsAt": "2026-11-25T00:03:18.000Z" }},
+      {{ "id": "3p-5h", "kind": "session", "windowDurationMins": 300, "usedPercent": 40 }},
+      {{ "id": "3p-weekly", "kind": "weekly", "windowDurationMins": 10080, "usedPercent": 31 }}
+    ]
+  }}
+}}"#
+            ),
+        );
+        let st = fetch_from_root(
+            &t3,
+            src("agy-main", "antigravity", Some("antigravity")),
+            900,
+            NOW,
+        );
+        let w = |k: &str| st.windows.iter().find(|w| w.key == k).unwrap().clone();
+        assert_eq!(w("gemini-5h").remaining_percent, 0.0);
+        assert_eq!(w("gemini-5h").resets_at, w("gemini-weekly").resets_at);
+        // a busier 5-hour window keeps its own figure
+        assert_eq!(w("3p-5h").remaining_percent, 60.0);
+        assert_eq!(w("3p-5h").scope.as_deref(), Some("Сторонние модели"));
     }
 
     #[test]
