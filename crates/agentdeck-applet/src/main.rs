@@ -46,24 +46,17 @@ fn popup_scroll_offset(delta: mouse::ScrollDelta, popup_hovered: bool) -> Option
     }
 }
 
-/// `listen_with` takes a plain `fn`, so tag events with their window id and
-/// filter against `self.popup` in `update`.
+/// `listen_with` takes a plain `fn`, so tag hover events with their window id
+/// and filter against `self.popup` in `update`.
 fn applet_events(
     event: Event,
     _status: cosmic::iced::core::event::Status,
     window_id: window::Id,
 ) -> Option<Message> {
     match event {
-        Event::Mouse(mouse::Event::CursorEntered) => {
-            Some(Message::PopupHovered(window_id, true))
-        }
-        Event::Mouse(mouse::Event::CursorMoved { .. }) => {
-            Some(Message::PopupHovered(window_id, true))
-        }
+        Event::Mouse(mouse::Event::CursorEntered) => Some(Message::PopupHovered(window_id, true)),
         Event::Mouse(mouse::Event::CursorLeft) => Some(Message::PopupHovered(window_id, false)),
-        Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
-            Some(Message::PopupWheel(window_id, delta))
-        }
+        Event::Mouse(mouse::Event::WheelScrolled { delta }) => Some(Message::PopupWheel(delta)),
         _ => None,
     }
 }
@@ -310,7 +303,7 @@ enum Message {
     CloseRequested(window::Id),
     Reveal(String),
     PopupHovered(window::Id, bool),
-    PopupWheel(window::Id, mouse::ScrollDelta),
+    PopupWheel(mouse::ScrollDelta),
 }
 
 impl App {
@@ -354,10 +347,12 @@ impl cosmic::Application for App {
         Some(cosmic::applet::style())
     }
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
-            cosmic::iced::time::every(Duration::from_secs(5)).map(|_| Message::Tick),
-            cosmic::iced::event::listen_with(applet_events),
-        ])
+        let tick = cosmic::iced::time::every(Duration::from_secs(5)).map(|_| Message::Tick);
+        if self.popup.is_some() {
+            Subscription::batch([tick, cosmic::iced::event::listen_with(applet_events)])
+        } else {
+            tick
+        }
     }
     fn update(&mut self, message: Message) -> app::Task<Message> {
         match message {
@@ -382,7 +377,7 @@ impl cosmic::Application for App {
                     self.popup_hovered = hovered;
                 }
             }
-            Message::PopupWheel(_id, delta) => {
+            Message::PopupWheel(delta) => {
                 // One Wayland axis frame reaches a single surface, so act
                 // whenever the popup is open (pointer on icon or in popup).
                 if self.popup.is_some()
