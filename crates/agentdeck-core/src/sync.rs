@@ -197,13 +197,11 @@ pub fn restore_blocks(paths: &Paths, home: &Path) -> anyhow::Result<Vec<Change>>
     Ok(changes)
 }
 
-/// Gather global instruction drift and registry instance drift (Claude + Codex).
-/// `home` is the real `$HOME` in production, a temp dir in tests;
-/// `t3_root` is accepted and
-/// ignored: T3 provider-instance envelopes are explicit T3 management
-/// (`t3 sync`), never Drift, so they contribute no badge or notification.
+/// Gather global instruction drift, registry instance drift (Claude + Codex),
+/// and newly added enabled T3 instances waiting to be imported (Additive).
+/// T3 provider-instance envelopes (enabled/config) stay explicit (`t3 sync`),
+/// never Drift, so they contribute no badge or notification.
 pub fn gather(paths: &Paths, home: &Path, t3_root: Option<&Path>) -> anyhow::Result<Vec<SyncItem>> {
-    let _ = t3_root;
     let reg = Registry::load(paths)?;
     let mut out = instruction_items(home);
     out.extend(block_items(&reg, paths, home));
@@ -226,6 +224,19 @@ pub fn gather(paths: &Paths, home: &Path, t3_root: Option<&Path>) -> anyhow::Res
             }
             // Managed later (M7); background sync only watches Claude/Codex.
             crate::Harness::Opencode | crate::Harness::Agy => {}
+        }
+    }
+    if let Some(root) = t3_root
+        && crate::t3::settings_file(root).is_file()
+        && let Ok((pending, _)) = crate::t3::import_t3_enabled(paths, root, true)
+    {
+        for item in pending {
+            out.push(SyncItem::new(
+                &item.id,
+                item.harness.as_str(),
+                ItemKind::Additive,
+                "new T3 instance (import into registry)".to_string(),
+            ));
         }
     }
     out.sort_by(|a, b| (&a.instance, &a.detail).cmp(&(&b.instance, &b.detail)));
@@ -424,7 +435,10 @@ pub fn apply_additive(
     if let Some(root) = t3_root
         && crate::t3::settings_file(root).is_file()
     {
-        applied.extend(crate::t3::import_t3_enabled(paths, root, false)?.1);
+        match crate::t3::import_t3_enabled(paths, root, false) {
+            Ok((_, changes)) => applied.extend(changes),
+            Err(err) => eprintln!("agentdeck sync: T3 import skipped: {err:#}"),
+        }
     }
     Ok(applied)
 }
@@ -920,6 +934,15 @@ mod tests {
             "codex_old": {"driver": "codex", "enabled": false, "config": {}}
         }}"#;
         fs::write(&settings, raw).unwrap();
+        // gather previews pending enabled T3 imports as Additive (never Decision).
+        let pending = gather(&fx.paths, &fx.home, Some(&t3_root)).unwrap();
+        assert!(
+            pending.iter().any(|i| i.instance == "antigravity_2"
+                && i.harness == "agy"
+                && i.kind == ItemKind::Additive),
+            "{pending:?}"
+        );
+        assert!(pending.iter().all(|i| i.instance != "codex_old"));
         let applied = apply_additive(&fx.paths, &fx.home, Some(&t3_root)).unwrap();
         assert!(
             applied
@@ -939,6 +962,16 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn corrupt_t3_settings_does_not_fail_additive_apply() {
+        let fx = fixture();
+        let t3_root = fx.dir.join("t3");
+        fs::create_dir_all(t3_root.join("userdata")).unwrap();
+        fs::write(t3_root.join("userdata/settings.json"), "{ broken").unwrap();
+        let applied = apply_additive(&fx.paths, &fx.home, Some(&t3_root)).unwrap();
+        assert!(!applied.is_empty(), "claude/codex drift still applied");
     }
 
     #[test]

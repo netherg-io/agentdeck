@@ -920,11 +920,14 @@ fn proc_stat_ppid(pid: u32) -> Option<u32> {
 
 fn detect_source(settings: &Value) -> Option<String> {
     let mut pid = proc_stat_ppid(std::process::id())?;
+    let mut saw_agy = false;
     for _ in 0..12 {
         if pid <= 1 {
             break;
         }
-        let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        let Some(cmd) = std::fs::read(format!("/proc/{pid}/cmdline")).ok() else {
+            break;
+        };
         let parts: Vec<&str> = cmd
             .split(|b| *b == 0)
             .map(|b| std::str::from_utf8(b).unwrap_or_default())
@@ -1000,14 +1003,17 @@ fn detect_source(settings: &Value) -> Option<String> {
                 .map(|e| String::from_utf8_lossy(e).into_owned())
                 .collect();
             let argv: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
-            return Some(
-                crate::policy::antigravity_instance(settings, &env, &argv)
-                    .unwrap_or_else(|| "antigravity".into()),
-            );
+            if let Some(id) = crate::policy::antigravity_instance(settings, &env, &argv) {
+                return Some(id);
+            }
+            saw_agy = true;
         }
-        pid = proc_stat_ppid(pid)?;
+        let Some(parent) = proc_stat_ppid(pid) else {
+            break;
+        };
+        pid = parent;
     }
-    None
+    saw_agy.then(|| "antigravity".into())
 }
 
 // --- Jev ---------------------------------------------------------------------

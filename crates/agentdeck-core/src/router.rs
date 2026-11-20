@@ -127,7 +127,7 @@ pub const WORKER_AGENT: &str = "agentdeck-worker";
 
 /// Account key from a usage id: `claude-main` -> `claude`,
 /// `codex-second` -> `codex_second`.
-fn account_key(id: &str) -> String {
+pub(crate) fn account_key(id: &str) -> String {
     id.strip_suffix("-main").unwrap_or(id).replace('-', "_")
 }
 
@@ -201,7 +201,13 @@ pub fn router_json_value(reg: &Registry) -> anyhow::Result<Value> {
                 );
             }
             mapped.insert(inst.clone());
-            accounts.insert(account_key(&u.id), Value::Object(o));
+            let key = account_key(&u.id);
+            if accounts.insert(key.clone(), Value::Object(o)).is_some() {
+                anyhow::bail!(
+                    "usage {:?} collides with another router account key {key:?}",
+                    u.id
+                );
+            }
         }
     }
     let mut uncovered: Vec<String> = reg
@@ -240,11 +246,20 @@ pub fn router_json_value(reg: &Registry) -> anyhow::Result<Value> {
             "usageProvider".into(),
             Value::String(u.kind.as_str().to_string()),
         );
+        if matches!(u.kind, UsageKind::Antigravity) && take.len() == 1 {
+            o.insert("usageId".into(), Value::String(u.id.clone()));
+        }
         uncovered.retain(|i| !take.contains(i));
         for i in &take {
             mapped.insert(i.clone());
         }
-        accounts.insert(account_key(&u.id), Value::Object(o));
+        let key = account_key(&u.id);
+        if accounts.insert(key.clone(), Value::Object(o)).is_some() {
+            anyhow::bail!(
+                "usage {:?} collides with another router account key {key:?}",
+                u.id
+            );
+        }
     }
     if mapped.contains("opencode")
         && reg
@@ -1361,6 +1376,19 @@ mod tests {
         assert_eq!(acc["agy"]["usageId"], "agy-main");
         assert_eq!(acc["antigravity_2"]["usageId"], "antigravity-2");
         assert_eq!(acc["antigravity_2"]["instances"][0], "antigravity_2");
+    }
+
+    #[test]
+    fn colliding_account_keys_are_rejected() {
+        let mut reg = Registry::empty();
+        reg.add(spec("codex")).unwrap();
+        reg.add(spec("codex_main")).unwrap();
+        reg.add_usage(usage("codex", UsageKind::Codex, Some("codex")))
+            .unwrap();
+        reg.add_usage(usage("codex-main", UsageKind::Codex, Some("codex_main")))
+            .unwrap();
+        let err = router_json_value(&reg).unwrap_err().to_string();
+        assert!(err.contains("collides"), "{err}");
     }
 
     #[test]

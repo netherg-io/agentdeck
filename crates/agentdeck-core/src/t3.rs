@@ -728,6 +728,10 @@ fn import(
     let old = fs::read(paths.registry_file()).ok();
     Registry::update(paths, |r| {
         found = add_missing(r, pi, only_enabled)?;
+        if crate::plugins::plugin_enabled(r, crate::plugins::PLUGIN_ROUTER) {
+            // Validate router JSON before committing so a conflict never half-applies.
+            crate::router::router_json_value(r)?;
+        }
         Ok(())
     })?;
     found.sort_by(|a, b| a.id.cmp(&b.id));
@@ -771,7 +775,12 @@ fn add_missing(
         if only_enabled && !enabled {
             continue;
         }
-        check_t3_slug(id)?;
+        if let Err(err) = check_t3_slug(id) {
+            if only_enabled {
+                continue;
+            }
+            return Err(err);
+        }
         let cfg = env.get("config").and_then(Value::as_object);
         let str_field = |k: &str| {
             cfg.and_then(|c| c.get(k))
@@ -819,18 +828,8 @@ fn add_missing(
         })?;
         r.set_enabled(id, enabled)?;
         let usage_id = match kind {
-            Some(kind) if !r.usage.iter().any(|u| u.instance.as_deref() == Some(id)) => {
-                let base = id.replace('_', "-");
-                let uid = (1..)
-                    .map(|n| {
-                        if n == 1 {
-                            base.clone()
-                        } else {
-                            format!("{base}-{n}")
-                        }
-                    })
-                    .find(|c| r.usage.iter().all(|u| &u.id != c))
-                    .expect("unbounded candidates");
+            Some(kind) => {
+                let uid = free_usage_id(&r.usage, id);
                 r.add_usage(UsageEntry {
                     id: uid.clone(),
                     kind,
@@ -842,7 +841,7 @@ fn add_missing(
                 })?;
                 Some(uid)
             }
-            _ => None,
+            None => None,
         };
         found.push(Imported {
             id: id.clone(),
@@ -853,6 +852,26 @@ fn add_missing(
         });
     }
     Ok(found)
+}
+
+fn free_usage_id(existing: &[crate::usage::UsageEntry], instance_id: &str) -> String {
+    let base = instance_id.replace('_', "-");
+    let mut n = 1u32;
+    loop {
+        let candidate = if n == 1 {
+            base.clone()
+        } else {
+            format!("{base}-{n}")
+        };
+        let key = crate::router::account_key(&candidate);
+        let taken = existing
+            .iter()
+            .any(|u| u.id == candidate || crate::router::account_key(&u.id) == key);
+        if !taken {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Outcome of [`reenable`]. Exit codes map as 0 = Recovered or DryRun,
@@ -1467,6 +1486,46 @@ mod tests {
         assert!(!crate::router::router_json_path(&paths).exists());
         let (found, changes) = import_t3_enabled(&paths, &t3, false).unwrap();
         assert!(found.is_empty() && changes.is_empty());
+    }
+
+    #[test]
+    fn background_import_skips_bad_slugs_and_avoids_account_key_collision() {
+        let json = r#"{
+          "providerInstances": {
+            "bad slug!": {"driver": "antigravity", "enabled": true, "config": {}},
+            "codex_main": {"driver": "codex", "enabled": true, "config": {}}
+          }
+        }"#;
+        let (paths, t3, _g) = setup("import-collision", json);
+        Registry::update(&paths, |r| {
+            r.add(crate::AddSpec {
+                id: "codex".into(),
+                harness: Harness::Codex,
+                display_name: None,
+                home: "~/.codex".into(),
+                binary: None,
+                no_t3: false,
+            })?;
+            r.add_usage(crate::usage::UsageEntry {
+                id: "codex".into(),
+                kind: crate::usage::UsageKind::Codex,
+                instance: Some("codex".into()),
+                display: "Codex".into(),
+                api_key_env: None,
+                db_file: None,
+                extra: Default::default(),
+            })?;
+            r.plugins.insert(crate::plugins::PLUGIN_ROUTER.into(), true);
+            Ok(())
+        })
+        .unwrap();
+        let (found, _) = import_t3_enabled(&paths, &t3, false).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "codex_main");
+        // `codex-main` would collide with `codex` under `account_key`, so `-2` is chosen.
+        assert_eq!(found[0].usage_id.as_deref(), Some("codex-main-2"));
+        let reg = Registry::load(&paths).unwrap();
+        assert!(crate::router::router_json_value(&reg).is_ok());
     }
 
     #[test]
