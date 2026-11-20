@@ -143,7 +143,6 @@ version = "0.1.21"
 dependencies = [
  "agentdeck-usage",
  "libcosmic",
- "serde",
  "serde_json",
 ]
 

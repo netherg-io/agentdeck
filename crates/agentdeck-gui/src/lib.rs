@@ -28,6 +28,10 @@ pub fn run() -> iced::Result {
         .window(iced::window::Settings {
             size: iced::Size::new(1100.0, 700.0),
             min_size: Some(iced::Size::new(900.0, 560.0)),
+            platform_specific: iced::window::settings::PlatformSpecific {
+                application_id: "agentdeck".into(),
+                ..Default::default()
+            },
             ..iced::window::Settings::default()
         })
         .run()

@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=agentdeck
-Name[ru]=agentdeck
+Name=AgentDeck
 Exec=agentdeck
-Icon=utilities-system-monitor-symbolic
+Icon=agentdeck
 Terminal=false
 Categories=Development;Utility;
+StartupWMClass=agentdeck

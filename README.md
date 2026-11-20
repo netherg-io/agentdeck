@@ -23,11 +23,16 @@ What it does:
 cargo install --locked --path crates/agentdeck
 ```
 
-Desktop entry (points at `agentdeck` on `PATH`):
+Install the desktop launcher and icon. The launcher expects `agentdeck` on `PATH`.
 
 ```sh
-install -m 0644 crates/agentdeck/agentdeck.desktop ~/.local/share/applications/
+data_home=${XDG_DATA_HOME:-"$HOME/.local/share"}
+install -Dm644 crates/agentdeck/assets/agentdeck.svg "$data_home/icons/hicolor/scalable/apps/agentdeck.svg"
+touch "$data_home/icons/hicolor"
+install -Dm644 crates/agentdeck/agentdeck.desktop "$data_home/applications/agentdeck.desktop"
 ```
+
+For a GitHub release, use the downloaded `agentdeck.svg` and `agentdeck.desktop` as the source files.
 
 COSMIC applet (separate binary, libcosmic required):
 
@@ -169,8 +174,7 @@ Built-in, enabled per machine with `agentdeck plugin enable <name>`:
   `backlog_add` / `backlog_update` (a per-project backlog in
   `~/.local/state/agentdeck/coordinator/backlog/<project>.json`; closing needs
   the PR and merged SHA, or `done` with the evidence for work that has no PR). The GUI's Coordinator page shows every thread's goal,
-  checklist and the open backlog; the COSMIC applet lists coordinators with
-  open work updated in the last day. After upgrading from 0.1.16 with `router`
+  checklist and the open backlog. After upgrading from 0.1.16 with `router`
   on, run `agentdeck plugin enable coordinator` to keep the skill.
   Every `checklist_update` that changes an item's status writes a report
   (goal, N/M, what changed) to `coordinator/reports.jsonl` in the state dir,

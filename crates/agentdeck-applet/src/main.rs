@@ -240,84 +240,8 @@ fn read_state() -> Result<AppState, String> {
     Ok(state)
 }
 
-/// Fields of agentdeck's per-thread coordinator state the popup shows
-/// (`agentdeck_core::thread_state`; read directly to keep the applet light).
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-struct CoordItem {
-    title: String,
-    status: String,
-}
-
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-struct CoordState {
-    #[serde(default)]
-    state: String,
-    #[serde(default)]
-    updated: String,
-    #[serde(default)]
-    checklist: Vec<CoordItem>,
-}
-
-fn coord_dir() -> Option<PathBuf> {
-    std::env::var_os("AGENTDECK_STATE_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("XDG_STATE_HOME").map(|d| PathBuf::from(d).join("agentdeck")))
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state/agentdeck"))
-        })
-        .map(|d| d.join("threads"))
-}
-
-/// `YYYY-MM-DDTHH:MM:SSZ` to unix seconds (0 when malformed).
-fn parse_utc(s: &str) -> i64 {
-    let n = |r: std::ops::Range<usize>| s.get(r).and_then(|v| v.parse::<i64>().ok());
-    let (Some(y), Some(m), Some(d), Some(hh), Some(mm)) =
-        (n(0..4), n(5..7), n(8..10), n(11..13), n(14..16))
-    else {
-        return 0;
-    };
-    // Days from civil (H. Hinnant).
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    (era * 146_097 + doe - 719_468) * 86_400 + hh * 3600 + mm * 60
-}
-
-/// Coordinators with open checklist work updated in the last day, newest first.
-fn active_coordinators(dir: Option<PathBuf>, timestamp: i64) -> Vec<CoordState> {
-    let mut out: Vec<CoordState> = dir
-        .and_then(|d| std::fs::read_dir(d).ok())
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-        .filter_map(|e| serde_json::from_slice::<CoordState>(&std::fs::read(e.path()).ok()?).ok())
-        .filter(|c| {
-            c.checklist
-                .iter()
-                .any(|i| i.status != "done" && i.status != "held")
-        })
-        .filter(|c| timestamp - parse_utc(&c.updated) < 86_400)
-        .collect();
-    out.sort_by(|a, b| b.updated.cmp(&a.updated));
-    out
-}
-
-/// "5/8 · сейчас: <first running item>" (held items are not open work).
-fn coord_line(c: &CoordState) -> String {
-    let total = c.checklist.iter().filter(|i| i.status != "held").count();
-    let done = c.checklist.iter().filter(|i| i.status == "done").count();
-    match c.checklist.iter().find(|i| i.status == "running") {
-        Some(i) => format!("{done}/{total} · сейчас: {}", i.title),
-        None => format!("{done}/{total}"),
-    }
-}
-
 struct App {
     core: app::Core,
-    coordinators: Vec<CoordState>,
     state: Result<AppState, String>,
     popup: Option<window::Id>,
     revealed: HashSet<String>,
@@ -361,7 +285,6 @@ impl cosmic::Application for App {
         let mut app = Self {
             core,
             state: read_state(),
-            coordinators: active_coordinators(coord_dir(), now()),
             popup: None,
             revealed: HashSet::new(),
             prefs: Prefs::default(),
@@ -380,7 +303,6 @@ impl cosmic::Application for App {
         match message {
             Message::Tick => {
                 self.state = read_state();
-                self.coordinators = active_coordinators(coord_dir(), now());
                 self.reload_visibility();
             }
             Message::Reveal(id) => {
@@ -465,27 +387,6 @@ impl cosmic::Application for App {
             .padding(12)
             .width(Length::Fill)
             .push(widget::text::title4("AI Usage"));
-        if !self.coordinators.is_empty() {
-            content = content.push(widget::text::heading("Координатор"));
-            for c in &self.coordinators {
-                let goal = c.state.lines().next().unwrap_or_default();
-                content = content.push(
-                    widget::column(vec![])
-                        .spacing(2)
-                        .push(
-                            widget::text(goal.to_string())
-                                .size(14)
-                                .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1))),
-                        )
-                        .push(
-                            widget::text(coord_line(c))
-                                .size(13)
-                                .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1))),
-                        ),
-                );
-            }
-            content = content.push(widget::divider::horizontal::default());
-        }
         match &self.state {
             Err(error) => content = content.push(widget::text(error)),
             Ok(state) if state.accounts.is_empty() => {
@@ -643,41 +544,6 @@ mod tests {
 
     fn test_account(id: &str, provider: &str) -> AccountState {
         AccountState::error(id, id, provider, "")
-    }
-
-    #[test]
-    fn coordinators_show_open_recent_work_only() {
-        let dir =
-            std::env::temp_dir().join(format!("agentdeck-applet-coord-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let write = |name: &str, updated: &str, items: &str| {
-            std::fs::write(
-                dir.join(name),
-                format!(r#"{{"state":"Goal {name}\nmore","updated":"{updated}","decisions":[],"checklist":[{items}]}}"#),
-            )
-            .unwrap();
-        };
-        let now = parse_utc("2026-11-16T12:00:00Z");
-        assert_eq!(parse_utc("1970-01-02T00:00:00Z"), 86_400);
-        write(
-            "a.json",
-            "2026-11-16T11:00:00Z",
-            r#"{"id":"1","title":"Cutover","status":"running"},{"id":"2","title":"Tags","status":"done"},{"id":"3","title":"Later","status":"held"}"#,
-        );
-        write(
-            "b.json",
-            "2026-11-16T10:00:00Z",
-            r#"{"id":"1","title":"All done","status":"done"}"#,
-        );
-        write(
-            "c.json",
-            "2026-11-14T10:00:00Z",
-            r#"{"id":"1","title":"Old","status":"todo"}"#,
-        );
-        let active = active_coordinators(Some(dir.clone()), now);
-        assert_eq!(active.len(), 1);
-        assert_eq!(coord_line(&active[0]), "1/2 · сейчас: Cutover");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
