@@ -1,5 +1,10 @@
 use cosmic::iced::core::text::{Ellipsize, EllipsizeHeightLimit};
-use cosmic::iced::core::{event::Event, mouse};
+use cosmic::iced::core::{
+    Clipboard, Layout, Shell, Size, Vector, Widget,
+    event::{Event, Status},
+    layout, mouse, overlay, renderer,
+    widget::{Operation, Tree},
+};
 use cosmic::iced::platform_specific::shell::wayland::commands::popup::destroy_popup;
 use cosmic::iced::{Alignment, Length, Rectangle, Subscription, window};
 use cosmic::{Element, Task, app, widget};
@@ -17,47 +22,199 @@ use agentdeck_usage::visibility::Prefs;
 static AUTOSIZE: LazyLock<widget::Id> = LazyLock::new(widget::Id::unique);
 static SCROLL_ID: LazyLock<widget::Id> = LazyLock::new(widget::Id::unique);
 
-/// Extra gain for touchpad `Pixels` deltas: libcosmic forwards raw Wayland
-/// axis values 1:1 while a mouse-wheel notch scrolls 60px.
-const TOUCHPAD_PIXEL_MULTIPLIER: f32 = 2.5;
+/// Gain for touchpad `Pixels` deltas: libcosmic's sctk backend forwards raw
+/// logical Wayland axis units 1:1 (unlike winit's HiDPI-scaled deltas and
+/// unlike mouse-wheel `Lines`, which scroll 60px/notch).
+const TOUCHPAD_PIXEL_MULTIPLIER: f32 = 2.0;
 
-/// Vertical scroll offset for `scrollable::scroll_by` (positive scrolls DOWN,
-/// matching `Scrollable::update`: `-y * 60.0` for `Lines`, `-y` for `Pixels`).
-/// `None` means the widget already handled the event itself.
-fn popup_scroll_offset(delta: mouse::ScrollDelta, popup_hovered: bool) -> Option<f32> {
+/// Scale touchpad `Pixels` deltas in-place; mouse-wheel `Lines` stay 1x.
+fn scale_wheel_delta(delta: mouse::ScrollDelta) -> mouse::ScrollDelta {
     match delta {
-        mouse::ScrollDelta::Lines { y, .. } => {
-            if y == 0.0 || popup_hovered {
-                None
-            } else {
-                Some(-y * 60.0)
-            }
+        mouse::ScrollDelta::Pixels { x, y } => mouse::ScrollDelta::Pixels {
+            x: x * TOUCHPAD_PIXEL_MULTIPLIER,
+            y: y * TOUCHPAD_PIXEL_MULTIPLIER,
+        },
+        mouse::ScrollDelta::Lines { .. } => delta,
+    }
+}
+
+/// Vertical scroll offset for `scrollable::scroll_by` when a wheel event lands
+/// on the panel icon surface instead of the popup (positive scrolls DOWN).
+fn panel_scroll_offset(delta: mouse::ScrollDelta) -> Option<f32> {
+    match scale_wheel_delta(delta) {
+        mouse::ScrollDelta::Lines { y, .. } if y != 0.0 => Some(-y * 60.0),
+        mouse::ScrollDelta::Pixels { y, .. } if y != 0.0 => Some(-y),
+        _ => None,
+    }
+}
+
+/// Only forward unhandled wheel events (e.g. from the panel icon surface while
+/// the popup is open); popup-surface scrolling is handled directly by
+/// [`SmoothScroll`] without emitting a message or rebuilding `view()`.
+fn applet_events(event: Event, status: Status, window_id: window::Id) -> Option<Message> {
+    if status != Status::Ignored {
+        return None;
+    }
+    match event {
+        Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+            Some(Message::PanelWheel(window_id, delta))
         }
-        mouse::ScrollDelta::Pixels { y, .. } => {
-            if y == 0.0 {
-                None
-            } else if popup_hovered {
-                // Widget applied 1x itself; top up to the full multiplier.
-                Some(-y * (TOUCHPAD_PIXEL_MULTIPLIER - 1.0))
-            } else {
-                Some(-y * TOUCHPAD_PIXEL_MULTIPLIER)
-            }
+        _ => None,
+    }
+}
+
+/// Wraps the popup `Scrollable` to scale touchpad `Pixels` deltas in a single
+/// pass (zero `Message`s, zero `view()` rebuilds, zero two-phase stutter) and
+/// accept wheel events even while the pointer is parked outside the popup.
+struct SmoothScroll<'a, Message> {
+    content: Element<'a, Message>,
+}
+
+impl<'a, Message> SmoothScroll<'a, Message> {
+    fn new(content: impl Into<Element<'a, Message>>) -> Self {
+        Self {
+            content: content.into(),
         }
     }
 }
 
-/// `listen_with` takes a plain `fn`, so tag hover events with their window id
-/// and filter against `self.popup` in `update`.
-fn applet_events(
-    event: Event,
-    _status: cosmic::iced::core::event::Status,
-    window_id: window::Id,
-) -> Option<Message> {
-    match event {
-        Event::Mouse(mouse::Event::CursorEntered) => Some(Message::PopupHovered(window_id, true)),
-        Event::Mouse(mouse::Event::CursorLeft) => Some(Message::PopupHovered(window_id, false)),
-        Event::Mouse(mouse::Event::WheelScrolled { delta }) => Some(Message::PopupWheel(delta)),
-        _ => None,
+impl<Message> Widget<Message, cosmic::Theme, cosmic::Renderer> for SmoothScroll<'_, Message> {
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn size_hint(&self) -> Size<Length> {
+        self.content.as_widget().size_hint()
+    }
+
+    fn tag(&self) -> cosmic::iced::core::widget::tree::Tag {
+        self.content.as_widget().tag()
+    }
+
+    fn state(&self) -> cosmic::iced::core::widget::tree::State {
+        self.content.as_widget().state()
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        self.content.as_widget().children()
+    }
+
+    fn diff(&mut self, tree: &mut Tree) {
+        self.content.as_widget_mut().diff(tree);
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &cosmic::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content.as_widget_mut().layout(tree, renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &cosmic::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(tree, layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &cosmic::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        if let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event {
+            let scaled = Event::Mouse(mouse::Event::WheelScrolled {
+                delta: scale_wheel_delta(*delta),
+            });
+            let bounds = layout.bounds();
+            let effective_cursor = if cursor.position_over(bounds).is_some() {
+                cursor
+            } else {
+                mouse::Cursor::Available(bounds.center())
+            };
+            self.content.as_widget_mut().update(
+                tree,
+                &scaled,
+                layout,
+                effective_cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+            return;
+        }
+        self.content.as_widget_mut().update(
+            tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &cosmic::Renderer,
+    ) -> mouse::Interaction {
+        self.content
+            .as_widget()
+            .mouse_interaction(tree, layout, cursor, viewport, renderer)
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut cosmic::Renderer,
+        theme: &cosmic::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content
+            .as_widget()
+            .draw(tree, renderer, theme, style, layout, cursor, viewport);
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &cosmic::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, cosmic::Theme, cosmic::Renderer>> {
+        self.content
+            .as_widget_mut()
+            .overlay(tree, layout, renderer, viewport, translation)
+    }
+
+    fn id(&self) -> Option<widget::Id> {
+        self.content.as_widget().id()
+    }
+
+    fn set_id(&mut self, id: widget::Id) {
+        self.content.as_widget_mut().set_id(id);
+    }
+}
+
+impl<'a, Message: 'a> From<SmoothScroll<'a, Message>> for Element<'a, Message> {
+    fn from(wrapper: SmoothScroll<'a, Message>) -> Self {
+        Element::new(wrapper)
     }
 }
 
@@ -290,7 +447,6 @@ struct App {
     core: app::Core,
     state: Result<AppState, String>,
     popup: Option<window::Id>,
-    popup_hovered: bool,
     revealed: HashSet<String>,
     prefs: Prefs,
     prefs_error: Option<String>,
@@ -302,8 +458,7 @@ enum Message {
     TogglePopup(Rectangle<i32>),
     CloseRequested(window::Id),
     Reveal(String),
-    PopupHovered(window::Id, bool),
-    PopupWheel(mouse::ScrollDelta),
+    PanelWheel(window::Id, mouse::ScrollDelta),
 }
 
 impl App {
@@ -335,7 +490,6 @@ impl cosmic::Application for App {
             core,
             state: read_state(),
             popup: None,
-            popup_hovered: false,
             revealed: HashSet::new(),
             prefs: Prefs::default(),
             prefs_error: None,
@@ -368,20 +522,12 @@ impl cosmic::Application for App {
             Message::CloseRequested(id) => {
                 if self.popup == Some(id) {
                     self.popup = None;
-                    self.popup_hovered = false;
                     self.revealed.clear();
                 }
             }
-            Message::PopupHovered(id, hovered) => {
-                if self.popup == Some(id) {
-                    self.popup_hovered = hovered;
-                }
-            }
-            Message::PopupWheel(delta) => {
-                // One Wayland axis frame reaches a single surface, so act
-                // whenever the popup is open (pointer on icon or in popup).
-                if self.popup.is_some()
-                    && let Some(y) = popup_scroll_offset(delta, self.popup_hovered)
+            Message::PanelWheel(window_id, delta) => {
+                if self.popup.is_some_and(|p| p != window_id)
+                    && let Some(y) = panel_scroll_offset(delta)
                 {
                     return cosmic::iced::widget::scrollable::scroll_by(
                         SCROLL_ID.clone(),
@@ -391,7 +537,6 @@ impl cosmic::Application for App {
             }
             Message::TogglePopup(rectangle) => {
                 self.revealed.clear();
-                self.popup_hovered = false;
                 if let Some(id) = self.popup.take() {
                     return destroy_popup(id);
                 }
@@ -544,13 +689,13 @@ impl cosmic::Application for App {
         self.core
             .applet
             .popup_container(
-                widget::container(
+                widget::container(SmoothScroll::new(
                     widget::scrollable(content)
                         .id(SCROLL_ID.clone())
                         .scroller_width(4.0)
                         .scrollbar_width(8.0)
                         .height(Length::Shrink),
-                )
+                ))
                 .width(360)
                 .max_height(600),
             )
@@ -622,46 +767,34 @@ mod tests {
     }
 
     #[test]
-    fn popup_scroll_offset_outside_popup_scrolls_full_speed() {
-        // One mouse-wheel notch down scrolls 60px, matching iced.
+    fn wheel_scaling_boosts_touchpad_pixels_and_preserves_mouse_lines() {
         assert_eq!(
-            popup_scroll_offset(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }, false),
+            scale_wheel_delta(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }),
+            mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }
+        );
+        assert_eq!(
+            scale_wheel_delta(mouse::ScrollDelta::Pixels { x: 2.0, y: -10.0 }),
+            mouse::ScrollDelta::Pixels {
+                x: 2.0 * TOUCHPAD_PIXEL_MULTIPLIER,
+                y: -10.0 * TOUCHPAD_PIXEL_MULTIPLIER,
+            }
+        );
+        assert_eq!(
+            panel_scroll_offset(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }),
             Some(60.0)
         );
-        // Touchpad pixels get the full multiplier when the widget ignores
-        // the event (pointer outside the popup).
         assert_eq!(
-            popup_scroll_offset(mouse::ScrollDelta::Pixels { x: 0.0, y: -10.0 }, false),
+            panel_scroll_offset(mouse::ScrollDelta::Pixels { x: 0.0, y: -10.0 }),
             Some(10.0 * TOUCHPAD_PIXEL_MULTIPLIER)
         );
-    }
-
-    #[test]
-    fn popup_scroll_offset_inside_popup_only_boosts_touchpad() {
-        // Mouse wheel is already handled by the widget: no double-scroll.
         assert_eq!(
-            popup_scroll_offset(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }, true),
+            panel_scroll_offset(mouse::ScrollDelta::Lines { x: 0.0, y: 0.0 }),
             None
         );
-        // Touchpad already scrolled 1x in the widget; top up the remainder.
         assert_eq!(
-            popup_scroll_offset(mouse::ScrollDelta::Pixels { x: 0.0, y: -10.0 }, true),
-            Some(10.0 * (TOUCHPAD_PIXEL_MULTIPLIER - 1.0))
+            panel_scroll_offset(mouse::ScrollDelta::Pixels { x: 0.0, y: 0.0 }),
+            None
         );
-    }
-
-    #[test]
-    fn popup_scroll_offset_ignores_zero_deltas() {
-        for hovered in [false, true] {
-            assert_eq!(
-                popup_scroll_offset(mouse::ScrollDelta::Lines { x: 0.0, y: 0.0 }, hovered),
-                None
-            );
-            assert_eq!(
-                popup_scroll_offset(mouse::ScrollDelta::Pixels { x: 0.0, y: 0.0 }, hovered),
-                None
-            );
-        }
     }
 
     #[test]
