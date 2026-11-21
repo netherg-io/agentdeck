@@ -147,6 +147,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentdeck-coordinator"
+version = "0.1.23"
+dependencies = [
+ "agentdeck-core",
+ "anyhow",
+ "libc",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "agentdeck-core"
 version = "0.1.23"
 dependencies = [
