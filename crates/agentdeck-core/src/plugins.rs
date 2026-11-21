@@ -364,7 +364,7 @@ const PLUGIN_SKILLS: [(&str, &[(&str, &str)]); 3] = [
 /// (`shipped_skills_revision_is_bumped` pins the content hash). A build never
 /// rewrites skills that a build with a higher revision wrote, so a stale
 /// daemon or MCP server left running after an upgrade cannot roll them back.
-pub const PLUGIN_SKILLS_REV: u64 = 8;
+pub const PLUGIN_SKILLS_REV: u64 = 9;
 const PLUGIN_SKILLS_REV_FILE: &str = ".rev";
 
 fn stored_plugin_skills_rev(dir: &Path) -> u64 {
@@ -916,15 +916,15 @@ pub fn status(paths: &Paths, home: &Path, exe: &Path) -> Vec<PluginStatus> {
             format!("open backlog items: {open}"),
         ],
     });
-    let app = crate::settings::read_approver(&reg).unwrap_or_default();
-    let tg_ok = crate::settings::approver_telegram_configured(&paths.config_dir);
-    out.push(PluginStatus {
-        name: PLUGIN_APPROVER,
-        enabled: plugin_enabled(&reg, PLUGIN_APPROVER),
-        available: true,
-        detail: vec![
+    let app = crate::settings::read_approver(&reg);
+    let tg = crate::settings::approver_env_status(&paths.config_dir);
+    // Strictly read-only: an invalid `[approver]` is reported as invalid
+    // (never silently replaced by defaults), and a malformed `approver.env`
+    // is never reported as configured.
+    let approver_detail = match &app {
+        Ok(app) => vec![
             format!("socket: {}", app.resolved_socket_path().display()),
-            format!("telegram: {}", if tg_ok { "configured" } else { "missing" }),
+            format!("telegram: {}", tg.as_str()),
             format!(
                 "timeouts: {}s autonomous / {}s interactive",
                 app.autonomous_timeout_secs, app.interactive_timeout_secs
@@ -940,6 +940,16 @@ pub fn status(paths: &Paths, home: &Path, exe: &Path) -> Vec<PluginStatus> {
                 app.judge_confidence_threshold,
             ),
         ],
+        Err(e) => vec![
+            format!("config: invalid ({e:#})"),
+            format!("telegram: {}", tg.as_str()),
+        ],
+    };
+    out.push(PluginStatus {
+        name: PLUGIN_APPROVER,
+        enabled: plugin_enabled(&reg, PLUGIN_APPROVER),
+        available: true,
+        detail: approver_detail,
     });
     out.push(PluginStatus {
         name: PLUGIN_MCP_SERVER,
@@ -1192,7 +1202,9 @@ pub fn plan_disable(
 }
 
 /// Apply enable/disable changes (files, symlink, registry). Service reloads
-/// ride along with their own changes; nothing is ever started.
+/// ride along with their own changes; nothing is ever started. The registry
+/// flag goes through a locked key update (not the planned whole-image bytes),
+/// so a settings edit that landed after the plan is never overwritten.
 pub fn apply_all(
     paths: &Paths,
     name: &str,
@@ -1223,7 +1235,9 @@ pub fn apply_all(
     } else {
         apply_changes(&file_changes)?;
     }
-    apply_changes(&reg_changes)?;
+    if !reg_changes.is_empty() {
+        Registry::update(paths, |reg| set_plugin_flag(reg, name, enable))?;
+    }
     Ok(())
 }
 
@@ -1333,7 +1347,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!((PLUGIN_SKILLS_REV, hash), (8, 0x8f14_2515_75ec_92e1));
+        assert_eq!((PLUGIN_SKILLS_REV, hash), (9, 0xfcc7_7ee8_837e_e9c6));
     }
 
     /// Every file, link and dir under `root` except agentdeck's own config
@@ -1959,5 +1973,75 @@ mod tests {
         assert!(plan_enable_agent_process(&home, &files, &exe, false, &paths.state_dir).is_err());
         assert!(!agent_process_link(&home).exists());
         assert_eq!(fs::read(&files[0]).unwrap(), b"ok\n");
+    }
+
+    #[test]
+    fn plugin_toggle_preserves_concurrent_settings_edit() {
+        let _env = test_env_lock();
+        let (_g, home, paths, files, exe) = setup("toggle-race");
+        // Plan the toggle against a snapshot, then land an approver edit
+        // before applying: the stale plan must not clobber it.
+        let planned = plan_enable(&paths, &home, &files, &exe, PLUGIN_COORDINATOR, false).unwrap();
+        assert!(!planned.is_empty());
+        crate::settings::write_approver(
+            &paths,
+            &crate::settings::ApproverSettings {
+                autonomous_timeout_secs: 90,
+                interactive_timeout_secs: 300,
+                ..crate::settings::ApproverSettings::default()
+            },
+            false,
+        )
+        .unwrap();
+        apply_all(&paths, PLUGIN_COORDINATOR, true, &planned).unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        assert!(plugin_enabled(&reg, PLUGIN_COORDINATOR));
+        assert_eq!(
+            crate::settings::read_approver(&reg).unwrap().autonomous_timeout_secs,
+            90
+        );
+    }
+
+    #[test]
+    fn approver_status_is_read_only_and_strict() {
+        let _env = test_env_lock();
+        let (_g, home, paths, _files, exe) = setup("approver-status");
+        let detail = |name: &str| {
+            status(&paths, &home, &exe)
+                .into_iter()
+                .find(|s| s.name == name)
+                .unwrap()
+                .detail
+                .join("\n")
+        };
+        // Absent config and env: defaults plus missing.
+        assert!(detail(PLUGIN_APPROVER).contains("telegram: missing"));
+        // An invalid [approver] is reported, not defaulted.
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::write(
+            paths.registry_file(),
+            "version = 1\n[approver]\nautonomous_timeout_secs = 0\n",
+        )
+        .unwrap();
+        assert!(detail(PLUGIN_APPROVER).contains("config: invalid"));
+        // A malformed approver.env is invalid, never configured.
+        fs::write(
+            paths.config_dir.join("approver.env"),
+            "TELEGRAM_BOT_TOKEN=x\nTELEGRAM_OWNER_ID=not-a-number\n",
+        )
+        .unwrap();
+        let d = detail(PLUGIN_APPROVER);
+        assert!(d.contains("telegram: invalid"), "{d}");
+        assert!(!d.contains("configured"), "{d}");
+        fs::write(
+            paths.config_dir.join("approver.env"),
+            "TELEGRAM_BOT_TOKEN=x\nTELEGRAM_OWNER_ID=42\n",
+        )
+        .unwrap();
+        assert!(detail(PLUGIN_APPROVER).contains("telegram: configured"));
+        // Status never writes: the registry bytes are untouched by the calls above.
+        let snap = fs::read(paths.registry_file()).unwrap();
+        let _ = detail(PLUGIN_APPROVER);
+        assert_eq!(fs::read(paths.registry_file()).unwrap(), snap);
     }
 }

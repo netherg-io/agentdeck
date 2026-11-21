@@ -5,7 +5,7 @@
 //! its own reads its parent's, and its first write copies that state over.
 
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -88,6 +88,12 @@ pub struct ThreadState {
     pub checkpoint_count: u32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub last_checkpoint_at: String,
+    /// Cumulative T3 run/item totals at the last Checkpoint: the Watchdog
+    /// subtracts these baselines so only work since the Checkpoint counts.
+    #[serde(default)]
+    pub checkpoint_run_count: u64,
+    #[serde(default)]
+    pub checkpoint_item_count: u64,
 }
 
 /// Autonomous Run phase. `Intake` is the default so legacy threads deserialize.
@@ -413,6 +419,16 @@ fn reports_file(paths: &Paths) -> PathBuf {
 }
 
 fn append_report(paths: &Paths, r: &Report) -> anyhow::Result<()> {
+    // Serialized by an exclusive flock so concurrent checklist updates from
+    // several threads never race on the shared temp path or truncate lines.
+    let dir = paths.state_dir.join("coordinator");
+    fs::create_dir_all(&dir)?;
+    let _guard = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("reports.lock"))?;
+    _guard.lock()?;
     let path = reports_file(paths);
     let mut lines: Vec<String> = fs::read_to_string(&path)
         .unwrap_or_default()
@@ -576,6 +592,23 @@ pub fn set_run_meta(
     )
 }
 
+/// Partial state write; absent fields keep their value. `sleep_until`: None
+/// leaves the deadline unchanged, Some(None) clears it, Some(Some(t)) sets
+/// it. `checkpoint_run_count` / `checkpoint_item_count` are cumulative T3
+/// totals stored only when `record_checkpoint` succeeds (the Watchdog
+/// subtracts them so only work since the Checkpoint counts).
+#[derive(Debug, Clone, Default)]
+pub struct StateUpdate<'a> {
+    pub state: Option<&'a str>,
+    pub decision: Option<&'a str>,
+    pub phase: Option<RunPhase>,
+    pub mandate: Option<RunMandate>,
+    pub sleep_until: Option<Option<String>>,
+    pub record_checkpoint: bool,
+    pub checkpoint_run_count: Option<u64>,
+    pub checkpoint_item_count: Option<u64>,
+}
+
 /// One atomic transaction for every state change: validates sizes, the RFC3339
 /// `sleep_until` deadline and checkpoint freshness under the per-thread lock,
 /// then mutates and saves once. `write` and `set_run_meta` delegate here so
@@ -593,50 +626,166 @@ pub fn apply_update(
     sleep_until: Option<Option<String>>,
     record_checkpoint: bool,
 ) -> anyhow::Result<ThreadState> {
-    if state.is_some_and(|s| s.len() > MAX_STATE) {
+    apply_state_update(
+        paths,
+        t3_root,
+        id,
+        StateUpdate {
+            state,
+            decision,
+            phase,
+            mandate,
+            sleep_until,
+            record_checkpoint,
+            checkpoint_run_count: None,
+            checkpoint_item_count: None,
+        },
+    )
+}
+
+/// Same locked transaction as [`apply_update`], but also records cumulative
+/// T3 run/item baselines when `update.record_checkpoint` succeeds.
+pub fn apply_state_update(
+    paths: &Paths,
+    t3_root: Option<&Path>,
+    id: &str,
+    update: StateUpdate<'_>,
+) -> anyhow::Result<ThreadState> {
+    if update.state.is_some_and(|s| s.len() > MAX_STATE) {
         anyhow::bail!(
             "state over {MAX_STATE} bytes: keep it a summary that cites issues and files"
         );
     }
-    if decision.is_some_and(|d| d.len() > MAX_DECISION) {
+    if update.decision.is_some_and(|d| d.len() > MAX_DECISION) {
         anyhow::bail!("decision over {MAX_DECISION} bytes");
     }
-    if let Some(Some(s)) = sleep_until.as_ref()
+    if let Some(Some(s)) = update.sleep_until.as_ref()
         && !valid_sleep_until(s)
     {
         anyhow::bail!("sleep_until {s:?} is not RFC3339 (YYYY-MM-DDTHH:MM:SSZ)");
     }
     mutate(paths, t3_root, id, |data, now| {
-        if let Some(s) = state {
+        if let Some(s) = update.state {
             data.state = s.to_string();
             // Fresh snapshot: it reflects all checklist movement so far.
             data.state_updated_at = now.to_string();
             data.checklist_updates_since_state = 0;
         }
-        if let Some(d) = decision {
+        if let Some(d) = update.decision {
             data.decisions.push(Decision {
                 at: now.to_string(),
                 text: d.to_string(),
             });
         }
-        if let Some(p) = phase {
+        if let Some(p) = update.phase {
             data.phase = p;
         }
-        if let Some(m) = mandate {
+        if let Some(m) = update.mandate {
             data.mandate = Some(m);
         }
-        if let Some(s) = sleep_until.clone() {
+        // A finished or reset run never keeps a live owner grant: a later
+        // `Running` write without a fresh grant stays ungranted.
+        if matches!(data.phase, RunPhase::Completed | RunPhase::Intake)
+            && let Some(m) = data.mandate.as_mut()
+        {
+            m.owner_granted = false;
+        }
+        if let Some(s) = update.sleep_until.clone() {
             data.sleep_until = s;
         }
-        if record_checkpoint {
+        if update.record_checkpoint {
             // After the fresh snapshot above, so one call can write state and
             // record its checkpoint together.
             data.can_checkpoint()?;
             data.checkpoint_count = data.checkpoint_count.saturating_add(1);
             data.last_checkpoint_at = now.to_string();
+            if let Some(n) = update.checkpoint_run_count {
+                data.checkpoint_run_count = n;
+            }
+            if let Some(n) = update.checkpoint_item_count {
+                data.checkpoint_item_count = n;
+            }
         }
         Ok(())
     })
+}
+
+/// Owner Grant sealed under the per-thread lock: requires an existing mandate
+/// matching `expected` (scope fields only; `owner_granted` is ignored),
+/// rejects completed runs, and flips ONLY `owner_granted` on (scope untouched).
+/// Intake, Running and SleepingForQuota are all grantable.
+pub fn grant_mandate_if_matches(
+    paths: &Paths,
+    thread_id: &str,
+    expected: &RunMandate,
+) -> anyhow::Result<ThreadState> {
+    mutate(paths, None, thread_id, |data, _| {
+        let m = data.mandate.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("thread {thread_id:?} has no mandate to grant")
+        })?;
+        if data.phase == RunPhase::Completed {
+            anyhow::bail!("thread {thread_id:?} is completed: start a new run instead");
+        }
+        if m.project != expected.project
+            || m.allowed_hosts != expected.allowed_hosts
+            || m.allowed_apps != expected.allowed_apps
+            || m.allow_releases != expected.allow_releases
+            || m.fix_forward_max != expected.fix_forward_max
+            || m.review_rounds_max != expected.review_rounds_max
+            || m.notes != expected.notes
+        {
+            anyhow::bail!(
+                "thread {thread_id:?} mandate changed since it was shown: re-check before granting"
+            );
+        }
+        m.owner_granted = true;
+        Ok(())
+    })
+}
+
+/// Owner Revoke under the per-thread lock: clears ONLY `owner_granted` on the
+/// existing mandate without replacing scope.
+pub fn revoke_mandate(paths: &Paths, thread_id: &str) -> anyhow::Result<ThreadState> {
+    mutate(paths, None, thread_id, |data, _| {
+        let m = data.mandate.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("thread {thread_id:?} has no mandate to revoke")
+        })?;
+        m.owner_granted = false;
+        Ok(())
+    })
+}
+
+/// Atomic compare-and-swap of run phase for the Watchdog: under the
+/// per-thread lock, returns `Ok(None)` without writing when the current
+/// `phase` or `sleep_until` deadline differs from the expected pair;
+/// otherwise writes the new phase/deadline (revoking `owner_granted` on
+/// `Completed`/`Intake`) and returns the saved state.
+pub fn transition_phase_if(
+    paths: &Paths,
+    thread_id: &str,
+    expected_phase: RunPhase,
+    expected_sleep_until: Option<&str>,
+    new_phase: RunPhase,
+    new_sleep_until: Option<Option<String>>,
+) -> anyhow::Result<Option<ThreadState>> {
+    let (path, _guard) = thread_lock(paths, thread_id)?;
+    let mut data = load_or_seed(paths, None, thread_id)?;
+    if data.phase != expected_phase || data.sleep_until.as_deref() != expected_sleep_until {
+        return Ok(None);
+    }
+    data.phase = new_phase;
+    if let Some(s) = new_sleep_until {
+        data.sleep_until = s;
+    }
+    if matches!(new_phase, RunPhase::Completed | RunPhase::Intake)
+        && let Some(m) = data.mandate.as_mut()
+    {
+        m.owner_granted = false;
+    }
+    let now = utc_now();
+    data.updated = now;
+    crate::backlog::save_json(&path, &data)?;
+    Ok(Some(data))
 }
 
 /// Checked RFC3339 deadline (`YYYY-MM-DDTHH:MM:SS[.frac]` with `Z` or a
@@ -812,6 +961,39 @@ pub fn assumption_add(
         .ok_or_else(|| anyhow::anyhow!("assumption was not saved"))
 }
 
+/// Exclusive flock on `<thread_id>.lock` (same pattern as `backlog::locked`),
+/// so concurrent writers never interleave on one thread's file.
+fn thread_lock(paths: &Paths, id: &str) -> anyhow::Result<(PathBuf, File)> {
+    let path = file(paths, id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let guard = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("lock"))?;
+    guard.lock()?;
+    Ok((path, guard))
+}
+
+/// This thread's state, else a forked-from ancestor's (mandate stripped), else
+/// a blank state.
+fn load_or_seed(paths: &Paths, t3_root: Option<&Path>, id: &str) -> anyhow::Result<ThreadState> {
+    match load(paths, id)? {
+        Some(d) => Ok(d),
+        None => Ok(read(paths, t3_root, id)?
+            .map(|f| {
+                let mut d = f.data;
+                if f.inherited_from.is_some() {
+                    d.strip_inherited_mandate();
+                }
+                d
+            })
+            .unwrap_or_default()),
+    }
+}
+
 /// Load this thread's state (or seed it from a forked-from ancestor), apply
 /// `f`, stamp it and save atomically. Serialized by an exclusive flock on
 /// `<thread_id>.lock` (same pattern as `backlog::locked`), so concurrent
@@ -822,28 +1004,8 @@ fn mutate(
     id: &str,
     f: impl FnOnce(&mut ThreadState, &str) -> anyhow::Result<()>,
 ) -> anyhow::Result<ThreadState> {
-    let path = file(paths, id)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let _guard = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path.with_extension("lock"))?;
-    _guard.lock()?;
-    let mut data = match load(paths, id)? {
-        Some(d) => d,
-        None => read(paths, t3_root, id)?
-            .map(|f| {
-                let mut d = f.data;
-                if f.inherited_from.is_some() {
-                    d.strip_inherited_mandate();
-                }
-                d
-            })
-            .unwrap_or_default(),
-    };
+    let (path, _guard) = thread_lock(paths, id)?;
+    let mut data = load_or_seed(paths, t3_root, id)?;
     let now = utc_now();
     f(&mut data, &now)?;
     data.updated = now;
@@ -1129,6 +1291,8 @@ mod tests {
         assert!(f.data.sleep_until.is_none());
         assert_eq!(f.data.checklist_updates_since_state, 0);
         assert_eq!(f.data.checkpoint_count, 0);
+        assert_eq!(f.data.checkpoint_run_count, 0);
+        assert_eq!(f.data.checkpoint_item_count, 0);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1432,6 +1596,297 @@ mod tests {
         assert!(!load(&paths, "t").unwrap().unwrap().has_unblocked_work());
         update_checklist(&paths, None, "t", None, &[p("d", "D", "review")], &[]).unwrap();
         assert!(load(&paths, "t").unwrap().unwrap().has_unblocked_work());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn granted_mandate() -> RunMandate {
+        RunMandate {
+            project: "blockfield".into(),
+            allowed_hosts: vec!["staging".into()],
+            allowed_apps: vec!["deploy".into()],
+            owner_granted: true,
+            ..RunMandate::default()
+        }
+    }
+
+    #[test]
+    fn completing_or_intake_revokes_owner_grant() {
+        let (dir, paths) = fx("revoke");
+        write(&paths, None, "t", Some("Goal: x"), None).unwrap();
+        set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::Running),
+            Some(granted_mandate()),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(load(&paths, "t").unwrap().unwrap().mandate.unwrap().owner_granted);
+        // Completing the run clears the grant ...
+        let s = set_run_meta(&paths, None, "t", Some(RunPhase::Completed), None, None, false)
+            .unwrap();
+        assert!(!s.mandate.as_ref().unwrap().owner_granted);
+        // ... and flipping back to Running does not resurrect it.
+        let s =
+            set_run_meta(&paths, None, "t", Some(RunPhase::Running), None, None, false).unwrap();
+        assert!(!s.mandate.as_ref().unwrap().owner_granted);
+        // Same for a reset to Intake.
+        set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::Running),
+            Some(granted_mandate()),
+            None,
+            false,
+        )
+        .unwrap();
+        let s =
+            set_run_meta(&paths, None, "t", Some(RunPhase::Intake), None, None, false).unwrap();
+        assert!(!s.mandate.as_ref().unwrap().owner_granted);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn grant_and_revoke_mandate_keep_scope() {
+        let (dir, paths) = fx("grant");
+        write(&paths, None, "t", Some("Goal: x"), None).unwrap();
+        // No mandate: both fail.
+        assert!(grant_mandate_if_matches(&paths, "t", &granted_mandate()).is_err());
+        assert!(revoke_mandate(&paths, "t").is_err());
+        // Intake is grantable, and only the flag flips.
+        set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::Intake),
+            Some(RunMandate {
+                owner_granted: false,
+                ..granted_mandate()
+            }),
+            None,
+            false,
+        )
+        .unwrap();
+        let shown = RunMandate {
+            owner_granted: false,
+            ..granted_mandate()
+        };
+        let s = grant_mandate_if_matches(&paths, "t", &shown).unwrap();
+        let m = s.mandate.unwrap();
+        assert!(m.owner_granted);
+        assert_eq!((m.project.as_str(), m.allowed_hosts, m.allowed_apps), ("blockfield", vec!["staging".to_string()], vec!["deploy".to_string()]));
+        // A concurrently modified scope is rejected, grant untouched.
+        let mut changed = shown.clone();
+        changed.allowed_hosts.push("prod".into());
+        set_run_meta(&paths, None, "t", Some(RunPhase::Running), Some(changed), None, false)
+            .unwrap();
+        assert!(grant_mandate_if_matches(&paths, "t", &shown).is_err());
+        // Completed runs are never grantable.
+        set_run_meta(&paths, None, "t", Some(RunPhase::Completed), None, None, false).unwrap();
+        assert!(grant_mandate_if_matches(&paths, "t", &shown).is_err());
+        // Revoke clears only the flag.
+        let s = revoke_mandate(&paths, "t").unwrap();
+        let m = s.mandate.unwrap();
+        assert!(!m.owner_granted);
+        assert_eq!(m.allowed_hosts, vec!["staging".to_string(), "prod".to_string()]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn transition_phase_if_is_a_locked_cas() {
+        let (dir, paths) = fx("cas");
+        write(&paths, None, "t", Some("Goal: x"), None).unwrap();
+        set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::SleepingForQuota),
+            Some(granted_mandate()),
+            Some(Some("2026-11-22T00:00:00Z".into())),
+            false,
+        )
+        .unwrap();
+        // Wrong expected phase: no write.
+        assert!(
+            transition_phase_if(
+                &paths,
+                "t",
+                RunPhase::Running,
+                Some("2026-11-22T00:00:00Z"),
+                RunPhase::Running,
+                Some(None),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(load(&paths, "t").unwrap().unwrap().phase, RunPhase::SleepingForQuota);
+        // Wrong expected deadline: no write.
+        assert!(
+            transition_phase_if(
+                &paths,
+                "t",
+                RunPhase::SleepingForQuota,
+                Some("2026-11-23T00:00:00Z"),
+                RunPhase::Running,
+                Some(None),
+            )
+            .unwrap()
+            .is_none()
+        );
+        // Match: flips phase and clears the deadline.
+        let s = transition_phase_if(
+            &paths,
+            "t",
+            RunPhase::SleepingForQuota,
+            Some("2026-11-22T00:00:00Z"),
+            RunPhase::Running,
+            Some(None),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(s.phase, RunPhase::Running);
+        assert!(s.sleep_until.is_none());
+        assert!(s.mandate.as_ref().unwrap().owner_granted);
+        // A completed thread is never flipped back to Running (stale CAS loses).
+        set_run_meta(&paths, None, "t", Some(RunPhase::Completed), None, None, false).unwrap();
+        assert!(
+            transition_phase_if(
+                &paths,
+                "t",
+                RunPhase::SleepingForQuota,
+                None,
+                RunPhase::Running,
+                Some(None),
+            )
+            .unwrap()
+            .is_none()
+        );
+        let s = load(&paths, "t").unwrap().unwrap();
+        assert_eq!(s.phase, RunPhase::Completed);
+        assert!(!s.mandate.as_ref().unwrap().owner_granted);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn checkpoint_baselines_recorded_only_on_success() {
+        let (dir, paths) = fx("baselines");
+        write(&paths, None, "t", Some("Goal: x"), None).unwrap();
+        let s = apply_state_update(
+            &paths,
+            None,
+            "t",
+            StateUpdate {
+                record_checkpoint: true,
+                checkpoint_run_count: Some(81),
+                checkpoint_item_count: Some(1501),
+                ..StateUpdate::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((s.checkpoint_count, s.checkpoint_run_count, s.checkpoint_item_count), (1, 81, 1501));
+        // A checkpoint without totals leaves the baselines alone.
+        let s = apply_state_update(
+            &paths,
+            None,
+            "t",
+            StateUpdate {
+                record_checkpoint: true,
+                ..StateUpdate::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((s.checkpoint_count, s.checkpoint_run_count, s.checkpoint_item_count), (2, 81, 1501));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_checkpoint_rolls_back_decision() {
+        let (dir, paths) = fx("rollback");
+        write(&paths, None, "t", Some("Goal: x"), None).unwrap();
+        // Age the snapshot: 5 note-only checklist updates make it stale.
+        update_checklist(
+            &paths,
+            None,
+            "t",
+            None,
+            &[ItemPatch {
+                id: "a".into(),
+                title: Some("A".into()),
+                ..ItemPatch::default()
+            }],
+            &[],
+        )
+        .unwrap();
+        for _ in 0..5 {
+            update_checklist(
+                &paths,
+                None,
+                "t",
+                None,
+                &[ItemPatch {
+                    id: "a".into(),
+                    note: Some("still running".into()),
+                    ..ItemPatch::default()
+                }],
+                &[],
+            )
+            .unwrap();
+        }
+        let before = load(&paths, "t").unwrap().unwrap();
+        assert!(before.state_stale());
+        assert!(
+            apply_update(
+                &paths,
+                None,
+                "t",
+                None,
+                Some("owner: go"),
+                None,
+                None,
+                None,
+                true,
+            )
+            .is_err()
+        );
+        let after = load(&paths, "t").unwrap().unwrap();
+        assert!(after.decisions.is_empty(), "failed checkpoint must not keep the decision");
+        assert_eq!(after.decisions, before.decisions);
+        assert_eq!(after.checkpoint_count, before.checkpoint_count);
+        assert_eq!(after.state, before.state);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_reports_all_land() {
+        let (dir, paths) = fx("reports");
+        write(&paths, None, "t", Some("Goal: x"), None).unwrap();
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let p = Paths::new(paths.config_dir.clone(), paths.state_dir.clone());
+                s.spawn(move || {
+                    for i in 0..10 {
+                        update_checklist(
+                            &p,
+                            None,
+                            "t",
+                            None,
+                            &[ItemPatch {
+                                id: format!("t{t}-i{i}"),
+                                title: Some(format!("item {t}-{i}")),
+                                ..ItemPatch::default()
+                            }],
+                            &[],
+                        )
+                        .unwrap();
+                    }
+                });
+            }
+        });
+        let lines = fs::read_to_string(paths.state_dir.join("coordinator/reports.jsonl")).unwrap();
+        assert_eq!(lines.lines().count(), 80);
         let _ = fs::remove_dir_all(dir);
     }
 }

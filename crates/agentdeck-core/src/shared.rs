@@ -480,7 +480,7 @@ fn top_key(line: &str) -> Option<(&str, &str)> {
 
 /// Trailing YAML `#` comment outside quotes: `true # why` is boolean true.
 /// A `#` without preceding whitespace is not a comment (`true#x` stays as is).
-fn strip_yaml_comment(v: &str) -> &str {
+pub(crate) fn strip_yaml_comment(v: &str) -> &str {
     if v.starts_with(['"', '\'']) {
         return v;
     }

@@ -192,6 +192,19 @@ impl Registry {
         paths: &Paths,
         f: impl FnOnce(&mut Self) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        Self::update_locked(paths, |reg| {
+            f(reg)?;
+            Ok(())
+        })
+    }
+
+    /// Same as [`update`], but returns the closure's value so callers can apply
+    /// a delta to the latest settings inside one lock (no stale snapshot is
+    /// ever written back over a concurrent edit).
+    pub fn update_locked<R>(
+        paths: &Paths,
+        f: impl FnOnce(&mut Self) -> anyhow::Result<R>,
+    ) -> anyhow::Result<R> {
         let _lock = exclusive_lock(paths)?;
         let file = paths.registry_file();
         let old = match fs::read(&file) {
@@ -211,17 +224,17 @@ impl Registry {
                 }
             }
         };
-        f(&mut reg)?;
+        let ret = f(&mut reg)?;
         reg.validate()?;
         let new_text = reg.render()?;
         if old.as_deref() == Some(new_text.as_bytes()) {
-            return Ok(());
+            return Ok(ret);
         }
         if old.is_some() {
             backup(paths)?;
         }
         atomic_write(&file, new_text.as_bytes())?;
-        Ok(())
+        Ok(ret)
     }
 
     pub fn add(&mut self, spec: AddSpec) -> anyhow::Result<()> {
