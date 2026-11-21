@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use agentdeck_coordinator::checkpoint::{
-    CheckpointInput, CheckpointJudge, CheckpointVerdict, HeuristicCheckpointJudge, record_outcome,
+    CheckpointInput, CheckpointJudge, CheckpointVerdict, HeuristicCheckpointJudge, precheck,
+    record_outcome,
 };
 use agentdeck_coordinator::config::{CoordinatorConfig, CoordinatorPoolEntry};
 use agentdeck_coordinator::hygiene::{check_disk_ok, find_stale_worktrees, free_disk_gb};
@@ -243,6 +244,23 @@ fn pool_empty_is_no_pool_configured() {
 }
 
 #[test]
+fn pool_excludes_entries_without_a_quota_view() {
+    let cfg = cfg_with_pool();
+    let q = quotas(&[("codex_b", view(80.0, 80.0))]);
+    let selection = select_coordinator(&cfg, &q, NOW, Some(("claude_a", "claude-opus-4-6")));
+    assert!(
+        matches!(selection, PoolSelection::Selected { entry, .. } if entry.instance_id == "codex_b")
+    );
+    assert!(matches!(
+        select_coordinator(&cfg, &HashMap::new(), NOW, None),
+        PoolSelection::SleepForQuota {
+            next_candidate: None,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn proactive_rotate_needs_thin_current_and_headroom() {
     let cfg = cfg_with_pool();
     assert!(should_proactively_rotate(&cfg, &view(5.0, 80.0), &view(60.0, 80.0)));
@@ -255,11 +273,54 @@ fn proactive_rotate_needs_thin_current_and_headroom() {
 }
 
 #[test]
+fn proactive_rotate_enforces_weekly_reserve_on_both_sides() {
+    let cfg = cfg_with_pool();
+    assert!(should_proactively_rotate(
+        &cfg,
+        &view(90.0, 5.0),
+        &view(85.0, 80.0)
+    ));
+    assert!(!should_proactively_rotate(
+        &cfg,
+        &view(5.0, 80.0),
+        &view(90.0, 5.0)
+    ));
+}
+
+#[test]
+fn quota_sleep_deadline_cannot_overflow_or_wrap() {
+    let mut cfg = cfg_with_pool();
+    let max = parse_epoch_rfc3339("9999-12-31T23:59:59Z").unwrap();
+    for (buffer, reset) in [(u64::MAX, NOW + 600), (120, i64::MAX - 1), (120, max - 1)] {
+        cfg.quota_sleep_buffer_secs = buffer;
+        let mut blocked = view(0.0, 80.0);
+        blocked.five_hour_resets_at = Some(reset);
+        let q = quotas(&[("codex_b", blocked), ("claude_a", view(0.0, 80.0))]);
+        assert!(matches!(
+            select_coordinator(&cfg, &q, NOW, None),
+            PoolSelection::SleepForQuota {
+                wake_at_epoch_secs, next_candidate: None, ..
+            } if wake_at_epoch_secs == NOW + 300
+        ));
+    }
+    assert!(matches!(
+        select_coordinator(&cfg, &HashMap::new(), max - 1, None),
+        PoolSelection::SleepForQuota {
+            wake_at_epoch_secs, ..
+        } if wake_at_epoch_secs == max
+    ));
+}
+
+#[test]
 fn rfc3339_parses_t3_shapes() {
     assert_eq!(parse_epoch_rfc3339("2026-11-13T11:00:00Z"), Some(1_794_567_600));
     assert_eq!(parse_epoch_rfc3339("2026-11-13T10:00:00.000Z"), Some(1_794_564_000));
     assert_eq!(
         parse_epoch_rfc3339("2026-11-13T11:00:00+00:00"),
+        Some(1_794_567_600)
+    );
+    assert_eq!(
+        parse_epoch_rfc3339("2026-11-13T10:00:00-0100"),
         Some(1_794_567_600)
     );
     assert!(parse_epoch_rfc3339("not a date").is_none());
@@ -280,6 +341,11 @@ fn rfc3339_checked_parser_never_panics() {
         "2026-11-21",
         "2026-11-21T04:00:00",
         "2026-11-21T04:00:00+99:99",
+        "2026-11-21T04:00:00+€a",
+        "2026-11-21T04:00:00+::00::00",
+        "2026-11-21T04:00:00:99Z",
+        "2026-11-21T04:00:00.badZ",
+        "999999999999999999-01-01T00:00:00Z",
         "not a date",
         "2026-13-01T00:00:00Z",
         "2026-00-10T00:00:00Z",
@@ -290,6 +356,14 @@ fn rfc3339_checked_parser_never_panics() {
 }
 
 // --- checkpoint golden eval (>= 20 scenarios) --------------------------------
+
+#[test]
+fn checkpoint_precheck_refuses_active_children_even_at_a_milestone() {
+    let verdict = precheck(&input(90, 10, true, false, 1, &[]), &cfg_with_pool())
+        .expect("active children must be refused before consulting a judge");
+    assert!(!verdict.should_checkpoint);
+    assert!(verdict.reason.contains("child agents"));
+}
 
 fn input(
     runs: u32,
@@ -579,6 +653,40 @@ fn reactive_rotation_never_restarts_stale_failed_account() {
 }
 
 #[test]
+fn reactive_rotation_skips_uncached_failed_instance_with_unknown_model() {
+    let mut cfg = cfg_with_pool();
+    cfg.pool.insert(
+        1,
+        CoordinatorPoolEntry::new("claude_a", "claude-sonnet-4-6"),
+    );
+    let mut o = observed("t12");
+    o.provider_instance_id = Some("claude_a".into());
+    o.hit_quota_limit = true;
+    let mut inp = tick_input(run("t12"), o);
+    inp.quotas = quotas(&[("codex_b", view(80.0, 80.0))]);
+    assert!(matches!(
+        decide(&cfg, &inp),
+        WatchdogAction::RotateAndWake { to_entry, .. } if to_entry.instance_id == "codex_b"
+    ));
+}
+
+#[test]
+fn sleeping_run_with_invalid_or_missing_deadline_stays_quiet() {
+    let cfg = cfg_with_pool();
+    for persisted in [None, Some("2026-11-21T04:00:00+€a"), Some("invalid")] {
+        let mut run = run("sleeping");
+        run.phase = RunPhase::SleepingForQuota;
+        run.sleep_until_epoch = persisted.and_then(parse_epoch_rfc3339);
+        let mut inp = tick_input(run, observed("sleeping"));
+        inp.quotas = quotas(&[("codex_b", view(80.0, 80.0))]);
+        assert!(
+            matches!(decide(&cfg, &inp), WatchdogAction::Noop { .. }),
+            "{persisted:?}"
+        );
+    }
+}
+
+#[test]
 fn proactive_rotation_skips_ineligible_alternative() {
     // codex_b has the fullest 5h window but 0% weekly: ineligible, so it can
     // neither win nor hide. With no other entry the thin account wakes plainly.
@@ -701,6 +809,7 @@ fn two_pool_models_on_one_instance_keep_separate_quota_views() {
 struct FakeController {
     configured: Mutex<Vec<(String, String, String)>>,
     messaged: Mutex<Vec<(String, String, bool)>>,
+    fail_send: std::cell::Cell<bool>,
 }
 
 impl T3ThreadController for FakeController {
@@ -721,6 +830,7 @@ impl T3ThreadController for FakeController {
         message: &str,
         fresh_context: bool,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.fail_send.replace(false), "transient T3 failure");
         self.messaged.lock().unwrap().push((thread_id.into(), message.into(), fresh_context));
         Ok(())
     }
@@ -754,6 +864,50 @@ async fn executor_debounces_double_wake_and_reports_sleeps() {
     assert_eq!(c.messaged.lock().unwrap().len(), 2);
 }
 
+#[tokio::test]
+async fn executor_retries_failed_rpc_before_starting_debounce() {
+    let c = FakeController::default();
+    let mut debounce = ActionDebounce::new(300);
+    let actions = [
+        WatchdogAction::Wake {
+            thread_id: "t".into(),
+            fresh_context: false,
+            message: "hi".into(),
+            reason: "test".into(),
+        },
+        WatchdogAction::RotateAndWake {
+            thread_id: "t".into(),
+            to_entry: pool2().remove(0),
+            fresh_context: false,
+            message: "hi".into(),
+            reason: "test".into(),
+        },
+        WatchdogAction::TriggerCheckpoint {
+            thread_id: "t".into(),
+            target: Some(pool2().remove(0)),
+            reason: "test".into(),
+        },
+    ];
+    for action in actions {
+        c.fail_send.set(true);
+        assert!(
+            execute_action(&c, &action, &mut debounce, NOW)
+                .await
+                .is_err()
+        );
+        assert!(
+            execute_action(&c, &action, &mut debounce, NOW + 1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !execute_action(&c, &action, &mut debounce, NOW + 2)
+                .await
+                .unwrap()
+        );
+    }
+}
+
 // --- quota message detection --------------------------------------------------
 
 #[test]
@@ -781,6 +935,19 @@ fn write_cache(t3: &Path, id: &str, body: &serde_json::Value) {
     std::fs::write(t3.join(format!("caches/{id}.json")), body.to_string()).unwrap();
 }
 
+fn write_t3_instances(t3: &Path, instances: &[&str]) {
+    let providers: serde_json::Map<String, serde_json::Value> = instances
+        .iter()
+        .map(|id| (id.to_string(), serde_json::json!({"enabled": true})))
+        .collect();
+    std::fs::create_dir_all(t3.join("userdata")).unwrap();
+    std::fs::write(
+        t3.join("userdata/settings.json"),
+        serde_json::json!({"providerInstances": providers}).to_string(),
+    )
+    .unwrap();
+}
+
 fn tmpdir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "coord-eval-{tag}-{}-{}",
@@ -798,6 +965,7 @@ fn tmpdir(tag: &str) -> PathBuf {
 #[test]
 fn quota_view_reads_5h_and_weekly_windows() {
     let dir = tmpdir("cache");
+    write_t3_instances(&dir, &["claude_a"]);
     write_cache(
         &dir,
         "claude_a",
@@ -824,6 +992,7 @@ fn quota_view_reads_5h_and_weekly_windows() {
 #[test]
 fn quota_view_respects_antigravity_buckets() {
     let dir = tmpdir("agy");
+    write_t3_instances(&dir, &["agy"]);
     write_cache(
         &dir,
         "agy",
@@ -849,15 +1018,42 @@ fn quota_view_respects_antigravity_buckets() {
 }
 
 #[test]
-fn quota_view_missing_cache_is_unknown_healthy_error_is_not() {
+fn quota_view_distinguishes_known_uncached_instances_from_deleted_ones() {
     let dir = tmpdir("missing");
-    std::fs::create_dir_all(dir.join("caches")).unwrap();
-    let v = quota_from_t3_cache(&dir, "ghost", "m");
+    write_t3_instances(&dir, &["known", "bad"]);
+    write_cache(&dir, "deleted", &serde_json::json!({"status": "ready"}));
+    let v = quota_from_t3_cache(&dir, "known", "m");
     assert!(v.healthy);
     assert_eq!(v.five_hour_remaining_pct, None);
+    assert!(!quota_from_t3_cache(&dir, "deleted", "m").healthy);
+    assert!(!quota_from_t3_cache(&dir, "typo", "m").healthy);
     write_cache(&dir, "bad", &serde_json::json!({"status": "error", "message": "auth failed"}));
     let v = quota_from_t3_cache(&dir, "bad", "m");
     assert!(!v.healthy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn quota_view_only_matches_openai_windows_to_openai_models() {
+    let dir = tmpdir("mixed");
+    write_t3_instances(&dir, &["mixed"]);
+    write_cache(
+        &dir,
+        "mixed",
+        &serde_json::json!({
+            "status": "ready",
+            "usageLimits": {"windows": [
+                {"id": "openai-week", "windowDurationMins": 10080, "usedPercent": 99.0,
+                 "resetsAt": "2026-11-21T04:00:00+€a"},
+                {"id": "claude-week", "windowDurationMins": 10080, "usedPercent": 20.0}
+            ]}
+        }),
+    );
+    let claude = quota_from_t3_cache(&dir, "mixed", "claude-sonnet-4-6");
+    assert_eq!(claude.weekly_remaining_pct, Some(80.0));
+    let codex = quota_from_t3_cache(&dir, "mixed", "codex-mini");
+    assert_eq!(codex.weekly_remaining_pct, Some(1.0));
+    assert_eq!(codex.weekly_resets_at, None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -918,7 +1114,7 @@ fn observer_reads_run_status_quota_tail_and_children() {
     assert_eq!(o.model.as_deref(), Some("claude-opus-4-6"));
     assert_eq!(o.run_count, 1);
     assert_eq!(o.updated_at_epoch, 1749999900);
-    assert!(o.hit_quota_limit, "tail: {}", o.last_message_text);
+    assert!(!o.hit_quota_limit, "a running turn is not a quota failure");
     assert_eq!(o.pending_background_tasks, 1);
     assert!(observe_thread_sqlite(&dir, "nope").unwrap().is_none());
     let _ = std::fs::remove_dir_all(&dir);
@@ -936,7 +1132,7 @@ fn observer_picks_newest_run_limit_recovery_and_attempt_reason() {
     // Real projection schema, two runs on different accounts, inserted
     // out of order: ordinal 2 (failed, on codex_b) lands before ordinal 1
     // (completed, on claude_a). The newest run must win; the thread-level
-    // limitRecovery marker and the failed attempt's `reason` both prove quota.
+    // failed attempt's `reason` identifies the quota failure.
     use rusqlite::Connection;
     let dir = tmpdir("sqlite-newest");
     std::fs::create_dir_all(dir.join("userdata")).unwrap();
@@ -960,7 +1156,7 @@ fn observer_picks_newest_run_limit_recovery_and_attempt_reason() {
             "t-n",
             "Coord",
             "2026-11-21T02:00:00Z",
-            r#"{"modelSelection":{"instanceId":"codex_b","model":"gpt-6.2-sol"},"limitRecovery":true}"#,
+            r#"{"modelSelection":{"instanceId":"codex_b","model":"gpt-6.2-sol"}}"#,
             "codex_b",
         ],
     )
@@ -1006,10 +1202,93 @@ fn observer_picks_newest_run_limit_recovery_and_attempt_reason() {
     assert_eq!(o.run_count, 2);
     assert!(!o.is_running);
     assert!(o.hit_quota_limit, "tail: {}", o.last_message_text);
-    // The failed attempt's title is the tail; the quota verdict came from
-    // `limitRecovery` + the attempt `reason`, not the tail text.
+    // The attempt's title is the tail and its reason identifies the quota failure.
     assert!(o.last_message_text.contains("Run failed"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn observer_only_reports_quota_from_the_latest_failed_turn() {
+    let dir = tmpdir("quota-status");
+    fixture_db(&dir);
+    let db = rusqlite::Connection::open(dir.join("userdata/statev2.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE orchestration_v2_projection_turn_items
+           (thread_id TEXT, run_id TEXT, type TEXT, status TEXT, payload_json TEXT);
+         CREATE TABLE orchestration_v2_projection_messages
+           (message_id TEXT, thread_id TEXT, role TEXT, updated_at TEXT, payload_json TEXT);",
+    )
+    .unwrap();
+    for (status, recovery_run, assistant_text, error_item, expected) in [
+        ("completed", Some("older-run"), None, false, false),
+        ("completed", Some("r1"), None, false, false),
+        (
+            "completed",
+            None,
+            Some("The rate limit resets at 14:00."),
+            false,
+            false,
+        ),
+        ("completed", None, None, true, false),
+        ("failed", Some("older-run"), None, false, false),
+        ("failed", Some("r1"), None, false, true),
+        (
+            "interrupted",
+            None,
+            Some("The rate limit resets at 14:00."),
+            false,
+            true,
+        ),
+        ("running", Some("r1"), None, false, false),
+    ] {
+        let payload = serde_json::json!({"limitRecovery": recovery_run.map(|id| serde_json::json!({"runId": id}))});
+        db.execute(
+            "UPDATE orchestration_v2_projection_threads SET payload_json=?1",
+            [payload.to_string()],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE orchestration_v2_projection_runs SET status=?1, payload_json='{}'",
+            [status],
+        )
+        .unwrap();
+        db.execute_batch("DELETE FROM orchestration_v2_projection_messages; DELETE FROM orchestration_v2_projection_turn_items;").unwrap();
+        if let Some(assistant_text) = assistant_text {
+            db.execute(
+                "INSERT INTO orchestration_v2_projection_messages VALUES ('msg', 't1', 'assistant', '1', ?1)",
+                [serde_json::json!({"text": assistant_text}).to_string()],
+            )
+            .unwrap();
+        }
+        if error_item {
+            db.execute(
+                "INSERT INTO orchestration_v2_projection_turn_items VALUES ('t1', 'r1', 'error', 'failed', ?1)",
+                [r#"{"failure":{"class":"usage_limit"}}"#],
+            )
+            .unwrap();
+        }
+        let o = observe_thread_sqlite(&dir, "t1").unwrap().unwrap();
+        assert_eq!(
+            o.hit_quota_limit, expected,
+            "{status}, {recovery_run:?}, {assistant_text:?}, {error_item}"
+        );
+    }
+    drop(db);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn observer_can_read_legacy_run_projection_without_status() {
+    let dir = tmpdir("legacy-status");
+    fixture_db(&dir);
+    let db = rusqlite::Connection::open(dir.join("userdata/statev2.sqlite")).unwrap();
+    db.execute_batch("ALTER TABLE orchestration_v2_projection_runs DROP COLUMN status")
+        .unwrap();
+    let o = observe_thread_sqlite(&dir, "t1").unwrap().unwrap();
+    assert_eq!(o.provider_instance_id.as_deref(), Some("claude_a"));
+    assert!(o.hit_quota_limit);
+    drop(db);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 // --- loopback enforcement + mock T3 server ------------------------------------
@@ -1053,7 +1332,10 @@ struct Seen {
 /// Minimal HTTP server: answers every JSON-RPC request with an empty result,
 /// recording bodies and authorization headers. Each connection is closed
 /// after one response so the client never deadlocks on keep-alive.
-fn serve_json_rpc(n_requests: usize) -> (std::net::SocketAddr, Arc<Seen>, std::thread::JoinHandle<()>) {
+fn serve_json_rpc(
+    n_requests: usize,
+    hold_sse_open: Option<std::sync::mpsc::Receiver<()>>,
+) -> (std::net::SocketAddr, Arc<Seen>, std::thread::JoinHandle<()>) {
     let seen = Arc::new(Seen {
         bodies: Mutex::new(Vec::new()),
         auths: Mutex::new(Vec::new()),
@@ -1063,7 +1345,7 @@ fn serve_json_rpc(n_requests: usize) -> (std::net::SocketAddr, Arc<Seen>, std::t
     let seen_clone = seen.clone();
     let handle = std::thread::spawn(move || {
         listener.set_nonblocking(false).ok();
-        for _ in 0..n_requests {
+        for i in 0..n_requests {
             let (mut stream, _) = listener.accept().unwrap();
             stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
             let mut raw = Vec::new();
@@ -1112,6 +1394,22 @@ fn serve_json_rpc(n_requests: usize) -> (std::net::SocketAddr, Arc<Seen>, std::t
                 "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{}}}}",
                 id = id
             );
+            if i + 1 == n_requests
+                && let Some(release) = hold_sse_open
+            {
+                stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n").unwrap();
+                let events = format!(
+                    "data: {{\"id\":99,\"result\":{{}}}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{id},\r\ndata: \"result\":{{\"text\":\"✓\"}}}}\r\n\n"
+                );
+                let split = events.find('✓').unwrap() + 1;
+                for chunk in [&events.as_bytes()[..split], &events.as_bytes()[split..]] {
+                    write!(stream, "{:x}\r\n", chunk.len()).unwrap();
+                    stream.write_all(chunk).unwrap();
+                    stream.write_all(b"\r\n").unwrap();
+                }
+                let _ = release.recv_timeout(std::time::Duration::from_secs(5));
+                break;
+            }
             let out = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 res.len(),
@@ -1234,7 +1532,7 @@ async fn http_controller_performs_session_handshake() {
 
 #[tokio::test]
 async fn http_controller_calls_json_rpc_over_loopback() {
-    let (addr, seen, handle) = serve_json_rpc(6);
+    let (addr, seen, handle) = serve_json_rpc(6, None);
     let endpoint = format!("http://127.0.0.1:{}/mcp", addr.port());
     let dir = tmpdir("token");
     let token_file = dir.join("t3.token");
@@ -1269,6 +1567,62 @@ async fn http_controller_calls_json_rpc_over_loopback() {
         assert_eq!(auth.as_deref(), Some("test-token-1"));
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn http_controller_returns_on_matching_sse_event_without_eof() {
+    let (release, hold) = std::sync::mpsc::channel();
+    let (addr, _, handle) = serve_json_rpc(3, Some(hold));
+    let c = HttpT3Controller::new(&format!("http://{addr}/mcp"), None).unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        c.send_message("t1", "hello", false),
+    )
+    .await;
+    let _ = release.send(());
+    assert!(result.is_ok(), "the server held the SSE stream open");
+    result.unwrap().unwrap();
+    handle.join().unwrap();
+}
+
+#[tokio::test]
+async fn http_controller_bypasses_env_proxy() {
+    const CHILD: &str = "AGENTDECK_COORDINATOR_PROXY_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = proxy.local_addr().unwrap();
+        drop(proxy);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "http_controller_bypasses_env_proxy"])
+            .env(CHILD, "1")
+            .env("HTTP_PROXY", format!("http://{addr}"))
+            .env_remove("http_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("all_proxy")
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .env_remove("REQUEST_METHOD")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+    let (addr, seen, handle) = serve_json_rpc(3, None);
+    let endpoint = format!("http://localhost:{}/mcp", addr.port());
+    let c = HttpT3Controller::new(&endpoint, None).unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        c.send_message("t1", "hello", false),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    handle.join().unwrap();
+    assert_eq!(seen.bodies.lock().unwrap().len(), 3);
 }
 
 // --- hygiene ------------------------------------------------------------------

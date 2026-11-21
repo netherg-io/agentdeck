@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{CoordinatorConfig, CoordinatorPoolEntry};
 
+const MAX_UTC_EPOCH: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
+
 /// Key into the quota map: `(instance_id, model)`. Two pool entries on one
 /// T3 instance (Claude on `3p-*` buckets vs Gemini on `gemini-*` buckets)
 /// must NEVER share one quota view, so the model is part of the key.
@@ -69,43 +71,57 @@ pub enum PoolSelection {
 /// Parse an RFC-3339 instant (`...Z` or numeric offset, optional fraction)
 /// to epoch seconds. T3 writes both `11:00:00Z` and `10:00:00.000Z`.
 pub fn parse_epoch_rfc3339(s: &str) -> Option<i64> {
+    fn field(s: &str, width: usize) -> Option<i64> {
+        if s.len() != width || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse().ok()
+    }
+
     let s = s.trim();
     let (dt, tz) = if let Some(bare) = s.strip_suffix(['Z', 'z']) {
         (bare, 0i64)
     } else {
         let i = s.rfind(['+', '-']).filter(|i| *i >= 10)?;
-        let (dt, off) = (&s[..i], &s[i..]);
-        let sign: i64 = if off.starts_with('-') { -1 } else { 1 };
-        let digits: String = off[1..].chars().filter(|c| *c != ':').collect();
-        if digits.len() != 4 {
-            return None;
-        }
-        let (h, m) = (digits[..2].parse::<i64>().ok()?, digits[2..].parse::<i64>().ok()?);
+        let (dt, offset) = s.split_at(i);
+        let sign = if offset.starts_with('-') { -1 } else { 1 };
+        let offset = &offset[1..];
+        let hours = offset.get(..2)?;
+        let minutes = match offset.len() {
+            4 => offset.get(2..)?,
+            5 => offset.get(2..)?.strip_prefix(':')?,
+            _ => return None,
+        };
+        let (h, m) = (field(hours, 2)?, field(minutes, 2)?);
         if h > 23 || m > 59 {
             return None;
         }
-        (dt, sign * (h * 3600 + m * 60))
+        (
+            dt,
+            h.checked_mul(3600)?
+                .checked_add(m.checked_mul(60)?)?
+                .checked_mul(sign)?,
+        )
     };
     let (date, time) = dt.split_once(['T', 't', ' '])?;
-    let d: Vec<i64> = date.split('-').map(|p| p.parse().unwrap_or(-1)).collect();
-    let t: Vec<&str> = time.split(':').collect();
-    if d.len() != 3 || t.len() < 2 {
+    let (y, date) = date.split_once('-')?;
+    let (m, day) = date.split_once('-')?;
+    let (y, m, day) = (field(y, 4)?, field(m, 2)?, field(day, 2)?);
+    let (hh, time) = time.split_once(':')?;
+    let (mm, secs) = time.split_once(':').unwrap_or((time, "00"));
+    let (hh, mm) = (field(hh, 2)?, field(mm, 2)?);
+    let (secs, fraction) = secs.split_once('.').unwrap_or((secs, "0"));
+    if fraction.is_empty() || !fraction.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    // No seconds (`...T04:00Z`): treat as the top of the minute, never panic.
-    let secs: f64 = t
-        .get(2)
-        .copied()
-        .unwrap_or("00")
-        .split('.')
-        .next()
-        .unwrap_or("00")
-        .parse()
-        .ok()
-        .unwrap_or(-1.0);
-    // Days since 1970-01-01 (H. Hinnant's algorithm, inverse of utc()).
-    let (mut y, m, day) = (d[0], d[1], d[2]);
-    if !(1..=12).contains(&m) || !(1..=31).contains(&day) || !(0.0..=60.0).contains(&secs) {
+    let secs = field(secs, 2)?;
+    if !(1970..=9999).contains(&y)
+        || !(1..=12).contains(&m)
+        || !(1..=31).contains(&day)
+        || hh >= 24
+        || mm >= 60
+        || !(0..=60).contains(&secs)
+    {
         return None;
     }
     let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
@@ -119,19 +135,25 @@ pub fn parse_epoch_rfc3339(s: &str) -> Option<i64> {
     if day > dim {
         return None;
     }
-    y -= i64::from(m <= 2);
+    // Days since 1970-01-01 (H. Hinnant's algorithm, inverse of utc()).
+    let y = y - i64::from(m <= 2);
     let era = y.div_euclid(400);
-    let yoe = y - era * 400;
+    let yoe = y.checked_sub(era.checked_mul(400)?)?;
     let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    let hh: i64 = t[0].parse().ok()?;
-    let mm: i64 = t[1].parse().ok()?;
-    if !(0..24).contains(&hh) || !(0..60).contains(&mm) {
-        return None;
-    }
-    Some(days * 86_400 + hh * 3600 + mm * 60 + secs as i64 - tz)
+    let doy = (mp.checked_mul(153)?.checked_add(2)? / 5).checked_add(day)? - 1;
+    let doe = yoe
+        .checked_mul(365)?
+        .checked_add(yoe / 4 - yoe / 100)?
+        .checked_add(doy)?;
+    let days = era
+        .checked_mul(146097)?
+        .checked_add(doe)?
+        .checked_sub(719468)?;
+    days.checked_mul(86_400)?
+        .checked_add(hh.checked_mul(3600)?)?
+        .checked_add(mm.checked_mul(60)?)?
+        .checked_add(secs)?
+        .checked_sub(tz)
 }
 
 /// Does a T3 usage window apply to `model`? Antigravity keeps separate
@@ -140,6 +162,9 @@ pub fn parse_epoch_rfc3339(s: &str) -> Option<i64> {
 fn window_matches_model(id: &str, kind: &str, label: &str, model: &str) -> bool {
     let text = format!("{id} {kind} {label}").to_lowercase();
     let model = model.to_lowercase();
+    if text.contains("codex") || text.contains("openai") {
+        return model.contains("gpt") || model.contains("codex");
+    }
     if text.contains("argon") {
         return model.contains("argon");
     }
@@ -149,40 +174,30 @@ fn window_matches_model(id: &str, kind: &str, label: &str, model: &str) -> bool 
     if text.contains("3p") || text.contains("third") {
         return !model.contains("gemini");
     }
-    if text.contains("claude") || text.contains("codex") || text.contains("openai") {
-        let family = if text.contains("codex") || text.contains("openai") {
-            "gpt"
-        } else {
-            "claude"
-        };
-        return model.contains(family)
+    if text.contains("claude") {
+        return model.contains("claude")
             || model.contains("sonnet")
             || model.contains("opus")
             || model.contains("haiku")
             || model.contains("fable");
     }
-    let _ = model;
     true
 }
 
 /// Read `caches/<instance_id>.json` via `agentdeck-core` and extract the 5h
-/// and weekly windows relevant to `model`. Missing cache file means healthy
-/// with unknown percents (assumed full); an unreadable/corrupt cache or a
-/// non-`ready` status means unhealthy.
-pub fn quota_from_t3_cache(
-    t3_root: &Path,
-    instance_id: &str,
-    model: &str,
-) -> QuotaWindowView {
+/// and weekly windows relevant to `model`. Only enabled T3 instances can be
+/// healthy. For those, a missing cache means unknown quota (assumed full).
+pub fn quota_from_t3_cache(t3_root: &Path, instance_id: &str, model: &str) -> QuotaWindowView {
+    if !matches!(
+        agentdeck_core::t3::read_instance_enabled(t3_root, instance_id),
+        Ok(Some(true))
+    ) {
+        return QuotaWindowView::default();
+    }
     let cache = match agentdeck_core::t3::read_usage_cache(t3_root, instance_id) {
         Ok(Some(c)) => c,
         Ok(None) => return QuotaWindowView::unknown_healthy(),
-        Err(_) => {
-            return QuotaWindowView {
-                healthy: false,
-                ..Default::default()
-            };
-        }
+        Err(_) => return QuotaWindowView::default(),
     };
     let healthy = cache.status.as_deref() == Some("ready");
     let mut view = QuotaWindowView {
@@ -245,7 +260,7 @@ fn view_for(quotas: &HashMap<PoolKey, QuotaWindowView>, instance_id: &str, model
     quotas
         .get(&pool_key(instance_id, model))
         .cloned()
-        .unwrap_or_else(QuotaWindowView::unknown_healthy)
+        .unwrap_or_default()
 }
 
 /// Pool eligibility: the exact bar a rotation target must clear (healthy,
@@ -370,9 +385,13 @@ pub fn select_coordinator(
             earliest = Some((usable, (*entry).clone()));
         }
     }
+    let earliest = earliest.and_then(|(reset, next)| {
+        let wake = reset.checked_add(i64::try_from(cfg.quota_sleep_buffer_secs).ok()?)?;
+        (wake <= MAX_UTC_EPOCH).then_some((wake, reset, next))
+    });
     match earliest {
-        Some((reset, next)) => PoolSelection::SleepForQuota {
-            wake_at_epoch_secs: reset + cfg.quota_sleep_buffer_secs as i64,
+        Some((wake, reset, next)) => PoolSelection::SleepForQuota {
+            wake_at_epoch_secs: wake,
             earliest_reset_epoch_secs: Some(reset),
             next_candidate: Some(next.clone()),
             reason: format!(
@@ -381,8 +400,8 @@ pub fn select_coordinator(
             ),
         },
         None => PoolSelection::SleepForQuota {
-            // No candidate has a usable future reset: bounded refresh, never now.
-            wake_at_epoch_secs: now_epoch_secs + 300,
+            // Keep the refresh deadline within the persisted RFC3339 range.
+            wake_at_epoch_secs: now_epoch_secs.saturating_add(300).min(MAX_UTC_EPOCH),
             earliest_reset_epoch_secs: None,
             next_candidate: None,
             reason: "no pool entry has a usable future reset; retrying after a bounded refresh".into(),
@@ -390,9 +409,8 @@ pub fn select_coordinator(
     }
 }
 
-/// Proactive in-turn rotation: the current account is getting thin and a
-/// meaningfully fuller pool entry exists (≥15 points of 5h headroom, so the
-/// daemon does not flap between near-equal accounts).
+/// Proactive rotation requires an eligible target and either a weekly
+/// reserve breach or a thin 5h window with at least 15 points of headroom.
 pub fn should_proactively_rotate(
     cfg: &CoordinatorConfig,
     current_quota: &QuotaWindowView,
@@ -400,9 +418,8 @@ pub fn should_proactively_rotate(
 ) -> bool {
     let cur_five = current_quota.five_hour_remaining_pct.unwrap_or(100.0);
     let cur_weekly = current_quota.weekly_remaining_pct.unwrap_or(100.0);
-    let thin = cur_five < cfg.proactive_rotate_below_5h_pct
-        || cur_weekly < cfg.min_weekly_reserve_pct;
-    thin
-        && best_other.healthy
-        && best_other.five_hour_remaining_pct.unwrap_or(100.0) >= cur_five + 15.0
+    eligible(cfg, best_other)
+        && (cur_weekly < cfg.min_weekly_reserve_pct
+            || (cur_five < cfg.proactive_rotate_below_5h_pct
+                && best_other.five_hour_remaining_pct.unwrap_or(100.0) >= cur_five + 15.0))
 }
