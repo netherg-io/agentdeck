@@ -15,8 +15,8 @@ use agentdeck_coordinator::checkpoint::{
 use agentdeck_coordinator::config::{CoordinatorConfig, CoordinatorPoolEntry};
 use agentdeck_coordinator::hygiene::{check_disk_ok, find_stale_worktrees, free_disk_gb};
 use agentdeck_coordinator::pool::{
-    PoolSelection, QuotaWindowView, parse_epoch_rfc3339, quota_from_t3_cache,
-    select_coordinator, should_proactively_rotate,
+    PoolKey, PoolSelection, QuotaWindowView, parse_epoch_rfc3339, pool_key,
+    quota_from_t3_cache, select_coordinator, should_proactively_rotate,
 };
 use agentdeck_coordinator::t3_control::{
     HttpT3Controller, ObservedThread, T3ThreadController, is_quota_limit_message,
@@ -43,10 +43,19 @@ fn cfg_with_pool() -> CoordinatorConfig {
     }
 }
 
-fn quotas(pairs: &[(&str, QuotaWindowView)]) -> HashMap<String, QuotaWindowView> {
+fn quotas(pairs: &[(&str, QuotaWindowView)]) -> HashMap<PoolKey, QuotaWindowView> {
     pairs
         .iter()
-        .map(|(id, q)| (id.to_string(), q.clone()))
+        .map(|(id, q)| {
+            // Tests use the fixed pool2() models, so the instance id alone
+            // identifies the (instance, model) key.
+            let model = pool2()
+                .into_iter()
+                .find(|e| &e.instance_id == id)
+                .map(|e| e.model)
+                .unwrap_or_else(|| "m".to_string());
+            (pool_key(id, &model), q.clone())
+        })
         .collect()
 }
 
@@ -114,11 +123,40 @@ fn pool_one_percent_5h_is_ineligible() {
 }
 
 #[test]
-fn pool_all_exhausted_sleeps_until_earliest_reset_plus_120s() {
+fn pool_all_exhausted_sleeps_until_earliest_usable_reset_plus_120s() {
     let cfg = cfg_with_pool();
     let mut a = QuotaWindowView::exhausted(Some(NOW + 3000), Some(NOW + 9000));
     a.healthy = true;
     let mut b = QuotaWindowView::exhausted(Some(NOW + 1000), Some(NOW + 8000));
+    b.healthy = true;
+    let q = quotas(&[("claude_a", a), ("codex_b", b)]);
+    match select_coordinator(&cfg, &q, NOW, None) {
+        // Each candidate is blocked by BOTH windows, so its usable reset is
+        // the later of the two (max): 9000 for claude_a, 8000 for codex_b.
+        PoolSelection::SleepForQuota {
+            wake_at_epoch_secs,
+            earliest_reset_epoch_secs,
+            next_candidate,
+            ..
+        } => {
+            assert_eq!(earliest_reset_epoch_secs, Some(NOW + 8000));
+            assert_eq!(wake_at_epoch_secs, NOW + 8000 + 120);
+            assert_eq!(next_candidate.unwrap().instance_id, "codex_b");
+        }
+        other => panic!("expected SleepForQuota, got {other:?}"),
+    }
+}
+
+#[test]
+fn pool_sleep_ignores_stale_resets_and_unknown_is_never_now() {
+    let cfg = cfg_with_pool();
+    // claude_a's reset is ten minutes in the past: stale, never usable.
+    let mut a = QuotaWindowView::exhausted(Some(NOW - 600), None);
+    a.weekly_remaining_pct = Some(60.0);
+    a.healthy = true;
+    // codex_b is blocked with no known reset at all: unknown is never now.
+    let mut b = QuotaWindowView::exhausted(None, None);
+    b.weekly_remaining_pct = Some(60.0);
     b.healthy = true;
     let q = quotas(&[("claude_a", a), ("codex_b", b)]);
     match select_coordinator(&cfg, &q, NOW, None) {
@@ -128,8 +166,34 @@ fn pool_all_exhausted_sleeps_until_earliest_reset_plus_120s() {
             next_candidate,
             ..
         } => {
-            assert_eq!(earliest_reset_epoch_secs, Some(NOW + 1000));
-            assert_eq!(wake_at_epoch_secs, NOW + 1000 + 120);
+            assert_eq!(earliest_reset_epoch_secs, None);
+            assert_eq!(wake_at_epoch_secs, NOW + 300);
+            assert!(next_candidate.is_none());
+        }
+        other => panic!("expected bounded-refresh SleepForQuota, got {other:?}"),
+    }
+}
+
+#[test]
+fn pool_sleep_uses_max_of_both_blocking_windows() {
+    let cfg = cfg_with_pool();
+    // Blocked by 5h (reset +1000) and weekly (reset +5000): unusable until +5000.
+    let mut a = QuotaWindowView::exhausted(Some(NOW + 1000), Some(NOW + 5000));
+    a.healthy = true;
+    // Blocked by 5h only (reset +2000), weekly healthy: usable at +2000.
+    let mut b = QuotaWindowView::exhausted(Some(NOW + 2000), None);
+    b.weekly_remaining_pct = Some(60.0);
+    b.healthy = true;
+    let q = quotas(&[("claude_a", a), ("codex_b", b)]);
+    match select_coordinator(&cfg, &q, NOW, None) {
+        PoolSelection::SleepForQuota {
+            wake_at_epoch_secs,
+            earliest_reset_epoch_secs,
+            next_candidate,
+            ..
+        } => {
+            assert_eq!(earliest_reset_epoch_secs, Some(NOW + 2000));
+            assert_eq!(wake_at_epoch_secs, NOW + 2000 + 120);
             assert_eq!(next_candidate.unwrap().instance_id, "codex_b");
         }
         other => panic!("expected SleepForQuota, got {other:?}"),
@@ -140,7 +204,7 @@ fn pool_all_exhausted_sleeps_until_earliest_reset_plus_120s() {
 fn pool_hysteresis_keeps_current_within_2pct() {
     let cfg = cfg_with_pool();
     let q = quotas(&[("claude_a", view(73.5, 80.0)), ("codex_b", view(75.0, 80.0))]);
-    match select_coordinator(&cfg, &q, NOW, Some("claude_a")) {
+    match select_coordinator(&cfg, &q, NOW, Some(("claude_a", "claude-opus-4-6"))) {
         PoolSelection::Selected { entry, reason, .. } => {
             assert_eq!(entry.instance_id, "claude_a");
             assert!(reason.contains("prompt cache"), "{reason}");
@@ -149,7 +213,7 @@ fn pool_hysteresis_keeps_current_within_2pct() {
     }
     // Beyond 2% the best entry wins.
     let q = quotas(&[("claude_a", view(70.0, 80.0)), ("codex_b", view(75.0, 80.0))]);
-    match select_coordinator(&cfg, &q, NOW, Some("claude_a")) {
+    match select_coordinator(&cfg, &q, NOW, Some(("claude_a", "claude-opus-4-6"))) {
         PoolSelection::Selected { entry, .. } => assert_eq!(entry.instance_id, "codex_b"),
         other => panic!("expected codex_b, got {other:?}"),
     }
@@ -200,6 +264,29 @@ fn rfc3339_parses_t3_shapes() {
     );
     assert!(parse_epoch_rfc3339("not a date").is_none());
     assert!(parse_epoch_rfc3339("2026-13-01T00:00:00Z").is_none());
+}
+
+#[test]
+fn rfc3339_checked_parser_never_panics() {
+    // Minutes without seconds: top of the minute, never an index panic.
+    let full = parse_epoch_rfc3339("2026-11-21T04:00:00Z").unwrap();
+    assert_eq!(parse_epoch_rfc3339("2026-11-21T04:00Z"), Some(full));
+    for bad in [
+        "garbage!@#",
+        "",
+        "2026-11-21T04:00",
+        "2026-11-21T25:00:00Z",
+        "2026-11-21T04:60:00Z",
+        "2026-11-21",
+        "2026-11-21T04:00:00",
+        "2026-11-21T04:00:00+99:99",
+        "not a date",
+        "2026-13-01T00:00:00Z",
+        "2026-00-10T00:00:00Z",
+        "2026-02-30T00:00:00Z",
+    ] {
+        assert!(parse_epoch_rfc3339(bad).is_none(), "{bad}");
+    }
 }
 
 // --- checkpoint golden eval (>= 20 scenarios) --------------------------------
@@ -307,6 +394,7 @@ fn failure1_weekly_limit_rotates_to_healthy_account_overnight() {
     r.phase = RunPhase::Running;
     let mut o = observed("t1");
     o.provider_instance_id = Some("claude_a".into());
+    o.model = Some("claude-opus-4-6".into());
     o.last_message_text = "You've hit your weekly limit. Try again Sunday.".into();
     o.hit_quota_limit = true;
     let mut inp = tick_input(r, o);
@@ -335,13 +423,18 @@ fn failure2_all_exhausted_sleeps_cleanly_until_reset_plus_2m() {
     r.phase = RunPhase::Running;
     let mut o = observed("t2");
     o.provider_instance_id = Some("claude_a".into());
+    o.model = Some("claude-opus-4-6".into());
     o.last_message_text = "You've hit your 5-hour limit".into();
     o.hit_quota_limit = true;
     let mut inp = tick_input(r, o);
-    inp.quotas = quotas(&[
-        ("claude_a", QuotaWindowView::exhausted(Some(NOW + 5000), None)),
-        ("codex_b", QuotaWindowView::exhausted(Some(NOW + 2000), None)),
-    ]);
+    // Weekly stays healthy: only the 5h window blocks, so the sleep deadline
+    // is the 5h reset + 120s. (0% weekly with no weekly reset would leave no
+    // usable future reset at all.)
+    let mut clogged = QuotaWindowView::exhausted(Some(NOW + 5000), None);
+    clogged.weekly_remaining_pct = Some(60.0);
+    let mut spare = QuotaWindowView::exhausted(Some(NOW + 2000), None);
+    spare.weekly_remaining_pct = Some(60.0);
+    inp.quotas = quotas(&[("claude_a", clogged), ("codex_b", spare)]);
     match decide(&cfg, &inp) {
         WatchdogAction::EnterQuotaSleep { wake_at_epoch_secs, .. } => {
             assert_eq!(wake_at_epoch_secs, NOW + 2000 + 120);
@@ -452,6 +545,7 @@ fn proactive_rotation_fires_on_silent_thin_account() {
     let cfg = cfg_with_pool();
     let mut o = observed("t5");
     o.provider_instance_id = Some("claude_a".into());
+    o.model = Some("claude-opus-4-6".into());
     let mut inp = tick_input(run("t5"), o);
     inp.quotas = quotas(&[("claude_a", view(5.0, 80.0)), ("codex_b", view(60.0, 80.0))]);
     match decide(&cfg, &inp) {
@@ -459,6 +553,145 @@ fn proactive_rotation_fires_on_silent_thin_account() {
             assert_eq!(to_entry.instance_id, "codex_b");
         }
         other => panic!("expected proactive RotateAndWake, got {other:?}"),
+    }
+}
+
+#[test]
+fn reactive_rotation_never_restarts_stale_failed_account() {
+    // The T3 cache is stale: the failed account still shows 95% 5h while the
+    // spare shows 80%. The observed failure must win over the cache.
+    let cfg = cfg_with_pool();
+    let mut r = run("t12");
+    r.phase = RunPhase::Running;
+    let mut o = observed("t12");
+    o.provider_instance_id = Some("claude_a".into());
+    o.model = Some("claude-opus-4-6".into());
+    o.hit_quota_limit = true;
+    let mut inp = tick_input(r, o);
+    inp.quotas = quotas(&[("claude_a", view(95.0, 80.0)), ("codex_b", view(80.0, 60.0))]);
+    match decide(&cfg, &inp) {
+        WatchdogAction::RotateAndWake { to_entry, reason, .. } => {
+            assert_eq!(to_entry.instance_id, "codex_b", "{reason}");
+            assert!(reason.contains("quota limit"), "{reason}");
+        }
+        other => panic!("expected RotateAndWake away from the failed account, got {other:?}"),
+    }
+}
+
+#[test]
+fn proactive_rotation_skips_ineligible_alternative() {
+    // codex_b has the fullest 5h window but 0% weekly: ineligible, so it can
+    // neither win nor hide. With no other entry the thin account wakes plainly.
+    let cfg = cfg_with_pool();
+    let mut o = observed("t14");
+    o.provider_instance_id = Some("claude_a".into());
+    o.model = Some("claude-opus-4-6".into());
+    let mut inp = tick_input(run("t14"), o);
+    inp.quotas = quotas(&[("claude_a", view(5.0, 80.0)), ("codex_b", view(90.0, 0.0))]);
+    assert!(matches!(decide(&cfg, &inp), WatchdogAction::Wake { .. }));
+
+    // Three entries: the 5h-fullest is unhealthy, the runner-up is eligible.
+    // The unhealthy leader must not hide the healthy runner-up.
+    let cfg3 = CoordinatorConfig {
+        pool: vec![
+            CoordinatorPoolEntry::new("thin", "m-thin"),
+            CoordinatorPoolEntry::new("sick", "m-sick"),
+            CoordinatorPoolEntry::new("spare", "m-spare"),
+        ],
+        ..Default::default()
+    };
+    let thin = view(5.0, 80.0);
+    let mut sick = view(95.0, 80.0);
+    sick.healthy = false;
+    let spare = view(60.0, 80.0);
+    let q: HashMap<PoolKey, QuotaWindowView> = [
+        (pool_key("thin", "m-thin"), thin),
+        (pool_key("sick", "m-sick"), sick),
+        (pool_key("spare", "m-spare"), spare),
+    ]
+    .into_iter()
+    .collect();
+    let mut o = observed("t14b");
+    o.provider_instance_id = Some("thin".into());
+    o.model = Some("m-thin".into());
+    let mut inp = tick_input(run("t14b"), o);
+    inp.quotas = q;
+    match decide(&cfg3, &inp) {
+        WatchdogAction::RotateAndWake { to_entry, .. } => {
+            assert_eq!(to_entry.instance_id, "spare");
+        }
+        other => panic!("expected rotation to the healthy runner-up, got {other:?}"),
+    }
+}
+
+#[test]
+fn sleeping_run_with_no_work_or_active_run_stays_quiet() {
+    let cfg = cfg_with_pool();
+    let q = quotas(&[("claude_a", view(60.0, 60.0)), ("codex_b", view(70.0, 60.0))]);
+    // Past the deadline with an eligible pool, but the work completed while
+    // sleeping: Noop, never a wake.
+    let r = RunSnapshot {
+        thread_id: "t15".into(),
+        phase: RunPhase::SleepingForQuota,
+        sleep_until_epoch: Some(NOW - 1),
+        has_unblocked_work: false,
+    };
+    let mut inp = tick_input(r, observed("t15"));
+    inp.quotas = q.clone();
+    assert!(matches!(decide(&cfg, &inp), WatchdogAction::Noop { .. }));
+    // Past the deadline but the thread already resumed: Noop, never a wake.
+    let r = RunSnapshot {
+        thread_id: "t15".into(),
+        phase: RunPhase::SleepingForQuota,
+        sleep_until_epoch: Some(NOW - 1),
+        has_unblocked_work: true,
+    };
+    let mut o = observed("t15");
+    o.is_running = true;
+    let mut inp = tick_input(r, o);
+    inp.quotas = q;
+    assert!(matches!(decide(&cfg, &inp), WatchdogAction::Noop { .. }));
+}
+
+#[test]
+fn two_pool_models_on_one_instance_keep_separate_quota_views() {
+    // Two entries share one Antigravity instance id with different models: the
+    // Claude entry must see the 3p bucket, the Gemini entry the Gemini one.
+    let cfg = CoordinatorConfig {
+        pool: vec![
+            CoordinatorPoolEntry::new("agy", "claude-sonnet-4-6"),
+            CoordinatorPoolEntry::new("agy", "gemini-3-flash"),
+        ],
+        ..Default::default()
+    };
+    let claude_view = view(95.0, 80.0);
+    let gemini_view = view(10.0, 80.0);
+    let q: HashMap<PoolKey, QuotaWindowView> = [
+        (pool_key("agy", "claude-sonnet-4-6"), claude_view),
+        (pool_key("agy", "gemini-3-flash"), gemini_view),
+    ]
+    .into_iter()
+    .collect();
+    match select_coordinator(&cfg, &q, NOW, None) {
+        PoolSelection::Selected { entry, .. } => {
+            assert_eq!(entry.model, "claude-sonnet-4-6");
+        }
+        other => panic!("expected the healthy Claude entry, got {other:?}"),
+    }
+    // ... and marking the Claude entry ineligible leaves the Gemini entry.
+    let mut claude_bad = view(95.0, 80.0);
+    claude_bad.healthy = false;
+    let q: HashMap<PoolKey, QuotaWindowView> = [
+        (pool_key("agy", "claude-sonnet-4-6"), claude_bad),
+        (pool_key("agy", "gemini-3-flash"), view(10.0, 80.0)),
+    ]
+    .into_iter()
+    .collect();
+    match select_coordinator(&cfg, &q, NOW, None) {
+        PoolSelection::Selected { entry, .. } => {
+            assert_eq!(entry.model, "gemini-3-flash");
+        }
+        other => panic!("expected the Gemini entry, got {other:?}"),
     }
 }
 
@@ -698,6 +931,87 @@ fn observer_absent_db_is_none() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn observer_picks_newest_run_limit_recovery_and_attempt_reason() {
+    // Real projection schema, two runs on different accounts, inserted
+    // out of order: ordinal 2 (failed, on codex_b) lands before ordinal 1
+    // (completed, on claude_a). The newest run must win; the thread-level
+    // limitRecovery marker and the failed attempt's `reason` both prove quota.
+    use rusqlite::Connection;
+    let dir = tmpdir("sqlite-newest");
+    std::fs::create_dir_all(dir.join("userdata")).unwrap();
+    let db = Connection::open(dir.join("userdata/statev2.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE orchestration_v2_projection_threads (
+           thread_id TEXT PRIMARY KEY, title TEXT, updated_at TEXT,
+           payload_json TEXT, provider_instance_id TEXT);
+         CREATE TABLE orchestration_v2_projection_runs (
+           run_id TEXT PRIMARY KEY, thread_id TEXT, ordinal INTEGER, status TEXT,
+           requested_at TEXT, completed_at TEXT, payload_json TEXT,
+           provider_instance_id TEXT);
+         CREATE TABLE orchestration_v2_projection_turn_items (
+           turn_item_id TEXT PRIMARY KEY, thread_id TEXT, run_id TEXT,
+           ordinal INTEGER, type TEXT, status TEXT, payload_json TEXT);",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO orchestration_v2_projection_threads VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            "t-n",
+            "Coord",
+            "2026-11-21T02:00:00Z",
+            r#"{"modelSelection":{"instanceId":"codex_b","model":"gpt-6.2-sol"},"limitRecovery":true}"#,
+            "codex_b",
+        ],
+    )
+    .unwrap();
+    // Newest run inserted FIRST so rowid order disagrees with ordinal order.
+    db.execute(
+        "INSERT INTO orchestration_v2_projection_runs VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        rusqlite::params![
+            "r2",
+            "t-n",
+            2,
+            "failed",
+            "2026-11-21T02:00:00Z",
+            "2026-11-21T02:05:00Z",
+            r#"{"modelSelection":{"instanceId":"codex_b","model":"gpt-6.2-sol"}}"#,
+            "codex_b",
+        ],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO orchestration_v2_projection_runs VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        rusqlite::params![
+            "r1",
+            "t-n",
+            1,
+            "completed",
+            "2026-11-21T01:00:00Z",
+            "2026-11-21T01:10:00Z",
+            r#"{"modelSelection":{"instanceId":"claude_a","model":"claude-opus-4-6"},"lastMessage":"all done"}"#,
+            "claude_a",
+        ],
+    )
+    .unwrap();
+    // No failure.class: only the plain `reason` carries the quota signal.
+    db.execute(
+        "INSERT INTO orchestration_v2_projection_turn_items VALUES ('ti1','t-n','r2',1,'error','failed',?1)",
+        [r#"{"title":"Run failed","reason":"API rate limit exceeded, try again at 3pm"}"#],
+    )
+    .unwrap();
+    let o = observe_thread_sqlite(&dir, "t-n").unwrap().expect("thread t-n");
+    assert_eq!(o.provider_instance_id.as_deref(), Some("codex_b"));
+    assert_eq!(o.model.as_deref(), Some("gpt-6.2-sol"));
+    assert_eq!(o.run_count, 2);
+    assert!(!o.is_running);
+    assert!(o.hit_quota_limit, "tail: {}", o.last_message_text);
+    // The failed attempt's title is the tail; the quota verdict came from
+    // `limitRecovery` + the attempt `reason`, not the tail text.
+    assert!(o.last_message_text.contains("Run failed"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // --- loopback enforcement + mock T3 server ------------------------------------
 
 #[test]
@@ -710,6 +1024,15 @@ fn loopback_enforcement_rejects_remote_endpoints() {
         "http://user@127.0.0.1:3773/mcp",
         "http://127.0.0.1:3773/mcp#frag",
         "http://[::1]:3773/mcp\n",
+        // A loopback-looking suffix is a different host.
+        "http://127.0.0.1.attacker.com/mcp",
+        "http://localhost.attacker.com/mcp",
+        // IPv4-mapped IPv6 is not one of the three accepted literals.
+        "http://[::ffff:127.0.0.1]:3773/mcp",
+        // Credentials hidden in the userinfo part parse as host under a
+        // hand-rolled split; the real URL parser must still refuse them.
+        "http://127.0.0.1%09@evil.com/mcp",
+        "http://:pass@127.0.0.1:3773/mcp",
     ] {
         assert!(HttpT3Controller::new(bad, None).is_err(), "{bad}");
     }
@@ -801,9 +1124,117 @@ fn serve_json_rpc(n_requests: usize) -> (std::net::SocketAddr, Arc<Seen>, std::t
     (addr, seen, handle)
 }
 
+struct HandshakeSeen {
+    methods: Mutex<Vec<String>>,
+    sessions: Mutex<Vec<Option<String>>>,
+    tool_calls: Mutex<Vec<serde_json::Value>>,
+}
+
+/// Mock Streamable HTTP server: answers `initialize` with an
+/// `Mcp-Session-Id` response header and records the session header and tool
+/// arguments of every request.
+fn serve_handshake() -> (std::net::SocketAddr, Arc<HandshakeSeen>, std::thread::JoinHandle<()>) {
+    let seen = Arc::new(HandshakeSeen {
+        methods: Mutex::new(Vec::new()),
+        sessions: Mutex::new(Vec::new()),
+        tool_calls: Mutex::new(Vec::new()),
+    });
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen_clone = seen.clone();
+    let handle = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            let len = text
+                .lines()
+                .find_map(|l| {
+                    l.to_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            let header_end = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(text.len());
+            let mut body = raw[header_end.min(raw.len())..].to_vec();
+            while body.len() < len {
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&buf[..n]);
+            }
+            let session = text.lines().find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                (k.trim().eq_ignore_ascii_case("mcp-session-id")).then(|| v.trim().to_string())
+            });
+            let req: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("").to_string();
+            if method == "tools/call" {
+                seen_clone.tool_calls.lock().unwrap().push(req.clone());
+            }
+            seen_clone.methods.lock().unwrap().push(method);
+            seen_clone.sessions.lock().unwrap().push(session);
+            // The notification carries no id.
+            let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+            let res = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{}}}}");
+            let out = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nmcp-session-id: sess-1\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                res.len(),
+                res
+            );
+            stream.write_all(out.as_bytes()).unwrap();
+            stream.flush().ok();
+        }
+    });
+    (addr, seen, handle)
+}
+
+#[tokio::test]
+async fn http_controller_performs_session_handshake() {
+    let (addr, seen, handle) = serve_handshake();
+    let endpoint = format!("http://127.0.0.1:{}/mcp", addr.port());
+    let c = HttpT3Controller::new(&endpoint, None).unwrap();
+    let mut options = HashMap::new();
+    options.insert("temperature".to_string(), serde_json::json!(0));
+    c.configure_thread("t1", "inst-a", "model-x", &options).await.unwrap();
+    handle.join().unwrap();
+    // Full handshake: initialize, then notifications/initialized, then the call.
+    assert_eq!(
+        *seen.methods.lock().unwrap(),
+        vec!["initialize", "notifications/initialized", "tools/call"],
+    );
+    // The initialize response's session rides on every later request.
+    assert_eq!(
+        *seen.sessions.lock().unwrap(),
+        vec![None, Some("sess-1".to_string()), Some("sess-1".to_string())],
+    );
+    // The configure call nests instanceId/model/options under modelSelection.
+    let calls = seen.tool_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let args = &calls[0]["params"]["arguments"];
+    assert_eq!(args["threadId"], "t1");
+    assert_eq!(args["modelSelection"]["instanceId"], "inst-a");
+    assert_eq!(args["modelSelection"]["model"], "model-x");
+    assert_eq!(args["modelSelection"]["options"]["temperature"], 0);
+    assert_eq!(calls[0]["params"]["name"], "t3_thread_configure");
+}
+
 #[tokio::test]
 async fn http_controller_calls_json_rpc_over_loopback() {
-    let (addr, seen, handle) = serve_json_rpc(4);
+    let (addr, seen, handle) = serve_json_rpc(6);
     let endpoint = format!("http://127.0.0.1:{}/mcp", addr.port());
     let dir = tmpdir("token");
     let token_file = dir.join("t3.token");
@@ -815,7 +1246,13 @@ async fn http_controller_calls_json_rpc_over_loopback() {
     c.send_message("t1", "hello", false).await.unwrap();
     handle.join().unwrap();
     let bodies = seen.bodies.lock().unwrap();
-    assert_eq!(bodies.len(), 4);
+    // initialize + notifications/initialized + tools/call per operation.
+    assert_eq!(bodies.len(), 6);
+    let inits = bodies
+        .iter()
+        .filter(|b| b.get("method").and_then(|m| m.as_str()) == Some("initialize"))
+        .count();
+    assert_eq!(inits, 2);
     let calls: Vec<&serde_json::Value> = bodies
         .iter()
         .filter(|b| b.get("method").and_then(|m| m.as_str()) == Some("tools/call"))
@@ -883,5 +1320,29 @@ fn stale_worktree_discovery_flags_only_clean_merged() {
     let active: HashSet<String> = ["current".to_string()].into_iter().collect();
     let stale = find_stale_worktrees(&dir, &active);
     assert_eq!(stale, vec![dir.join("old-done")]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stale_worktree_discovery_ignores_plain_subdirectory_of_parent_repo() {
+    if std::process::Command::new("git").arg("--version").output().is_err() {
+        return; // no git on PATH: nothing to discover with.
+    }
+    // The scanned dir IS a clean merged checkout: its own plain subdir walks
+    // up to the parent repo for every git probe but is not a worktree root.
+    let dir = tmpdir("wt-sub");
+    git_repo(&dir);
+    std::fs::create_dir_all(dir.join("inner")).unwrap();
+    std::fs::write(dir.join("inner/notes.txt"), "work").unwrap();
+    std::process::Command::new("git").arg("-C").arg(&dir).args(["add", "."]).output().unwrap();
+    std::process::Command::new("git").arg("-C").arg(&dir).args(["commit", "-m", "sub"]).output().unwrap();
+    std::process::Command::new("git")
+        .arg("-C").arg(&dir)
+        .args(["update-ref", "refs/remotes/origin/main", "HEAD"])
+        .output().unwrap();
+    // Only the merged checkouts directly under `dir` are candidates; `inner`
+    // is not its own checkout even though git probes succeed inside it.
+    let stale = find_stale_worktrees(&dir, &HashSet::new());
+    assert!(!stale.contains(&dir.join("inner")), "{stale:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }

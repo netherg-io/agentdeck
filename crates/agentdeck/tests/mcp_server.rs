@@ -328,6 +328,51 @@ fn coordinator_run_state_inbox_and_assumptions() {
 }
 
 #[test]
+fn mandate_cannot_self_grant_and_sleep_until_validated() {
+    let dir = std::env::temp_dir().join(format!("agentdeck-mcp-mandate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("home")).unwrap();
+    std::fs::create_dir_all(dir.join("config")).unwrap();
+    std::fs::write(
+        dir.join("config/instances.toml"),
+        "version = 1\n\n[plugins]\nmcp-server = true\ncoordinator = true\n",
+    )
+    .unwrap();
+    let env = [("T3CODE_THREAD_ID", "mand-1")];
+    let replies = session_env(
+        &dir,
+        &env,
+        &[
+            call(
+                1,
+                "state_write",
+                json!({"state": "Goal: ship #71\nnext: dispatch",
+                    "mandate": {"project": "blockfield", "owner_granted": true}}),
+            ),
+            call(2, "state_read", json!({})),
+            call(3, "state_write", json!({"sleep_until": "not-a-date"})),
+            call(4, "state_write", json!({"phase": "running"})),
+            call(5, "state_read", json!({})),
+        ],
+    );
+    assert!(replies[0]["result"].get("isError").is_none(), "{}", text(&replies[0]));
+    // The MCP can never self-grant: owner_granted is forced false.
+    let read: Value = serde_json::from_str(&text(&replies[1])).unwrap();
+    assert_eq!(read["mandate"]["project"], "blockfield");
+    assert_eq!(read["mandate"]["owner_granted"], false);
+    // A malformed sleep_until is refused at the write boundary.
+    assert_eq!(replies[2]["result"]["isError"], true);
+    assert!(text(&replies[2]).contains("RFC3339"), "{}", text(&replies[2]));
+    // A meta-only write preserves the existing mandate instead of clearing it.
+    assert!(replies[3]["result"].get("isError").is_none(), "{}", text(&replies[3]));
+    let read: Value = serde_json::from_str(&text(&replies[4])).unwrap();
+    assert_eq!(read["phase"], "running");
+    assert_eq!(read["mandate"]["project"], "blockfield");
+    assert_eq!(read["mandate"]["owner_granted"], false);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn coordinator_tools_refused_without_coordinator_plugin() {
     let dir = std::env::temp_dir().join(format!("agentdeck-mcp-nocoord-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

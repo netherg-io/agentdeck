@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::checkpoint::CheckpointVerdict;
 use crate::config::{CoordinatorConfig, CoordinatorPoolEntry};
-use crate::pool::{PoolSelection, QuotaWindowView, select_coordinator, should_proactively_rotate};
+use crate::pool::{
+    PoolKey, PoolSelection, QuotaWindowView, eligible, pool_key, select_coordinator,
+    should_proactively_rotate,
+};
 use crate::t3_control::{ObservedThread, T3ThreadController};
 
 /// Phase of an Autonomous Run as tracked by the daemon (mirrors the
@@ -31,13 +34,14 @@ pub struct RunSnapshot {
     pub has_unblocked_work: bool,
 }
 
-/// Everything one Watchdog tick needs. `quotas` maps pool `instance_id` to
-/// its current window view (built from `quota_from_t3_cache`).
+/// Everything one Watchdog tick needs. `quotas` maps each pool
+/// `(instance_id, model)` to its current window view (built from
+/// `quota_from_t3_cache`).
 #[derive(Debug, Clone)]
 pub struct WatchdogThreadInput {
     pub run: RunSnapshot,
     pub observed: ObservedThread,
-    pub quotas: HashMap<String, QuotaWindowView>,
+    pub quotas: HashMap<PoolKey, QuotaWindowView>,
     pub now_epoch_secs: i64,
     pub checkpoint_verdict: Option<CheckpointVerdict>,
 }
@@ -84,6 +88,51 @@ impl WatchdogAction {
             Self::TriggerCheckpoint { .. } => "checkpoint",
         }
     }
+}
+
+/// The observed `(instance_id, model)` pair, when both are known.
+fn current_key(observed: &ObservedThread) -> Option<(&str, &str)> {
+    Some((
+        observed.provider_instance_id.as_deref()?,
+        observed.model.as_deref()?,
+    ))
+}
+
+/// Quotas with the just-failed `(instance_id, model)` marked ineligible at
+/// 0% 5h, so reactive rotation NEVER restarts the account that just failed
+/// even if its T3 cache is stale. A credible future reset already in the
+/// cache is kept; a stale or unknown one is dropped so it can never produce
+/// a premature wake.
+fn with_failed_marked_ineligible(
+    quotas: &HashMap<PoolKey, QuotaWindowView>,
+    observed: &ObservedThread,
+    now_epoch_secs: i64,
+) -> HashMap<PoolKey, QuotaWindowView> {
+    let mut adjusted = quotas.clone();
+    let keys: Vec<PoolKey> = match (
+        observed.provider_instance_id.as_deref(),
+        observed.model.as_deref(),
+    ) {
+        (Some(inst), Some(model)) => vec![pool_key(inst, model)],
+        (Some(inst), None) => adjusted
+            .keys()
+            .filter(|(i, _)| i == inst)
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    };
+    for key in keys {
+        let mut v = adjusted
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(QuotaWindowView::unknown_healthy);
+        v.five_hour_remaining_pct = Some(0.0);
+        if v.five_hour_resets_at.is_none_or(|r| r <= now_epoch_secs) {
+            v.five_hour_resets_at = None;
+        }
+        adjusted.insert(key, v);
+    }
+    adjusted
 }
 
 pub const WAKE_MESSAGE: &str = "Watchdog wake: unblocked checklist work remains. Read state_read and continue the Autonomous Run.";
@@ -140,7 +189,7 @@ pub fn decide_action(
     cfg: &CoordinatorConfig,
     run: &RunSnapshot,
     observed: &ObservedThread,
-    quotas: &HashMap<String, QuotaWindowView>,
+    quotas: &HashMap<PoolKey, QuotaWindowView>,
     now_epoch_secs: i64,
     checkpoint_verdict: Option<&CheckpointVerdict>,
 ) -> WatchdogAction {
@@ -150,12 +199,21 @@ pub fn decide_action(
     if !matches!(run.phase, RunPhase::Running | RunPhase::SleepingForQuota) {
         return noop("run is neither running nor sleeping-for-quota");
     }
+    // Active-run and unblocked-work guards run before the quota-sleep wake
+    // branch: work that completed or was parked in Owner Inbox while
+    // sleeping (or a thread that already resumed) must Noop, never wake.
+    if observed.is_running {
+        return noop("active run in progress");
+    }
+    if !run.has_unblocked_work {
+        return noop("no unblocked work: remaining items are done, held, or parked in Owner Inbox");
+    }
     if run.phase == RunPhase::SleepingForQuota {
         if run.sleep_until_epoch.is_some_and(|until| now_epoch_secs < until) {
             return noop("still inside quota sleep window");
         }
         // Sleep over: rotate onto the first eligible entry, else re-sleep.
-        return match select_coordinator(cfg, quotas, now_epoch_secs, observed.provider_instance_id.as_deref()) {
+        return match select_coordinator(cfg, quotas, now_epoch_secs, current_key(observed)) {
             PoolSelection::Selected { entry, reason, .. } => rotate(
                 &run.thread_id,
                 entry,
@@ -170,18 +228,15 @@ pub fn decide_action(
             }
         };
     }
-    if observed.is_running {
-        return noop("active run in progress");
-    }
-    if !run.has_unblocked_work {
-        return noop("no unblocked work: remaining items are done, held, or parked in Owner Inbox");
-    }
     if observed.hit_quota_limit {
+        // The observed failure takes effect BEFORE selection: the just-failed
+        // account is ineligible even when its T3 cache is stale.
+        let adjusted = with_failed_marked_ineligible(quotas, observed, now_epoch_secs);
         return match select_coordinator(
             cfg,
-            quotas,
+            &adjusted,
             now_epoch_secs,
-            observed.provider_instance_id.as_deref(),
+            current_key(observed),
         ) {
             PoolSelection::Selected { entry, five_hour_pct, weekly_pct, .. } => rotate(
                 &run.thread_id,
@@ -209,22 +264,30 @@ pub fn decide_action(
     }
     // Silent with unblocked work: prefer proactive rotation, then an approved
     // Checkpoint, then a plain wake.
-    if let Some(current) = observed.provider_instance_id.as_deref()
-        && let Some(cur_q) = quotas.get(current)
+    if let Some((cur_inst, cur_model)) = current_key(observed)
+        && let Some(cur_q) = quotas.get(&pool_key(cur_inst, cur_model))
     {
         let mut best_other: Option<(&CoordinatorPoolEntry, &QuotaWindowView)> = None;
-        for entry in cfg.pool.iter().filter(|e| e.enabled && e.instance_id != current) {
-            if let Some(q) = quotas.get(&entry.instance_id) {
-                let five = q.five_hour_remaining_pct.unwrap_or(100.0);
-                let take = match best_other {
-                    None => true,
-                    Some((_, bq)) => {
-                        five > bq.five_hour_remaining_pct.unwrap_or(100.0)
-                    }
-                };
-                if take {
-                    best_other = Some((entry, q));
+        for entry in cfg.pool.iter().filter(|e| {
+            e.enabled && (e.instance_id != cur_inst || e.model != cur_model)
+        }) {
+            let Some(q) = quotas.get(&pool_key(&entry.instance_id, &entry.model)) else {
+                continue;
+            };
+            // The exact pool eligibility bar: an unhealthy or 0%-weekly
+            // candidate can never beat or hide a healthy eligible runner-up.
+            if !eligible(cfg, q) {
+                continue;
+            }
+            let five = q.five_hour_remaining_pct.unwrap_or(100.0);
+            let take = match best_other {
+                None => true,
+                Some((_, bq)) => {
+                    five > bq.five_hour_remaining_pct.unwrap_or(100.0)
                 }
+            };
+            if take {
+                best_other = Some((entry, q));
             }
         }
         if let Some((entry, other_q)) = best_other
@@ -234,8 +297,8 @@ pub fn decide_action(
                 &run.thread_id,
                 entry.clone(),
                 format!(
-                    "proactive rotation: {} is thin, {} is fuller",
-                    current, entry.instance_id
+                    "proactive rotation: {cur_inst} is thin, {} is fuller",
+                    entry.instance_id
                 ),
                 false,
             );
