@@ -1071,3 +1071,106 @@ fn audit_viewer_maps_outcomes_and_read_errors() {
     agentdeck_gui::i18n::set_language("en");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn approver_gui_saves_and_preserves_telegram_credentials() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _env = lock_env();
+    let (paths, dir) = test_env("approver-creds-gui");
+    agentdeck_gui::i18n::set_language("en");
+
+    let mut sstate = gsettings::State::default();
+    let _ = gsettings::update(&mut sstate, paths.clone(), gsettings::load_approver(&paths));
+    assert!(!sstate.approver.loaded.creds.bot_token_set);
+    assert!(sstate.approver.owner_id.is_empty());
+
+    // Enter Telegram bot token + owner ID directly in GUI and save.
+    let _ = gsettings::update(
+        &mut sstate,
+        paths.clone(),
+        gsettings::Msg::Approver(Box::new(gsettings::ApproverMsg::BotToken(
+            "123456:ABC-gui-token".into(),
+        ))),
+    );
+    let _ = gsettings::update(
+        &mut sstate,
+        paths.clone(),
+        gsettings::Msg::Approver(Box::new(gsettings::ApproverMsg::OwnerId(
+            "987654321".into(),
+        ))),
+    );
+    let done = drain(gsettings::update(
+        &mut sstate,
+        paths.clone(),
+        gsettings::Msg::Approver(Box::new(gsettings::ApproverMsg::Save)),
+    ));
+    let reload = drain(gsettings::update(
+        &mut sstate,
+        paths.clone(),
+        done[0].clone(),
+    ));
+    for msg in reload {
+        let _ = gsettings::update(&mut sstate, paths.clone(), msg);
+    }
+
+    assert!(
+        sstate.approver.bot_token.is_empty(),
+        "token input cleared after save"
+    );
+    assert!(sstate.approver.loaded.creds.bot_token_set);
+    assert_eq!(sstate.approver.owner_id, "987654321");
+    assert!(settings::approver_telegram_configured(&paths.config_dir));
+    let env_path = paths.config_dir.join("approver.env");
+    let mode = std::fs::metadata(&env_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+
+    // Unrelated timeout save with blank token field preserves the stored bot token.
+    let _ = gsettings::update(
+        &mut sstate,
+        paths.clone(),
+        gsettings::Msg::Approver(Box::new(gsettings::ApproverMsg::AutoTimeout("90".into()))),
+    );
+    let done = drain(gsettings::update(
+        &mut sstate,
+        paths.clone(),
+        gsettings::Msg::Approver(Box::new(gsettings::ApproverMsg::Save)),
+    ));
+    let reload = drain(gsettings::update(
+        &mut sstate,
+        paths.clone(),
+        done[0].clone(),
+    ));
+    for msg in reload {
+        let _ = gsettings::update(&mut sstate, paths.clone(), msg);
+    }
+    let raw = std::fs::read_to_string(&env_path).unwrap();
+    assert!(raw.contains("TELEGRAM_BOT_TOKEN=123456:ABC-gui-token"));
+    assert!(raw.contains("TELEGRAM_OWNER_ID=987654321"));
+
+    // Invalid owner ID fails inline without touching disk or erasing the draft.
+    for bad in ["not-a-number", "0"] {
+        let _ = gsettings::update(
+            &mut sstate,
+            paths.clone(),
+            gsettings::Msg::Approver(Box::new(gsettings::ApproverMsg::OwnerId(bad.into()))),
+        );
+        let follow = drain(gsettings::update(
+            &mut sstate,
+            paths.clone(),
+            gsettings::Msg::Approver(Box::new(gsettings::ApproverMsg::Save)),
+        ));
+        assert!(
+            follow.is_empty(),
+            "invalid owner_id {bad} must not spawn save"
+        );
+        assert!(matches!(sstate.approver.result, Some((_, true))));
+        assert_eq!(sstate.approver.owner_id, bad);
+    }
+    assert_eq!(
+        settings::read_approver_credentials(&paths.config_dir).owner_id,
+        Some(987654321)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -439,12 +439,17 @@ fn every_page_fits_at_min_size_with_long_names() {
         update(
             &mut state,
             Message::Settings(settings::Msg::Approver(Box::new(
-                settings::ApproverMsg::Loaded(settings::ApproverLoaded {
+                settings::ApproverMsg::Loaded(Box::new(settings::ApproverLoaded {
                     cfg: Some(agentdeck_core::settings::ApproverSettings {
                         remote_hosts: vec![LONG_PATH.into()],
                         extra_hard_deny_patterns: vec![LONG_PATH.into()],
                         ..Default::default()
                     }),
+                    creds: agentdeck_core::settings::ApproverCredentialsStatus {
+                        bot_token_set: true,
+                        owner_id: Some(123_456_789),
+                        error: None,
+                    },
                     audit: vec![settings::AuditRow {
                         at: "1234567890".into(),
                         host: LONG_PATH.into(),
@@ -454,7 +459,7 @@ fn every_page_fits_at_min_size_with_long_names() {
                     }],
                     audit_error: None,
                     error: None,
-                }),
+                })),
             ))),
         );
         update(&mut state, Message::SelectPage(Page::ApproverSettings));

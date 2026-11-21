@@ -4,8 +4,8 @@
 use std::path::PathBuf;
 
 use agentdeck_core::settings::{
-    self, ApproverSettings, CoordinatorPoolEntry, CoordinatorSettings, Settings, UserRuleSource,
-    UserRules,
+    self, ApproverCredentialsStatus, ApproverCredentialsUpdate, ApproverSettings,
+    CoordinatorPoolEntry, CoordinatorSettings, Settings, UserRuleSource, UserRules,
 };
 use agentdeck_core::{Paths, Registry};
 use i18n_embed_fl::fl;
@@ -758,6 +758,7 @@ pub struct AuditRow {
 #[derive(Debug, Clone, Default)]
 pub struct ApproverLoaded {
     pub cfg: Option<ApproverSettings>,
+    pub creds: ApproverCredentialsStatus,
     pub audit: Vec<AuditRow>,
     /// Reading the audit log failed (missing file stays an empty `audit`).
     pub audit_error: Option<String>,
@@ -811,6 +812,9 @@ impl JudgeProvider {
 #[derive(Default)]
 pub struct ApproverState {
     pub loaded: ApproverLoaded,
+    /// Write-only Telegram bot token draft; cleared after save, never pre-filled.
+    pub bot_token: String,
+    pub owner_id: String,
     pub auto_timeout: String,
     pub inter_timeout: String,
     pub judge: JudgeProvider,
@@ -850,7 +854,9 @@ pub struct CoordState {
 
 #[derive(Debug, Clone)]
 pub enum ApproverMsg {
-    Loaded(ApproverLoaded),
+    Loaded(Box<ApproverLoaded>),
+    BotToken(String),
+    OwnerId(String),
     AutoTimeout(String),
     InterTimeout(String),
     Judge(JudgeProvider),
@@ -1012,7 +1018,8 @@ fn parse_audit_line(line: &str) -> Option<AuditRow> {
 }
 
 pub fn load_approver(paths: &Paths) -> Msg {
-    am(ApproverMsg::Loaded(match Registry::load(paths) {
+    let creds = settings::read_approver_credentials(&paths.config_dir);
+    am(ApproverMsg::Loaded(Box::new(match Registry::load(paths) {
         Ok(reg) => match settings::read_approver(&reg) {
             Ok(cfg) => {
                 // Bounded read; the page itself loads inside a Task, Refresh
@@ -1023,21 +1030,24 @@ pub fn load_approver(paths: &Paths) -> Msg {
                 };
                 ApproverLoaded {
                     cfg: Some(cfg),
+                    creds,
                     audit,
                     audit_error,
                     error: None,
                 }
             }
             Err(e) => ApproverLoaded {
+                creds,
                 error: Some(format!("{e:#}")),
                 ..Default::default()
             },
         },
         Err(e) => ApproverLoaded {
+            creds,
             error: Some(format!("{e:#}")),
             ..Default::default()
         },
-    }))
+    })))
 }
 
 pub fn load_coord(paths: &Paths) -> Msg {
@@ -1103,9 +1113,35 @@ fn coord_cfg(s: &CoordState) -> Result<CoordinatorSettings, String> {
     Ok(cfg)
 }
 
+fn parse_owner_id(raw: &str) -> Result<Option<i64>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    trimmed
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id != 0)
+        .map(Some)
+        .ok_or_else(|| fl!(loader(), "approver-owner-id-invalid"))
+}
+
+fn approver_cred_update(s: &ApproverState) -> Result<ApproverCredentialsUpdate, String> {
+    let token = s.bot_token.trim();
+    if token.chars().any(|c| c.is_control()) {
+        return Err(fl!(loader(), "approver-bot-token-invalid"));
+    }
+    let owner_id = parse_owner_id(&s.owner_id)?;
+    Ok(ApproverCredentialsUpdate {
+        telegram_bot_token: (!token.is_empty()).then(|| Some(token.to_string())),
+        telegram_owner_id: (owner_id != s.loaded.creds.owner_id).then_some(owner_id),
+    })
+}
+
 fn update_approver(state: &mut ApproverState, paths: Paths, msg: ApproverMsg) -> Task<Msg> {
     match msg {
         ApproverMsg::Loaded(loaded) => {
+            let loaded = *loaded;
             if let Some(cfg) = &loaded.cfg {
                 state.auto_timeout = cfg.autonomous_timeout_secs.to_string();
                 state.inter_timeout = cfg.interactive_timeout_secs.to_string();
@@ -1122,7 +1158,20 @@ fn update_approver(state: &mut ApproverState, paths: Paths, msg: ApproverMsg) ->
                 // survive an unrelated save byte-for-byte.
                 state.deny = format_patterns(&cfg.extra_hard_deny_patterns);
             }
+            state.owner_id = loaded
+                .creds
+                .owner_id
+                .map(|id| id.to_string())
+                .unwrap_or_default();
             state.loaded = loaded;
+            Task::none()
+        }
+        ApproverMsg::BotToken(v) => {
+            state.bot_token = v;
+            Task::none()
+        }
+        ApproverMsg::OwnerId(v) => {
+            state.owner_id = v;
             Task::none()
         }
         ApproverMsg::AutoTimeout(v) => {
@@ -1162,6 +1211,13 @@ fn update_approver(state: &mut ApproverState, paths: Paths, msg: ApproverMsg) ->
             if state.busy {
                 return Task::none();
             }
+            let cred_update = match approver_cred_update(state) {
+                Ok(u) => u,
+                Err(e) => {
+                    state.result = Some((e, true));
+                    return Task::none();
+                }
+            };
             match approver_cfg(state) {
                 Err(e) => {
                     state.result = Some((e, true));
@@ -1173,8 +1229,17 @@ fn update_approver(state: &mut ApproverState, paths: Paths, msg: ApproverMsg) ->
                         async move {
                             tokio::task::spawn_blocking(move || {
                                 settings::write_approver(&paths, &cfg, false)
-                                    .map(|_| ())
-                                    .map_err(|e| format!("{e:#}"))
+                                    .map_err(|e| format!("{e:#}"))?;
+                                if cred_update.telegram_bot_token.is_some()
+                                    || cred_update.telegram_owner_id.is_some()
+                                {
+                                    settings::write_approver_credentials(
+                                        &paths.config_dir,
+                                        &cred_update,
+                                    )
+                                    .map_err(|e| format!("{e:#}"))?;
+                                }
+                                Ok(())
                             })
                             .await
                             .map_err(|e| e.to_string())
@@ -1189,6 +1254,9 @@ fn update_approver(state: &mut ApproverState, paths: Paths, msg: ApproverMsg) ->
             state.busy = false;
             // A failed write keeps the draft: only a success reloads.
             let ok = result.is_ok();
+            if ok {
+                state.bot_token.clear();
+            }
             state.result = Some(match result {
                 Ok(()) => (fl!(loader(), "settings-saved"), false),
                 Err(e) => (e, true),
@@ -1474,7 +1542,39 @@ pub fn approver_view(state: &State) -> Element<'_, Msg> {
             .width(Length::Fill)
             .into()
     };
+    let (token_placeholder, token_hint) = if s.loaded.creds.bot_token_set {
+        (
+            fl!(loader(), "approver-bot-token-placeholder"),
+            fl!(loader(), "approver-bot-token-set"),
+        )
+    } else {
+        (
+            "123456:ABC-...".to_string(),
+            fl!(loader(), "approver-bot-token-missing"),
+        )
+    };
     let form = column![
+        field(
+            fl!(loader(), "approver-bot-token"),
+            text_input(&token_placeholder, &s.bot_token)
+                .secure(true)
+                .on_input(|v| am(ApproverMsg::BotToken(v)))
+                .on_submit(am(ApproverMsg::Save))
+                .size(size)
+                .width(Length::Fill)
+                .into(),
+            Some(token_hint),
+        ),
+        field(
+            fl!(loader(), "approver-owner-id"),
+            text_input("123456789", &s.owner_id)
+                .on_input(|v| am(ApproverMsg::OwnerId(v)))
+                .on_submit(am(ApproverMsg::Save))
+                .size(size)
+                .width(Length::Fill)
+                .into(),
+            Some(fl!(loader(), "approver-owner-id-hint")),
+        ),
         field(
             fl!(loader(), "approver-auto-timeout"),
             input(&s.auto_timeout, ApproverMsg::AutoTimeout),
@@ -1531,6 +1631,9 @@ pub fn approver_view(state: &State) -> Element<'_, Msg> {
     .spacing(st::SPACE_M);
     let mut col = column![].spacing(st::SPACE_S);
     if let Some(e) = &s.loaded.error {
+        col = col.push(st::card(st::muted(fl!(loader(), "load-error", what = e))));
+    }
+    if let Some(e) = &s.loaded.creds.error {
         col = col.push(st::card(st::muted(fl!(loader(), "load-error", what = e))));
     }
     col = col.push(st::card(form));
