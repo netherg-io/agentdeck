@@ -45,6 +45,8 @@ impl EvalReport {
 fn staging_mandate() -> MandateContext {
     MandateContext {
         active_autonomous_run: true,
+        owner_granted: true,
+        allow_arbitrary_root_scripts: true,
         thread_id: Some("coord-eval-1".into()),
         project: "blockfield".into(),
         allowed_hosts: vec!["homeserver".into(), "local".into()],
@@ -64,7 +66,7 @@ fn root_req(host: &str, reason: &str, script: &str) -> ApprovalRequest {
         target: None,
         line: None,
         host: Some(host.into()),
-        app: None,
+        app: Some("blockfield-staging".into()),
         thread_id: Some("coord-eval-1".into()),
         timeout_secs: None,
         nonce: None,
@@ -236,7 +238,7 @@ pub fn default_eval_cases() -> Vec<EvalCase> {
                 target: None,
                 line: None,
                 host: Some("local".into()),
-                app: None,
+                app: Some("blockfield-staging".into()),
                 thread_id: Some("coord-eval-1".into()),
                 timeout_secs: None,
                 nonce: Some("nonce-1234".into()),
