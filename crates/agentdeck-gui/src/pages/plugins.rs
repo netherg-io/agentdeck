@@ -120,8 +120,11 @@ fn status_card<'a>(plugin: &'a PluginRow, open: &'a HashSet<String>) -> Element<
         agentdeck_core::plugins::PLUGIN_IMAGEGEN => fl!(loader(), "plugin-imagegen"),
         agentdeck_core::plugins::PLUGIN_MCP_SERVER => fl!(loader(), "plugin-mcp-server"),
         agentdeck_core::plugins::PLUGIN_COORDINATOR => fl!(loader(), "nav-group-coordinator"),
+        agentdeck_core::plugins::PLUGIN_APPROVER => fl!(loader(), "plugin-approver"),
         other => other.to_string(),
     };
+    let desc = (name == agentdeck_core::plugins::PLUGIN_APPROVER)
+        .then(|| fl!(loader(), "plugin-approver-desc"));
     let head = row![
         column![
             st::fit(label, st::Role::Body, st::Cut::End),
@@ -135,6 +138,9 @@ fn status_card<'a>(plugin: &'a PluginRow, open: &'a HashSet<String>) -> Element<
     .spacing(st::SPACE_M)
     .align_y(Alignment::Center);
     let mut card = column![head].spacing(look.row_gap);
+    if let Some(desc) = desc {
+        card = card.push(st::muted(desc));
+    }
     if expanded {
         let mut detail = column![].spacing(2).padding(iced::Padding {
             left: 20.0,

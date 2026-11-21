@@ -1,8 +1,10 @@
-//! Coordinator page: each coordinator thread's goal and checklist, then the
-//! open backlog per project. Read-only; coordinators write through MCP.
+//! Coordinator page: each coordinator thread's goal and checklist, plus the
+//! open backlog per project. Shows the Autonomous Run phase, the Run Mandate
+//! with the owner's Grant/Revoke button, the Owner Inbox with Resolve
+//! buttons, and recorded Assumptions.
 
 use agentdeck_core::backlog::Entry;
-use agentdeck_core::thread_state::{Item, Report};
+use agentdeck_core::thread_state::{Item, Report, RunMandate, RunPhase, ThreadState};
 use i18n_embed_fl::fl;
 use iced::widget::{column, container, row};
 use iced::{Alignment, Element, Length};
@@ -11,6 +13,14 @@ use crate::app::Message;
 use crate::data::{CoordRow, Data};
 use crate::i18n::loader;
 use crate::style as st;
+
+/// Fluent wraps placeables in bidi isolates; strip them so exact-text
+/// matching (headless tests, assistive readers of the plain string) works.
+fn plain(s: String) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '\u{2068}' | '\u{2069}'))
+        .collect()
+}
 
 fn status_key(status: &str) -> (&'static str, st::Tone) {
     match status {
@@ -26,6 +36,23 @@ fn status_key(status: &str) -> (&'static str, st::Tone) {
 fn status_pill<'a>(status: &str) -> Element<'a, Message> {
     let (key, tone) = status_key(status);
     st::pill(loader().get(key), tone)
+}
+
+fn phase_pill<'a>(state: &ThreadState) -> Element<'a, Message> {
+    let (label, tone) = match state.phase {
+        RunPhase::Intake => (fl!(loader(), "coord-phase-intake"), st::Tone::Neutral),
+        RunPhase::Running => (fl!(loader(), "coord-phase-running"), st::Tone::Accent),
+        RunPhase::SleepingForQuota => (
+            plain(fl!(
+                loader(),
+                "coord-phase-sleeping",
+                until = state.sleep_until.as_deref().unwrap_or("—")
+            )),
+            st::Tone::Warn,
+        ),
+        RunPhase::Completed => (fl!(loader(), "coord-phase-completed"), st::Tone::Ok),
+    };
+    st::pill(label, tone)
 }
 
 fn reports_card(reports: &[Report]) -> Element<'_, Message> {
@@ -83,6 +110,155 @@ fn item_row(i: &Item) -> Element<'_, Message> {
     .into()
 }
 
+fn list_or_dash(items: &[String]) -> String {
+    if items.is_empty() {
+        "—".to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+/// Structured Run Mandate summary plus the owner's Grant/Revoke button. The
+/// button writes `owner_granted` directly: only the owner seals the mandate.
+fn mandate_block<'a>(thread: &'a str, mandate: Option<&'a RunMandate>) -> Element<'a, Message> {
+    let mut col = column![st::caption(fl!(loader(), "coord-mandate"))].spacing(4);
+    match mandate {
+        None => {
+            col = col.push(st::muted(fl!(loader(), "coord-mandate-none")));
+            col = col.push(
+                st::btn(st::Btn::Primary, fl!(loader(), "coord-grant"))
+                    .on_press(Message::CoordMandate {
+                        thread: thread.to_string(),
+                        grant: true,
+                    }),
+            );
+        }
+        Some(m) => {
+            let (state, tone) = if m.owner_granted {
+                (fl!(loader(), "coord-mandate-granted"), st::Tone::Ok)
+            } else {
+                (fl!(loader(), "coord-mandate-pending"), st::Tone::Warn)
+            };
+            col = col.push(
+                row![
+                    st::pill(state, tone),
+                    iced::widget::Space::new().width(Length::Fill),
+                    st::btn(
+                        st::Btn::Quiet,
+                        if m.owner_granted {
+                            fl!(loader(), "coord-revoke")
+                        } else {
+                            fl!(loader(), "coord-grant")
+                        }
+                    )
+                    .on_press(Message::CoordMandate {
+                        thread: thread.to_string(),
+                        grant: !m.owner_granted,
+                    }),
+                ]
+                .spacing(st::SPACE_S)
+                .align_y(Alignment::Center),
+            );
+            for (label, value) in [
+                (
+                    fl!(loader(), "coord-mandate-hosts"),
+                    list_or_dash(&m.allowed_hosts),
+                ),
+                (
+                    fl!(loader(), "coord-mandate-apps"),
+                    list_or_dash(&m.allowed_apps),
+                ),
+                (
+                    fl!(loader(), "coord-mandate-releases"),
+                    if m.allow_releases {
+                        loader().get("coord-mandate-releases-allowed")
+                    } else {
+                        loader().get("coord-mandate-releases-blocked")
+                    },
+                ),
+            ] {
+                col = col.push(
+                    row![
+                        container(st::caption(label)).width(96),
+                        st::fit(value, st::Role::Body, st::Cut::End),
+                    ]
+                    .spacing(st::SPACE_S)
+                    .align_y(Alignment::Center),
+                );
+            }
+            col = col.push(st::mono_muted(plain(fl!(
+                loader(),
+                "coord-mandate-caps",
+                fix = m.fix_forward_max,
+                rev = m.review_rounds_max
+            ))));
+        }
+    }
+    col.into()
+}
+
+/// Open Owner Inbox items with a Resolve button each; resolved ones stay out.
+fn inbox_block<'a>(thread: &'a str, state: &'a ThreadState) -> Option<Element<'a, Message>> {
+    let open: Vec<_> = state.owner_inbox.iter().filter(|i| !i.resolved).collect();
+    if open.is_empty() {
+        return None;
+    }
+    let mut col = column![st::caption(fl!(loader(), "coord-inbox"))].spacing(4);
+    for item in open {
+        let mut text = column![st::fit(item.title.as_str(), st::Role::Body, st::Cut::End)].spacing(2);
+        if !item.reason.is_empty() {
+            text = text.push(st::fit(item.reason.as_str(), st::Role::Muted, st::Cut::End));
+        }
+        if !item.action.is_empty() {
+            text = text.push(st::fit(item.action.as_str(), st::Role::Muted, st::Cut::End));
+        }
+        if !item.blocked_items.is_empty() {
+            text = text.push(st::mono_muted(plain(fl!(
+                loader(),
+                "coord-inbox-blocks",
+                items = item.blocked_items.join(", ")
+            ))));
+        }
+        col = col.push(
+            row![
+                text.width(Length::Fill),
+                st::btn(st::Btn::Quiet, fl!(loader(), "coord-resolve")).on_press(
+                    Message::CoordResolve {
+                        thread: thread.to_string(),
+                        item: item.id.clone(),
+                    }
+                ),
+            ]
+            .spacing(st::SPACE_S)
+            .align_y(Alignment::Center),
+        );
+    }
+    Some(col.into())
+}
+
+fn assumptions_block(state: &ThreadState) -> Option<Element<'_, Message>> {
+    if state.assumptions.is_empty() {
+        return None;
+    }
+    let mut col = column![st::caption(fl!(loader(), "coord-assumptions"))].spacing(4);
+    for a in &state.assumptions {
+        let mut text =
+            column![st::fit(a.decision.as_str(), st::Role::Body, st::Cut::End)].spacing(2);
+        if !a.rationale.is_empty() {
+            text = text.push(st::fit(a.rationale.as_str(), st::Role::Muted, st::Cut::End));
+        }
+        if !a.revert_hint.is_empty() {
+            text = text.push(st::mono_muted(plain(fl!(
+                loader(),
+                "coord-assumption-revert",
+                hint = a.revert_hint.clone()
+            ))));
+        }
+        col = col.push(text);
+    }
+    Some(col.into())
+}
+
 fn thread_card(c: &CoordRow) -> Element<'_, Message> {
     let (done, total) = c.state.progress();
     let name = c.title.clone().unwrap_or_else(|| c.thread.clone());
@@ -100,6 +276,17 @@ fn thread_card(c: &CoordRow) -> Element<'_, Message> {
             },
         ));
     }
+    head = head.push(phase_pill(&c.state));
+    if c.state.state_stale() {
+        head = head.push(st::pill(fl!(loader(), "coord-stale"), st::Tone::Danger));
+    }
+    let open = c.state.open_inbox_count();
+    if open > 0 {
+        head = head.push(st::pill(
+            plain(fl!(loader(), "coord-inbox-badge", count = open)),
+            st::Tone::Warn,
+        ));
+    }
     head = head.push(st::nowrap(st::caption(stamp(&c.state.updated))));
     let mut col = column![head].spacing(st::SPACE_S);
     if let Some(goal) = c.state.state.lines().next().filter(|g| !g.is_empty()) {
@@ -107,6 +294,13 @@ fn thread_card(c: &CoordRow) -> Element<'_, Message> {
     }
     if total > 0 {
         col = col.push(st::progress(done as f32 * 100.0 / total as f32).length(Length::Fill));
+    }
+    col = col.push(mandate_block(&c.thread, c.state.mandate.as_ref()));
+    if let Some(inbox) = inbox_block(&c.thread, &c.state) {
+        col = col.push(inbox);
+    }
+    if let Some(assumptions) = assumptions_block(&c.state) {
+        col = col.push(assumptions);
     }
     if c.state.checklist.is_empty() {
         col = col.push(st::caption(fl!(loader(), "coord-no-checklist")));
