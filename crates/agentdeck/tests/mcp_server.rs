@@ -16,8 +16,10 @@ fn session_env(dir: &Path, env: &[(&str, &str)], requests: &[Value]) -> Vec<Valu
     let mut child = Command::new(env!("CARGO_BIN_EXE_agentdeck"))
         .arg("mcp-server")
         .env_remove("T3CODE_THREAD_ID")
-        .envs(env.iter().copied())
+        .env_remove("JEV_OPENROUTER_API_KEY")
+        .env_remove("AI_GATEWAY_API_KEY")
         .env("AGENTDECK_T3_DIR", dir.join("no-t3"))
+        .envs(env.iter().copied())
         .env("HOME", dir.join("home"))
         .env("AGENTDECK_CONFIG_DIR", dir.join("config"))
         .env("AGENTDECK_STATE_DIR", dir.join("state"))
@@ -352,5 +354,160 @@ fn coordinator_tools_refused_without_coordinator_plugin() {
         "{}",
         text(&replies[0])
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn coordinator_pool_checkpoint_and_hygiene_mcp_tools() {
+    let dir = std::env::temp_dir().join(format!(
+        "agentdeck-mcp-coord-u5-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let t3 = dir.join("t3");
+    std::fs::create_dir_all(dir.join("home")).unwrap();
+    std::fs::create_dir_all(dir.join("config")).unwrap();
+    std::fs::create_dir_all(t3.join("caches")).unwrap();
+    std::fs::write(
+        dir.join("config/instances.toml"),
+        "version = 1\n\n\
+         [plugins]\n\
+         mcp-server = true\n\
+         coordinator = true\n\n\
+         [coordinator]\n\
+         min_weekly_reserve_pct = 10.0\n\
+         min_free_disk_gb = 0\n\n\
+         [[coordinator.pool]]\n\
+         instance_id = \"claude_a\"\n\
+         model = \"claude-opus-4-6\"\n\
+         enabled = true\n\n\
+         [[coordinator.pool]]\n\
+         instance_id = \"codex_b\"\n\
+         model = \"gpt-6.2-sol\"\n\
+         enabled = true\n",
+    )
+    .unwrap();
+    // claude_a is thin (5% 5h), codex_b is healthy and full (80% 5h, 70% weekly).
+    std::fs::write(
+        t3.join("caches/claude_a.json"),
+        r#"{"status":"ready","usageLimits":{"windows":[{"id":"5h","windowDurationMins":300,"usedPercent":95.0,"resetsAt":"2026-11-21T06:00:00Z"},{"id":"week","windowDurationMins":10080,"usedPercent":20.0}]}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        t3.join("caches/codex_b.json"),
+        r#"{"status":"ready","usageLimits":{"windows":[{"id":"5h","windowDurationMins":300,"usedPercent":20.0},{"id":"week","windowDurationMins":10080,"usedPercent":30.0}]}}"#,
+    )
+    .unwrap();
+
+    let t3_str = t3.to_string_lossy().into_owned();
+    let dir_str = dir.to_string_lossy().into_owned();
+    let env = [
+        ("T3CODE_THREAD_ID", "coord-u5"),
+        ("AGENTDECK_T3_DIR", t3_str.as_str()),
+    ];
+
+    let replies = session_env(
+        &dir,
+        &env,
+        &[
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            call(
+                2,
+                "coordinator_next_target",
+                json!({"current_instance": "claude_a"}),
+            ),
+            call(
+                3,
+                "state_write",
+                json!({"state": "Goal: wire U5\nnext: verify", "phase": "running"}),
+            ),
+            call(
+                4,
+                "coordinator_checkpoint_check",
+                json!({"milestone_just_completed": false, "run_count_since_checkpoint": 5, "item_count_since_checkpoint": 50}),
+            ),
+            call(
+                5,
+                "coordinator_checkpoint_check",
+                json!({"milestone_just_completed": true, "run_count_since_checkpoint": 5, "item_count_since_checkpoint": 50}),
+            ),
+            call(
+                6,
+                "coordinator_hygiene_check",
+                json!({"path": dir_str}),
+            ),
+        ],
+    );
+    let names: Vec<&str> = replies[0]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    for tool in [
+        "coordinator_next_target",
+        "coordinator_checkpoint_check",
+        "coordinator_hygiene_check",
+    ] {
+        assert!(names.contains(&tool), "missing {tool} in {names:?}");
+    }
+    let next: Value = serde_json::from_str(&text(&replies[1])).unwrap();
+    assert_eq!(next["status"], "selected", "{next}");
+    assert_eq!(next["target"]["instance_id"], "codex_b");
+    assert_eq!(next["proactive_rotate"], true);
+
+    let quiet: Value = serde_json::from_str(&text(&replies[3])).unwrap();
+    assert_eq!(quiet["should_checkpoint"], false, "{quiet}");
+    assert_eq!(quiet["state_stale"], false);
+
+    let milestone: Value = serde_json::from_str(&text(&replies[4])).unwrap();
+    assert_eq!(milestone["should_checkpoint"], true, "{milestone}");
+    assert_eq!(milestone["state_stale"], false);
+    assert_eq!(milestone["recommended_target"]["instance_id"], "codex_b");
+
+    let hyg: Value = serde_json::from_str(&text(&replies[5])).unwrap();
+    assert_eq!(hyg["ok"], true, "{hyg}");
+    assert_eq!(hyg["min_gb"], 0);
+
+    // 5 checklist updates make state stale -> checkpoint_check must refuse immediately.
+    let mut stale_reqs = vec![call(
+        10,
+        "checklist_update",
+        json!({"items": [{"id": "u1", "title": "Unit"}]}),
+    )];
+    for i in 11..15 {
+        stale_reqs.push(call(
+            i,
+            "checklist_update",
+            json!({"items": [{"id": "u1", "note": format!("tick {i}")}]}),
+        ));
+    }
+    stale_reqs.push(call(
+        15,
+        "coordinator_checkpoint_check",
+        json!({"milestone_just_completed": true, "run_count_since_checkpoint": 200}),
+    ));
+    let stale_replies = session_env(&dir, &env, &stale_reqs);
+    let chk: Value = serde_json::from_str(&text(&stale_replies[5])).unwrap();
+    assert_eq!(chk["state_stale"], true, "{chk}");
+    assert_eq!(chk["should_checkpoint"], false, "{chk}");
+    assert!(chk["reason"].as_str().unwrap().contains("stale"), "{chk}");
+
+    // Exhaust both pool entries -> sleeping_for_quota with wake_at.
+    std::fs::write(
+        t3.join("caches/claude_a.json"),
+        r#"{"status":"ready","usageLimits":{"windows":[{"id":"5h","windowDurationMins":300,"usedPercent":100.0,"resetsAt":"2026-11-21T06:00:00Z"}]}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        t3.join("caches/codex_b.json"),
+        r#"{"status":"ready","usageLimits":{"windows":[{"id":"5h","windowDurationMins":300,"usedPercent":100.0,"resetsAt":"2026-11-21T05:00:00Z"}]}}"#,
+    )
+    .unwrap();
+    let sleep_replies = session_env(&dir, &env, &[call(20, "coordinator_next_target", json!({}))]);
+    let sleep: Value = serde_json::from_str(&text(&sleep_replies[0])).unwrap();
+    assert_eq!(sleep["status"], "sleeping_for_quota", "{sleep}");
+    assert_eq!(sleep["wake_at"], "2026-11-21T05:02:00Z", "{sleep}");
+
     let _ = std::fs::remove_dir_all(&dir);
 }

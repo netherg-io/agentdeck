@@ -1,8 +1,15 @@
 //! Module settings kept in `instances.toml` beside the registry:
 //! `[router] decision_provider / decision_model`, `[router.rules]`
-//! user model restrictions, and `[usage_poll] refresh_seconds /
-//! stale_seconds`. Absent keys mean the built-in defaults.
+//! user model restrictions, `[usage_poll] refresh_seconds / stale_seconds`,
+//! `[approver]` broker/judge config, and `[coordinator]` pool/watchdog config.
+//! Absent keys mean the built-in defaults.
 
+use std::fs;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use crate::changes::{Change, plan_write_file};
 use crate::paths::Paths;
 use crate::registry::Registry;
 
@@ -356,6 +363,554 @@ pub(crate) fn set(reg: &mut Registry, table: &str, key: &str, value: Option<toml
     }
 }
 
+pub const DEFAULT_APPROVER_AUTONOMOUS_TIMEOUT_SECS: u64 = 120;
+pub const DEFAULT_APPROVER_INTERACTIVE_TIMEOUT_SECS: u64 = 600;
+pub const DEFAULT_APPROVER_CONFIDENCE_THRESHOLD: f64 = 0.85;
+
+fn default_approver_autonomous_timeout() -> u64 {
+    DEFAULT_APPROVER_AUTONOMOUS_TIMEOUT_SECS
+}
+
+fn default_approver_interactive_timeout() -> u64 {
+    DEFAULT_APPROVER_INTERACTIVE_TIMEOUT_SECS
+}
+
+fn default_approver_confidence_threshold() -> f64 {
+    DEFAULT_APPROVER_CONFIDENCE_THRESHOLD
+}
+
+/// `[approver]` settings kept in `instances.toml` (ADR-0001).
+/// Mirrors `agentdeck_approver::ApproverConfig` so CLI, daemon and GUI share one schema.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApproverSettings {
+    pub socket_path: Option<PathBuf>,
+    #[serde(default = "default_approver_autonomous_timeout")]
+    pub autonomous_timeout_secs: u64,
+    #[serde(default = "default_approver_interactive_timeout")]
+    pub interactive_timeout_secs: u64,
+    pub judge_provider: Option<String>,
+    pub judge_model: Option<String>,
+    #[serde(default = "default_approver_confidence_threshold")]
+    pub judge_confidence_threshold: f64,
+    pub remote_hosts: Vec<String>,
+    pub extra_hard_deny_patterns: Vec<String>,
+}
+
+impl Default for ApproverSettings {
+    fn default() -> Self {
+        Self {
+            socket_path: None,
+            autonomous_timeout_secs: DEFAULT_APPROVER_AUTONOMOUS_TIMEOUT_SECS,
+            interactive_timeout_secs: DEFAULT_APPROVER_INTERACTIVE_TIMEOUT_SECS,
+            judge_provider: None,
+            judge_model: None,
+            judge_confidence_threshold: DEFAULT_APPROVER_CONFIDENCE_THRESHOLD,
+            remote_hosts: Vec::new(),
+            extra_hard_deny_patterns: Vec::new(),
+        }
+    }
+}
+
+impl ApproverSettings {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.autonomous_timeout_secs == 0 {
+            anyhow::bail!("[approver] autonomous_timeout_secs must be positive");
+        }
+        if self.interactive_timeout_secs == 0 {
+            anyhow::bail!("[approver] interactive_timeout_secs must be positive");
+        }
+        if !self.judge_confidence_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.judge_confidence_threshold)
+        {
+            anyhow::bail!(
+                "[approver] judge_confidence_threshold must be within [0.0, 1.0], got {}",
+                self.judge_confidence_threshold
+            );
+        }
+        if let Some(m) = self.judge_model.as_deref()
+            && (m.is_empty() || m.chars().any(char::is_whitespace))
+        {
+            anyhow::bail!("[approver] judge_model must be non-empty and contain no spaces");
+        }
+        if let Some(p) = self.judge_provider.as_deref() {
+            if p != PROVIDER_OPENROUTER && p != PROVIDER_VERCEL {
+                anyhow::bail!(
+                    "[approver] judge_provider must be {PROVIDER_OPENROUTER} or {PROVIDER_VERCEL}, got {p:?}"
+                );
+            }
+            if p == PROVIDER_VERCEL && self.judge_model.as_deref().is_none_or(str::is_empty) {
+                anyhow::bail!("[approver] judge_provider \"vercel\" requires judge_model");
+            }
+        }
+        for host in &self.remote_hosts {
+            if host.is_empty() || host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                anyhow::bail!("[approver] invalid remote_hosts entry {host:?}");
+            }
+        }
+        for pat in &self.extra_hard_deny_patterns {
+            if pat.is_empty() {
+                anyhow::bail!("[approver] extra_hard_deny_patterns must not contain empty patterns");
+            }
+            regex::Regex::new(&format!("(?i){pat}")).map_err(|e| {
+                anyhow::anyhow!("[approver] invalid extra_hard_deny_pattern {pat:?}: {e}")
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn resolved_socket_path(&self) -> PathBuf {
+        if let Some(path) = &self.socket_path {
+            return path.clone();
+        }
+        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+            return PathBuf::from(dir).join("agentdeck").join("approver.sock");
+        }
+        std::env::temp_dir().join("agentdeck-approver.sock")
+    }
+}
+
+/// Read `[approver]` from `instances.toml`; absent means defaults. Unknown keys are ignored.
+pub fn read_approver(reg: &Registry) -> anyhow::Result<ApproverSettings> {
+    let Some(val) = reg.extra.get("approver") else {
+        return Ok(ApproverSettings::default());
+    };
+    if !val.is_table() {
+        anyhow::bail!("[approver] must be a TOML table");
+    }
+    let cfg: ApproverSettings = val
+        .clone()
+        .try_into()
+        .map_err(|e| anyhow::anyhow!("invalid [approver] config: {e}"))?;
+    cfg.validate()?;
+    Ok(cfg)
+}
+
+fn apply_approver_to_registry(reg: &mut Registry, cfg: &ApproverSettings) {
+    let str_arr = |items: &[String]| {
+        (!items.is_empty()).then(|| {
+            toml::Value::Array(items.iter().cloned().map(toml::Value::String).collect())
+        })
+    };
+    set(
+        reg,
+        "approver",
+        "socket_path",
+        cfg.socket_path
+            .as_ref()
+            .map(|p| toml::Value::String(p.to_string_lossy().into_owned())),
+    );
+    set(
+        reg,
+        "approver",
+        "autonomous_timeout_secs",
+        Some(toml::Value::Integer(cfg.autonomous_timeout_secs as i64)),
+    );
+    set(
+        reg,
+        "approver",
+        "interactive_timeout_secs",
+        Some(toml::Value::Integer(cfg.interactive_timeout_secs as i64)),
+    );
+    set(
+        reg,
+        "approver",
+        "judge_provider",
+        cfg.judge_provider.clone().map(toml::Value::String),
+    );
+    set(
+        reg,
+        "approver",
+        "judge_model",
+        cfg.judge_model.clone().map(toml::Value::String),
+    );
+    set(
+        reg,
+        "approver",
+        "judge_confidence_threshold",
+        Some(toml::Value::Float(cfg.judge_confidence_threshold)),
+    );
+    set(reg, "approver", "remote_hosts", str_arr(&cfg.remote_hosts));
+    set(
+        reg,
+        "approver",
+        "extra_hard_deny_patterns",
+        str_arr(&cfg.extra_hard_deny_patterns),
+    );
+}
+
+/// Validated write of `[approver]` into `instances.toml`, preserving unknown keys.
+pub fn write_approver(
+    paths: &Paths,
+    cfg: &ApproverSettings,
+    dry_run: bool,
+) -> anyhow::Result<Vec<Change>> {
+    cfg.validate()?;
+    let mut reg = Registry::load(paths)?;
+    apply_approver_to_registry(&mut reg, cfg);
+    reg.validate()?;
+    let new_text = reg.render()?;
+    let old = fs::read(paths.registry_file()).ok();
+    let changes = plan_write_file(paths.registry_file(), old.as_deref(), new_text.as_bytes())
+        .map(|c| vec![c])
+        .unwrap_or_default();
+    if !dry_run && !changes.is_empty() {
+        Registry::update(paths, |r| {
+            apply_approver_to_registry(r, cfg);
+            Ok(())
+        })?;
+    }
+    Ok(changes)
+}
+
+/// Read-only check whether `approver.env` defines both Telegram bot token and owner id.
+pub fn approver_telegram_configured(config_dir: &std::path::Path) -> bool {
+    let Ok(raw) = fs::read_to_string(config_dir.join("approver.env")) else {
+        return false;
+    };
+    let (mut has_token, mut has_owner) = (false, false);
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed).trim();
+        let Some((key, val)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let val = val.trim().trim_matches('"').trim_matches('\'');
+        if val.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "TELEGRAM_BOT_TOKEN" => has_token = true,
+            "TELEGRAM_OWNER_ID" => has_owner = val.parse::<i64>().is_ok(),
+            _ => {}
+        }
+    }
+    has_token && has_owner
+}
+
+fn default_coord_weekly_reserve() -> f64 {
+    10.0
+}
+fn default_coord_proactive_below_5h() -> f64 {
+    10.0
+}
+fn default_coord_sleep_buffer() -> u64 {
+    120
+}
+fn default_coord_wake_grace() -> u64 {
+    180
+}
+fn default_coord_soft_runs() -> u32 {
+    80
+}
+fn default_coord_soft_items() -> u32 {
+    1500
+}
+fn default_coord_confidence() -> f64 {
+    0.80
+}
+fn default_coord_min_disk() -> u64 {
+    15
+}
+fn default_true_bool() -> bool {
+    true
+}
+
+/// One strong-model entry in `[coordinator]`'s dedicated `Coordinator Pool`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoordinatorPoolEntry {
+    pub instance_id: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub options: serde_json::Map<String, serde_json::Value>,
+    #[serde(default = "default_true_bool")]
+    pub enabled: bool,
+}
+
+/// `[coordinator]` settings kept in `instances.toml` (ADR-0002).
+/// Mirrors `agentdeck_coordinator::CoordinatorConfig` for CLI, daemon and GUI.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CoordinatorSettings {
+    #[serde(default)]
+    pub pool: Vec<CoordinatorPoolEntry>,
+    #[serde(default = "default_coord_weekly_reserve")]
+    pub min_weekly_reserve_pct: f64,
+    #[serde(default = "default_coord_proactive_below_5h")]
+    pub proactive_rotate_below_5h_pct: f64,
+    #[serde(default = "default_coord_sleep_buffer")]
+    pub quota_sleep_buffer_secs: u64,
+    #[serde(default = "default_coord_wake_grace")]
+    pub idle_wake_grace_secs: u64,
+    #[serde(default = "default_coord_soft_runs")]
+    pub checkpoint_soft_runs: u32,
+    #[serde(default = "default_coord_soft_items")]
+    pub checkpoint_soft_items: u32,
+    #[serde(default = "default_coord_confidence")]
+    pub checkpoint_confidence_threshold: f64,
+    #[serde(default = "default_coord_min_disk")]
+    pub min_free_disk_gb: u64,
+    #[serde(default)]
+    pub t3_endpoint: Option<String>,
+    #[serde(default)]
+    pub t3_token_file: Option<PathBuf>,
+    #[serde(default)]
+    pub judge_provider: Option<String>,
+    #[serde(default)]
+    pub judge_model: Option<String>,
+}
+
+impl Default for CoordinatorSettings {
+    fn default() -> Self {
+        Self {
+            pool: Vec::new(),
+            min_weekly_reserve_pct: default_coord_weekly_reserve(),
+            proactive_rotate_below_5h_pct: default_coord_proactive_below_5h(),
+            quota_sleep_buffer_secs: default_coord_sleep_buffer(),
+            idle_wake_grace_secs: default_coord_wake_grace(),
+            checkpoint_soft_runs: default_coord_soft_runs(),
+            checkpoint_soft_items: default_coord_soft_items(),
+            checkpoint_confidence_threshold: default_coord_confidence(),
+            min_free_disk_gb: default_coord_min_disk(),
+            t3_endpoint: None,
+            t3_token_file: None,
+            judge_provider: None,
+            judge_model: None,
+        }
+    }
+}
+
+fn validate_loopback_http(endpoint: &str) -> anyhow::Result<()> {
+    if endpoint
+        .chars()
+        .any(|c| c.is_control() || c == ' ' || c == '\u{7f}')
+    {
+        anyhow::bail!("[coordinator] t3_endpoint must not contain spaces or control characters");
+    }
+    let rest = endpoint.strip_prefix("http://").ok_or_else(|| {
+        anyhow::anyhow!("[coordinator] t3_endpoint must be loopback http:// (got {endpoint:?})")
+    })?;
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.contains('@') || rest.contains(['?', '#']) {
+        anyhow::bail!(
+            "[coordinator] t3_endpoint must be loopback http:// without userinfo, query or fragment"
+        );
+    }
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        authority
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(authority)
+    };
+    if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+        anyhow::bail!(
+            "[coordinator] t3_endpoint must be loopback (127.0.0.1, localhost or [::1])"
+        );
+    }
+    Ok(())
+}
+
+impl CoordinatorSettings {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.min_weekly_reserve_pct.is_finite()
+            || !(0.0..=100.0).contains(&self.min_weekly_reserve_pct)
+        {
+            anyhow::bail!(
+                "[coordinator] min_weekly_reserve_pct must be within [0.0, 100.0], got {}",
+                self.min_weekly_reserve_pct
+            );
+        }
+        if !self.proactive_rotate_below_5h_pct.is_finite()
+            || !(0.0..=100.0).contains(&self.proactive_rotate_below_5h_pct)
+        {
+            anyhow::bail!(
+                "[coordinator] proactive_rotate_below_5h_pct must be within [0.0, 100.0], got {}",
+                self.proactive_rotate_below_5h_pct
+            );
+        }
+        if !self.checkpoint_confidence_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.checkpoint_confidence_threshold)
+        {
+            anyhow::bail!(
+                "[coordinator] checkpoint_confidence_threshold must be within [0.0, 1.0], got {}",
+                self.checkpoint_confidence_threshold
+            );
+        }
+        if self.checkpoint_soft_runs == 0 {
+            anyhow::bail!("[coordinator] checkpoint_soft_runs must be positive");
+        }
+        if self.checkpoint_soft_items == 0 {
+            anyhow::bail!("[coordinator] checkpoint_soft_items must be positive");
+        }
+        for entry in &self.pool {
+            if entry.instance_id.is_empty()
+                || entry.instance_id.chars().any(char::is_whitespace)
+            {
+                anyhow::bail!(
+                    "[coordinator] pool entry has invalid instance_id {:?}",
+                    entry.instance_id
+                );
+            }
+            if entry.model.is_empty() || entry.model.chars().any(char::is_whitespace) {
+                anyhow::bail!(
+                    "[coordinator] pool entry {:?} has invalid model {:?}",
+                    entry.instance_id,
+                    entry.model
+                );
+            }
+        }
+        if let Some(ep) = self.t3_endpoint.as_deref() {
+            validate_loopback_http(ep)?;
+        }
+        if let Some(m) = self.judge_model.as_deref()
+            && (m.is_empty() || m.chars().any(char::is_whitespace))
+        {
+            anyhow::bail!("[coordinator] judge_model must be non-empty and contain no spaces");
+        }
+        if let Some(p) = self.judge_provider.as_deref()
+            && p != PROVIDER_OPENROUTER
+            && p != PROVIDER_VERCEL
+        {
+            anyhow::bail!(
+                "[coordinator] judge_provider must be {PROVIDER_OPENROUTER} or {PROVIDER_VERCEL}, got {p:?}"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Read `[coordinator]` from `instances.toml`; absent means defaults. Unknown keys are ignored.
+pub fn read_coordinator(reg: &Registry) -> anyhow::Result<CoordinatorSettings> {
+    let Some(val) = reg.extra.get("coordinator") else {
+        return Ok(CoordinatorSettings::default());
+    };
+    if !val.is_table() {
+        anyhow::bail!("[coordinator] must be a TOML table");
+    }
+    let cfg: CoordinatorSettings = val
+        .clone()
+        .try_into()
+        .map_err(|e| anyhow::anyhow!("invalid [coordinator] config: {e}"))?;
+    cfg.validate()?;
+    Ok(cfg)
+}
+
+fn apply_coordinator_to_registry(
+    reg: &mut Registry,
+    cfg: &CoordinatorSettings,
+) -> anyhow::Result<()> {
+    let pool_val = if cfg.pool.is_empty() {
+        None
+    } else {
+        Some(
+            toml::Value::try_from(&cfg.pool)
+                .map_err(|e| anyhow::anyhow!("cannot serialize [coordinator] pool: {e}"))?,
+        )
+    };
+    set(reg, "coordinator", "pool", pool_val);
+    set(
+        reg,
+        "coordinator",
+        "min_weekly_reserve_pct",
+        Some(toml::Value::Float(cfg.min_weekly_reserve_pct)),
+    );
+    set(
+        reg,
+        "coordinator",
+        "proactive_rotate_below_5h_pct",
+        Some(toml::Value::Float(cfg.proactive_rotate_below_5h_pct)),
+    );
+    set(
+        reg,
+        "coordinator",
+        "quota_sleep_buffer_secs",
+        Some(toml::Value::Integer(cfg.quota_sleep_buffer_secs as i64)),
+    );
+    set(
+        reg,
+        "coordinator",
+        "idle_wake_grace_secs",
+        Some(toml::Value::Integer(cfg.idle_wake_grace_secs as i64)),
+    );
+    set(
+        reg,
+        "coordinator",
+        "checkpoint_soft_runs",
+        Some(toml::Value::Integer(cfg.checkpoint_soft_runs as i64)),
+    );
+    set(
+        reg,
+        "coordinator",
+        "checkpoint_soft_items",
+        Some(toml::Value::Integer(cfg.checkpoint_soft_items as i64)),
+    );
+    set(
+        reg,
+        "coordinator",
+        "checkpoint_confidence_threshold",
+        Some(toml::Value::Float(cfg.checkpoint_confidence_threshold)),
+    );
+    set(
+        reg,
+        "coordinator",
+        "min_free_disk_gb",
+        Some(toml::Value::Integer(cfg.min_free_disk_gb as i64)),
+    );
+    set(
+        reg,
+        "coordinator",
+        "t3_endpoint",
+        cfg.t3_endpoint.clone().map(toml::Value::String),
+    );
+    set(
+        reg,
+        "coordinator",
+        "t3_token_file",
+        cfg.t3_token_file
+            .as_ref()
+            .map(|p| toml::Value::String(p.to_string_lossy().into_owned())),
+    );
+    set(
+        reg,
+        "coordinator",
+        "judge_provider",
+        cfg.judge_provider.clone().map(toml::Value::String),
+    );
+    set(
+        reg,
+        "coordinator",
+        "judge_model",
+        cfg.judge_model.clone().map(toml::Value::String),
+    );
+    Ok(())
+}
+
+/// Validated write of `[coordinator]` into `instances.toml`, preserving unknown keys.
+pub fn write_coordinator(
+    paths: &Paths,
+    cfg: &CoordinatorSettings,
+    dry_run: bool,
+) -> anyhow::Result<Vec<Change>> {
+    cfg.validate()?;
+    let mut reg = Registry::load(paths)?;
+    apply_coordinator_to_registry(&mut reg, cfg)?;
+    reg.validate()?;
+    let new_text = reg.render()?;
+    let old = fs::read(paths.registry_file()).ok();
+    let changes = plan_write_file(paths.registry_file(), old.as_deref(), new_text.as_bytes())
+        .map(|c| vec![c])
+        .unwrap_or_default();
+    if !dry_run && !changes.is_empty() {
+        Registry::update(paths, |r| apply_coordinator_to_registry(r, cfg))?;
+    }
+    Ok(changes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,5 +1019,137 @@ mod tests {
         );
         assert!(UserRules::from_json(Some(&serde_json::json!({"noReviewModels": [42]}))).is_err());
         assert!(UserRules::from_json(Some(&serde_json::json!("x"))).is_err());
+    }
+
+    #[test]
+    fn approver_settings_round_trip_preserves_unknown_keys_and_validates() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentdeck-settings-approver-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let paths = Paths::new(dir.join("config"), dir.join("state"));
+        assert_eq!(
+            read_approver(&Registry::empty()).unwrap(),
+            ApproverSettings::default()
+        );
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::write(
+            paths.registry_file(),
+            "version = 1\n[approver]\nfuture_flag = true\n",
+        )
+        .unwrap();
+        let cfg = ApproverSettings {
+            socket_path: Some(PathBuf::from("/tmp/custom-approver.sock")),
+            autonomous_timeout_secs: 90,
+            interactive_timeout_secs: 300,
+            judge_provider: Some(PROVIDER_OPENROUTER.into()),
+            judge_model: Some("~typesafe/jev-latest".into()),
+            judge_confidence_threshold: 0.9,
+            remote_hosts: vec!["homeserver".into()],
+            extra_hard_deny_patterns: vec!["drop\\s+schema".into()],
+        };
+        // dry-run leaves file untouched.
+        let planned = write_approver(&paths, &cfg, true).unwrap();
+        assert_eq!(planned.len(), 1);
+        assert_eq!(
+            read_approver(&Registry::load(&paths).unwrap()).unwrap(),
+            ApproverSettings::default()
+        );
+        write_approver(&paths, &cfg, false).unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        assert_eq!(read_approver(&reg).unwrap(), cfg);
+        assert_eq!(
+            reg.extra["approver"]["future_flag"].as_bool(),
+            Some(true),
+            "unknown keys in [approver] must survive writes"
+        );
+        // Invalid configs fail closed.
+        let bad_regex = ApproverSettings {
+            extra_hard_deny_patterns: vec!["([".into()],
+            ..cfg.clone()
+        };
+        assert!(write_approver(&paths, &bad_regex, false).is_err());
+        let bad_threshold = ApproverSettings {
+            judge_confidence_threshold: 1.5,
+            ..cfg.clone()
+        };
+        assert!(write_approver(&paths, &bad_threshold, false).is_err());
+        let bad_vercel = ApproverSettings {
+            judge_provider: Some(PROVIDER_VERCEL.into()),
+            judge_model: None,
+            ..cfg
+        };
+        assert!(write_approver(&paths, &bad_vercel, false).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn coordinator_settings_round_trip_preserves_unknown_keys_and_validates() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentdeck-settings-coord-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let paths = Paths::new(dir.join("config"), dir.join("state"));
+        assert_eq!(
+            read_coordinator(&Registry::empty()).unwrap(),
+            CoordinatorSettings::default()
+        );
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::write(
+            paths.registry_file(),
+            "version = 1\n[coordinator]\nfuture_knob = \"keep\"\n",
+        )
+        .unwrap();
+        let mut opts = serde_json::Map::new();
+        opts.insert("effort".into(), serde_json::json!("high"));
+        let cfg = CoordinatorSettings {
+            pool: vec![
+                CoordinatorPoolEntry {
+                    instance_id: "claude_a".into(),
+                    model: "claude-opus-4-6".into(),
+                    options: opts,
+                    enabled: true,
+                },
+                CoordinatorPoolEntry {
+                    instance_id: "codex_b".into(),
+                    model: "gpt-6.2-sol".into(),
+                    options: Default::default(),
+                    enabled: false,
+                },
+            ],
+            min_weekly_reserve_pct: 12.0,
+            proactive_rotate_below_5h_pct: 15.0,
+            quota_sleep_buffer_secs: 180,
+            idle_wake_grace_secs: 240,
+            checkpoint_soft_runs: 60,
+            checkpoint_soft_items: 1200,
+            checkpoint_confidence_threshold: 0.82,
+            min_free_disk_gb: 20,
+            t3_endpoint: Some("http://127.0.0.1:3773/mcp".into()),
+            t3_token_file: Some(PathBuf::from("/tmp/t3.token")),
+            judge_provider: Some(PROVIDER_OPENROUTER.into()),
+            judge_model: Some("~typesafe/jev-latest".into()),
+        };
+        write_coordinator(&paths, &cfg, false).unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        assert_eq!(read_coordinator(&reg).unwrap(), cfg);
+        assert_eq!(
+            reg.extra["coordinator"]["future_knob"].as_str(),
+            Some("keep")
+        );
+        // Remote endpoint rejected.
+        let bad_ep = CoordinatorSettings {
+            t3_endpoint: Some("http://example.com/mcp".into()),
+            ..cfg.clone()
+        };
+        assert!(write_coordinator(&paths, &bad_ep, false).is_err());
+        let bad_pct = CoordinatorSettings {
+            min_weekly_reserve_pct: 101.0,
+            ..cfg
+        };
+        assert!(write_coordinator(&paths, &bad_pct, false).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

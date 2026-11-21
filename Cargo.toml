@@ -1,7 +1,7 @@
 [workspace]
 members = ["crates/*"]
 # libcosmic is heavy: the applet builds in its own CI job, not in the default gates.
-default-members = ["crates/agentdeck", "crates/agentdeck-core", "crates/agentdeck-gui", "crates/agentdeck-usage", "crates/agent-process"]
+default-members = ["crates/agentdeck", "crates/agentdeck-core", "crates/agentdeck-gui", "crates/agentdeck-usage", "crates/agent-process", "crates/agentdeck-approver", "crates/agentdeck-coordinator"]
 resolver = "2"
 
 [workspace.package]

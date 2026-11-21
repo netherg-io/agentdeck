@@ -6,9 +6,18 @@
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
+use agentdeck_coordinator::checkpoint::{
+    CheckpointInput, CheckpointJudge, CheckpointVerdict, HeuristicCheckpointJudge,
+    HttpCheckpointJudge, record_outcome,
+};
+use agentdeck_coordinator::hygiene::check_disk_ok;
+use agentdeck_coordinator::pool::{PoolSelection, select_coordinator};
+use agentdeck_coordinator::t3_control::observe_thread_sqlite;
 use agentdeck_core::shared::InstructionChoice;
 use agentdeck_core::{Change, Paths, Registry, backlog, manage, plugins, sync, thread_state};
 use serde_json::{Value, json};
+
+use crate::cmd_coordinator;
 
 const PROTOCOL: &str = "2025-06-18";
 
@@ -150,6 +159,34 @@ fn tools() -> Value {
             "inputSchema": {"type": "object", "properties": {"thread": thread}}
         },
         {
+            "name": "coordinator_next_target",
+            "description": "Select the best Coordinator Pool target from live T3 usage caches (fullest 5h window while guarding weekly reserve), or return sleeping_for_quota with wake_at when all entries are exhausted, plus whether proactive rotation is recommended.",
+            "inputSchema": {"type": "object", "properties": {
+                "current_instance": {"type": "string", "description": "Current T3 provider instance id (defaults to the thread's observed instance)"},
+                "thread": thread
+            }}
+        },
+        {
+            "name": "coordinator_checkpoint_check",
+            "description": "Check whether this Coordinator thread is at a clean Checkpoint boundary. Refuses immediately if `state_stale` is true; otherwise checks soft thresholds / milestone / active children / hazards and returns { should_checkpoint, state_stale, confidence, reason, recommended_target }.",
+            "inputSchema": {"type": "object", "properties": {
+                "milestone_just_completed": {"type": "boolean"},
+                "run_count_since_checkpoint": {"type": "integer"},
+                "item_count_since_checkpoint": {"type": "integer"},
+                "active_children": {"type": "integer"},
+                "recent_events_tail": {"type": "array", "items": {"type": "string"}},
+                "current_instance": {"type": "string"},
+                "thread": thread
+            }}
+        },
+        {
+            "name": "coordinator_hygiene_check",
+            "description": "Check free disk space on the workspace partition against [coordinator] min_free_disk_gb and return { ok, free_gb, min_gb }.",
+            "inputSchema": {"type": "object", "properties": {
+                "path": {"type": "string", "description": "Directory to inspect; defaults to the server's current working directory"}
+            }}
+        },
+        {
             "name": "backlog_list",
             "description": "A project's coordinator backlog (findings, follow-ups, deferred steps, owner decisions to act on). Without `id`: one line per item; with `id`: the full item with history. Status filter: open (default), closed or all; `label` filters by label such as next-release or partial.",
             "inputSchema": {"type": "object", "required": ["project"], "properties": {
@@ -225,7 +262,7 @@ fn project_arg(args: &Value) -> anyhow::Result<Option<PathBuf>> {
     }
 }
 
-const COORDINATOR_TOOLS: [&str; 9] = [
+const COORDINATOR_TOOLS: [&str; 12] = [
     "checklist_update",
     "backlog_list",
     "backlog_add",
@@ -235,6 +272,9 @@ const COORDINATOR_TOOLS: [&str; 9] = [
     "owner_inbox_list",
     "assumption_add",
     "assumption_list",
+    "coordinator_next_target",
+    "coordinator_checkpoint_check",
+    "coordinator_hygiene_check",
 ];
 
 fn coordinator_enabled(paths: &Paths) -> bool {
@@ -284,7 +324,7 @@ fn skill_dir(
         })
 }
 
-fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> {
+async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> {
     let home = home()?;
     match name {
         "skills_list" => {
@@ -482,7 +522,11 @@ fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> {
         | "owner_inbox_resolve"
         | "owner_inbox_list"
         | "assumption_add"
-        | "assumption_list" if !coordinator_enabled(paths) =>
+        | "assumption_list"
+        | "coordinator_next_target"
+        | "coordinator_checkpoint_check"
+        | "coordinator_hygiene_check"
+            if !coordinator_enabled(paths) =>
         {
             anyhow::bail!("the agentdeck coordinator plugin is disabled")
         }
@@ -632,6 +676,172 @@ fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> {
                 .unwrap_or_default();
             Ok(json!({ "thread": thread, "items": items }))
         }
+        "coordinator_next_target" => {
+            let reg = Registry::load(paths)?;
+            let cfg = cmd_coordinator::coordinator_config(&reg)?;
+            let t3_root = agentdeck_core::t3::t3_root().ok();
+            let current_instance = str_arg(args, "current_instance")
+                .map(str::to_string)
+                .or_else(|| {
+                    let tid = str_arg(args, "thread")
+                        .map(str::to_string)
+                        .or_else(session_thread)?;
+                    let root = t3_root.as_deref()?;
+                    observe_thread_sqlite(root, &tid)
+                        .ok()
+                        .flatten()
+                        .and_then(|o| o.provider_instance_id)
+                });
+            let quotas = cmd_coordinator::collect_pool_quotas(&cfg, t3_root.as_deref());
+            let now = cmd_coordinator::now_epoch_secs();
+            let selection = select_coordinator(&cfg, &quotas, now, current_instance.as_deref());
+            let proactive = cmd_coordinator::proactive_rotate_recommended(
+                &cfg,
+                &quotas,
+                current_instance.as_deref(),
+            );
+            match selection {
+                PoolSelection::Selected {
+                    entry,
+                    five_hour_pct,
+                    weekly_pct,
+                    reason,
+                } => Ok(json!({
+                    "status": "selected",
+                    "target": entry,
+                    "five_hour_remaining_pct": five_hour_pct,
+                    "weekly_remaining_pct": weekly_pct,
+                    "proactive_rotate": proactive,
+                    "reason": reason,
+                })),
+                PoolSelection::SleepForQuota {
+                    wake_at_epoch_secs,
+                    earliest_reset_epoch_secs,
+                    next_candidate,
+                    reason,
+                } => Ok(json!({
+                    "status": "sleeping_for_quota",
+                    "wake_at": cmd_coordinator::format_utc_rfc3339(wake_at_epoch_secs),
+                    "wake_at_epoch_secs": wake_at_epoch_secs,
+                    "earliest_reset_epoch_secs": earliest_reset_epoch_secs,
+                    "next_candidate": next_candidate,
+                    "proactive_rotate": false,
+                    "reason": reason,
+                })),
+                PoolSelection::NoPoolConfigured => Ok(json!({
+                    "status": "no_pool_configured",
+                    "proactive_rotate": false,
+                    "reason": "no Coordinator Pool entries configured in [coordinator]",
+                })),
+            }
+        }
+        "coordinator_checkpoint_check" => {
+            let thread = thread_arg(args)?;
+            let reg = Registry::load(paths)?;
+            let cfg = cmd_coordinator::coordinator_config(&reg)?;
+            let t3_root = agentdeck_core::t3::t3_root().ok();
+            let found = thread_state::read(paths, t3_root.as_deref(), &thread)?;
+            let state_stale = found.as_ref().is_some_and(|f| f.data.state_stale());
+            let observed = t3_root
+                .as_deref()
+                .and_then(|root| observe_thread_sqlite(root, &thread).ok().flatten());
+            let current_instance = str_arg(args, "current_instance")
+                .map(str::to_string)
+                .or_else(|| {
+                    observed
+                        .as_ref()
+                        .and_then(|o| o.provider_instance_id.clone())
+                });
+            let quotas = cmd_coordinator::collect_pool_quotas(&cfg, t3_root.as_deref());
+            let recommended_target = match select_coordinator(
+                &cfg,
+                &quotas,
+                cmd_coordinator::now_epoch_secs(),
+                current_instance.as_deref(),
+            ) {
+                PoolSelection::Selected { entry, .. } => Some(entry),
+                _ => None,
+            };
+            if state_stale {
+                return Ok(json!({
+                    "should_checkpoint": false,
+                    "state_stale": true,
+                    "confidence": 1.0,
+                    "reason": "state snapshot is stale; rewrite state before checkpoint",
+                    "recommended_target": recommended_target,
+                }));
+            }
+            let recent_events_tail: Vec<String> = match args.get("recent_events_tail") {
+                Some(v) => serde_json::from_value(v.clone())?,
+                None => observed
+                    .as_ref()
+                    .filter(|o| !o.last_message_text.is_empty())
+                    .map(|o| vec![o.last_message_text.clone()])
+                    .unwrap_or_default(),
+            };
+            let input = CheckpointInput {
+                run_count_since_checkpoint: args
+                    .get("run_count_since_checkpoint")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32)
+                    .unwrap_or_else(|| observed.as_ref().map(|o| o.run_count as u32).unwrap_or(0)),
+                item_count_since_checkpoint: args
+                    .get("item_count_since_checkpoint")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32)
+                    .unwrap_or_else(|| {
+                        observed.as_ref().map(|o| o.item_count as u32).unwrap_or(0)
+                    }),
+                milestone_just_completed: args
+                    .get("milestone_just_completed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                state_stale,
+                active_children: args
+                    .get("active_children")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as usize)
+                    .unwrap_or_else(|| {
+                        observed
+                            .as_ref()
+                            .map(|o| o.pending_background_tasks as usize)
+                            .unwrap_or(0)
+                    }),
+                recent_events_tail,
+            };
+            let verdict = match HttpCheckpointJudge::from_env(&cfg) {
+                Ok(http) => match http.judge(&input, &cfg).await {
+                    Ok(v) => v,
+                    Err(e) => CheckpointVerdict::refuse(&format!("checkpoint judge error: {e}")),
+                },
+                Err(_) => HeuristicCheckpointJudge.judge(&input, &cfg).await?,
+            };
+            let _ = record_outcome(&paths.state_dir, &input, &verdict);
+            let should_checkpoint =
+                verdict.should_checkpoint && verdict.confidence >= cfg.checkpoint_confidence_threshold;
+            Ok(json!({
+                "should_checkpoint": should_checkpoint,
+                "state_stale": state_stale,
+                "confidence": verdict.confidence,
+                "reason": verdict.reason,
+                "recommended_target": recommended_target,
+            }))
+        }
+        "coordinator_hygiene_check" => {
+            let reg = Registry::load(paths)?;
+            let cfg = cmd_coordinator::coordinator_config(&reg)?;
+            let dir = match str_arg(args, "path") {
+                Some(p) => PathBuf::from(p),
+                None => std::env::current_dir()?,
+            };
+            let check = check_disk_ok(&dir, cfg.min_free_disk_gb);
+            Ok(json!({
+                "ok": check.ok,
+                "free_gb": check.free_gb,
+                "min_gb": check.min_gb,
+                "path": dir,
+            }))
+        }
         other => anyhow::bail!("unknown tool {other}"),
     }
 }
@@ -648,7 +858,7 @@ fn init_instructions(paths: &Paths) -> String {
     thread_state::instructions(found.as_ref())
 }
 
-fn handle(paths: &Paths, msg: &Value) -> Option<Value> {
+async fn handle(paths: &Paths, msg: &Value) -> Option<Value> {
     let id = msg.get("id").cloned()?; // notifications get no reply
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let result = match method {
@@ -683,7 +893,7 @@ fn handle(paths: &Paths, msg: &Value) -> Option<Value> {
             let enabled = Registry::load(paths)
                 .is_ok_and(|r| plugins::plugin_enabled(&r, plugins::PLUGIN_MCP_SERVER));
             let out = if enabled {
-                call(paths, name, &args)
+                call(paths, name, &args).await
             } else {
                 Err(anyhow::anyhow!(
                     "the agentdeck mcp-server plugin is disabled"
@@ -708,7 +918,7 @@ fn handle(paths: &Paths, msg: &Value) -> Option<Value> {
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
-pub fn run(paths: &Paths) -> anyhow::Result<()> {
+pub async fn run(paths: &Paths) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -717,7 +927,7 @@ pub fn run(paths: &Paths) -> anyhow::Result<()> {
             continue;
         }
         let reply = match serde_json::from_str::<Value>(&line) {
-            Ok(msg) => handle(paths, &msg),
+            Ok(msg) => handle(paths, &msg).await,
             Err(e) => Some(json!({
                 "jsonrpc": "2.0", "id": null,
                 "error": { "code": -32700, "message": format!("parse error: {e}") }
