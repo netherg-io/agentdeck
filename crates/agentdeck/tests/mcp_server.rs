@@ -455,7 +455,7 @@ fn coordinator_pool_checkpoint_and_hygiene_mcp_tools() {
     // claude_a is thin (5% 5h), codex_b is healthy and full (80% 5h, 70% weekly).
     std::fs::write(
         t3.join("caches/claude_a.json"),
-        r#"{"status":"ready","usageLimits":{"windows":[{"id":"5h","windowDurationMins":300,"usedPercent":95.0,"resetsAt":"2026-11-21T06:00:00Z"},{"id":"week","windowDurationMins":10080,"usedPercent":20.0}]}}"#,
+        r#"{"status":"ready","usageLimits":{"windows":[{"id":"5h","windowDurationMins":300,"usedPercent":95.0,"resetsAt":"2099-11-21T06:00:00Z"},{"id":"week","windowDurationMins":10080,"usedPercent":20.0}]}}"#,
     )
     .unwrap();
     std::fs::write(
@@ -561,12 +561,12 @@ fn coordinator_pool_checkpoint_and_hygiene_mcp_tools() {
     // Exhaust both pool entries -> sleeping_for_quota with wake_at.
     std::fs::write(
         t3.join("caches/claude_a.json"),
-        r#"{"status":"ready","usageLimits":{"windows":[{"id":"5h","windowDurationMins":300,"usedPercent":100.0,"resetsAt":"2026-11-21T06:00:00Z"}]}}"#,
+        r#"{"status":"ready","usageLimits":{"windows":[{"id":"5h","windowDurationMins":300,"usedPercent":100.0,"resetsAt":"2099-11-21T06:00:00Z"}]}}"#,
     )
     .unwrap();
     std::fs::write(
         t3.join("caches/codex_b.json"),
-        r#"{"status":"ready","usageLimits":{"windows":[{"id":"5h","windowDurationMins":300,"usedPercent":100.0,"resetsAt":"2026-11-21T05:00:00Z"}]}}"#,
+        r#"{"status":"ready","usageLimits":{"windows":[{"id":"5h","windowDurationMins":300,"usedPercent":100.0,"resetsAt":"2099-11-21T05:00:00Z"}]}}"#,
     )
     .unwrap();
     let sleep_replies = session_env(
@@ -576,7 +576,7 @@ fn coordinator_pool_checkpoint_and_hygiene_mcp_tools() {
     );
     let sleep: Value = serde_json::from_str(&text(&sleep_replies[0])).unwrap();
     assert_eq!(sleep["status"], "sleeping_for_quota", "{sleep}");
-    assert_eq!(sleep["wake_at"], "2026-11-21T05:02:00Z", "{sleep}");
+    assert_eq!(sleep["wake_at"], "2099-11-21T05:02:00Z", "{sleep}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
