@@ -431,13 +431,9 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
             let t3 = agentdeck_core::t3::t3_root().ok();
             match thread_state::read(paths, t3.as_deref(), &id)? {
                 Some(f) => {
+                    let stale = f.data.state_stale();
                     let mut v = serde_json::to_value(f)?;
-                    v["state_stale"] = json!(v["checklist_updates_since_state"]
-                        .as_u64()
-                        .unwrap_or(0)
-                        >= 5
-                        || (v["state"].as_str().unwrap_or("").trim().is_empty()
-                            && !v["checklist"].as_array().is_none_or(Vec::is_empty)));
+                    v["state_stale"] = json!(stale);
                     Ok(v)
                 }
                 None => Ok(json!({ "thread": id, "state": null, "state_stale": false, "checklist_updates_since_state": 0 })),
@@ -447,15 +443,24 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
             let id = thread_arg(args)?;
             let t3 = agentdeck_core::t3::t3_root().ok();
             let t3r = t3.as_deref();
-            let has_snapshot = args.get("state").and_then(Value::as_str).is_some()
-                || args.get("decision").and_then(Value::as_str).is_some_and(|s| !s.is_empty());
+            let state = args.get("state").and_then(Value::as_str);
+            let decision = str_arg(args, "decision");
+            let has_snapshot = state.is_some() || decision.is_some_and(|s| !s.is_empty());
             let phase: Option<thread_state::RunPhase> = match args.get("phase") {
                 None | Some(Value::Null) => None,
                 Some(v) => Some(serde_json::from_value(v.clone())?),
             };
+            // The MCP can never self-grant an owner mandate: any `mandate`
+            // written here lands with `owner_granted = false` (only the owner
+            // via GUI or `grant-mandate` sets a trusted grant). A call that
+            // does NOT touch `mandate` preserves the existing grant.
             let mandate: Option<thread_state::RunMandate> = match args.get("mandate") {
                 None | Some(Value::Null) => None,
-                Some(v) => Some(serde_json::from_value(v.clone())?),
+                Some(v) => {
+                    let mut m: thread_state::RunMandate = serde_json::from_value(v.clone())?;
+                    m.owner_granted = false;
+                    Some(m)
+                }
             };
             let sleep_until: Option<Option<String>> = match args.get("sleep_until") {
                 None => None,
@@ -475,28 +480,20 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
             if !has_snapshot && !meta_requested {
                 anyhow::bail!("pass state, decision, phase, mandate, sleep_until or record_checkpoint");
             }
-            let mut current = if has_snapshot {
-                thread_state::write(
-                    paths,
-                    t3r,
-                    &id,
-                    args.get("state").and_then(Value::as_str),
-                    str_arg(args, "decision"),
-                )?
-            } else {
-                thread_state::read(paths, t3r, &id)?.map(|f| f.data).unwrap_or_default()
-            };
-            if meta_requested {
-                current = thread_state::set_run_meta(
-                    paths,
-                    t3r,
-                    &id,
-                    phase,
-                    mandate,
-                    sleep_until,
-                    record_checkpoint,
-                )?;
-            }
+            // ONE atomic locked transaction: snapshot, decision, phase,
+            // mandate, sleep_until and checkpoint commit together (validated
+            // up front, saved once), so concurrent writers cannot interleave.
+            let current = thread_state::apply_update(
+                paths,
+                t3r,
+                &id,
+                state,
+                decision,
+                phase,
+                mandate,
+                sleep_until,
+                record_checkpoint,
+            )?;
             let stale = current.state_stale();
             let mut out = json!({
                 "thread": id,
@@ -680,26 +677,34 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
             let reg = Registry::load(paths)?;
             let cfg = cmd_coordinator::coordinator_config(&reg)?;
             let t3_root = agentdeck_core::t3::t3_root().ok();
+            let observed_pair: Option<(String, String)> = (|| {
+                let tid = str_arg(args, "thread")
+                    .map(str::to_string)
+                    .or_else(session_thread)?;
+                let root = t3_root.as_deref()?;
+                let o = observe_thread_sqlite(root, &tid).ok().flatten()?;
+                Some((o.provider_instance_id?, o.model?))
+            })();
             let current_instance = str_arg(args, "current_instance")
                 .map(str::to_string)
-                .or_else(|| {
-                    let tid = str_arg(args, "thread")
-                        .map(str::to_string)
-                        .or_else(session_thread)?;
-                    let root = t3_root.as_deref()?;
-                    observe_thread_sqlite(root, &tid)
-                        .ok()
-                        .flatten()
-                        .and_then(|o| o.provider_instance_id)
-                });
+                .or_else(|| observed_pair.as_ref().map(|(i, _)| i.clone()));
+            // The pool model for the instance wins (quota views are keyed by
+            // both); the observed model is the fallback for unconfigured threads.
+            let current_model = current_instance.as_deref().and_then(|c| {
+                cfg.pool
+                    .iter()
+                    .find(|e| e.instance_id == c)
+                    .map(|e| e.model.clone())
+            }).or_else(|| observed_pair.as_ref().map(|(_, m)| m.clone()));
+            let current = match (current_instance.as_deref(), current_model.as_deref()) {
+                (Some(i), Some(m)) => Some((i, m)),
+                _ => None,
+            };
             let quotas = cmd_coordinator::collect_pool_quotas(&cfg, t3_root.as_deref());
             let now = cmd_coordinator::now_epoch_secs();
-            let selection = select_coordinator(&cfg, &quotas, now, current_instance.as_deref());
-            let proactive = cmd_coordinator::proactive_rotate_recommended(
-                &cfg,
-                &quotas,
-                current_instance.as_deref(),
-            );
+            let selection = select_coordinator(&cfg, &quotas, now, current);
+            let proactive =
+                cmd_coordinator::proactive_rotate_recommended(&cfg, &quotas, current);
             match selection {
                 PoolSelection::Selected {
                     entry,
@@ -752,12 +757,22 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
                         .as_ref()
                         .and_then(|o| o.provider_instance_id.clone())
                 });
+            let current_model = current_instance.as_deref().and_then(|c| {
+                cfg.pool
+                    .iter()
+                    .find(|e| e.instance_id == c)
+                    .map(|e| e.model.clone())
+            }).or_else(|| observed.as_ref().and_then(|o| o.model.clone()));
+            let current = match (current_instance.as_deref(), current_model.as_deref()) {
+                (Some(i), Some(m)) => Some((i, m)),
+                _ => None,
+            };
             let quotas = cmd_coordinator::collect_pool_quotas(&cfg, t3_root.as_deref());
             let recommended_target = match select_coordinator(
                 &cfg,
                 &quotas,
                 cmd_coordinator::now_epoch_secs(),
-                current_instance.as_deref(),
+                current,
             ) {
                 PoolSelection::Selected { entry, .. } => Some(entry),
                 _ => None,

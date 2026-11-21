@@ -197,6 +197,38 @@ impl HttpCheckpointJudge {
     }
 
     fn request_body(&self, input: &CheckpointInput) -> serde_json::Value {
+        let question = serde_json::json!({
+            "type": "score",
+            "instructions": "Is this a clean, safe boundary to checkpoint (persist state and start a fresh context)?",
+            "criteria": [
+                "Unsafe: work is mid-flight, state is stale, or children are still running.",
+                "Risky: minor loose ends, but checkpointing would not lose work.",
+                "Clean: a quiet stretch with nothing in flight.",
+                "Ideal: a milestone boundary with fresh state and no loose ends.",
+            ],
+        });
+        // Vercel's decisions endpoint takes an array of named questions (same
+        // shape `agentdeck-router` sends); OpenRouter takes the question map.
+        let questions = if self.endpoint.contains("vercel") {
+            let levels: Vec<serde_json::Value> = question
+                .get("criteria")
+                .and_then(serde_json::Value::as_array)
+                .map(|cs| {
+                    cs.iter()
+                        .enumerate()
+                        .map(|(i, c)| serde_json::json!({"label": i.to_string(), "description": c}))
+                        .collect()
+                })
+                .unwrap_or_default();
+            serde_json::json!([{
+                "type": "score",
+                "name": "checkpoint_safe",
+                "instructions": question.get("instructions"),
+                "levels": levels,
+            }])
+        } else {
+            serde_json::json!({ "checkpoint_safe": question })
+        };
         serde_json::json!({
             "model": self.model,
             "state": {
@@ -206,33 +238,43 @@ impl HttpCheckpointJudge {
                 "activeChildren": input.active_children,
                 "recentEventsTail": input.recent_events_tail.join("\n"),
             },
-            "questions": {
-                "checkpoint_safe": {
-                    "type": "score",
-                    "instructions": "Is this a clean, safe boundary to checkpoint (persist state and start a fresh context)?",
-                    "criteria": [
-                        "Unsafe: work is mid-flight, state is stale, or children are still running.",
-                        "Risky: minor loose ends, but checkpointing would not lose work.",
-                        "Clean: a quiet stretch with nothing in flight.",
-                        "Ideal: a milestone boundary with fresh state and no loose ends.",
-                    ],
-                }
-            },
+            "questions": questions,
         })
     }
 
+    /// Accept both OpenRouter's `{name: {score, confidence}}` map and
+    /// Vercel's `[{name, score, confidence}]` array (refusals are dropped, so
+    /// a missing entry is malformed, not a default).
+    fn normalize_answer<'a>(&self, answers: &'a serde_json::Value) -> anyhow::Result<&'a serde_json::Value> {
+        if let Some(a) = answers.get("checkpoint_safe") {
+            return Ok(a);
+        }
+        if let Some(list) = answers.as_array()
+            && let Some(a) = list
+                .iter()
+                .find(|a| a.get("name").and_then(serde_json::Value::as_str) == Some("checkpoint_safe"))
+        {
+            return Ok(a);
+        }
+        anyhow::bail!("judge returned no checkpoint_safe answer: {answers}")
+    }
+
     fn parse_answers(&self, answers: &serde_json::Value) -> anyhow::Result<CheckpointVerdict> {
-        let a = answers.get("checkpoint_safe").ok_or_else(|| {
-            anyhow::anyhow!("judge returned no checkpoint_safe answer: {answers}")
-        })?;
+        let a = self.normalize_answer(answers)?;
+        // Raw ranges are validated, never clamped: a 1.4 binary-style score
+        // or an out-of-range confidence is malformed and must fail loudly.
         let score = a.get("score").and_then(serde_json::Value::as_f64).ok_or_else(|| {
             anyhow::anyhow!("checkpoint_safe answer has no score: {a}")
         })?;
-        let confidence = a
-            .get("confidence")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.5)
-            .clamp(0.0, 1.0);
+        if !score.is_finite() || !(0.0..=3.0).contains(&score) {
+            anyhow::bail!("checkpoint_safe score {score} out of range 0..=3: {a}");
+        }
+        let confidence = match a.get("confidence") {
+            None => 0.5,
+            Some(v) => v.as_f64().filter(|c| c.is_finite() && (0.0..=1.0).contains(c)).ok_or_else(|| {
+                anyhow::anyhow!("checkpoint_safe confidence out of range 0..=1: {a}")
+            })?,
+        };
         Ok(CheckpointVerdict {
             should_checkpoint: score >= 2.0,
             confidence,
@@ -315,4 +357,89 @@ pub fn record_outcome(
         .open(dir.join("checkpoint-outcomes.jsonl"))?;
     writeln!(f, "{}", line)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn judge_for(endpoint: &str) -> HttpCheckpointJudge {
+        HttpCheckpointJudge {
+            endpoint: endpoint.to_string(),
+            api_key: "test".to_string(),
+            model: "jev-decision-1".to_string(),
+        }
+    }
+
+    fn sample_input() -> CheckpointInput {
+        CheckpointInput {
+            run_count_since_checkpoint: 90,
+            item_count_since_checkpoint: 10,
+            milestone_just_completed: false,
+            state_stale: false,
+            active_children: 0,
+            recent_events_tail: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn request_body_matches_provider_shape() {
+        let openrouter = judge_for("https://openrouter.ai/api/alpha/decisions")
+            .request_body(&sample_input());
+        assert!(openrouter["questions"].is_object());
+        assert!(openrouter["questions"]["checkpoint_safe"].is_object());
+        let vercel = judge_for("https://ai-gateway.vercel.sh/v1/decisions").request_body(&sample_input());
+        let list = vercel["questions"].as_array().expect("vercel questions are an array");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["name"], "checkpoint_safe");
+        assert_eq!(list[0]["type"], "score");
+    }
+
+    #[test]
+    fn parse_answers_accepts_both_provider_shapes() {
+        let j = judge_for("https://openrouter.ai/api/alpha/decisions");
+        // OpenRouter map shape.
+        let v = j
+            .parse_answers(&serde_json::json!({
+                "checkpoint_safe": {"score": 3.0, "confidence": 0.9}
+            }))
+            .unwrap();
+        assert!(v.should_checkpoint);
+        assert_eq!(v.confidence, 0.9);
+        // Vercel array shape.
+        let v = j
+            .parse_answers(&serde_json::json!([
+                {"name": "checkpoint_safe", "type": "score", "score": 1.0, "confidence": 0.8}
+            ]))
+            .unwrap();
+        assert!(!v.should_checkpoint);
+        // Missing confidence falls back to 0.5, never to a clamped garbage value.
+        let v = j
+            .parse_answers(&serde_json::json!({"checkpoint_safe": {"score": 2.0}}))
+            .unwrap();
+        assert!(v.should_checkpoint);
+        assert_eq!(v.confidence, 0.5);
+    }
+
+    #[test]
+    fn parse_answers_rejects_malformed_and_out_of_range() {
+        let j = judge_for("https://openrouter.ai/api/alpha/decisions");
+        for bad in [
+            // No answer at all (and refusals dropped from an array).
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!([{"name": "other", "score": 3.0}]),
+            // Score of the wrong type or outside 0..=3.
+            serde_json::json!({"checkpoint_safe": {"confidence": 0.9}}),
+            serde_json::json!({"checkpoint_safe": {"score": "high", "confidence": 0.9}}),
+            serde_json::json!({"checkpoint_safe": {"score": 5.0, "confidence": 0.9}}),
+            serde_json::json!({"checkpoint_safe": {"score": -1.0, "confidence": 0.9}}),
+            serde_json::json!({"checkpoint_safe": {"score": 1.4, "confidence": 2.0}}),
+            // Confidence of the wrong type or outside 0..=1.
+            serde_json::json!({"checkpoint_safe": {"score": 3.0, "confidence": 1.5}}),
+            serde_json::json!({"checkpoint_safe": {"score": 3.0, "confidence": "sure"}}),
+        ] {
+            assert!(j.parse_answers(&bad).is_err(), "{bad}");
+        }
+    }
 }

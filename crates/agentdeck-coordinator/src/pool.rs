@@ -9,6 +9,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{CoordinatorConfig, CoordinatorPoolEntry};
 
+/// Key into the quota map: `(instance_id, model)`. Two pool entries on one
+/// T3 instance (Claude on `3p-*` buckets vs Gemini on `gemini-*` buckets)
+/// must NEVER share one quota view, so the model is part of the key.
+pub type PoolKey = (String, String);
+
+/// Build a [`PoolKey`] for one pool entry (or one observation).
+pub fn pool_key(instance_id: &str, model: &str) -> PoolKey {
+    (instance_id.to_string(), model.to_string())
+}
+
 /// Remaining-quota view for one pool entry, read from T3's usage cache.
 /// `None` percents mean unknown (treated as full); `resets_at` is epoch secs.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -71,6 +81,9 @@ pub fn parse_epoch_rfc3339(s: &str) -> Option<i64> {
             return None;
         }
         let (h, m) = (digits[..2].parse::<i64>().ok()?, digits[2..].parse::<i64>().ok()?);
+        if h > 23 || m > 59 {
+            return None;
+        }
         (dt, sign * (h * 3600 + m * 60))
     };
     let (date, time) = dt.split_once(['T', 't', ' '])?;
@@ -79,10 +92,31 @@ pub fn parse_epoch_rfc3339(s: &str) -> Option<i64> {
     if d.len() != 3 || t.len() < 2 {
         return None;
     }
-    let secs: f64 = t[2].split('.').next().unwrap_or("0").parse().ok().unwrap_or(-1.0);
+    // No seconds (`...T04:00Z`): treat as the top of the minute, never panic.
+    let secs: f64 = t
+        .get(2)
+        .copied()
+        .unwrap_or("00")
+        .split('.')
+        .next()
+        .unwrap_or("00")
+        .parse()
+        .ok()
+        .unwrap_or(-1.0);
     // Days since 1970-01-01 (H. Hinnant's algorithm, inverse of utc()).
     let (mut y, m, day) = (d[0], d[1], d[2]);
     if !(1..=12).contains(&m) || !(1..=31).contains(&day) || !(0.0..=60.0).contains(&secs) {
+        return None;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let dim = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if leap { 29 } else { 28 }
+        }
+    };
+    if day > dim {
         return None;
     }
     y -= i64::from(m <= 2);
@@ -207,37 +241,43 @@ pub fn quota_from_t3_cache(
     view
 }
 
-fn view_for(
-    quotas: &HashMap<String, QuotaWindowView>,
-    instance_id: &str,
-) -> QuotaWindowView {
-    quotas.get(instance_id).cloned().unwrap_or_else(QuotaWindowView::unknown_healthy)
+fn view_for(quotas: &HashMap<PoolKey, QuotaWindowView>, instance_id: &str, model: &str) -> QuotaWindowView {
+    quotas
+        .get(&pool_key(instance_id, model))
+        .cloned()
+        .unwrap_or_else(QuotaWindowView::unknown_healthy)
 }
 
-fn eligible(cfg: &CoordinatorConfig, q: &QuotaWindowView) -> bool {
+/// Pool eligibility: the exact bar a rotation target must clear (healthy,
+/// weekly reserve intact, 5h window above 1%). Both the reactive and the
+/// proactive rotation paths filter through this one predicate.
+pub fn eligible(cfg: &CoordinatorConfig, q: &QuotaWindowView) -> bool {
     q.healthy
         && q.weekly_remaining_pct.unwrap_or(100.0) >= cfg.min_weekly_reserve_pct
         && q.five_hour_remaining_pct.unwrap_or(100.0) > 1.0
 }
 
 /// Pick the pool entry with the fullest 5-hour window (tie-break: fullest
-/// weekly, then keep `current_instance` when within 2% to preserve prompt
+/// weekly, then keep `current` when within 2% to preserve prompt
 /// cache, else pool order). Exhausted pools sleep until the earliest
-/// blocking `resets_at + quota_sleep_buffer_secs`.
+/// future point at which a candidate clears every blocking window,
+/// plus `quota_sleep_buffer_secs`; with no usable future reset the sleep
+/// is a bounded `now + 300s` refresh.
 pub fn select_coordinator(
     cfg: &CoordinatorConfig,
-    quotas: &HashMap<String, QuotaWindowView>,
+    quotas: &HashMap<PoolKey, QuotaWindowView>,
     now_epoch_secs: i64,
-    current_instance: Option<&str>,
+    current: Option<(&str, &str)>,
 ) -> PoolSelection {
     let enabled: Vec<&CoordinatorPoolEntry> =
         cfg.pool.iter().filter(|e| e.enabled).collect();
     if enabled.is_empty() {
         return PoolSelection::NoPoolConfigured;
     }
+    let view = |e: &CoordinatorPoolEntry| view_for(quotas, &e.instance_id, &e.model);
     let healthy: Vec<(&CoordinatorPoolEntry, QuotaWindowView)> = enabled
         .iter()
-        .map(|e| (*e, view_for(quotas, &e.instance_id)))
+        .map(|e| (*e, view(e)))
         .filter(|(_, q)| q.healthy)
         .collect();
     let mut best: Option<(&CoordinatorPoolEntry, f64, f64)> = None;
@@ -257,21 +297,30 @@ pub fn select_coordinator(
         }
     }
     if let Some((entry, five, weekly)) = best {
-        // Cache-preserving hysteresis: stay on the current instance when it
+        // Cache-preserving hysteresis: stay on the current entry when it
         // is eligible and within 2% of the best 5h window.
-        if let Some(cur) = current_instance {
-            let cq = view_for(quotas, cur);
-            if cfg.pool.iter().any(|e| e.enabled && e.instance_id == cur) && eligible(cfg, &cq) {
+        if let Some((cur_inst, cur_model)) = current {
+            let cq = view_for(quotas, cur_inst, cur_model);
+            if cfg
+                .pool
+                .iter()
+                .any(|e| e.enabled && e.instance_id == cur_inst && e.model == cur_model)
+                && eligible(cfg, &cq)
+            {
                 let cfive = cq.five_hour_remaining_pct.unwrap_or(100.0);
                 let cweekly = cq.weekly_remaining_pct.unwrap_or(100.0);
                 if five - cfive <= 2.0 {
-                    let entry = cfg.pool.iter().find(|e| e.instance_id == cur).expect("checked above");
+                    let entry = cfg
+                        .pool
+                        .iter()
+                        .find(|e| e.instance_id == cur_inst && e.model == cur_model)
+                        .expect("checked above");
                     return PoolSelection::Selected {
                         entry: entry.clone(),
                         five_hour_pct: cfive,
                         weekly_pct: cweekly,
                         reason: format!(
-                            "keeping {cur} (5h {cfive:.1}% within 2% of best {five:.1}%) to preserve prompt cache"
+                            "keeping {cur_inst}/{cur_model} (5h {cfive:.1}% within 2% of best {five:.1}%) to preserve prompt cache"
                         ),
                     };
                 }
@@ -287,31 +336,38 @@ pub fn select_coordinator(
             ),
         };
     }
-    // Nobody is eligible: find the earliest reset of a blocking window.
+    // Nobody is eligible: find the earliest future point at which a blocked
+    // candidate clears every window that blocks it. A candidate blocked by
+    // both the 5h and the weekly window cannot run when only the earlier
+    // window resets, so its usable reset is the later of the two. Stale
+    // (`<= now`) and unknown (`None`) resets are never usable: a blocked
+    // window without a credible future reset disqualifies the candidate.
     let mut earliest: Option<(i64, CoordinatorPoolEntry)> = None;
     for (entry, q) in &healthy {
         let blocked_5h = q.five_hour_remaining_pct.unwrap_or(100.0) <= 1.0;
         let blocked_weekly =
             q.weekly_remaining_pct.unwrap_or(100.0) < cfg.min_weekly_reserve_pct;
+        if !blocked_5h && !blocked_weekly {
+            continue;
+        }
         let mut resets: Vec<i64> = Vec::new();
         if blocked_5h {
-            resets.extend(q.five_hour_resets_at);
+            resets.extend(q.five_hour_resets_at.filter(|r| *r > now_epoch_secs));
         }
         if blocked_weekly {
-            resets.extend(q.weekly_resets_at);
+            resets.extend(q.weekly_resets_at.filter(|r| *r > now_epoch_secs));
         }
-        // A blocked window without a known reset still counts: fall back to now.
-        if (blocked_5h || blocked_weekly) && resets.is_empty() {
-            resets.push(now_epoch_secs);
+        let want = usize::from(blocked_5h) + usize::from(blocked_weekly);
+        if resets.len() < want {
+            continue;
         }
-        for r in resets {
-            let take = match earliest {
-                None => true,
-                Some((er, _)) => r < er,
-            };
-            if take {
-                earliest = Some((r, (*entry).clone()));
-            }
+        let usable = resets.into_iter().max().expect("want >= 1");
+        let take = match earliest {
+            None => true,
+            Some((er, _)) => usable < er,
+        };
+        if take {
+            earliest = Some((usable, (*entry).clone()));
         }
     }
     match earliest {
@@ -320,16 +376,16 @@ pub fn select_coordinator(
             earliest_reset_epoch_secs: Some(reset),
             next_candidate: Some(next.clone()),
             reason: format!(
-                "all pool entries exhausted; earliest reset is {} at {reset}, waking +{}s",
+                "all pool entries exhausted; earliest usable reset is {} at {reset}, waking +{}s",
                 next.instance_id, cfg.quota_sleep_buffer_secs
             ),
         },
         None => PoolSelection::SleepForQuota {
-            // No healthy entry and no known reset: retry after one buffer.
-            wake_at_epoch_secs: now_epoch_secs + cfg.quota_sleep_buffer_secs as i64,
+            // No candidate has a usable future reset: bounded refresh, never now.
+            wake_at_epoch_secs: now_epoch_secs + 300,
             earliest_reset_epoch_secs: None,
             next_candidate: None,
-            reason: "no healthy pool entry with a known reset; retrying after sleep buffer".into(),
+            reason: "no pool entry has a usable future reset; retrying after a bounded refresh".into(),
         },
     }
 }

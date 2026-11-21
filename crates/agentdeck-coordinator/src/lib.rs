@@ -18,6 +18,6 @@ pub mod watchdog;
 
 pub use checkpoint::{CheckpointInput, CheckpointJudge, CheckpointVerdict};
 pub use config::{CoordinatorConfig, CoordinatorPoolEntry};
-pub use pool::{PoolSelection, QuotaWindowView};
+pub use pool::{PoolKey, PoolSelection, QuotaWindowView, eligible, pool_key};
 pub use t3_control::{HttpT3Controller, ObservedThread, T3ThreadController};
 pub use watchdog::{ActionDebounce, RunPhase, RunSnapshot, WatchdogAction, WatchdogThreadInput};

@@ -11,28 +11,28 @@ use serde::{Deserialize, Serialize};
 
 /// Reject anything that is not an `http://` loopback URL without credentials,
 /// query or fragment (same bar as `agentdeck-router::mcp_call`: a daemon that
-/// can be pointed at a remote host is a credential leak).
+/// can be pointed at a remote host is a credential leak). Parsed with the
+/// exact parser the client uses, so no hand-rolled split can disagree with it.
 pub fn check_loopback_url(endpoint: &str) -> anyhow::Result<()> {
     if endpoint.chars().any(|c| c.is_control() || c == ' ' || c == '\u{7f}') {
         anyhow::bail!("invalid T3 MCP endpoint: control characters or spaces");
     }
-    let rest = endpoint
-        .strip_prefix("http://")
-        .ok_or_else(|| anyhow::anyhow!("T3 MCP endpoint must be loopback http:// (got {endpoint:?})"))?;
-    let authority = rest.split('/').next().unwrap_or("");
-    if authority.contains('@') || rest.contains(['?', '#']) {
+    let url = reqwest::Url::parse(endpoint)
+        .map_err(|_| anyhow::anyhow!("T3 MCP endpoint must be loopback http:// (got {endpoint:?})"))?;
+    if url.scheme() != "http" {
+        anyhow::bail!("T3 MCP endpoint must be loopback http:// (got {endpoint:?})");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
         anyhow::bail!("T3 MCP endpoint must be loopback http:// without userinfo, query or fragment");
     }
-    // Split host from port, honouring a bracketed `[::1]` literal.
-    let host = if let Some(bracketed) = authority.strip_prefix('[') {
-        bracketed.split(']').next().unwrap_or("")
-    } else {
-        authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority)
-    };
-    if host != "127.0.0.1" && host != "localhost" && host != "::1" {
-        anyhow::bail!("T3 MCP endpoint must be loopback (127.0.0.1, localhost or [::1])");
+    if url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("T3 MCP endpoint must be loopback http:// without userinfo, query or fragment");
     }
-    Ok(())
+    match url.host_str() {
+        // `host_str` keeps IPv6 brackets: `[::1]` here is the `::1` loopback.
+        Some("127.0.0.1") | Some("localhost") | Some("[::1]") => Ok(()),
+        _ => anyhow::bail!("T3 MCP endpoint must be loopback (127.0.0.1, localhost or [::1])"),
+    }
 }
 
 /// `Send` is deliberately unbounded: the daemon awaits these futures
@@ -77,6 +77,7 @@ impl HttpT3Controller {
             endpoint: endpoint.to_string(),
             authorization,
             client: reqwest::Client::builder()
+                .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|_| anyhow::anyhow!("cannot build T3 MCP client"))?,
@@ -87,13 +88,14 @@ impl HttpT3Controller {
         &self.endpoint
     }
 
-    async fn rpc(&self, method: &str, params: Option<serde_json::Value>, id: u64) -> anyhow::Result<serde_json::Value> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params.unwrap_or(serde_json::Value::Null),
-        });
+    async fn send(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+        id: Option<u64>,
+        session: &mut Option<String>,
+        protocol: &mut Option<String>,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
         let mut req = self
             .client
             .post(&self.endpoint)
@@ -103,6 +105,19 @@ impl HttpT3Controller {
         if let Some(auth) = &self.authorization {
             req = req.header("authorization", auth.clone());
         }
+        if let Some(s) = session.as_deref() {
+            req = req.header("mcp-session-id", s);
+        }
+        if let Some(p) = protocol.as_deref() {
+            req = req.header("mcp-protocol-version", p);
+        }
+        let mut body = serde_json::json!({ "jsonrpc": "2.0", "method": method });
+        if let Some(i) = id {
+            body["id"] = i.into();
+        }
+        if let Some(p) = params {
+            body["params"] = p;
+        }
         let res = req
             .body(body.to_string())
             .send()
@@ -111,6 +126,19 @@ impl HttpT3Controller {
         if !res.status().is_success() {
             anyhow::bail!("T3 MCP HTTP {}.", res.status().as_u16());
         }
+        if let Some(s) = res
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+        {
+            *session = Some(s);
+        }
+        // Notifications carry no id and expect no body back.
+        let id = match id {
+            Some(i) => i,
+            None => return Ok(None),
+        };
         let is_sse = res
             .headers()
             .get("content-type")
@@ -127,31 +155,47 @@ impl HttpT3Controller {
                 .map_err(|_| anyhow::anyhow!("Invalid T3 MCP JSON envelope."))?
         };
         if envelope.get("id") != Some(&serde_json::Value::from(id))
+            || envelope.get("error").is_some()
             || !envelope.get("result").is_some_and(|r| r.is_object())
         {
             anyhow::bail!("T3 MCP rejected the request or returned an invalid response.");
         }
-        Ok(envelope["result"].clone())
+        if let Some(p) = envelope["result"].get("protocolVersion").and_then(|p| p.as_str()) {
+            *protocol = Some(p.to_string());
+        }
+        Ok(Some(envelope["result"].clone()))
     }
 
+    /// Full Streamable HTTP handshake mirroring `agentdeck-router::mcp_call`:
+    /// `initialize` (capturing `Mcp-Session-Id`), `notifications/initialized`
+    /// with the session, then `tools/call` with the session.
     async fn call_tool(&self, name: &str, arguments: serde_json::Value) -> anyhow::Result<()> {
-        self.rpc(
+        let mut session = None;
+        let mut protocol = None;
+        self.send(
             "initialize",
             Some(serde_json::json!({
                 "protocolVersion": "2025-06-18",
                 "capabilities": {},
                 "clientInfo": {"name": "agentdeck-coordinator", "version": "1"},
             })),
-            1,
+            Some(1),
+            &mut session,
+            &mut protocol,
         )
         .await?;
+        self.send("notifications/initialized", None, None, &mut session, &mut protocol)
+            .await?;
         let result = self
-            .rpc(
+            .send(
                 "tools/call",
                 Some(serde_json::json!({"name": name, "arguments": arguments})),
-                2,
+                Some(2),
+                &mut session,
+                &mut protocol,
             )
-            .await?;
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("T3 MCP tool call failed."))?;
         if result.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
             anyhow::bail!("T3 MCP tool {name} returned isError");
         }
@@ -363,6 +407,20 @@ fn thread_row(conn: &Connection, thread_id: &str) -> Option<ThreadRow> {
     })
 }
 
+/// T3 marks the thread payload once a limit failure is known
+/// (`limitRecovery`): a present truthy marker proves the thread died on
+/// quota even when the tail text has rotated away.
+fn has_limit_recovery_marker(payload: &serde_json::Value) -> bool {
+    ["limitRecovery", "limit_recovery"].iter().any(|k| {
+        payload.get(*k).is_some_and(|v| match v {
+            serde_json::Value::Null => false,
+            serde_json::Value::Bool(b) => *b,
+            serde_json::Value::String(s) => !s.is_empty(),
+            _ => true,
+        })
+    })
+}
+
 fn payload_str(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|k| {
         payload
@@ -482,9 +540,8 @@ pub fn observe_thread_sqlite(t3_root: &Path, thread_id: &str) -> anyhow::Result<
             .collect();
         observed.run_count = observed.run_count.max(rows.len() as u64);
         for (idx, row) in rows.iter().enumerate() {
-            let (run_id, instance, payload_json, status, requested_at, completed_at) = (
+            let (run_id, payload_json, status, requested_at, completed_at) = (
                 &row.run_id,
-                &row.instance,
                 &row.payload_json,
                 &row.status,
                 &row.requested_at,
@@ -504,40 +561,10 @@ pub fn observe_thread_sqlite(t3_root: &Path, thread_id: &str) -> anyhow::Result<
                     observed.active_run_id = Some(run_id.clone());
                 }
             }
-            if observed.provider_instance_id.is_none() {
-                observed.provider_instance_id = instance.clone();
-            }
             let payload: serde_json::Value = payload_json
                 .as_deref()
                 .and_then(|p| serde_json::from_str(p).ok())
                 .unwrap_or(serde_json::Value::Null);
-            if observed.provider_instance_id.is_none() {
-                observed.provider_instance_id = payload_str(&payload, &["providerInstanceId"])
-                    .or_else(|| {
-                        payload
-                            .pointer("/modelSelection/instanceId")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    });
-            }
-            if observed.model.is_none() {
-                observed.model = payload_str(&payload, &["model", "modelSelection.model"]).or_else(
-                    || {
-                        payload
-                            .pointer("/modelSelection/model")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    },
-                );
-            }
-            // Latest run first wins for tail text.
-            if observed.last_message_text.is_empty() {
-                observed.last_message_text = payload_str(
-                    &payload,
-                    &["lastMessage", "last_message", "lastAssistantMessage", "tail"],
-                )
-                .unwrap_or_default();
-            }
             for ts in [
                 completed_at.as_deref().and_then(parse_epoch_str),
                 requested_at.as_deref().and_then(parse_epoch_str),
@@ -558,9 +585,41 @@ pub fn observe_thread_sqlite(t3_root: &Path, thread_id: &str) -> anyhow::Result<
                 observed.updated_at_epoch = observed.updated_at_epoch.max(ts);
             }
         }
+        // Newest run first (`ORDER BY ordinal DESC` above): provider, model
+        // and tail come from the newest run only, so a second run on a
+        // different account never reports the stale account. Older runs only
+        // feed liveness, `run_count` and `updated_at`.
+        if let Some(newest) = rows.first() {
+            let payload: serde_json::Value = newest
+                .payload_json
+                .as_deref()
+                .and_then(|p| serde_json::from_str(p).ok())
+                .unwrap_or(serde_json::Value::Null);
+            observed.provider_instance_id = newest
+                .instance
+                .clone()
+                .or_else(|| payload_str(&payload, &["providerInstanceId"]))
+                .or_else(|| {
+                    payload
+                        .pointer("/modelSelection/instanceId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                });
+            observed.model = payload_str(&payload, &["model"]).or_else(|| {
+                payload
+                    .pointer("/modelSelection/model")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+            observed.last_message_text = payload_str(
+                &payload,
+                &["lastMessage", "last_message", "lastAssistantMessage", "tail"],
+            )
+            .unwrap_or_default();
+        }
     }
 
-    // Fallback provider_instance_id / model from the thread row itself when no run supplied them.
+    // Fallback provider_instance_id / model from the thread row itself when the newest run supplied none.
     if observed.provider_instance_id.is_none() {
         observed.provider_instance_id = trow
             .provider_instance_id
@@ -602,7 +661,16 @@ pub fn observe_thread_sqlite(t3_root: &Path, thread_id: &str) -> anyhow::Result<
         if let Ok(raw) = conn.query_row(&sql, [thread_id, run_id], |r| r.get::<_, String>(0))
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
         {
+            // All 899 real failed attempts carry a `reason`; the structured
+            // quota signal is `failure.class == "usage_limit"` OR a quota
+            // marker in `reason` / `failure.reason` / `failure.message`.
+            let reason_text = ["/reason", "/failure/reason", "/failure/message", "/title"]
+                .iter()
+                .filter_map(|p| v.pointer(p).and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
             if v.pointer("/failure/class").and_then(serde_json::Value::as_str) == Some("usage_limit")
+                || is_quota_limit_message(&reason_text)
             {
                 structured_usage_limit = true;
             }
@@ -611,6 +679,7 @@ pub fn observe_thread_sqlite(t3_root: &Path, thread_id: &str) -> anyhow::Result<
                     .pointer("/failure/message")
                     .and_then(serde_json::Value::as_str)
                     .or_else(|| v.get("title").and_then(serde_json::Value::as_str))
+                    .or_else(|| v.pointer("/reason").and_then(serde_json::Value::as_str))
                     .unwrap_or("")
                     .to_string();
             }
@@ -669,8 +738,9 @@ pub fn observe_thread_sqlite(t3_root: &Path, thread_id: &str) -> anyhow::Result<
             .unwrap_or(0);
     }
     observed.pending_background_tasks = pending;
-    observed.hit_quota_limit =
-        structured_usage_limit || is_quota_limit_message(&observed.last_message_text);
+    observed.hit_quota_limit = structured_usage_limit
+        || has_limit_recovery_marker(&thread_payload)
+        || is_quota_limit_message(&observed.last_message_text);
     Ok(Some(observed))
 }
 

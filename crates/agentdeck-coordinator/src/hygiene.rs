@@ -80,6 +80,15 @@ pub fn find_stale_worktrees(work_dir: &Path, active_names: &HashSet<String>) -> 
         if git_out(&path, &["rev-parse", "--git-dir"]).is_none() {
             continue;
         }
+        // An ordinary subdirectory inside a parent repo is never a
+        // standalone checkout: the candidate's own canonical path must equal
+        // its own `git rev-parse --show-toplevel`.
+        let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let top = git_out(&path, &["rev-parse", "--show-toplevel"])
+            .map(|t| std::fs::canonicalize(&t).unwrap_or_else(|_| PathBuf::from(t)));
+        if top.as_ref() != Some(&canon) {
+            continue;
+        }
         // Dirty (including untracked): hands off.
         if git_out(&path, &["status", "--porcelain"]).is_none_or(|s| !s.is_empty()) {
             continue;

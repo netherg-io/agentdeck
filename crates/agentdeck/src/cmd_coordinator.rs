@@ -11,8 +11,8 @@ use agentdeck_coordinator::checkpoint::{
 use agentdeck_coordinator::config::{CoordinatorConfig, CoordinatorPoolEntry};
 use agentdeck_coordinator::hygiene::check_disk_ok;
 use agentdeck_coordinator::pool::{
-    PoolSelection, QuotaWindowView, quota_from_t3_cache, select_coordinator,
-    should_proactively_rotate,
+    PoolKey, PoolSelection, QuotaWindowView, eligible, pool_key, quota_from_t3_cache,
+    select_coordinator, should_proactively_rotate,
 };
 use agentdeck_core::settings;
 use agentdeck_core::{Paths, Registry, t3, thread_state};
@@ -105,40 +105,50 @@ pub fn coordinator_config(reg: &Registry) -> anyhow::Result<CoordinatorConfig> {
     })
 }
 
-/// Read live `QuotaWindowView` from T3 usage caches for every entry in `cfg.pool`.
+/// Read live `QuotaWindowView` from T3 usage caches for every entry in `cfg.pool`,
+/// keyed by `(instance_id, model)` so two entries on one instance never share a view.
 pub fn collect_pool_quotas(
     cfg: &CoordinatorConfig,
     t3_root: Option<&Path>,
-) -> HashMap<String, QuotaWindowView> {
+) -> HashMap<PoolKey, QuotaWindowView> {
     let mut quotas = HashMap::new();
     for entry in &cfg.pool {
         let view = match t3_root {
             Some(root) => quota_from_t3_cache(root, &entry.instance_id, &entry.model),
             None => QuotaWindowView::unknown_healthy(),
         };
-        quotas.insert(entry.instance_id.clone(), view);
+        quotas.insert(pool_key(&entry.instance_id, &entry.model), view);
     }
     quotas
 }
 
-/// True when `current_instance` is thin and a meaningfully fuller pool entry exists.
+/// Resolve a CLI `--current instance_id` to the pool `(instance_id, model)` key.
+fn current_pool_key<'a>(cfg: &'a CoordinatorConfig, current: Option<&str>) -> Option<(&'a str, &'a str)> {
+    let cur = current?;
+    cfg.pool
+        .iter()
+        .find(|e| e.instance_id == cur)
+        .map(|e| (e.instance_id.as_str(), e.model.as_str()))
+}
+
+/// True when `current` is thin and a meaningfully fuller pool entry exists.
 pub fn proactive_rotate_recommended(
     cfg: &CoordinatorConfig,
-    quotas: &HashMap<String, QuotaWindowView>,
-    current_instance: Option<&str>,
+    quotas: &HashMap<PoolKey, QuotaWindowView>,
+    current: Option<(&str, &str)>,
 ) -> bool {
-    let Some(cur) = current_instance else {
+    let Some((cur_inst, cur_model)) = current else {
         return false;
     };
-    let Some(cur_q) = quotas.get(cur) else {
+    let Some(cur_q) = quotas.get(&pool_key(cur_inst, cur_model)) else {
         return false;
     };
     let best_other = cfg
         .pool
         .iter()
-        .filter(|e| e.enabled && e.instance_id != cur)
-        .filter_map(|e| quotas.get(&e.instance_id))
-        .filter(|q| q.healthy)
+        .filter(|e| e.enabled && (e.instance_id != cur_inst || e.model != cur_model))
+        .filter_map(|e| quotas.get(&pool_key(&e.instance_id, &e.model)))
+        .filter(|q| eligible(cfg, q))
         .max_by(|a, b| {
             a.five_hour_remaining_pct
                 .unwrap_or(100.0)
@@ -231,6 +241,7 @@ fn pool(paths: &Paths, current: Option<&str>, as_json: bool) -> anyhow::Result<(
     let t3_root = t3::t3_root().ok();
     let quotas = collect_pool_quotas(&cfg, t3_root.as_deref());
     let now = now_epoch_secs();
+    let current = current_pool_key(&cfg, current);
     let selection = select_coordinator(&cfg, &quotas, now, current);
     let proactive = proactive_rotate_recommended(&cfg, &quotas, current);
 
@@ -239,7 +250,7 @@ fn pool(paths: &Paths, current: Option<&str>, as_json: bool) -> anyhow::Result<(
             .pool
             .iter()
             .map(|e| {
-                let q = quotas.get(&e.instance_id);
+                let q = quotas.get(&pool_key(&e.instance_id, &e.model));
                 json!({
                     "instance_id": e.instance_id,
                     "model": e.model,
@@ -299,7 +310,7 @@ fn pool(paths: &Paths, current: Option<&str>, as_json: bool) -> anyhow::Result<(
         return Ok(());
     }
     for e in &cfg.pool {
-        let q = quotas.get(&e.instance_id);
+        let q = quotas.get(&pool_key(&e.instance_id, &e.model));
         let five = q
             .and_then(|v| v.five_hour_remaining_pct)
             .map(|p| format!("{p:.1}%"))
