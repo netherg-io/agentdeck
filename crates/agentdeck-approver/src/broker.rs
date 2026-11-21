@@ -6,13 +6,14 @@
 //! enforces strict pre-execution timeout, and returns Opaque Approval results.
 
 use std::fs;
-use std::future::Future;
+use std::future::{Future, poll_fn, ready};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
@@ -20,6 +21,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 
 use crate::audit::{AuditRecord, AuditSource, append_record, unix_timestamp_secs};
 use crate::config::ApproverConfig;
@@ -29,7 +31,7 @@ use crate::perimeter::{
 };
 use crate::telegram::{
     FINALIZE_APPROVED, FINALIZE_DENIED, FINALIZE_TIMEOUT, PendingDecisions, TelegramDecision,
-    TelegramTransport,
+    TelegramTransport, log_api_failure, retryable_edit_error,
 };
 
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -208,314 +210,262 @@ fn record_audit(
     }
 }
 
-/// Core approval broker state machine.
-///
-/// Enforces:
-/// 1. Hard-Deny Perimeter before Policy Judge (never calls judge on HardDeny).
-/// 2. Policy Judge only during active Autonomous Runs with fail-closed threshold.
-/// 3. Strict pre-execution approval timeout + instant Telegram cancel on client disconnect.
-/// 4. Periodic keepalive ticks on `pending_tx`.
+/// Evaluate a request while sending the same keepalives for both approval paths.
 pub async fn evaluate_and_wait<J, T, F>(
     req: &ApprovalRequest,
     ctx: &BrokerContext<'_>,
     judge: &J,
-    telegram: &T,
+    telegram: &Arc<T>,
     client_disconnected: F,
     pending_tx: Option<mpsc::UnboundedSender<PendingEvent>>,
 ) -> Result<BrokerDecision>
 where
     J: PolicyJudge,
-    T: TelegramTransport,
+    T: TelegramTransport + 'static,
     F: Future<Output = ()> + Send,
 {
     req.validate()?;
     let request_id = generate_request_id();
     let started = Instant::now();
-
-    if let Some(tx) = &pending_tx
-        && tx
-            .send(PendingEvent {
-                id: request_id.clone(),
-                elapsed_secs: 0,
-            })
-            .is_err()
-    {
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        let perimeter =
-            check_perimeter_with_extra(req, ctx.mandate, &ctx.config.extra_hard_deny_patterns);
-        record_audit(
-            ctx.audit_path,
-            &request_id,
-            req,
-            &perimeter,
-            None,
-            None,
-            None,
-            "client_cancelled",
-            AuditSource::ClientCancelled,
-            elapsed_ms,
-        );
-        return Ok(BrokerDecision {
-            request_id,
-            outcome: BrokerOutcome::ClientCancelled,
-            elapsed_ms,
-        });
-    }
-
-    let perimeter =
-        check_perimeter_with_extra(req, ctx.mandate, &ctx.config.extra_hard_deny_patterns);
-    let autonomous = ctx.mandate.is_some_and(|m| m.active_autonomous_run);
-
-    let mut judge_allow: Option<bool> = None;
-    let mut judge_confidence: Option<f64> = None;
-    let mut judge_reason: Option<String> = None;
-
-    tokio::pin!(client_disconnected);
-
-    // Policy Judge runs ONLY during an active Autonomous Run and ONLY when
-    // the Hard-Deny Perimeter is Clear.
-    if autonomous
-        && !perimeter.is_hard_deny()
-        && let Some(mandate) = ctx.mandate
-    {
-        let judge_result = tokio::select! {
-            biased;
-            _ = &mut client_disconnected => {
-                let elapsed_ms = started.elapsed().as_millis() as u64;
-                record_audit(
-                    ctx.audit_path,
-                    &request_id,
-                    req,
-                    &perimeter,
-                    None,
-                    None,
-                    None,
-                    "client_cancelled",
-                    AuditSource::ClientCancelled,
-                    elapsed_ms,
-                );
-                return Ok(BrokerDecision {
-                    request_id,
-                    outcome: BrokerOutcome::ClientCancelled,
-                    elapsed_ms,
-                });
+    let evaluation = evaluate(
+        req,
+        ctx,
+        judge,
+        telegram,
+        async {
+            tokio::select! {
+                _ = client_disconnected => {}
+                _ = async {
+                    match &pending_tx {
+                        Some(tx) => tx.closed().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
             }
-            res = judge.evaluate(req, mandate) => res,
-        };
-
-        match judge_result {
-            Ok(verdict) => {
-                let approved = is_auto_approved(&verdict, ctx.config.judge_confidence_threshold);
-                judge_allow = Some(verdict.allow);
-                judge_confidence = verdict.confidence.is_finite().then_some(verdict.confidence);
-                judge_reason = Some(verdict.reason);
-                if approved {
-                    let elapsed_ms = started.elapsed().as_millis() as u64;
-                    record_audit(
-                        ctx.audit_path,
-                        &request_id,
-                        req,
-                        &perimeter,
-                        judge_allow,
-                        judge_confidence,
-                        judge_reason,
-                        "approved",
-                        AuditSource::PolicyJudge,
-                        elapsed_ms,
-                    );
-                    return Ok(BrokerDecision {
-                        request_id,
-                        outcome: BrokerOutcome::Approved { secret_value: None },
-                        elapsed_ms,
-                    });
-                }
-            }
-            Err(err) => {
-                // Fail closed on any judge error: record reason and escalate to Telegram.
-                judge_allow = Some(false);
-                judge_confidence = Some(0.0);
-                judge_reason = Some(format!("judge_error: {err}"));
-            }
-        }
-    }
-
-    // Escalate to Telegram with strict pre-execution timeout.
-    let (timeout_dur, timeout_secs_display) =
-        resolve_timeout(req, ctx.config, autonomous, ctx.timings);
-    let mut rx = ctx.pending.register(request_id.clone(), req.kind == "secret");
-
-    let message_id = match telegram
-        .send_request(&request_id, req, perimeter.rule(), timeout_secs_display)
-        .await
-    {
-        Ok(mid) => mid,
-        Err(err) => {
-            ctx.pending.remove(&request_id);
-            return Err(err);
-        }
-    };
-    ctx.pending.attach_message_id(&request_id, message_id);
-
-    let deadline = tokio::time::sleep(timeout_dur);
-    tokio::pin!(deadline);
-
-    let keepalive_step = ctx.timings.keepalive_interval.max(Duration::from_millis(5));
-    let mut keepalive = tokio::time::interval_at(
-        tokio::time::Instant::now() + keepalive_step,
-        keepalive_step,
+        },
+        &request_id,
+        started,
     );
-    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let Some(tx) = &pending_tx else {
+        return evaluation.await;
+    };
 
+    let _ = tx.send(PendingEvent {
+        id: request_id.clone(),
+        elapsed_secs: 0,
+    });
+    let step = ctx.timings.keepalive_interval.max(Duration::from_millis(5));
+    let mut keepalive = tokio::time::interval_at(started + step, step);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tokio::pin!(evaluation);
     loop {
         tokio::select! {
             biased;
-
-            _ = &mut client_disconnected => {
-                ctx.pending.remove(&request_id);
-                let _ = telegram.cancel_request(message_id, CANCEL_CLIENT_DISCONNECTED).await;
-                let elapsed_ms = started.elapsed().as_millis() as u64;
-                record_audit(
-                    ctx.audit_path,
-                    &request_id,
-                    req,
-                    &perimeter,
-                    judge_allow,
-                    judge_confidence,
-                    judge_reason,
-                    "client_cancelled",
-                    AuditSource::ClientCancelled,
-                    elapsed_ms,
-                );
-                return Ok(BrokerDecision {
-                    request_id,
-                    outcome: BrokerOutcome::ClientCancelled,
-                    elapsed_ms,
-                });
-            }
-
-            decision = &mut rx => {
-                ctx.pending.remove(&request_id);
-                let elapsed_ms = started.elapsed().as_millis() as u64;
-                match decision {
-                    Ok(TelegramDecision::Approved { secret_value }) => {
-                        let _ = telegram.finalize_request(message_id, FINALIZE_APPROVED).await;
-                        record_audit(
-                            ctx.audit_path,
-                            &request_id,
-                            req,
-                            &perimeter,
-                            judge_allow,
-                            judge_confidence,
-                            judge_reason,
-                            "approved",
-                            AuditSource::Telegram,
-                            elapsed_ms,
-                        );
-                        return Ok(BrokerDecision {
-                            request_id,
-                            outcome: BrokerOutcome::Approved { secret_value },
-                            elapsed_ms,
-                        });
-                    }
-                    Ok(TelegramDecision::Denied) => {
-                        let _ = telegram.finalize_request(message_id, FINALIZE_DENIED).await;
-                        record_audit(
-                            ctx.audit_path,
-                            &request_id,
-                            req,
-                            &perimeter,
-                            judge_allow,
-                            judge_confidence,
-                            judge_reason,
-                            "denied",
-                            AuditSource::Denied,
-                            elapsed_ms,
-                        );
-                        return Ok(BrokerDecision {
-                            request_id,
-                            outcome: BrokerOutcome::Denied,
-                            elapsed_ms,
-                        });
-                    }
-                    Err(_) => {
-                        let _ = telegram.cancel_request(message_id, CANCEL_BROKER_SHUTDOWN).await;
-                        record_audit(
-                            ctx.audit_path,
-                            &request_id,
-                            req,
-                            &perimeter,
-                            judge_allow,
-                            judge_confidence,
-                            judge_reason,
-                            "client_cancelled",
-                            AuditSource::ClientCancelled,
-                            elapsed_ms,
-                        );
-                        return Ok(BrokerDecision {
-                            request_id,
-                            outcome: BrokerOutcome::ClientCancelled,
-                            elapsed_ms,
-                        });
-                    }
-                }
-            }
-
-            _ = &mut deadline => {
-                ctx.pending.remove(&request_id);
-                let _ = telegram.finalize_request(message_id, FINALIZE_TIMEOUT).await;
-                let elapsed_ms = started.elapsed().as_millis() as u64;
-                record_audit(
-                    ctx.audit_path,
-                    &request_id,
-                    req,
-                    &perimeter,
-                    judge_allow,
-                    judge_confidence,
-                    judge_reason,
-                    "needs_owner",
-                    AuditSource::Timeout,
-                    elapsed_ms,
-                );
-                return Ok(BrokerDecision {
-                    request_id,
-                    outcome: BrokerOutcome::NeedsOwner,
-                    elapsed_ms,
-                });
-            }
-
+            decision = &mut evaluation => return decision,
             _ = keepalive.tick() => {
-                if let Some(tx) = &pending_tx {
-                    let ev = PendingEvent {
-                        id: request_id.clone(),
-                        elapsed_secs: started.elapsed().as_secs(),
-                    };
-                    if tx.send(ev).is_err() {
-                        // Writer dropped (client socket gone) -> cancel immediately.
-                        ctx.pending.remove(&request_id);
-                        let _ = telegram.cancel_request(message_id, CANCEL_CLIENT_DISCONNECTED).await;
-                        let elapsed_ms = started.elapsed().as_millis() as u64;
-                        record_audit(
-                            ctx.audit_path,
-                            &request_id,
-                            req,
-                            &perimeter,
-                            judge_allow,
-                            judge_confidence,
-                            judge_reason,
-                            "client_cancelled",
-                            AuditSource::ClientCancelled,
-                            elapsed_ms,
-                        );
-                        return Ok(BrokerDecision {
-                            request_id,
-                            outcome: BrokerOutcome::ClientCancelled,
-                            elapsed_ms,
-                        });
-                    }
-                }
+                let _ = tx.send(PendingEvent {
+                    id: request_id.clone(),
+                    elapsed_secs: started.elapsed().as_secs(),
+                });
             }
         }
     }
+}
+
+async fn disconnect_ready(disconnect: Pin<&mut impl Future<Output = ()>>) -> bool {
+    tokio::select! {
+        biased;
+        () = disconnect => true,
+        () = ready(()) => false,
+    }
+}
+
+async fn evaluate<J, T, F>(
+    req: &ApprovalRequest,
+    ctx: &BrokerContext<'_>,
+    judge: &J,
+    telegram: &Arc<T>,
+    client_disconnected: F,
+    request_id: &str,
+    started: Instant,
+) -> Result<BrokerDecision>
+where
+    J: PolicyJudge,
+    T: TelegramTransport + 'static,
+    F: Future<Output = ()> + Send,
+{
+    let mandate = ctx.mandate.filter(|m| {
+        m.thread_id
+            .as_ref()
+            .is_none_or(|id| !id.trim().is_empty() && req.thread_id.as_ref() == Some(id))
+    });
+    let autonomous = mandate.is_some_and(|m| m.active_autonomous_run);
+    let perimeter = check_perimeter_with_extra(req, mandate, &ctx.config.extra_hard_deny_patterns);
+    let complete = |outcome, source, label, (allow, confidence, reason)| {
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        record_audit(
+            ctx.audit_path,
+            request_id,
+            req,
+            &perimeter,
+            allow,
+            confidence,
+            reason,
+            label,
+            source,
+            elapsed_ms,
+        );
+        Ok(BrokerDecision {
+            request_id: request_id.into(),
+            outcome,
+            elapsed_ms,
+        })
+    };
+
+    tokio::pin!(client_disconnected);
+    let mut judge_fields = (None, None, None);
+    if let Some(mandate) =
+        mandate.filter(|m| autonomous && m.owner_granted && !perimeter.is_hard_deny())
+    {
+        let result = tokio::select! {
+            biased;
+            _ = &mut client_disconnected => return complete(
+                BrokerOutcome::ClientCancelled, AuditSource::ClientCancelled, "client_cancelled", judge_fields,
+            ),
+            result = judge.evaluate(req, mandate) => result,
+        };
+        match result {
+            Ok(verdict) => {
+                let approved = is_auto_approved(&verdict, ctx.config.judge_confidence_threshold);
+                judge_fields = (
+                    Some(verdict.allow),
+                    verdict.confidence.is_finite().then_some(verdict.confidence),
+                    Some(verdict.reason),
+                );
+                if approved {
+                    if disconnect_ready(client_disconnected.as_mut()).await {
+                        return complete(
+                            BrokerOutcome::ClientCancelled,
+                            AuditSource::ClientCancelled,
+                            "client_cancelled",
+                            judge_fields,
+                        );
+                    }
+                    return complete(
+                        BrokerOutcome::Approved { secret_value: None },
+                        AuditSource::PolicyJudge,
+                        "approved",
+                        judge_fields,
+                    );
+                }
+            }
+            Err(err) => {
+                judge_fields = (Some(false), Some(0.0), Some(format!("judge_error: {err}")))
+            }
+        }
+    }
+
+    let (timeout, display_secs) = resolve_timeout(req, ctx.config, autonomous, ctx.timings);
+    let deadline = Instant::now() + timeout;
+    let mut rx =
+        ctx.pending
+            .register_until(request_id.into(), req.kind == "secret", Some(deadline));
+    let sender = Arc::clone(telegram);
+    let sent_req = req.clone();
+    let sent_id = request_id.to_owned();
+    let rule = perimeter.rule();
+    let mut delivery = Box::pin(async move {
+        sender
+            .send_request(&sent_id, &sent_req, rule, display_secs)
+            .await
+    });
+
+    let mut delivery_started = false;
+    let mut message_id = None;
+    let (outcome, status) = 'wait: {
+        let delivered = tokio::select! {
+            biased;
+            _ = &mut client_disconnected => break 'wait (BrokerOutcome::ClientCancelled, CANCEL_CLIENT_DISCONNECTED),
+            _ = tokio::time::sleep_until(deadline) => break 'wait (BrokerOutcome::NeedsOwner, FINALIZE_TIMEOUT),
+            result = async {
+                delivery_started = true;
+                delivery.as_mut().await
+            } => result,
+        };
+        let id = match delivered {
+            Ok(id) => id,
+            Err(err) => {
+                ctx.pending.remove(request_id);
+                log_api_failure("delivery", &err);
+                bail!("approval service unavailable");
+            }
+        };
+        message_id = Some(id);
+        ctx.pending.attach_message_id(request_id, id);
+
+        let decision = tokio::select! {
+            biased;
+            _ = &mut client_disconnected => break 'wait (BrokerOutcome::ClientCancelled, CANCEL_CLIENT_DISCONNECTED),
+            _ = tokio::time::sleep_until(deadline) => break 'wait (BrokerOutcome::NeedsOwner, FINALIZE_TIMEOUT),
+            result = &mut rx => result,
+        };
+        if disconnect_ready(client_disconnected.as_mut()).await {
+            break 'wait (BrokerOutcome::ClientCancelled, CANCEL_CLIENT_DISCONNECTED);
+        }
+        if Instant::now() >= deadline {
+            break 'wait (BrokerOutcome::NeedsOwner, FINALIZE_TIMEOUT);
+        }
+        match decision {
+            Ok(TelegramDecision::Approved { secret_value }) => {
+                (BrokerOutcome::Approved { secret_value }, FINALIZE_APPROVED)
+            }
+            Ok(TelegramDecision::Denied) => (BrokerOutcome::Denied, FINALIZE_DENIED),
+            Err(_) => (BrokerOutcome::ClientCancelled, CANCEL_BROKER_SHUTDOWN),
+        }
+    };
+
+    ctx.pending.remove(request_id);
+    let cancelled = outcome == BrokerOutcome::ClientCancelled;
+    if delivery_started {
+        let telegram = Arc::clone(telegram);
+        tokio::spawn(async move {
+            let id = match message_id {
+                Some(id) => id,
+                None => match delivery.await {
+                    Ok(id) => id,
+                    Err(err) => {
+                        log_api_failure("delivery", &err);
+                        return;
+                    }
+                },
+            };
+            let edit = || async {
+                if cancelled {
+                    telegram.cancel_request(id, status).await
+                } else {
+                    telegram.finalize_request(id, status).await
+                }
+            };
+            if let Err(err) = edit().await {
+                let result = if retryable_edit_error(&err) {
+                    edit().await
+                } else {
+                    Err(err)
+                };
+                if let Err(err) = result {
+                    log_api_failure("card cleanup", &err);
+                }
+            }
+        });
+    }
+
+    let (source, label) = match outcome {
+        BrokerOutcome::Approved { .. } => (AuditSource::Telegram, "approved"),
+        BrokerOutcome::Denied => (AuditSource::Denied, "denied"),
+        BrokerOutcome::NeedsOwner => (AuditSource::Timeout, "needs_owner"),
+        BrokerOutcome::ClientCancelled => (AuditSource::ClientCancelled, "client_cancelled"),
+    };
+    complete(outcome, source, label, judge_fields)
 }
 
 /// Returns `true` when the peer has fully closed the Unix stream (`POLLHUP`/`POLLERR`),
@@ -531,31 +481,37 @@ fn is_peer_hup(fd: i32) -> bool {
 }
 
 async fn wait_client_disconnect(reader: &tokio::net::unix::OwnedReadHalf) {
-    let mut scratch = [0u8; 64];
-    loop {
-        if reader.readable().await.is_err() {
-            return;
-        }
-        match reader.try_read(&mut scratch) {
-            Ok(0) => {
-                // If peer fully closed (approve-client.py drop/kill), POLLHUP is set now.
-                // If peer only called shutdown(SHUT_WR) (SSH gateway), wait for full HUP.
-                let fd = reader.as_ref().as_raw_fd();
-                if is_peer_hup(fd) {
-                    return;
-                }
-                loop {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                    if is_peer_hup(fd) {
-                        return;
-                    }
-                }
+    let fd = reader.as_ref().as_raw_fd();
+    let wait = async {
+        let mut scratch = [0u8; 64];
+        loop {
+            if reader.readable().await.is_err() {
+                return;
             }
-            Ok(_) => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(_) => return,
+            match reader.try_read(&mut scratch) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(_) => return,
+            }
         }
-    }
+
+        // SHUT_WR clients can still read. Probe for their eventual full close.
+        while !is_peer_hup(fd) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
+
+    tokio::pin!(wait);
+    poll_fn(|cx| {
+        // An owner decision can wake the broker before the next half-close probe.
+        if is_peer_hup(fd) {
+            std::task::Poll::Ready(())
+        } else {
+            wait.as_mut().poll(cx)
+        }
+    })
+    .await;
 }
 
 /// Local Unix socket server implementing the line-JSON protocol of `approve-client.py`.
@@ -591,20 +547,49 @@ where
                 format!("failed to create socket parent dir {}", parent.display())
             })?;
         }
-        if socket_path.exists() {
-            // Remove stale socket only if nobody is listening on it.
-            match std::os::unix::net::UnixStream::connect(&socket_path) {
-                Ok(_) => bail!("approver socket already active at {}", socket_path.display()),
-                Err(_) => {
-                    let _ = fs::remove_file(&socket_path);
+        match fs::symlink_metadata(&socket_path) {
+            Ok(meta) => {
+                if !meta.file_type().is_socket() {
+                    bail!(
+                        "approver socket path is not a socket: {}",
+                        socket_path.display()
+                    );
                 }
+                match std::os::unix::net::UnixStream::connect(&socket_path) {
+                    Ok(_) => bail!(
+                        "approver socket already active at {}",
+                        socket_path.display()
+                    ),
+                    Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        let current = fs::symlink_metadata(&socket_path)?;
+                        if !current.file_type().is_socket()
+                            || (current.dev(), current.ino()) != (meta.dev(), meta.ino())
+                        {
+                            bail!("approver socket path changed: {}", socket_path.display());
+                        }
+                        fs::remove_file(&socket_path)?;
+                    }
+                    Err(err) => {
+                        return Err(err).with_context(|| {
+                            format!("failed to probe approver socket {}", socket_path.display())
+                        });
+                    }
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to inspect approver socket {}",
+                        socket_path.display()
+                    )
+                });
             }
         }
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("failed to bind Unix socket {}", socket_path.display()))?;
-        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).with_context(
-            || format!("failed to set 0600 on {}", socket_path.display()),
-        )?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to set 0600 on {}", socket_path.display()))?;
         Ok(Self {
             listener,
             socket_path,
@@ -792,7 +777,7 @@ async fn handle_connection<J, T>(
         &req,
         &ctx,
         judge.as_ref(),
-        telegram.as_ref(),
+        &telegram,
         disconnect_fut,
         Some(pending_tx),
     )
@@ -810,10 +795,33 @@ async fn handle_connection<J, T>(
                 let _ = write_line(&mut write_half, &line).await;
             }
         }
-        Err(e) => {
-            let line =
-                json!({"type": "result", "result": "error", "error": e.to_string()}).to_string();
+        Err(_) => {
+            let line = json!({
+                "type": "result",
+                "result": "error",
+                "error": "approval service unavailable",
+            })
+            .to_string();
             let _ = write_line(&mut write_half, &line).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_close_is_detected_between_half_close_probes() {
+        let (mut client, broker) = UnixStream::pair().unwrap();
+        client.shutdown().await.unwrap();
+        let (reader, _writer) = broker.into_split();
+        reader.readable().await.unwrap();
+
+        let disconnect = wait_client_disconnect(&reader);
+        tokio::pin!(disconnect);
+        assert!(!disconnect_ready(disconnect.as_mut()).await);
+        drop(client);
+        assert!(disconnect_ready(disconnect.as_mut()).await);
     }
 }

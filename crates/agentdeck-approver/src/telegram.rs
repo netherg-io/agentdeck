@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tokio::sync::{oneshot, watch};
+use tokio::time::Instant;
 
 use crate::perimeter::ApprovalRequest;
 
@@ -17,6 +18,7 @@ pub const HARD_DENY_PREFIX: &str = "[HARD-DENY: только человек]";
 pub const FINALIZE_APPROVED: &str = "— разрешено ✅";
 pub const FINALIZE_DENIED: &str = "— отказано ❌";
 pub const FINALIZE_TIMEOUT: &str = "— время вышло ⌛";
+const INLINE_PAYLOAD_MAX: usize = 3000;
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 const TELEGRAM_CALL_TIMEOUT: Duration = Duration::from_secs(15);
 const TELEGRAM_POLL_TIMEOUT_SECS: u64 = 50;
@@ -57,6 +59,7 @@ pub trait TelegramTransport: Send + Sync {
 }
 
 struct PendingEntry {
+    deadline: Option<Instant>,
     tx: oneshot::Sender<TelegramDecision>,
     is_secret: bool,
     message_id: Option<i64>,
@@ -74,11 +77,21 @@ impl PendingDecisions {
     }
 
     pub fn register(&self, id: String, is_secret: bool) -> oneshot::Receiver<TelegramDecision> {
+        self.register_until(id, is_secret, None)
+    }
+
+    pub(crate) fn register_until(
+        &self,
+        id: String,
+        is_secret: bool,
+        deadline: Option<Instant>,
+    ) -> oneshot::Receiver<TelegramDecision> {
         let (tx, rx) = oneshot::channel();
         let mut map = self.inner.lock().expect("pending decisions mutex poisoned");
         map.insert(
             id,
             PendingEntry {
+                deadline,
                 tx,
                 is_secret,
                 message_id: None,
@@ -116,8 +129,11 @@ impl PendingDecisions {
         let Some(entry) = map.get(id) else {
             return false;
         };
-        if entry.is_secret && action == CallbackAction::Approve {
-            // Secret requests can only be fulfilled by an owner reply, never by button click.
+        if (entry.is_secret && action == CallbackAction::Approve)
+            || entry
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
             return false;
         }
         let Some(entry) = map.remove(id) else {
@@ -135,7 +151,11 @@ impl PendingDecisions {
         let mut map = self.inner.lock().expect("pending decisions mutex poisoned");
         let matching_id = map
             .iter()
-            .find(|(_, e)| e.is_secret && e.message_id == Some(reply_to_message_id))
+            .find(|(_, e)| {
+                e.is_secret
+                    && e.message_id == Some(reply_to_message_id)
+                    && e.deadline.is_none_or(|deadline| Instant::now() < deadline)
+            })
             .map(|(k, _)| k.clone());
         let Some(id) = matching_id else {
             return false;
@@ -172,6 +192,15 @@ pub fn format_request_message(
     hard_deny: Option<&str>,
     timeout_secs: u64,
 ) -> String {
+    format_request_card(req, hard_deny, timeout_secs, false)
+}
+
+fn format_request_card(
+    req: &ApprovalRequest,
+    hard_deny: Option<&str>,
+    timeout_secs: u64,
+    attached: bool,
+) -> String {
     let mut text = String::new();
     if let Some(rule) = hard_deny {
         text.push_str(HARD_DENY_PREFIX);
@@ -201,25 +230,20 @@ pub fn format_request_message(
         text.push_str(&escape_html(summary));
     }
 
-    match req.kind.as_str() {
-        "root" | "approve" => {
-            if let Some(script) = &req.script {
-                let truncated: String = script.chars().take(3000).collect();
+    if attached {
+        text.push_str("\nПолный текст запроса во вложении.");
+    } else {
+        match req.kind.as_str() {
+            "root" | "approve" | "cp-console" => {
                 text.push_str("\n<pre>");
-                text.push_str(&escape_html(&truncated));
+                text.push_str(&escape_html(&req.canonical_payload()));
                 text.push_str("</pre>");
             }
-        }
-        "cp-console" => {
-            text.push_str("\n<pre>");
-            text.push_str(&escape_html(&req.canonical_payload()));
-            text.push_str("</pre>");
-        }
-        _ => {
-            if let Some(body) = &req.text {
-                let truncated: String = body.chars().take(3000).collect();
-                text.push('\n');
-                text.push_str(&escape_html(&truncated));
+            _ => {
+                if let Some(body) = &req.text {
+                    text.push('\n');
+                    text.push_str(&escape_html(body));
+                }
             }
         }
     }
@@ -273,7 +297,11 @@ pub fn handle_update(
             .is_some_and(|(action, id)| pending.resolve_callback(id, action));
         return Some(UpdateAction::AnswerCallback {
             callback_query_id,
-            text: if accepted { "" } else { "Запрос уже закрыт" },
+            text: if accepted {
+                ""
+            } else {
+                "Запрос уже закрыт"
+            },
         });
     }
 
@@ -340,58 +368,65 @@ impl BotApiTelegram {
         self.owner_id
     }
 
-    async fn call_api(&self, method: &str, payload: Value, timeout: Duration) -> Result<Value> {
+    fn api_request(&self, method: &str) -> reqwest::RequestBuilder {
         let url = format!("{}/bot{}/{method}", self.api_base, self.bot_token);
-        let res = self
-            .client
-            .post(&url)
-            .timeout(timeout)
-            .json(&payload)
-            .send()
-            .await
-            // Never include reqwest's error URL because it contains the bot token.
-            .map_err(|_| anyhow::anyhow!("Telegram API {method} request failed"))?;
-        if !res.status().is_success() {
-            bail!(
-                "Telegram API {method} returned HTTP {}",
-                res.status().as_u16()
-            );
+        self.client.post(url)
+    }
+
+    async fn call_api(
+        &self,
+        method: &'static str,
+        payload: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        send_api(method, self.api_request(method).json(&payload), timeout).await
+    }
+
+    async fn send_document(&self, payload: &str, filename: &str, hash: &str) -> Result<i64> {
+        let mut boundary = format!("agentdeck-{}", &hash[..32]);
+        while payload.contains(&boundary) {
+            boundary.push('0');
         }
-        let body: Value = res
-            .json()
-            .await
-            .map_err(|_| anyhow::anyhow!("Telegram API {method} returned invalid JSON"))?;
-        if body.get("ok").and_then(Value::as_bool) != Some(true) {
-            let desc = body
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            bail!("Telegram API {method} error: {desc}");
-        }
-        Ok(body.get("result").cloned().unwrap_or(Value::Null))
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{}\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{filename}\"\r\n\
+             Content-Type: application/octet-stream\r\n\r\n{payload}\r\n--{boundary}--\r\n",
+            self.owner_id,
+        );
+        let request = self
+            .api_request("sendDocument")
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body);
+        let result = send_api("sendDocument", request, TELEGRAM_CALL_TIMEOUT).await?;
+        message_id(&result, "sendDocument")
     }
 
     async fn edit_with_suffix(&self, message_id: i64, suffix: &str) -> Result<()> {
-        let original = {
-            let mut map = self.sent_texts.lock().expect("sent_texts mutex poisoned");
-            map.remove(&message_id)
+        let original = self
+            .sent_texts
+            .lock()
+            .expect("sent_texts mutex poisoned")
+            .remove(&message_id);
+        let mut payload = json!({
+            "chat_id": self.owner_id,
+            "message_id": message_id,
+            "reply_markup": { "inline_keyboard": [] }
+        });
+        let method = if let Some(original) = original
+            .filter(|text| text.encode_utf16().count() + suffix.encode_utf16().count() < 4096)
+        {
+            payload["text"] = json!(format!("{original}\n{}", escape_html(suffix)));
+            payload["parse_mode"] = json!("HTML");
+            "editMessageText"
+        } else {
+            // Remove the keyboard after a failed edit or when the status might exceed Telegram's text limit.
+            "editMessageReplyMarkup"
         };
-        let new_text = match original {
-            Some(orig) => format!("{orig}\n{}", escape_html(suffix)),
-            None => escape_html(suffix),
-        };
-        self.call_api(
-            "editMessageText",
-            json!({
-                "chat_id": self.owner_id,
-                "message_id": message_id,
-                "text": new_text,
-                "parse_mode": "HTML",
-                "reply_markup": { "inline_keyboard": [] }
-            }),
-            TELEGRAM_CALL_TIMEOUT,
-        )
-        .await?;
+        self.call_api(method, payload, TELEGRAM_CALL_TIMEOUT)
+            .await?;
         Ok(())
     }
 
@@ -491,6 +526,78 @@ impl BotApiTelegram {
     }
 }
 
+#[derive(Debug)]
+struct ApiFailure {
+    method: &'static str,
+    code: Option<i64>,
+}
+
+impl fmt::Display for ApiFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Telegram API {} failed", self.method)?;
+        if let Some(code) = self.code {
+            write!(f, " (error_code={code})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ApiFailure {}
+
+pub(crate) fn retryable_edit_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ApiFailure>()
+        .and_then(|e| e.code)
+        .is_none_or(|code| code == 408 || code == 429 || (500..600).contains(&code))
+}
+
+pub(crate) fn log_api_failure(stage: &str, err: &anyhow::Error) {
+    if let Some(failure) = err.downcast_ref::<ApiFailure>() {
+        eprintln!("approver {stage} failed: {failure}");
+    } else {
+        eprintln!("approver {stage} failed");
+    }
+}
+
+async fn send_api(
+    method: &'static str,
+    request: reqwest::RequestBuilder,
+    timeout: Duration,
+) -> Result<Value> {
+    let res = request
+        .timeout(timeout)
+        .send()
+        .await
+        // The reqwest error URL contains the bot token.
+        .map_err(|_| ApiFailure { method, code: None })?;
+    let status = res.status();
+    let body = res.json::<Value>().await;
+    if status.is_success() {
+        let body = body
+            .as_ref()
+            .map_err(|_| ApiFailure { method, code: None })?;
+        if body.get("ok").and_then(Value::as_bool) == Some(true) {
+            return Ok(body.get("result").cloned().unwrap_or(Value::Null));
+        }
+    }
+    let code = body
+        .ok()
+        .and_then(|body| body.get("error_code").and_then(Value::as_i64))
+        .unwrap_or_else(|| i64::from(status.as_u16()));
+    Err(ApiFailure {
+        method,
+        code: Some(code),
+    }
+    .into())
+}
+
+fn message_id(result: &Value, method: &'static str) -> Result<i64> {
+    result
+        .get("message_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| ApiFailure { method, code: None }.into())
+}
+
 impl TelegramTransport for BotApiTelegram {
     async fn send_request(
         &self,
@@ -499,7 +606,21 @@ impl TelegramTransport for BotApiTelegram {
         hard_deny: Option<&str>,
         timeout_secs: u64,
     ) -> Result<i64> {
-        let text = format_request_message(req, hard_deny, timeout_secs);
+        let payload = req.canonical_payload();
+        let document_id = if payload.chars().nth(INLINE_PAYLOAD_MAX).is_some() {
+            let filename = if matches!(req.kind.as_str(), "root" | "approve") {
+                "script.sh"
+            } else {
+                "request.txt"
+            };
+            Some(
+                self.send_document(&payload, filename, &req.payload_sha256())
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let text = format_request_card(req, hard_deny, timeout_secs, document_id.is_some());
         let inline_keyboard = if req.kind == "secret" {
             json!([[{ "text": "Отказать", "callback_data": format!("deny:{id}") }]])
         } else {
@@ -508,22 +629,19 @@ impl TelegramTransport for BotApiTelegram {
                 { "text": "Отказать", "callback_data": format!("deny:{id}") }
             ]])
         };
+        let mut card = json!({
+            "chat_id": self.owner_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "reply_markup": { "inline_keyboard": inline_keyboard }
+        });
+        if let Some(id) = document_id {
+            card["reply_parameters"] = json!({"message_id": id});
+        }
         let result = self
-            .call_api(
-                "sendMessage",
-                json!({
-                    "chat_id": self.owner_id,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "reply_markup": { "inline_keyboard": inline_keyboard }
-                }),
-                TELEGRAM_CALL_TIMEOUT,
-            )
+            .call_api("sendMessage", card, TELEGRAM_CALL_TIMEOUT)
             .await?;
-        let message_id = result
-            .get("message_id")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| anyhow::anyhow!("Telegram sendMessage response missing message_id"))?;
+        let message_id = message_id(&result, "sendMessage")?;
         self.sent_texts
             .lock()
             .expect("sent_texts mutex poisoned")
@@ -543,6 +661,118 @@ impl TelegramTransport for BotApiTelegram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn mock_api(
+        responses: Vec<(&'static str, Value)>,
+    ) -> (
+        BotApiTelegram,
+        tokio::task::JoinHandle<Vec<(String, String)>>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut bot = BotApiTelegram::new("fake-token".into(), 12345)
+            .unwrap()
+            .with_api_base(format!("http://{}", listener.local_addr().unwrap()));
+        bot.client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, response) in responses {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut first = String::new();
+                stream.read_line(&mut first).await.unwrap();
+                let mut size = 0;
+                loop {
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        size = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; size];
+                stream.read_exact(&mut body).await.unwrap();
+                let response = response.to_string();
+                stream.write_all(format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len(),
+                ).as_bytes()).await.unwrap();
+                requests.push((first, String::from_utf8(body).unwrap()));
+            }
+            requests
+        });
+        (bot, task)
+    }
+
+    #[tokio::test]
+    async fn oversized_script_is_uploaded_in_full_before_the_linked_card() {
+        let (bot, api) = mock_api(vec![
+            ("200 OK", json!({"ok": true, "result": {"message_id": 51}})),
+            ("200 OK", json!({"ok": true, "result": {"message_id": 52}})),
+        ])
+        .await;
+        let script = format!("{}\nprintf 'tail'\n", "x".repeat(3600));
+        let req: ApprovalRequest = serde_json::from_value(json!({
+            "kind": "root", "script": script,
+        }))
+        .unwrap();
+        assert_eq!(bot.send_request("req-1", &req, None, 90).await.unwrap(), 52);
+        let requests = api.await.unwrap();
+        assert!(requests[0].0.contains("/sendDocument "));
+        assert!(requests[0].1.contains("filename=\"script.sh\""));
+        assert!(requests[0].1.contains(&format!("\r\n\r\n{script}\r\n--")));
+        assert!(requests[1].0.contains("/sendMessage "));
+        let card: Value = serde_json::from_str(&requests[1].1).unwrap();
+        assert_eq!(card["reply_parameters"]["message_id"], 51);
+        assert_eq!(
+            card["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            "approve:req-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_failure_sends_no_approval_card_and_redacts_api_description() {
+        for status in ["200 OK", "400 Bad Request"] {
+            let (bot, api) = mock_api(vec![(
+                status,
+                json!({"ok": false, "error_code": 413, "description": "echoed fake-token"}),
+            )])
+            .await;
+            let req: ApprovalRequest = serde_json::from_value(json!({
+                "kind": "root", "script": "x".repeat(3600),
+            }))
+            .unwrap();
+            let err = bot.send_request("req-1", &req, None, 90).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "Telegram API sendDocument failed (error_code=413)"
+            );
+            let requests = api.await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].0.contains("/sendDocument "));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_registry_rejects_callbacks_and_secret_replies_at_the_deadline() {
+        let pending = PendingDecisions::new();
+        let delay = Duration::from_secs(1);
+        let deadline = Instant::now() + delay;
+        let mut callback = pending.register_until("card".into(), false, Some(deadline));
+        let mut secret = pending.register_until("secret".into(), true, Some(deadline));
+        pending.attach_message_id("secret", 1);
+
+        tokio::time::advance(delay).await;
+
+        assert!(!pending.resolve_callback("card", CallbackAction::Approve));
+        assert!(!pending.resolve_secret_reply(1, "fixture".into()));
+        assert!(callback.try_recv().is_err());
+        assert!(secret.try_recv().is_err());
+    }
 
     #[test]
     fn handle_update_strictly_verifies_owner_id() {

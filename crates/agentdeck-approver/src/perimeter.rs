@@ -34,11 +34,7 @@ pub struct ApprovalRequest {
     pub app: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
-    #[serde(
-        default,
-        alias = "timeout",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, alias = "timeout", skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nonce: Option<String>,
@@ -62,9 +58,7 @@ impl ApprovalRequest {
                 if script.contains('\0') {
                     bail!("script contains NUL byte");
                 }
-                if self.kind == "approve"
-                    && self.nonce.as_deref().is_none_or(|n| n.is_empty())
-                {
+                if self.kind == "approve" && self.nonce.as_deref().is_none_or(|n| n.is_empty()) {
                     bail!("missing nonce for kind \"approve\"");
                 }
             }
@@ -144,6 +138,11 @@ pub(crate) fn hex_lower(bytes: &[u8]) -> String {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MandateContext {
     pub active_autonomous_run: bool,
+    /// Set in memory by the caller after authenticating the owner grant.
+    #[serde(skip_deserializing)]
+    pub owner_granted: bool,
+    #[serde(default)]
+    pub allow_arbitrary_root_scripts: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     #[serde(default)]
@@ -377,6 +376,21 @@ fn compiled_rules() -> &'static [CompiledRule] {
                 "raw block device write via dd",
                 r"\bdd\b[^\n;|&]*\bof=/dev/(?:sd[a-z]|nvme|vd[a-z]|hd[a-z]|xvd[a-z]|mmcblk|dm-|md\d|loop\d|mapper/)",
             ),
+            (
+                "shell_obfuscation",
+                "shell substitution or eval",
+                r"\$\(|`|[<>]\(|\beval\b",
+            ),
+            (
+                "shell_obfuscation",
+                "decoder invocation",
+                r"\b(?:base64[^\n;|&]*\s(?:--decode|-[A-Za-z]*d[A-Za-z]*)|xxd[^\n;|&]*\s-[A-Za-z]*r[A-Za-z]*)\b",
+            ),
+            (
+                "shell_obfuscation",
+                "inline interpreter invocation",
+                r"\b(?:(?:python[0-9.]*|bash|(?:da|a|z|k)?sh)[^\n;|&]*\s(?:--command|-[A-Za-z]*c[A-Za-z]*)|(?:perl|ruby|node(?:js)?)[^\n;|&]*\s(?:--eval|--print|-[A-Za-z]*[eEp][A-Za-z]*))\b",
+            ),
         ];
         defs.iter()
             .map(|(rule, label, pat)| CompiledRule {
@@ -410,13 +424,15 @@ pub fn check_perimeter_with_extra(
         };
     }
 
-    // Check both raw surface and backslash-newline joined surface to stop trivial line splits.
+    // Scan the original and a conservative normalization of shell word quoting.
     let surface = req.inspectable_surface();
     let joined = surface.replace("\\\n", "");
+    let normalized = joined.replace(['\'', '"', '\\'], "");
+    let surfaces = [&surface, &joined, &normalized];
 
     // 2-4. Built-in code-enforced patterns.
     for compiled in compiled_rules() {
-        if compiled.regex.is_match(&surface) || compiled.regex.is_match(&joined) {
+        if surfaces.iter().any(|text| compiled.regex.is_match(text)) {
             return PerimeterVerdict::HardDeny {
                 rule: compiled.rule,
                 detail: compiled.label.to_string(),
@@ -426,18 +442,18 @@ pub fn check_perimeter_with_extra(
 
     // 5. Out-of-scope host or app relative to active mandate.
     if let Some(m) = mandate {
-        if !m.allowed_hosts.is_empty() {
-            let host = req.effective_host();
-            if !m.allowed_hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
-                return PerimeterVerdict::HardDeny {
-                    rule: "out_of_scope_host",
-                    detail: format!("host {host:?} is outside mandate allowed_hosts"),
-                };
-            }
+        let host = req.host.as_deref().unwrap_or_default().trim();
+        if !m.allowed_hosts.is_empty()
+            && (host.is_empty() || !m.allowed_hosts.iter().any(|h| h.eq_ignore_ascii_case(host)))
+        {
+            return PerimeterVerdict::HardDeny {
+                rule: "out_of_scope_host",
+                detail: format!("host {host:?} is outside mandate allowed_hosts"),
+            };
         }
+        let app = req.app.as_deref().unwrap_or_default().trim();
         if !m.allowed_apps.is_empty()
-            && let Some(app) = req.app.as_deref().map(str::trim).filter(|s| !s.is_empty())
-            && !m.allowed_apps.iter().any(|a| a.eq_ignore_ascii_case(app))
+            && (app.is_empty() || !m.allowed_apps.iter().any(|a| a.eq_ignore_ascii_case(app)))
         {
             return PerimeterVerdict::HardDeny {
                 rule: "out_of_scope_app",
@@ -450,7 +466,7 @@ pub fn check_perimeter_with_extra(
     for pat in extra_patterns {
         match Regex::new(&format!("(?i){pat}")) {
             Ok(re) => {
-                if re.is_match(&surface) || re.is_match(&joined) {
+                if surfaces.iter().any(|text| re.is_match(text)) {
                     return PerimeterVerdict::HardDeny {
                         rule: "extra_hard_deny_pattern",
                         detail: format!("matched extra hard-deny pattern {pat:?}"),
@@ -463,6 +479,21 @@ pub fn check_perimeter_with_extra(
                     detail: format!("invalid extra pattern {pat:?}: {e}"),
                 };
             }
+        }
+    }
+
+    if matches!(req.kind.as_str(), "root" | "approve") {
+        if normalized.contains('$') {
+            return PerimeterVerdict::HardDeny {
+                rule: "shell_obfuscation",
+                detail: "shell expansion requires human confirmation".into(),
+            };
+        }
+        if !mandate.is_some_and(|m| m.allow_arbitrary_root_scripts) {
+            return PerimeterVerdict::HardDeny {
+                rule: "arbitrary_root_script",
+                detail: "arbitrary root scripts require human confirmation".into(),
+            };
         }
     }
 
