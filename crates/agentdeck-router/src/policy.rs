@@ -2041,4 +2041,18 @@ mod neon_family_tests {
                 .contains("Neon")
         );
     }
+
+    #[test]
+    fn argon_is_spend_to_zero_implementer_with_no_review() {
+        let f = family_of("gemini-4-argon").expect("argon family");
+        assert_eq!(f.burn, 12.0);
+        assert!(f.spend_to_zero);
+        assert!(f.no_review);
+        assert!(
+            f.profile
+                .as_deref()
+                .unwrap_or_default()
+                .contains("strong implementer")
+        );
+    }
 }
