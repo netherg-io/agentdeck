@@ -4,6 +4,7 @@
 //! endpoint, and only when that endpoint is provably loopback.
 
 use std::collections::HashMap;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags};
@@ -14,6 +15,10 @@ use serde::{Deserialize, Serialize};
 /// can be pointed at a remote host is a credential leak). Parsed with the
 /// exact parser the client uses, so no hand-rolled split can disagree with it.
 pub fn check_loopback_url(endpoint: &str) -> anyhow::Result<()> {
+    loopback_addresses(endpoint).map(|_| ())
+}
+
+fn loopback_addresses(endpoint: &str) -> anyhow::Result<Vec<SocketAddr>> {
     if endpoint.chars().any(|c| c.is_control() || c == ' ' || c == '\u{7f}') {
         anyhow::bail!("invalid T3 MCP endpoint: control characters or spaces");
     }
@@ -30,7 +35,18 @@ pub fn check_loopback_url(endpoint: &str) -> anyhow::Result<()> {
     }
     match url.host_str() {
         // `host_str` keeps IPv6 brackets: `[::1]` here is the `::1` loopback.
-        Some("127.0.0.1") | Some("localhost") | Some("[::1]") => Ok(()),
+        Some("127.0.0.1" | "[::1]") => Ok(Vec::new()),
+        Some("localhost") => {
+            let addresses: Vec<_> = ("localhost", url.port().unwrap_or(80))
+                .to_socket_addrs()
+                .map_err(|_| anyhow::anyhow!("cannot resolve localhost for the T3 MCP endpoint"))?
+                .collect();
+            anyhow::ensure!(
+                !addresses.is_empty() && addresses.iter().all(|addr| addr.ip().is_loopback()),
+                "localhost for the T3 MCP endpoint must resolve exclusively to loopback addresses"
+            );
+            Ok(addresses)
+        }
         _ => anyhow::bail!("T3 MCP endpoint must be loopback (127.0.0.1, localhost or [::1])"),
     }
 }
@@ -66,7 +82,14 @@ pub struct HttpT3Controller {
 
 impl HttpT3Controller {
     pub fn new(endpoint: &str, token_file: Option<&Path>) -> anyhow::Result<Self> {
-        check_loopback_url(endpoint)?;
+        let addresses = loopback_addresses(endpoint)?;
+        let mut client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none());
+        if !addresses.is_empty() {
+            // Use the verified addresses for the connection too.
+            client = client.resolve_to_addrs("localhost", &addresses);
+        }
         let authorization = token_file
             .map(std::fs::read_to_string)
             .transpose()
@@ -76,9 +99,7 @@ impl HttpT3Controller {
         Ok(Self {
             endpoint: endpoint.to_string(),
             authorization,
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
+            client: client
                 .build()
                 .map_err(|_| anyhow::anyhow!("cannot build T3 MCP client"))?,
         })
@@ -144,14 +165,11 @@ impl HttpT3Controller {
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.contains("text/event-stream"));
-        let text = res
-            .text()
-            .await
-            .map_err(|_| anyhow::anyhow!("T3 MCP returned an unreadable body."))?;
         let envelope: serde_json::Value = if is_sse {
-            parse_sse_envelope(&text, id)?
+            parse_sse_envelope(res, id).await?
         } else {
-            serde_json::from_str(&text)
+            res.json()
+                .await
                 .map_err(|_| anyhow::anyhow!("Invalid T3 MCP JSON envelope."))?
         };
         if envelope.get("id") != Some(&serde_json::Value::from(id))
@@ -203,31 +221,41 @@ impl HttpT3Controller {
     }
 }
 
-/// First `data:` JSON envelope whose `id` matches, like the
-/// `agentdeck-router::mcp_call` SSE scan.
-fn parse_sse_envelope(text: &str, id: u64) -> anyhow::Result<serde_json::Value> {
-    let mut rest = text;
-    while let Some(pos) = rest.find("\r\n\r\n").or_else(|| rest.find("\n\n")) {
-        let sep = if rest[pos..].starts_with("\r\n") { 4 } else { 2 };
-        let event = &rest[..pos];
-        rest = &rest[pos + sep..];
-        let mut data = String::new();
-        for line in event.split(['\r', '\n']) {
-            if let Some(d) = line.strip_prefix("data:") {
-                let d = d.strip_prefix(' ').unwrap_or(d);
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                data.push_str(d);
+/// Read complete SSE events until the response with this request's id.
+async fn parse_sse_envelope(
+    mut response: reqwest::Response,
+    id: u64,
+) -> anyhow::Result<serde_json::Value> {
+    let id = serde_json::Value::from(id);
+    let mut pending_line = Vec::new();
+    let mut data = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| anyhow::anyhow!("T3 MCP returned an unreadable body."))?
+    {
+        for bytes in chunk.split_inclusive(|b| *b == b'\n') {
+            pending_line.extend_from_slice(bytes);
+            if !bytes.ends_with(b"\n") {
+                continue;
             }
-        }
-        if data.is_empty() {
-            continue;
-        }
-        let candidate: serde_json::Value = serde_json::from_str(&data)
-            .map_err(|_| anyhow::anyhow!("Invalid T3 MCP SSE envelope."))?;
-        if candidate.is_object() && candidate.get("id") == Some(&serde_json::Value::from(id)) {
-            return Ok(candidate);
+            let line = &pending_line[..pending_line.len() - 1];
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.is_empty() && !data.is_empty() {
+                let candidate: serde_json::Value = serde_json::from_slice(&data)
+                    .map_err(|_| anyhow::anyhow!("Invalid T3 MCP SSE envelope."))?;
+                if candidate.get("id") == Some(&id) {
+                    return Ok(candidate);
+                }
+                data.clear();
+            } else if let Some(d) = line.strip_prefix(b"data:") {
+                let d = d.strip_prefix(b" ").unwrap_or(d);
+                if !data.is_empty() {
+                    data.push(b'\n');
+                }
+                data.extend_from_slice(d);
+            }
+            pending_line.clear();
         }
     }
     anyhow::bail!("T3 MCP rejected the request or returned an invalid response.")
@@ -407,15 +435,27 @@ fn thread_row(conn: &Connection, thread_id: &str) -> Option<ThreadRow> {
     })
 }
 
-/// T3 marks the thread payload once a limit failure is known
-/// (`limitRecovery`): a present truthy marker proves the thread died on
-/// quota even when the tail text has rotated away.
-fn has_limit_recovery_marker(payload: &serde_json::Value) -> bool {
+/// T3 retains recovery markers after newer runs have started or finished.
+fn has_limit_recovery_marker(
+    payload: &serde_json::Value,
+    latest_run_id: Option<&str>,
+    latest_run_status: Option<&str>,
+) -> bool {
+    if matches!(
+        latest_run_status,
+        Some("completed" | "running" | "starting" | "queued" | "preparing" | "waiting")
+    ) {
+        return false;
+    }
     ["limitRecovery", "limit_recovery"].iter().any(|k| {
         payload.get(*k).is_some_and(|v| match v {
             serde_json::Value::Null => false,
             serde_json::Value::Bool(b) => *b,
             serde_json::Value::String(s) => !s.is_empty(),
+            serde_json::Value::Object(fields) => match fields.get("runId") {
+                Some(run_id) => run_id.as_str().is_some_and(|id| Some(id) == latest_run_id),
+                None => true,
+            },
             _ => true,
         })
     })
@@ -502,22 +542,25 @@ pub fn observe_thread_sqlite(t3_root: &Path, thread_id: &str) -> anyhow::Result<
         let has_timestamps =
             column_exists(&conn, "orchestration_v2_projection_runs", "requested_at")
                 && column_exists(&conn, "orchestration_v2_projection_runs", "completed_at");
-        let sql = if has_timestamps {
-            format!(
-                "SELECT run_id, provider_instance_id, payload_json, status, requested_at, completed_at \
-                 FROM orchestration_v2_projection_runs WHERE thread_id=?1 {order}"
-            )
+        let timestamps = if has_timestamps {
+            "requested_at, completed_at"
         } else {
-            format!(
-                "SELECT run_id, provider_instance_id, payload_json, status, NULL, NULL \
-                 FROM orchestration_v2_projection_runs WHERE thread_id=?1 {order}"
-            )
+            "NULL, NULL"
         };
+        let status = if column_exists(&conn, "orchestration_v2_projection_runs", "status") {
+            "status"
+        } else {
+            "NULL"
+        };
+        let sql = format!(
+            "SELECT run_id, provider_instance_id, payload_json, {status}, {timestamps} \
+             FROM orchestration_v2_projection_runs WHERE thread_id=?1 {order}"
+        );
         struct RunRow {
             run_id: String,
             instance: Option<String>,
             payload_json: Option<String>,
-            status: String,
+            status: Option<String>,
             requested_at: Option<String>,
             completed_at: Option<String>,
         }
@@ -549,15 +592,15 @@ pub fn observe_thread_sqlite(t3_root: &Path, thread_id: &str) -> anyhow::Result<
             );
             if idx == 0 {
                 latest_run_id = Some(run_id.clone());
-                latest_run_status = Some(status.clone());
+                latest_run_status = status.clone();
             }
             let live = matches!(
-                status.as_str(),
-                "queued" | "preparing" | "starting" | "running" | "waiting"
+                status.as_deref(),
+                Some("queued" | "preparing" | "starting" | "running" | "waiting")
             );
             if live {
                 observed.is_running = true;
-                if status == "running" || observed.active_run_id.is_none() {
+                if status.as_deref() == Some("running") || observed.active_run_id.is_none() {
                     observed.active_run_id = Some(run_id.clone());
                 }
             }
@@ -638,14 +681,15 @@ pub fn observe_thread_sqlite(t3_root: &Path, thread_id: &str) -> anyhow::Result<
             .map(str::to_string);
     }
 
+    let checks_failure = matches!(
+        latest_run_status.as_deref(),
+        None | Some("failed" | "interrupted")
+    );
     // Real T3 records structured quota failures as failed `error` turn_items on the latest run.
     let mut structured_usage_limit = false;
     if !observed.is_running
         && let Some(run_id) = latest_run_id.as_deref()
-        && matches!(
-            latest_run_status.as_deref(),
-            Some("failed" | "interrupted" | "completed")
-        )
+        && checks_failure
         && table_exists(&conn, "orchestration_v2_projection_turn_items")
     {
         let order = if column_exists(&conn, "orchestration_v2_projection_turn_items", "ordinal") {
@@ -739,8 +783,12 @@ pub fn observe_thread_sqlite(t3_root: &Path, thread_id: &str) -> anyhow::Result<
     }
     observed.pending_background_tasks = pending;
     observed.hit_quota_limit = structured_usage_limit
-        || has_limit_recovery_marker(&thread_payload)
-        || is_quota_limit_message(&observed.last_message_text);
+        || has_limit_recovery_marker(
+            &thread_payload,
+            latest_run_id.as_deref(),
+            latest_run_status.as_deref(),
+        )
+        || (checks_failure && is_quota_limit_message(&observed.last_message_text));
     Ok(Some(observed))
 }
 

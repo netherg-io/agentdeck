@@ -104,6 +104,7 @@ fn current_key(observed: &ObservedThread) -> Option<(&str, &str)> {
 /// cache is kept; a stale or unknown one is dropped so it can never produce
 /// a premature wake.
 fn with_failed_marked_ineligible(
+    cfg: &CoordinatorConfig,
     quotas: &HashMap<PoolKey, QuotaWindowView>,
     observed: &ObservedThread,
     now_epoch_secs: i64,
@@ -114,10 +115,11 @@ fn with_failed_marked_ineligible(
         observed.model.as_deref(),
     ) {
         (Some(inst), Some(model)) => vec![pool_key(inst, model)],
-        (Some(inst), None) => adjusted
-            .keys()
-            .filter(|(i, _)| i == inst)
-            .cloned()
+        (Some(inst), None) => cfg
+            .pool
+            .iter()
+            .filter(|entry| entry.instance_id == inst)
+            .map(|entry| pool_key(inst, &entry.model))
             .collect(),
         _ => Vec::new(),
     };
@@ -209,7 +211,10 @@ pub fn decide_action(
         return noop("no unblocked work: remaining items are done, held, or parked in Owner Inbox");
     }
     if run.phase == RunPhase::SleepingForQuota {
-        if run.sleep_until_epoch.is_some_and(|until| now_epoch_secs < until) {
+        let Some(until) = run.sleep_until_epoch else {
+            return noop("quota sleep has no valid deadline");
+        };
+        if now_epoch_secs < until {
             return noop("still inside quota sleep window");
         }
         // Sleep over: rotate onto the first eligible entry, else re-sleep.
@@ -231,7 +236,7 @@ pub fn decide_action(
     if observed.hit_quota_limit {
         // The observed failure takes effect BEFORE selection: the just-failed
         // account is ineligible even when its T3 cache is stale.
-        let adjusted = with_failed_marked_ineligible(quotas, observed, now_epoch_secs);
+        let adjusted = with_failed_marked_ineligible(cfg, quotas, observed, now_epoch_secs);
         return match select_coordinator(
             cfg,
             &adjusted,
@@ -297,7 +302,7 @@ pub fn decide_action(
                 &run.thread_id,
                 entry.clone(),
                 format!(
-                    "proactive rotation: {cur_inst} is thin, {} is fuller",
+                    "proactive rotation: {cur_inst} is below its quota threshold, {} is eligible",
                     entry.instance_id
                 ),
                 false,
@@ -340,39 +345,28 @@ pub fn decide(cfg: &CoordinatorConfig, input: &WatchdogThreadInput) -> WatchdogA
 /// cooldown window (e.g. two ticks racing one silent thread).
 #[derive(Debug, Default)]
 pub struct ActionDebounce {
-    window_secs: u64,
-    last: HashMap<(String, String), i64>,
+    window_secs: i64,
+    last: HashMap<(String, &'static str), i64>,
 }
 
 impl ActionDebounce {
     pub fn new(window_secs: u64) -> Self {
         Self {
-            window_secs,
+            window_secs: i64::try_from(window_secs).unwrap_or(i64::MAX),
             last: HashMap::new(),
         }
     }
 
-    /// `true` when this (thread, action-kind) fired recently and should be
-    /// skipped. Noop and quota-sleep updates are never debounced: they are
-    /// cheap and idempotent.
-    pub fn should_skip(&mut self, action: &WatchdogAction, thread_id: &str, now_epoch_secs: i64) -> bool {
-        if matches!(
-            action,
-            WatchdogAction::Noop { .. } | WatchdogAction::EnterQuotaSleep { .. }
-        ) {
-            return false;
-        }
-        let key = (thread_id.to_string(), action.kind().to_string());
-        if let Some(last) = self.last.get(&key)
-            && now_epoch_secs - *last < self.window_secs as i64
-        {
-            return true;
-        }
+    fn is_debounced(&self, key: &(String, &'static str), now_epoch_secs: i64) -> bool {
+        self.last
+            .get(key)
+            .is_some_and(|last| now_epoch_secs.saturating_sub(*last) < self.window_secs)
+    }
+
+    fn record(&mut self, key: (String, &'static str), now_epoch_secs: i64) {
         self.last.insert(key, now_epoch_secs);
-        // Bounded growth: drop entries older than the window.
-        let window = self.window_secs as i64;
-        self.last.retain(|_, t| now_epoch_secs - *t < window * 4);
-        false
+        self.last
+            .retain(|_, t| now_epoch_secs.saturating_sub(*t) < self.window_secs.saturating_mul(4));
     }
 }
 
@@ -385,48 +379,37 @@ pub async fn execute_action<C: T3ThreadController>(
     debounce: &mut ActionDebounce,
     now_epoch_secs: i64,
 ) -> anyhow::Result<bool> {
+    let thread_id = match action {
+        WatchdogAction::Noop { .. } => return Ok(false),
+        WatchdogAction::EnterQuotaSleep { .. } => return Ok(true),
+        WatchdogAction::RotateAndWake { thread_id, .. }
+        | WatchdogAction::Wake { thread_id, .. }
+        | WatchdogAction::TriggerCheckpoint { thread_id, .. } => thread_id,
+    };
+    let key = (thread_id.clone(), action.kind());
+    if debounce.is_debounced(&key, now_epoch_secs) {
+        return Ok(false);
+    }
     match action {
-        WatchdogAction::Noop { .. } => Ok(false),
         WatchdogAction::RotateAndWake {
-            thread_id,
             to_entry,
             fresh_context,
             message,
             ..
         } => {
-            if debounce.should_skip(action, thread_id, now_epoch_secs) {
-                return Ok(false);
-            }
             controller
                 .configure_thread(thread_id, &to_entry.instance_id, &to_entry.model, &to_entry.options_map())
                 .await?;
             controller.send_message(thread_id, message, *fresh_context).await?;
-            Ok(true)
         }
         WatchdogAction::Wake {
-            thread_id,
             fresh_context,
             message,
             ..
         } => {
-            if debounce.should_skip(action, thread_id, now_epoch_secs) {
-                return Ok(false);
-            }
             controller.send_message(thread_id, message, *fresh_context).await?;
-            Ok(true)
         }
-        WatchdogAction::EnterQuotaSleep { .. } => {
-            // No T3 call: the daemon persists the new sleep deadline itself.
-            Ok(true)
-        }
-        WatchdogAction::TriggerCheckpoint {
-            thread_id,
-            target,
-            reason,
-        } => {
-            if debounce.should_skip(action, thread_id, now_epoch_secs) {
-                return Ok(false);
-            }
+        WatchdogAction::TriggerCheckpoint { target, reason, .. } => {
             let message = match target {
                 Some(t) => {
                     controller
@@ -439,7 +422,9 @@ pub async fn execute_action<C: T3ThreadController>(
             // In-context instruction: the Coordinator needs its context to
             // write state before any reset, so never fresh here.
             controller.send_message(thread_id, &format!("{message}\nReason: {reason}"), false).await?;
-            Ok(true)
         }
+        WatchdogAction::Noop { .. } | WatchdogAction::EnterQuotaSleep { .. } => unreachable!(),
     }
+    debounce.record(key, now_epoch_secs);
+    Ok(true)
 }
