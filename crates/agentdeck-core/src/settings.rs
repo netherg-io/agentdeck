@@ -4,8 +4,10 @@
 //! `[approver]` broker/judge config, and `[coordinator]` pool/watchdog config.
 //! Absent keys mean the built-in defaults.
 
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -612,40 +614,196 @@ impl ApproverEnvStatus {
     }
 }
 
-pub(crate) fn approver_env_status(config_dir: &std::path::Path) -> ApproverEnvStatus {
-    let Ok(raw) = fs::read_to_string(config_dir.join("approver.env")) else {
-        return ApproverEnvStatus::Missing;
+/// Read-only view of Telegram credentials stored for the Approver plugin.
+/// Never returns the raw bot token so UI layers cannot accidentally echo it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApproverCredentialsStatus {
+    pub bot_token_set: bool,
+    pub owner_id: Option<i64>,
+    pub error: Option<String>,
+}
+
+/// Partial update for `approver.env` Telegram credentials:
+/// `None` preserves the existing value; `Some(Some(v))` sets it; `Some(None)` clears it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApproverCredentialsUpdate {
+    pub telegram_bot_token: Option<Option<String>>,
+    pub telegram_owner_id: Option<Option<i64>>,
+}
+
+fn strip_env_quotes(val: &str) -> &str {
+    if val.len() >= 2
+        && ((val.starts_with('"') && val.ends_with('"'))
+            || (val.starts_with('\'') && val.ends_with('\'')))
+    {
+        &val[1..val.len() - 1]
+    } else {
+        val
+    }
+}
+
+/// Strict read-only inspection of `config_dir/approver.env`. Never mutates files or permissions.
+pub fn read_approver_credentials(config_dir: &Path) -> ApproverCredentialsStatus {
+    let path = config_dir.join("approver.env");
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return ApproverCredentialsStatus::default();
+        }
+        Err(err) => {
+            return ApproverCredentialsStatus {
+                error: Some(format!("failed to read {}: {err}", path.display())),
+                ..Default::default()
+            };
+        }
     };
-    let (mut has_token, mut has_owner, mut invalid) = (false, false, false);
-    for line in raw.lines() {
+    let mut out = ApproverCredentialsStatus::default();
+    for (idx, line) in raw.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed).trim();
         let Some((key, val)) = trimmed.split_once('=') else {
+            out.error = Some(format!(
+                "malformed line {} in approver.env (expected KEY=VALUE)",
+                idx + 1
+            ));
             continue;
         };
-        let val = val.trim().trim_matches('"').trim_matches('\'');
+        let val = strip_env_quotes(val.trim());
         if val.is_empty() {
             continue;
         }
         match key.trim() {
-            "TELEGRAM_BOT_TOKEN" => has_token = true,
-            "TELEGRAM_OWNER_ID" => {
-                if val.parse::<i64>().is_ok() {
-                    has_owner = true;
-                } else {
-                    invalid = true;
+            "TELEGRAM_BOT_TOKEN" => out.bot_token_set = true,
+            "TELEGRAM_OWNER_ID" => match val.parse::<i64>() {
+                Ok(id) if id != 0 => out.owner_id = Some(id),
+                _ => {
+                    out.error = Some(format!("invalid TELEGRAM_OWNER_ID on line {}", idx + 1));
                 }
-            }
+            },
             _ => {}
         }
     }
-    if has_token && has_owner {
-        ApproverEnvStatus::Configured
-    } else if invalid {
+    out
+}
+
+/// Locked, atomic 0600 update of `TELEGRAM_BOT_TOKEN` / `TELEGRAM_OWNER_ID` in
+/// `config_dir/approver.env`, preserving comments and all other keys.
+pub fn write_approver_credentials(
+    config_dir: &Path,
+    update: &ApproverCredentialsUpdate,
+) -> anyhow::Result<()> {
+    if let Some(Some(tok)) = &update.telegram_bot_token {
+        let trimmed = tok.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("Telegram bot token cannot be empty");
+        }
+        if trimmed.chars().any(|c| c.is_control()) {
+            anyhow::bail!("Telegram bot token cannot contain control characters");
+        }
+    }
+    if let Some(Some(id)) = update.telegram_owner_id
+        && id == 0
+    {
+        anyhow::bail!("Telegram owner ID must be nonzero");
+    }
+
+    fs::create_dir_all(config_dir)?;
+    let lock_path = config_dir.join("approver.env.lock");
+    let guard = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&lock_path)?;
+    guard.lock()?;
+
+    let env_path = config_dir.join("approver.env");
+    let existing = match fs::read_to_string(&env_path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(err)
+                .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", env_path.display()));
+        }
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut saw_token = false;
+    let mut saw_owner = false;
+
+    for raw_line in existing.lines() {
+        let trimmed = raw_line.trim();
+        let key = if trimmed.is_empty() || trimmed.starts_with('#') {
+            None
+        } else {
+            let body = trimmed.strip_prefix("export ").unwrap_or(trimmed).trim();
+            body.split_once('=').map(|(k, _)| k.trim())
+        };
+        match key {
+            Some("TELEGRAM_BOT_TOKEN") => {
+                if let Some(target) = &update.telegram_bot_token {
+                    if !saw_token {
+                        saw_token = true;
+                        if let Some(tok) = target {
+                            lines.push(format!("TELEGRAM_BOT_TOKEN={}", tok.trim()));
+                        }
+                    }
+                } else {
+                    lines.push(raw_line.to_string());
+                }
+            }
+            Some("TELEGRAM_OWNER_ID") => {
+                if let Some(target) = &update.telegram_owner_id {
+                    if !saw_owner {
+                        saw_owner = true;
+                        if let Some(id) = target {
+                            lines.push(format!("TELEGRAM_OWNER_ID={id}"));
+                        }
+                    }
+                } else {
+                    lines.push(raw_line.to_string());
+                }
+            }
+            _ => lines.push(raw_line.to_string()),
+        }
+    }
+
+    if !saw_token && let Some(Some(tok)) = &update.telegram_bot_token {
+        lines.push(format!("TELEGRAM_BOT_TOKEN={}", tok.trim()));
+    }
+    if !saw_owner && let Some(Some(id)) = update.telegram_owner_id {
+        lines.push(format!("TELEGRAM_OWNER_ID={id}"));
+    }
+
+    let mut content = lines.join("\n");
+    if !content.is_empty() {
+        content.push('\n');
+    }
+
+    let tmp_path = config_dir.join("approver.env.tmp");
+    let mut tmp = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&tmp_path)?;
+    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
+    tmp.write_all(content.as_bytes())?;
+    tmp.sync_all()?;
+    drop(tmp);
+    fs::rename(&tmp_path, &env_path)?;
+    Ok(())
+}
+
+pub(crate) fn approver_env_status(config_dir: &Path) -> ApproverEnvStatus {
+    let creds = read_approver_credentials(config_dir);
+    if creds.error.is_some() {
         ApproverEnvStatus::Invalid
+    } else if creds.bot_token_set && creds.owner_id.is_some() {
+        ApproverEnvStatus::Configured
     } else {
         ApproverEnvStatus::Missing
     }
@@ -1640,6 +1798,97 @@ mod tests {
                 .autonomous_timeout_secs,
             90
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn approver_credentials_write_preserves_other_keys_and_enforces_0600() {
+        let dir =
+            std::env::temp_dir().join(format!("agentdeck-approver-creds-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("approver.env"),
+            "# keep comment\nOPENROUTER_API_KEY=sk-test-keep\n",
+        )
+        .unwrap();
+
+        write_approver_credentials(
+            &dir,
+            &ApproverCredentialsUpdate {
+                telegram_bot_token: Some(Some("123456:ABC-token".into())),
+                telegram_owner_id: Some(Some(987654321)),
+            },
+        )
+        .unwrap();
+
+        let mode = fs::metadata(dir.join("approver.env"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(approver_telegram_configured(&dir));
+        let status = read_approver_credentials(&dir);
+        assert!(status.bot_token_set);
+        assert_eq!(status.owner_id, Some(987654321));
+        assert!(status.error.is_none());
+
+        // Partial update changes owner ID while keeping token and unrelated keys.
+        write_approver_credentials(
+            &dir,
+            &ApproverCredentialsUpdate {
+                telegram_bot_token: None,
+                telegram_owner_id: Some(Some(111222333)),
+            },
+        )
+        .unwrap();
+        let raw = fs::read_to_string(dir.join("approver.env")).unwrap();
+        assert!(raw.contains("# keep comment"));
+        assert!(raw.contains("OPENROUTER_API_KEY=sk-test-keep"));
+        assert!(raw.contains("TELEGRAM_BOT_TOKEN=123456:ABC-token"));
+        assert!(raw.contains("TELEGRAM_OWNER_ID=111222333"));
+        assert!(!raw.contains("987654321"));
+
+        // Control chars and zero owner ID are rejected without clobbering the file.
+        assert!(
+            write_approver_credentials(
+                &dir,
+                &ApproverCredentialsUpdate {
+                    telegram_bot_token: Some(Some("bad\nINJECT=1".into())),
+                    telegram_owner_id: None,
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            write_approver_credentials(
+                &dir,
+                &ApproverCredentialsUpdate {
+                    telegram_bot_token: None,
+                    telegram_owner_id: Some(Some(0)),
+                }
+            )
+            .is_err()
+        );
+        let after = read_approver_credentials(&dir);
+        assert!(after.bot_token_set);
+        assert_eq!(after.owner_id, Some(111222333));
+
+        // Clearing owner ID drops only TELEGRAM_OWNER_ID.
+        write_approver_credentials(
+            &dir,
+            &ApproverCredentialsUpdate {
+                telegram_bot_token: None,
+                telegram_owner_id: Some(None),
+            },
+        )
+        .unwrap();
+        let cleared = read_approver_credentials(&dir);
+        assert!(cleared.bot_token_set);
+        assert_eq!(cleared.owner_id, None);
+        assert!(!approver_telegram_configured(&dir));
+
         let _ = fs::remove_dir_all(&dir);
     }
 }
