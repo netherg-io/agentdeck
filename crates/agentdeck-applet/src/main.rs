@@ -456,8 +456,17 @@ fn load_coords() -> Vec<CoordSummary> {
     let Ok(paths) = agentdeck_core::Paths::from_env() else {
         return Vec::new();
     };
-    let mut coords: Vec<CoordSummary> = thread_state::list(&paths)
+    summarize_coords(thread_state::list(&paths))
+}
+
+/// Completed runs stay out of the popup and the inbox badge: a finished run
+/// with a legacy open item must not sort above live work or inflate the count.
+fn summarize_coords(
+    rows: Vec<(String, agentdeck_core::thread_state::ThreadState)>,
+) -> Vec<CoordSummary> {
+    let mut coords: Vec<CoordSummary> = rows
         .into_iter()
+        .filter(|(_, state)| !matches!(state.phase, RunPhase::Completed))
         .map(|(thread, state)| CoordSummary {
             thread,
             phase: state.phase,
@@ -887,6 +896,30 @@ mod tests {
         let mut coords = vec![running, sleeping];
         coords.sort_by(|a, b| b.inbox.cmp(&a.inbox).then_with(|| a.thread.cmp(&b.thread)));
         assert_eq!(coords[0].thread, "t1");
+    }
+
+    #[test]
+    fn completed_runs_stay_out_of_rows_and_badge() {
+        use agentdeck_core::thread_state::{InboxItem, ThreadState};
+        let open = |id: &str| InboxItem {
+            id: id.into(),
+            title: "stale item".into(),
+            resolved: false,
+            ..InboxItem::default()
+        };
+        let mut done = ThreadState::default();
+        done.phase = RunPhase::Completed;
+        done.owner_inbox = vec![open("legacy")];
+        let mut running = ThreadState::default();
+        running.phase = RunPhase::Running;
+        running.owner_inbox = vec![open("live")];
+        let coords = summarize_coords(vec![
+            ("done".into(), done),
+            ("live".into(), running),
+        ]);
+        assert_eq!(coords.len(), 1);
+        assert_eq!(coords[0].thread, "live");
+        assert_eq!(coords.iter().map(|c| c.inbox).sum::<usize>(), 1);
     }
 
     #[test]

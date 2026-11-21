@@ -759,6 +759,8 @@ pub struct AuditRow {
 pub struct ApproverLoaded {
     pub cfg: Option<ApproverSettings>,
     pub audit: Vec<AuditRow>,
+    /// Reading the audit log failed (missing file stays an empty `audit`).
+    pub audit_error: Option<String>,
     pub error: Option<String>,
 }
 
@@ -860,7 +862,7 @@ pub enum ApproverMsg {
     Save,
     Done(Result<(), String>),
     RefreshAudit,
-    AuditLoaded(Vec<AuditRow>),
+    AuditLoaded(Result<Vec<AuditRow>, String>),
 }
 
 #[derive(Debug, Clone)]
@@ -924,48 +926,108 @@ fn blanked(raw: &str) -> Option<String> {
     Some(raw.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-/// Last 20 audit records, oldest first; a missing file is an empty list.
-fn read_audit(state_dir: &std::path::Path) -> Vec<AuditRow> {
-    let raw =
-        std::fs::read_to_string(state_dir.join("approver").join("audit.jsonl")).unwrap_or_default();
-    let mut rows: Vec<AuditRow> = raw
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .rev()
-        .take(20)
-        .filter_map(|l| {
-            let v: serde_json::Value = serde_json::from_str(l).ok()?;
-            let s = |key: &str| {
-                v.get(key)
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("—")
-                    .to_string()
-            };
-            Some(AuditRow {
-                at: v
-                    .get("timestamp")
-                    .and_then(|t| t.as_u64())
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|| "—".into()),
-                host: s("host"),
-                kind: s("kind"),
-                outcome: s("outcome"),
-                source: s("source"),
-            })
-        })
-        .collect();
+/// Days since the Unix epoch as a civil `YYYY-MM-DD` date (no timezone
+/// crate: the audit log is UTC by construction).
+fn civil_ymd(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    y += (m <= 2) as i64;
+    (y, m, d)
+}
+
+/// Epoch seconds as UTC `YYYY-MM-DD HH:MM:SS` (never a raw number in the UI).
+fn fmt_ts(ts: u64) -> String {
+    let (y, m, d) = civil_ymd((ts / 86_400) as i64);
+    let s = ts % 86_400;
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        s / 3600,
+        s % 3600 / 60,
+        s % 60
+    )
+}
+
+/// Last 20 valid audit records, oldest first, from a bounded tail read: the
+/// file stays off the UI thread and a huge log never loads fully. A missing
+/// file is an empty log; any other IO failure is an error.
+fn read_audit(state_dir: &std::path::Path) -> Result<Vec<AuditRow>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = state_dir.join("approver").join("audit.jsonl");
+    let mut f = match std::fs::File::open(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+        Ok(f) => f,
+    };
+    // Last 64 KiB only; a torn first line simply fails to parse and is skipped.
+    const TAIL: u64 = 64 * 1024;
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if len > TAIL {
+        f.seek(SeekFrom::Start(len - TAIL))
+            .map_err(|e| e.to_string())?;
+    }
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    let mut rows = Vec::new();
+    for line in String::from_utf8_lossy(&buf).lines().rev() {
+        if rows.len() >= 20 {
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(row) = parse_audit_line(line) {
+            rows.push(row);
+        }
+    }
     rows.reverse();
-    rows
+    Ok(rows)
+}
+
+fn parse_audit_line(line: &str) -> Option<AuditRow> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let s = |key: &str| {
+        v.get(key)
+            .and_then(|x| x.as_str())
+            .unwrap_or("—")
+            .to_string()
+    };
+    Some(AuditRow {
+        at: v
+            .get("timestamp")
+            .and_then(|t| t.as_u64())
+            .map(fmt_ts)
+            .unwrap_or_else(|| "—".into()),
+        host: s("host"),
+        kind: s("kind"),
+        outcome: s("outcome"),
+        source: s("source"),
+    })
 }
 
 pub fn load_approver(paths: &Paths) -> Msg {
     am(ApproverMsg::Loaded(match Registry::load(paths) {
         Ok(reg) => match settings::read_approver(&reg) {
-            Ok(cfg) => ApproverLoaded {
-                cfg: Some(cfg),
-                audit: read_audit(&paths.state_dir),
-                error: None,
-            },
+            Ok(cfg) => {
+                // Bounded read; the page itself loads inside a Task, Refresh
+                // re-reads off-thread via spawn_blocking.
+                let (audit, audit_error) = match read_audit(&paths.state_dir) {
+                    Ok(audit) => (audit, None),
+                    Err(e) => (Vec::new(), Some(e)),
+                };
+                ApproverLoaded {
+                    cfg: Some(cfg),
+                    audit,
+                    audit_error,
+                    error: None,
+                }
+            }
             Err(e) => ApproverLoaded {
                 error: Some(format!("{e:#}")),
                 ..Default::default()
@@ -1000,7 +1062,7 @@ pub fn load_coord(paths: &Paths) -> Msg {
 
 fn approver_cfg(s: &ApproverState) -> Result<ApproverSettings, String> {
     let d = ApproverSettings::default();
-    Ok(ApproverSettings {
+    let cfg = ApproverSettings {
         socket_path: blanked(&s.socket_path).map(PathBuf::from),
         autonomous_timeout_secs: seconds(&s.auto_timeout)?.unwrap_or(d.autonomous_timeout_secs),
         interactive_timeout_secs: seconds(&s.inter_timeout)?.unwrap_or(d.interactive_timeout_secs),
@@ -1009,12 +1071,16 @@ fn approver_cfg(s: &ApproverState) -> Result<ApproverSettings, String> {
         judge_confidence_threshold: number(&s.confidence)?.unwrap_or(d.judge_confidence_threshold),
         remote_hosts: patterns(&s.remote_hosts),
         extra_hard_deny_patterns: patterns(&s.deny),
-    })
+    };
+    // Core bounds (timeout ranges, loopback rules live in the coordinator
+    // cfg): reject here so the draft survives with an inline error.
+    cfg.validate().map_err(|e| format!("{e:#}"))?;
+    Ok(cfg)
 }
 
 fn coord_cfg(s: &CoordState) -> Result<CoordinatorSettings, String> {
     let d = CoordinatorSettings::default();
-    Ok(CoordinatorSettings {
+    let cfg = CoordinatorSettings {
         pool: s.entries.clone(),
         min_weekly_reserve_pct: number(&s.reserve)?.unwrap_or(d.min_weekly_reserve_pct),
         proactive_rotate_below_5h_pct: number(&s.proactive)?.unwrap_or(d.proactive_rotate_below_5h_pct),
@@ -1028,7 +1094,11 @@ fn coord_cfg(s: &CoordState) -> Result<CoordinatorSettings, String> {
         t3_token_file: s.token_file.clone(),
         judge_provider: s.judge.stored(),
         judge_model: blanked(&s.judge_model),
-    })
+    };
+    // Core bounds, duplicate pool keys and the loopback endpoint check: an
+    // inline error keeps the draft instead of a wiped failed save.
+    cfg.validate().map_err(|e| format!("{e:#}"))?;
+    Ok(cfg)
 }
 
 fn update_approver(state: &mut ApproverState, paths: Paths, msg: ApproverMsg) -> Task<Msg> {
@@ -1046,7 +1116,9 @@ fn update_approver(state: &mut ApproverState, paths: Paths, msg: ApproverMsg) ->
                     .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default();
-                state.deny = cfg.extra_hard_deny_patterns.join(", ");
+                // Escaped form: patterns with literal commas or backslashes
+                // survive an unrelated save byte-for-byte.
+                state.deny = format_patterns(&cfg.extra_hard_deny_patterns);
             }
             state.loaded = loaded;
             Task::none()
@@ -1083,7 +1155,12 @@ fn update_approver(state: &mut ApproverState, paths: Paths, msg: ApproverMsg) ->
             state.deny = v;
             Task::none()
         }
-        ApproverMsg::Save => match approver_cfg(state) {
+        ApproverMsg::Save => {
+            // A second Save (or Enter) while a write is in flight is ignored.
+            if state.busy {
+                return Task::none();
+            }
+            match approver_cfg(state) {
             Err(e) => {
                 state.result = Some((e, true));
                 Task::none()
@@ -1104,20 +1181,42 @@ fn update_approver(state: &mut ApproverState, paths: Paths, msg: ApproverMsg) ->
                     |r| am(ApproverMsg::Done(r)),
                 )
             }
-        },
+        }
+        }
         ApproverMsg::Done(result) => {
             state.busy = false;
+            // A failed write keeps the draft: only a success reloads.
+            let ok = result.is_ok();
             state.result = Some(match result {
                 Ok(()) => (fl!(loader(), "settings-saved"), false),
                 Err(e) => (e, true),
             });
-            Task::done(load_approver(&paths))
+            if ok {
+                Task::done(load_approver(&paths))
+            } else {
+                Task::none()
+            }
         }
         ApproverMsg::RefreshAudit => {
-            Task::done(am(ApproverMsg::AuditLoaded(read_audit(&paths.state_dir))))
+            let dir = paths.state_dir.clone();
+            Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || read_audit(&dir))
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r)
+                },
+                |r| am(ApproverMsg::AuditLoaded(r)),
+            )
         }
-        ApproverMsg::AuditLoaded(audit) => {
-            state.loaded.audit = audit;
+        ApproverMsg::AuditLoaded(result) => {
+            match result {
+                Ok(audit) => {
+                    state.loaded.audit = audit;
+                    state.loaded.audit_error = None;
+                }
+                Err(e) => state.loaded.audit_error = Some(e),
+            }
             Task::none()
         }
     }
@@ -1234,7 +1333,11 @@ fn update_coord(state: &mut CoordState, paths: Paths, msg: CoordMsg) -> Task<Msg
             state.judge_model = v;
             Task::none()
         }
-        CoordMsg::Save => match coord_cfg(state) {
+        CoordMsg::Save => {
+            if state.busy {
+                return Task::none();
+            }
+            match coord_cfg(state) {
             Err(e) => {
                 state.result = Some((e, true));
                 Task::none()
@@ -1255,14 +1358,20 @@ fn update_coord(state: &mut CoordState, paths: Paths, msg: CoordMsg) -> Task<Msg
                     |r| cm(CoordMsg::Done(r)),
                 )
             }
-        },
+        }
+        }
         CoordMsg::Done(result) => {
             state.busy = false;
+            let ok = result.is_ok();
             state.result = Some(match result {
                 Ok(()) => (fl!(loader(), "settings-saved"), false),
                 Err(e) => (e, true),
             });
-            Task::done(load_coord(&paths))
+            if ok {
+                Task::done(load_coord(&paths))
+            } else {
+                Task::none()
+            }
         }
     }
 }
@@ -1287,9 +1396,36 @@ fn sub_result(result: &Option<(String, bool)>) -> Option<Element<'_, Msg>> {
     })
 }
 
+/// Broker outcome to its localized pill (unknown values pass through raw).
+fn outcome_label(outcome: &str) -> (String, st::Tone) {
+    match outcome {
+        "approved" => (fl!(loader(), "approver-outcome-approved"), st::Tone::Ok),
+        "denied" => (fl!(loader(), "approver-outcome-denied"), st::Tone::Danger),
+        "needs_owner" => (
+            fl!(loader(), "approver-outcome-needs-owner"),
+            st::Tone::Warn,
+        ),
+        "client_cancelled" => (
+            fl!(loader(), "approver-outcome-cancelled"),
+            st::Tone::Neutral,
+        ),
+        other => (other.to_string(), st::Tone::Neutral),
+    }
+}
+
+/// Broker audit source to its localized pill (unknown values pass through).
+fn source_label(source: &str) -> String {
+    match source {
+        "PolicyJudge" => fl!(loader(), "approver-source-judge"),
+        "Telegram" => fl!(loader(), "approver-source-telegram"),
+        "Denied" => fl!(loader(), "approver-source-denied"),
+        "Timeout" => fl!(loader(), "approver-source-timeout"),
+        "ClientCancelled" => fl!(loader(), "approver-source-cancelled"),
+        other => other.to_string(),
+    }
+}
+
 fn audit_card(state: &ApproverState) -> Element<'_, Msg> {
-    let size = st::look().body;
-    let _ = size;
     let mut col = column![
         row![
             st::caption(fl!(loader(), "approver-audit")),
@@ -1300,20 +1436,19 @@ fn audit_card(state: &ApproverState) -> Element<'_, Msg> {
         .align_y(Alignment::Center),
     ]
     .spacing(st::SPACE_S);
-    if state.loaded.audit.is_empty() {
+    if let Some(error) = &state.loaded.audit_error {
+        col = col.push(st::body(fl!(loader(), "approver-audit-error")));
+        col = col.push(st::muted(error.as_str()));
+    } else if state.loaded.audit.is_empty() {
         col = col.push(st::muted(fl!(loader(), "approver-audit-empty")));
     }
     for row_ in state.loaded.audit.iter().rev().take(20) {
-        let tone = match row_.outcome.as_str() {
-            o if o.contains("allow") || o == "ok" => st::Tone::Ok,
-            o if o.contains("deny") => st::Tone::Danger,
-            _ => st::Tone::Neutral,
-        };
+        let (outcome, tone) = outcome_label(&row_.outcome);
         col = col.push(
             column![
                 row![
-                    st::pill(row_.source.clone(), st::Tone::Neutral),
-                    st::pill(row_.outcome.clone(), tone),
+                    st::pill(source_label(&row_.source), st::Tone::Neutral),
+                    st::pill(outcome, tone),
                     st::mono(row_.kind.clone()),
                 ]
                 .spacing(st::SPACE_S)
@@ -1442,10 +1577,14 @@ pub fn coord_view(state: &State) -> Element<'_, Msg> {
     }
     pool = pool.push(
         row![
-            text_input(&fl!(loader(), "coord-pool-instance"), &s.new_instance)
-                .on_input(|v| cm(CoordMsg::NewInstance(v)))
-                .size(size)
-                .width(Length::Fill),
+            pick_list(
+                s.loaded.instances.clone(),
+                (!s.new_instance.is_empty()).then(|| s.new_instance.clone()),
+                |v| cm(CoordMsg::NewInstance(v)),
+            )
+            .placeholder(fl!(loader(), "coord-pool-instance"))
+            .text_size(size)
+            .width(Length::Fill),
             text_input(&fl!(loader(), "coord-pool-model"), &s.new_model)
                 .on_input(|v| cm(CoordMsg::NewModel(v)))
                 .on_submit(cm(CoordMsg::Add))
@@ -1538,7 +1677,7 @@ pub fn coord_view(state: &State) -> Element<'_, Msg> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_patterns, patterns, seconds};
+    use super::{civil_ymd, fmt_ts, format_patterns, patterns, seconds};
     use agentdeck_core::settings::{UserRuleSource, UserRules};
 
     #[test]
@@ -1557,6 +1696,14 @@ mod tests {
         assert_eq!(patterns("a, b ,,c "), vec!["a", "b", "c"]);
         let original = vec![r"model-{1,3}\d".to_string(), r"x\,y".to_string()];
         assert_eq!(patterns(&format_patterns(&original)), original);
+    }
+
+    #[test]
+    fn epoch_seconds_render_as_utc_dates() {
+        assert_eq!(civil_ymd(0), (1970, 1, 1));
+        assert_eq!(fmt_ts(0), "1970-01-01 00:00:00");
+        assert_eq!(fmt_ts(123), "1970-01-01 00:02:03");
+        assert_eq!(fmt_ts(1_791_234_567), "2026-10-05 21:09:27");
     }
 
     #[test]

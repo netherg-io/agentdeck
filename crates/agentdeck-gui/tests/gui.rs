@@ -650,7 +650,7 @@ fn module_switch_preview_cancel_and_snapshots() {
         for name in ["ai-usage", "router", "agent-process", "approver"] {
             ui.find(name).expect("module status card");
         }
-        ui.find("Local approvals: hard-deny perimeter, policy judge, Telegram confirm.")
+        ui.find("Approves in-scope requests and sends the rest to Telegram.")
             .expect("approver description");
     }
     let _ = app::update(&mut state, app::Message::PluginDetail("router".into()));
