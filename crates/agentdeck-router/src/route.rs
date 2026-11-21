@@ -583,6 +583,18 @@ fn compute_codex_costs(env: &Env) -> Measured {
 
 // --- quota -----------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy)]
+struct LiveQuotaHealth {
+    updated_at: f64,
+    min_remaining: f64,
+    max_remaining: f64,
+}
+
+const QUOTA_RESET_SETTLE_SECS: f64 = 120.0;
+const QUOTA_RESET_REPEAT_SETTLE_SECS: f64 = 15.0 * 60.0;
+const QUOTA_RESET_FLOOR_PCT: f64 = 10.0;
+const QUOTA_RESET_HEALTHY_PCT: f64 = 50.0;
+
 struct QuotaResult {
     burn: Option<f64>,
     weekly: Option<[f64; 4]>,
@@ -598,6 +610,28 @@ struct QuotaResult {
     cost: Option<[f64; 4]>,
     note: String,
     active_agents: usize,
+    live_health: Option<LiveQuotaHealth>,
+}
+
+impl QuotaResult {
+    /// True when a fresh, live `status == "ok"` quota snapshot recorded after a
+    /// quota failure proves the provider suddenly reset the model's quota.
+    /// Repeated consecutive failures require a longer settle window so a lagging
+    /// provider quota API cannot cause a tight retry loop.
+    fn refilled_since(&self, block: crate::load::QuotaBlock, now: f64) -> bool {
+        let Some(health) = self.live_health else {
+            return false;
+        };
+        let settle = if block.count >= 2 {
+            QUOTA_RESET_REPEAT_SETTLE_SECS
+        } else {
+            QUOTA_RESET_SETTLE_SECS
+        };
+        health.updated_at <= now
+            && health.updated_at >= block.failed_at + settle
+            && health.min_remaining >= QUOTA_RESET_FLOOR_PCT
+            && health.max_remaining >= QUOTA_RESET_HEALTHY_PCT
+    }
 }
 
 fn unknown_quota(err: &str, load_unknown: bool, stale_minutes: Option<i64>) -> QuotaResult {
@@ -616,6 +650,7 @@ fn unknown_quota(err: &str, load_unknown: bool, stale_minutes: Option<i64>) -> Q
         cost: None,
         note: format!("quota unknown ({err})"),
         active_agents: 0,
+        live_health: None,
     }
 }
 
@@ -745,6 +780,33 @@ fn quota(
         return unknown_quota("no ai-usage account", !load.known, None);
     };
     let mut acc = acc.clone();
+    // Capture raw live window health before synthesizing resets for elapsed periods
+    // so only an actual fresh provider reading can clear a prior quota failure.
+    let live_health = if acc.status.as_deref() == Some("ok")
+        && acc.updated_at.is_finite()
+        && acc.updated_at <= now
+    {
+        let raw_windows = quota_windows(&acc.provider, model, &acc.windows);
+        if !raw_windows.is_empty() && raw_windows.iter().all(|w| w.remaining_percent.is_finite()) {
+            let min_remaining = raw_windows
+                .iter()
+                .map(|w| w.remaining_percent)
+                .fold(f64::INFINITY, f64::min);
+            let max_remaining = raw_windows
+                .iter()
+                .map(|w| w.remaining_percent)
+                .fold(f64::NEG_INFINITY, f64::max);
+            Some(LiveQuotaHealth {
+                updated_at: acc.updated_at,
+                min_remaining,
+                max_remaining,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     // A window whose reset already passed is a stale reading of a finished
     // period (e.g. the poller is in backoff): treat it as refilled.
     for w in acc.windows.iter_mut() {
@@ -903,6 +965,7 @@ fn quota(
         cost,
         note,
         active_agents: reserved.active_agents,
+        live_health,
     }
 }
 
@@ -1916,12 +1979,15 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         {
             policy_ban = Some("excluded: account hit a usage limit".to_string());
         }
+        let q = quota(&cfg, &measured, &usage, &load, provider, model, now);
         let failure = failures.get(provider);
-        if let Some(until) = failure.and_then(|f| f.quota_for(model)) {
+        if let Some(block) = failure.and_then(|f| f.quota_block_for(model))
+            && !q.refilled_since(block, now)
+        {
             policy_ban = policy_ban.or_else(|| {
                 Some(format!(
                     "recent quota failure; retry after {} seconds",
-                    (until - now).ceil() as u64
+                    (block.until - now).ceil() as u64
                 ))
             });
         }
@@ -1945,7 +2011,6 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                 .and_then(|p| p.get("3"))
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0);
-        let q = quota(&cfg, &measured, &usage, &load, provider, model, now);
         let spend_zero = fam.as_ref().is_some_and(|f| f.spend_to_zero);
         candidates.push(Candidate {
             provider: provider.clone(),

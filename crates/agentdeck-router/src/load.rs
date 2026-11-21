@@ -89,23 +89,57 @@ pub fn read_active_agents(file: &std::path::Path) -> AgentLoad {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuotaBlock {
+    pub until: f64,
+    pub failed_at: f64,
+    pub count: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct InstanceFailures {
     /// Provider-wide quota block, for failures that do not name their model.
     pub quota_until: Option<f64>,
+    /// Detailed provider-wide quota block (reset target, newest failure timestamp, repeat count).
+    pub quota_block: Option<QuotaBlock>,
     /// Quota blocks per model: Antigravity keeps separate buckets (Argon week vs Gemini week).
     pub model_quota_until: std::collections::HashMap<String, f64>,
+    pub model_quota_blocks: std::collections::HashMap<String, QuotaBlock>,
     /// Excluded until then after an error streak or a setting refusal that a retry cannot fix.
     pub cooldown_until: Option<f64>,
     pub penalty: f64,
 }
 
+fn merge_quota_block(slot: Option<QuotaBlock>, until: f64, failed_at: f64) -> QuotaBlock {
+    match slot {
+        Some(prev) => QuotaBlock {
+            until: prev.until.max(until),
+            failed_at: prev.failed_at.max(failed_at),
+            count: prev.count + 1,
+        },
+        None => QuotaBlock {
+            until,
+            failed_at,
+            count: 1,
+        },
+    }
+}
+
 impl InstanceFailures {
     /// When `model` becomes routable again after a quota failure, if it is blocked now.
     pub fn quota_for(&self, model: &str) -> Option<f64> {
-        let own = self.model_quota_until.get(model).copied();
-        match (self.quota_until, own) {
-            (Some(a), Some(b)) => Some(a.max(b)),
+        self.quota_block_for(model).map(|b| b.until)
+    }
+
+    /// Detailed quota block for `model`, merging provider-wide and model-specific blocks.
+    pub fn quota_block_for(&self, model: &str) -> Option<QuotaBlock> {
+        let own = self.model_quota_blocks.get(model).copied();
+        match (self.quota_block, own) {
+            (Some(a), Some(b)) => Some(QuotaBlock {
+                until: a.until.max(b.until),
+                failed_at: a.failed_at.max(b.failed_at),
+                count: a.count + b.count,
+            }),
             (a, b) => a.or(b),
         }
     }
@@ -226,10 +260,20 @@ pub fn read_instance_failures(
                     .or_insert_with(InstanceFailures::default);
                 match model {
                     Some(m) => {
-                        let slot = entry.model_quota_until.entry(m).or_insert(until);
+                        let slot = entry.model_quota_until.entry(m.clone()).or_insert(until);
                         *slot = slot.max(until);
+                        let merged = merge_quota_block(
+                            entry.model_quota_blocks.get(&m).copied(),
+                            until,
+                            finished,
+                        );
+                        entry.model_quota_blocks.insert(m, merged);
                     }
-                    None => entry.quota_until = Some(entry.quota_until.unwrap_or(until).max(until)),
+                    None => {
+                        entry.quota_until = Some(entry.quota_until.unwrap_or(until).max(until));
+                        entry.quota_block =
+                            Some(merge_quota_block(entry.quota_block, until, finished));
+                    }
                 }
             }
         } else if now - finished < 2.0 * 3600.0

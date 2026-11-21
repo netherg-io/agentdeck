@@ -1,6 +1,6 @@
 [package]
 name = "agentdeck-coordinator"
-version = "0.1.26"
+version = "0.1.27"
 edition = "2024"
 description = "External Watchdog, Coordinator Pool rotation, Jev-gated Checkpoints and pre-dispatch hygiene for long-horizon Autonomous Runs (ADR-0002)"
 license = "GPL-3.0-or-later"

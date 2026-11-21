@@ -1148,3 +1148,106 @@ fn repeated_provider_errors_exclude_for_a_cooldown() {
         "{failed}"
     );
 }
+
+#[test]
+fn sudden_quota_reset_clears_stale_quota_failure() {
+    let fx = Fixture::new(&[SOL, OPUS]);
+    let state_path = fx.dir.join(".local/state/ai-usage/state.json");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64() as i64;
+    let write_codex_usage = |updated_at: i64, status: &str, remaining: f64| {
+        let usage = serde_json::json!({"accounts": [
+            {"provider": "claude", "id": "claude-main", "plan": "Max 5x", "status": "ok", "updated_at": now, "balances": [],
+             "windows": [
+                {"key": "weekly_all", "label": "Week", "remaining_percent": 60, "duration_mins": 10080, "resets_at": now + 6 * 86400},
+                {"key": "session", "label": "5h", "remaining_percent": 20, "duration_mins": 300, "resets_at": now + 2 * 3600}]},
+            {"provider": "codex", "id": "codex-main", "plan": "Pro 5x", "status": status, "updated_at": updated_at, "balances": [],
+             "windows": [{"key": "weekly", "label": "Week", "remaining_percent": remaining, "duration_mins": 10080, "resets_at": now + 3 * 86400}]},
+        ]});
+        std::fs::write(&state_path, serde_json::to_string(&usage).unwrap()).unwrap();
+    };
+    let db = rusqlite::Connection::open(fx.dir.join(".t3/userdata/statev2.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE orchestration_v2_projection_subagents (
+        subagent_id TEXT, provider_instance_id TEXT, status TEXT, completed_at TEXT,
+        updated_at TEXT, payload_json TEXT);
+        INSERT INTO orchestration_v2_projection_subagents VALUES ('quota-old', 'codex', 'failed',
+        strftime('%Y-%m-%dT%H:%M:%fZ','now','-15 hours'), strftime('%Y-%m-%dT%H:%M:%fZ','now','-15 hours'),
+        '{\"model\":\"gpt-6.1-sol\",\"result\":\"You have reached your quota for this period. Resets in 99h33m49s.\"}');",
+    )
+    .unwrap();
+    let jev = answers_for(
+        &[
+            ("codex_gpt_6_1_sol", level(2.9, 0.95)),
+            ("claudeagent_claude_opus_5_5", level(2.4, 0.95)),
+        ],
+        1.0,
+        1.0,
+    );
+    let mock = write_mock(&fx, &jev);
+    let run = || {
+        let (code, out, err) = run_rust(
+            &fx,
+            &["--source", "claudeAgent", "Implement the parser"],
+            &mock,
+            None,
+        );
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+
+    // 1. Sudden quota reset: live poll 15h after failure reports 100% remaining -> unblocked.
+    write_codex_usage(now, "ok", 100.0);
+    let reset = run();
+    assert_eq!(reset["target"]["model"], SOL.1, "{reset}");
+    let sol_row = reset["ranking"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["provider"] == SOL.0)
+        .unwrap();
+    assert_eq!(sol_row["eligible"], true, "{sol_row}");
+    assert!(sol_row["policyBan"].is_null(), "{sol_row}");
+
+    // 2. Stale pre-failure cache (updated_at before failure) must NOT clear the block.
+    write_codex_usage(now - 16 * 3600, "ok", 100.0);
+    let stale = run();
+    assert_eq!(stale["target"]["model"], OPUS.1, "{stale}");
+
+    // 3. Fresh cache with non-ok status must NOT clear the block.
+    write_codex_usage(now, "error", 100.0);
+    let cached_err = run();
+    assert_eq!(cached_err["target"]["model"], OPUS.1, "{cached_err}");
+
+    // 4. Fresh cache still reporting exhausted (<10%) quota must NOT clear the block.
+    write_codex_usage(now, "ok", 1.5);
+    let still_empty = run();
+    assert_eq!(still_empty["target"]["model"], OPUS.1, "{still_empty}");
+
+    // 5. Two consecutive quota failures 5 min ago stay blocked for the 15-min anti-loop settle window
+    //    even if a lagging provider API still reports 100%.
+    db.execute_batch(
+        "DELETE FROM orchestration_v2_projection_subagents;
+        INSERT INTO orchestration_v2_projection_subagents VALUES
+        ('q1', 'codex', 'failed', strftime('%Y-%m-%dT%H:%M:%fZ','now','-8 minutes'), strftime('%Y-%m-%dT%H:%M:%fZ','now','-8 minutes'),
+         '{\"model\":\"gpt-6.1-sol\",\"result\":\"You have reached your quota for this period. Resets in 4h.\"}'),
+        ('q2', 'codex', 'failed', strftime('%Y-%m-%dT%H:%M:%fZ','now','-5 minutes'), strftime('%Y-%m-%dT%H:%M:%fZ','now','-5 minutes'),
+         '{\"model\":\"gpt-6.1-sol\",\"result\":\"You have reached your quota for this period. Resets in 4h.\"}');",
+    )
+    .unwrap();
+    write_codex_usage(now, "ok", 100.0);
+    let repeated = run();
+    assert_eq!(repeated["target"]["model"], OPUS.1, "{repeated}");
+
+    // Once the 15-min repeat settle window passes and live quota is still 100%, unblock again.
+    db.execute_batch(
+        "UPDATE orchestration_v2_projection_subagents SET
+         completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now','-20 minutes'),
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now','-20 minutes');",
+    )
+    .unwrap();
+    let recovered = run();
+    assert_eq!(recovered["target"]["model"], SOL.1, "{recovered}");
+}
