@@ -73,15 +73,19 @@ fn tools() -> Value {
         },
         {
             "name": "state_read",
-            "description": "Saved working state of this T3 thread (or the thread it was forked from): the snapshot (goal, scope, done, next) and the owner's verbatim decisions. Read it first after a handoff, compaction, limit pause or \"continue\".",
+            "description": "Saved working state of this T3 thread (or the thread it was forked from): the snapshot (goal, scope, done, next), the owner's verbatim decisions, run phase/mandate, Owner Inbox and Assumptions. Read it first after a handoff, compaction, limit pause or \"continue\". Returns `state_stale` (true when the snapshot lags checklist movement) and `checklist_updates_since_state`.",
             "inputSchema": {"type": "object", "properties": {"thread": thread}}
         },
         {
             "name": "state_write",
-            "description": "Save this T3 thread's working state. `state` replaces the snapshot (first line = the goal; cite issues and files instead of copying them; max 16 KiB). `decision` appends one owner decision or consent verbatim with a timestamp; decisions are never removed.",
+            "description": "Save this T3 thread's working state. `state` replaces the snapshot (first line = the goal; cite issues and files instead of copying them; max 16 KiB) and resets freshness tracking. `decision` appends one owner decision or consent verbatim with a timestamp; decisions are never removed. `phase` sets the run phase (intake, running, sleeping_for_quota, completed), `mandate` the structured Run Mandate, `sleep_until` an RFC3339 deadline (null clears it), `record_checkpoint` records a Checkpoint (refused while `state_stale`).",
             "inputSchema": {"type": "object", "properties": {
                 "state": {"type": "string"},
                 "decision": {"type": "string"},
+                "phase": {"type": "string", "enum": ["intake", "running", "sleeping_for_quota", "completed"]},
+                "mandate": {"type": "object", "description": "Structured Run Mandate (project, allowed_hosts, allowed_apps, allow_releases, fix_forward_max, review_rounds_max, notes)"},
+                "sleep_until": {"type": ["string", "null"], "description": "RFC3339 UTC deadline while sleeping_for_quota; null clears it"},
+                "record_checkpoint": {"type": "boolean"},
                 "thread": thread
             }}
         },
@@ -100,6 +104,50 @@ fn tools() -> Value {
                 "project": project_name,
                 "thread": thread
             }}
+        },
+        {
+            "name": "owner_inbox_add",
+            "description": "Park one branch in the Owner Inbox: work that physically needs the owner (credentials, manual external actions) or exceeds the Run Mandate. Only that branch parks; the rest of the backlog continues. `action` is the ready command, script path or link for the owner.",
+            "inputSchema": {"type": "object", "required": ["title", "reason", "action"], "properties": {
+                "title": {"type": "string"},
+                "reason": {"type": "string"},
+                "action": {"type": "string"},
+                "id": {"type": "string", "description": "Caller-provided slug; generated as inbox-N when omitted"},
+                "blocked_items": {"type": "array", "items": {"type": "string"}},
+                "thread": thread
+            }}
+        },
+        {
+            "name": "owner_inbox_resolve",
+            "description": "Mark one Owner Inbox item resolved (the owner handled it or it lapsed).",
+            "inputSchema": {"type": "object", "required": ["id"], "properties": {
+                "id": {"type": "string"},
+                "thread": thread
+            }}
+        },
+        {
+            "name": "owner_inbox_list",
+            "description": "List this thread's Owner Inbox items, open ones first. Pass `include_resolved: true` to also see resolved items.",
+            "inputSchema": {"type": "object", "properties": {
+                "include_resolved": {"type": "boolean"},
+                "thread": thread
+            }}
+        },
+        {
+            "name": "assumption_add",
+            "description": "Record one reversible autonomous decision (product or technical detail) with a revert hint, so the owner can review or override it in the Run Summary.",
+            "inputSchema": {"type": "object", "required": ["decision", "rationale", "revert_hint"], "properties": {
+                "decision": {"type": "string"},
+                "rationale": {"type": "string"},
+                "revert_hint": {"type": "string"},
+                "id": {"type": "string", "description": "Caller-provided slug; generated as asm-N when omitted"},
+                "thread": thread
+            }}
+        },
+        {
+            "name": "assumption_list",
+            "description": "List this thread's recorded Assumptions.",
+            "inputSchema": {"type": "object", "properties": {"thread": thread}}
         },
         {
             "name": "backlog_list",
@@ -177,11 +225,16 @@ fn project_arg(args: &Value) -> anyhow::Result<Option<PathBuf>> {
     }
 }
 
-const COORDINATOR_TOOLS: [&str; 4] = [
+const COORDINATOR_TOOLS: [&str; 9] = [
     "checklist_update",
     "backlog_list",
     "backlog_add",
     "backlog_update",
+    "owner_inbox_add",
+    "owner_inbox_resolve",
+    "owner_inbox_list",
+    "assumption_add",
+    "assumption_list",
 ];
 
 fn coordinator_enabled(paths: &Paths) -> bool {
@@ -337,24 +390,99 @@ fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> {
             let id = thread_arg(args)?;
             let t3 = agentdeck_core::t3::t3_root().ok();
             match thread_state::read(paths, t3.as_deref(), &id)? {
-                Some(f) => Ok(serde_json::to_value(f)?),
-                None => Ok(json!({ "thread": id, "state": null })),
+                Some(f) => {
+                    let mut v = serde_json::to_value(f)?;
+                    v["state_stale"] = json!(v["checklist_updates_since_state"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        >= 5
+                        || (v["state"].as_str().unwrap_or("").trim().is_empty()
+                            && !v["checklist"].as_array().is_none_or(Vec::is_empty)));
+                    Ok(v)
+                }
+                None => Ok(json!({ "thread": id, "state": null, "state_stale": false, "checklist_updates_since_state": 0 })),
             }
         }
         "state_write" => {
             let id = thread_arg(args)?;
             let t3 = agentdeck_core::t3::t3_root().ok();
-            let s = thread_state::write(
-                paths,
-                t3.as_deref(),
-                &id,
-                args.get("state").and_then(Value::as_str),
-                str_arg(args, "decision"),
-            )?;
-            Ok(json!({ "thread": id, "updated": s.updated, "decisions": s.decisions.len() }))
+            let t3r = t3.as_deref();
+            let has_snapshot = args.get("state").and_then(Value::as_str).is_some()
+                || args.get("decision").and_then(Value::as_str).is_some_and(|s| !s.is_empty());
+            let phase: Option<thread_state::RunPhase> = match args.get("phase") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(serde_json::from_value(v.clone())?),
+            };
+            let mandate: Option<thread_state::RunMandate> = match args.get("mandate") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(serde_json::from_value(v.clone())?),
+            };
+            let sleep_until: Option<Option<String>> = match args.get("sleep_until") {
+                None => None,
+                Some(Value::Null) => Some(None),
+                Some(v) => match v.as_str() {
+                    Some("") => Some(None),
+                    Some(s) => Some(Some(s.to_string())),
+                    None => anyhow::bail!("sleep_until must be an RFC3339 string or null"),
+                },
+            };
+            let record_checkpoint = args
+                .get("record_checkpoint")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let meta_requested =
+                phase.is_some() || mandate.is_some() || sleep_until.is_some() || record_checkpoint;
+            if !has_snapshot && !meta_requested {
+                anyhow::bail!("pass state, decision, phase, mandate, sleep_until or record_checkpoint");
+            }
+            let mut current = if has_snapshot {
+                thread_state::write(
+                    paths,
+                    t3r,
+                    &id,
+                    args.get("state").and_then(Value::as_str),
+                    str_arg(args, "decision"),
+                )?
+            } else {
+                thread_state::read(paths, t3r, &id)?.map(|f| f.data).unwrap_or_default()
+            };
+            if meta_requested {
+                current = thread_state::set_run_meta(
+                    paths,
+                    t3r,
+                    &id,
+                    phase,
+                    mandate,
+                    sleep_until,
+                    record_checkpoint,
+                )?;
+            }
+            let stale = current.state_stale();
+            let mut out = json!({
+                "thread": id,
+                "updated": current.updated,
+                "decisions": current.decisions.len(),
+                "phase": current.phase,
+                "state_stale": stale,
+                "checklist_updates_since_state": current.checklist_updates_since_state,
+                "checkpoint_count": current.checkpoint_count,
+            });
+            if stale {
+                out["warning"] = json!(
+                    "state is stale: rewrite the snapshot before the next Checkpoint"
+                );
+            }
+            Ok(out)
         }
-        "checklist_update" | "backlog_list" | "backlog_add" | "backlog_update"
-            if !coordinator_enabled(paths) =>
+        "checklist_update"
+        | "backlog_list"
+        | "backlog_add"
+        | "backlog_update"
+        | "owner_inbox_add"
+        | "owner_inbox_resolve"
+        | "owner_inbox_list"
+        | "assumption_add"
+        | "assumption_list" if !coordinator_enabled(paths) =>
         {
             anyhow::bail!("the agentdeck coordinator plugin is disabled")
         }
@@ -417,6 +545,92 @@ fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> {
             let patch: backlog::Patch = serde_json::from_value(args.clone())?;
             let e = backlog::update(paths, project, id, patch)?;
             Ok(json!({ "id": e.id, "status": e.status, "updated": e.updated }))
+        }
+        "owner_inbox_add" => {
+            let id = thread_arg(args)?;
+            let t3 = agentdeck_core::t3::t3_root().ok();
+            let blocked: Vec<String> =
+                serde_json::from_value(args.get("blocked_items").cloned().unwrap_or(json!([])))?;
+            let item = thread_state::inbox_add(
+                paths,
+                t3.as_deref(),
+                &id,
+                thread_state::NewInboxItem {
+                    id: args
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    title: str_arg(args, "title")
+                        .ok_or_else(|| anyhow::anyhow!("title is required"))?
+                        .to_string(),
+                    reason: str_arg(args, "reason")
+                        .ok_or_else(|| anyhow::anyhow!("reason is required"))?
+                        .to_string(),
+                    action: str_arg(args, "action")
+                        .ok_or_else(|| anyhow::anyhow!("action is required"))?
+                        .to_string(),
+                    blocked_items: blocked,
+                },
+            )?;
+            Ok(serde_json::to_value(item)?)
+        }
+        "owner_inbox_resolve" => {
+            let thread = thread_arg(args)?;
+            let t3 = agentdeck_core::t3::t3_root().ok();
+            let item_id =
+                str_arg(args, "id").ok_or_else(|| anyhow::anyhow!("id is required"))?;
+            let item = thread_state::inbox_resolve(paths, t3.as_deref(), &thread, item_id)?;
+            Ok(serde_json::to_value(item)?)
+        }
+        "owner_inbox_list" => {
+            let thread = thread_arg(args)?;
+            let t3 = agentdeck_core::t3::t3_root().ok();
+            let found = thread_state::read(paths, t3.as_deref(), &thread)?;
+            let include_resolved = args
+                .get("include_resolved")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let items: Vec<Value> = found
+                .map(|f| f.data.owner_inbox)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|i| include_resolved || !i.resolved)
+                .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
+                .collect();
+            Ok(json!({ "thread": thread, "items": items }))
+        }
+        "assumption_add" => {
+            let thread = thread_arg(args)?;
+            let t3 = agentdeck_core::t3::t3_root().ok();
+            let item = thread_state::assumption_add(
+                paths,
+                t3.as_deref(),
+                &thread,
+                thread_state::NewAssumption {
+                    id: args
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    decision: str_arg(args, "decision")
+                        .ok_or_else(|| anyhow::anyhow!("decision is required"))?
+                        .to_string(),
+                    rationale: str_arg(args, "rationale")
+                        .ok_or_else(|| anyhow::anyhow!("rationale is required"))?
+                        .to_string(),
+                    revert_hint: str_arg(args, "revert_hint")
+                        .ok_or_else(|| anyhow::anyhow!("revert_hint is required"))?
+                        .to_string(),
+                },
+            )?;
+            Ok(serde_json::to_value(item)?)
+        }
+        "assumption_list" => {
+            let thread = thread_arg(args)?;
+            let t3 = agentdeck_core::t3::t3_root().ok();
+            let items = thread_state::read(paths, t3.as_deref(), &thread)?
+                .map(|f| f.data.assumptions)
+                .unwrap_or_default();
+            Ok(json!({ "thread": thread, "items": items }))
         }
         other => anyhow::bail!("unknown tool {other}"),
     }
