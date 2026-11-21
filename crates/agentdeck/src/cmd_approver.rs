@@ -161,9 +161,21 @@ fn status(paths: &Paths, as_json: bool) -> anyhow::Result<()> {
     let socket_listening =
         socket.exists() && std::os::unix::net::UnixStream::connect(&socket).is_ok();
     let secrets_path = ApproverSecrets::secrets_path(&paths.config_dir);
-    let secrets = ApproverSecrets::load(&paths.config_dir).unwrap_or_default();
-    let telegram_configured =
-        secrets.telegram_bot_token.is_some() && secrets.telegram_owner_id.is_some();
+    let (telegram_status, secrets_error, secrets) =
+        match ApproverSecrets::inspect_readonly(&paths.config_dir) {
+            Ok(Some(s)) => {
+                let configured =
+                    s.telegram_bot_token.is_some() && s.telegram_owner_id.is_some();
+                (
+                    if configured { "configured" } else { "missing" },
+                    None,
+                    s,
+                )
+            }
+            Ok(None) => ("missing", None, ApproverSecrets::default()),
+            Err(e) => ("invalid", Some(format!("{e:#}")), ApproverSecrets::default()),
+        };
+    let telegram_configured = telegram_status == "configured";
     let provider = cfg
         .judge_provider
         .as_deref()
@@ -182,26 +194,28 @@ fn status(paths: &Paths, as_json: bool) -> anyhow::Result<()> {
     let recent_audit_count = read_recent(&audit_path, 1000).map(|r| r.len()).unwrap_or(0);
 
     if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "enabled": cfg.enabled,
-                "socket_path": socket,
-                "socket_listening": socket_listening,
-                "secrets_path": secrets_path,
-                "telegram_configured": telegram_configured,
-                "autonomous_timeout_secs": cfg.autonomous_timeout_secs,
-                "interactive_timeout_secs": cfg.interactive_timeout_secs,
-                "judge_provider": provider,
-                "judge_model": model,
-                "judge_confidence_threshold": cfg.judge_confidence_threshold,
-                "judge_key_present": judge_key_present,
-                "remote_hosts": cfg.remote_hosts,
-                "extra_hard_deny_patterns": cfg.extra_hard_deny_patterns,
-                "audit_path": audit_path,
-                "recent_audit_count": recent_audit_count,
-            }))?
-        );
+        let mut out = json!({
+            "enabled": cfg.enabled,
+            "socket_path": socket,
+            "socket_listening": socket_listening,
+            "secrets_path": secrets_path,
+            "telegram_configured": telegram_configured,
+            "telegram_status": telegram_status,
+            "autonomous_timeout_secs": cfg.autonomous_timeout_secs,
+            "interactive_timeout_secs": cfg.interactive_timeout_secs,
+            "judge_provider": provider,
+            "judge_model": model,
+            "judge_confidence_threshold": cfg.judge_confidence_threshold,
+            "judge_key_present": judge_key_present,
+            "remote_hosts": cfg.remote_hosts,
+            "extra_hard_deny_patterns": cfg.extra_hard_deny_patterns,
+            "audit_path": audit_path,
+            "recent_audit_count": recent_audit_count,
+        });
+        if let Some(err) = &secrets_error {
+            out["secrets_error"] = json!(err);
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
 
@@ -218,15 +232,10 @@ fn status(paths: &Paths, as_json: bool) -> anyhow::Result<()> {
             "inactive"
         }
     );
-    println!(
-        "telegram: {} ({})",
-        if telegram_configured {
-            "configured"
-        } else {
-            "missing"
-        },
-        secrets_path.display()
-    );
+    println!("telegram: {telegram_status} ({})", secrets_path.display());
+    if let Some(err) = &secrets_error {
+        println!("secrets error: {err}");
+    }
     println!(
         "timeouts: {}s autonomous / {}s interactive",
         cfg.autonomous_timeout_secs, cfg.interactive_timeout_secs
@@ -411,59 +420,78 @@ fn ssh_relay(
     Ok(status.code().unwrap_or(1))
 }
 
-fn config(paths: &Paths, args: ApproverConfigArgs) -> anyhow::Result<()> {
-    let reg = Registry::load(paths)?;
-    let mut cfg: ApproverSettings = settings::read_approver(&reg)?;
-    if !args.has_mutations() {
-        println!("{}", serde_json::to_string_pretty(&cfg)?);
-        return Ok(());
-    }
+fn apply_config_args(cfg: &mut ApproverSettings, args: &ApproverConfigArgs) {
     if let Some(v) = args.autonomous_timeout {
         cfg.autonomous_timeout_secs = v;
     }
     if let Some(v) = args.interactive_timeout {
         cfg.interactive_timeout_secs = v;
     }
-    if let Some(p) = args.judge_provider {
+    if let Some(p) = &args.judge_provider {
         cfg.judge_provider = (!p.trim().is_empty()).then(|| p.trim().to_string());
     }
-    if let Some(m) = args.judge_model {
+    if let Some(m) = &args.judge_model {
         cfg.judge_model = (!m.trim().is_empty()).then(|| m.trim().to_string());
     }
     if let Some(t) = args.judge_threshold {
         cfg.judge_confidence_threshold = t;
     }
-    if let Some(s) = args.socket_path {
+    if let Some(s) = &args.socket_path {
         cfg.socket_path = (!s.trim().is_empty()).then(|| PathBuf::from(s.trim()));
     }
-    for h in args.add_remote_hosts {
-        if !cfg.remote_hosts.contains(&h) {
-            cfg.remote_hosts.push(h);
+    for h in &args.add_remote_hosts {
+        if !cfg.remote_hosts.contains(h) {
+            cfg.remote_hosts.push(h.clone());
         }
     }
     if !args.remove_remote_hosts.is_empty() {
         cfg.remote_hosts
             .retain(|h| !args.remove_remote_hosts.contains(h));
     }
-    for p in args.add_deny_patterns {
-        if !cfg.extra_hard_deny_patterns.contains(&p) {
-            cfg.extra_hard_deny_patterns.push(p);
+    for p in &args.add_deny_patterns {
+        if !cfg.extra_hard_deny_patterns.contains(p) {
+            cfg.extra_hard_deny_patterns.push(p.clone());
         }
     }
     if !args.remove_deny_patterns.is_empty() {
         cfg.extra_hard_deny_patterns
             .retain(|p| !args.remove_deny_patterns.contains(p));
     }
-    let changes = settings::write_approver(paths, &cfg, args.dry_run)?;
-    if changes.is_empty() {
-        println!("approver config: unchanged");
+}
+
+fn config(paths: &Paths, args: ApproverConfigArgs) -> anyhow::Result<()> {
+    if !args.has_mutations() {
+        let reg = Registry::load(paths)?;
+        let cfg: ApproverSettings = settings::read_approver(&reg)?;
+        println!("{}", serde_json::to_string_pretty(&cfg)?);
         return Ok(());
     }
-    for c in &changes {
-        println!("{}", c.describe());
-    }
     if args.dry_run {
+        let reg = Registry::load(paths)?;
+        let mut cfg: ApproverSettings = settings::read_approver(&reg)?;
+        apply_config_args(&mut cfg, &args);
+        let changes = settings::write_approver(paths, &cfg, true)?;
+        if changes.is_empty() {
+            println!("approver config: unchanged");
+            return Ok(());
+        }
+        for c in &changes {
+            println!("{}", c.describe());
+        }
         println!("dry-run: registry unchanged");
+        return Ok(());
+    }
+    // Apply only the requested CLI deltas under the registry lock so concurrent
+    // single-field edits never overwrite each other.
+    let mut changed = false;
+    settings::update_approver(paths, |cfg| {
+        let before = cfg.clone();
+        apply_config_args(cfg, &args);
+        changed = *cfg != before;
+        Ok(())
+    })?;
+    if !changed {
+        println!("approver config: unchanged");
     } else {
         println!("updated [approver] config");
     }

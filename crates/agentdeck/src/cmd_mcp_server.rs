@@ -3,6 +3,7 @@
 //! once instead of patching only its own, and keeps per-T3-thread working
 //! state that survives provider switches. Newline-delimited JSON-RPC 2.0.
 
+use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -10,7 +11,7 @@ use agentdeck_coordinator::checkpoint::{
     CheckpointInput, CheckpointJudge, CheckpointVerdict, HeuristicCheckpointJudge,
     HttpCheckpointJudge, record_outcome,
 };
-use agentdeck_coordinator::hygiene::check_disk_ok;
+use agentdeck_coordinator::hygiene::{check_disk_ok, find_stale_worktrees};
 use agentdeck_coordinator::pool::{PoolSelection, select_coordinator};
 use agentdeck_coordinator::t3_control::observe_thread_sqlite;
 use agentdeck_core::shared::InstructionChoice;
@@ -163,6 +164,7 @@ fn tools() -> Value {
             "description": "Select the best Coordinator Pool target from live T3 usage caches (fullest 5h window while guarding weekly reserve), or return sleeping_for_quota with wake_at when all entries are exhausted, plus whether proactive rotation is recommended.",
             "inputSchema": {"type": "object", "properties": {
                 "current_instance": {"type": "string", "description": "Current T3 provider instance id (defaults to the thread's observed instance)"},
+                "current_model": {"type": "string", "description": "Current model id (defaults to the thread's observed model)"},
                 "thread": thread
             }}
         },
@@ -176,14 +178,16 @@ fn tools() -> Value {
                 "active_children": {"type": "integer"},
                 "recent_events_tail": {"type": "array", "items": {"type": "string"}},
                 "current_instance": {"type": "string"},
+                "current_model": {"type": "string"},
                 "thread": thread
             }}
         },
         {
             "name": "coordinator_hygiene_check",
-            "description": "Check free disk space on the workspace partition against [coordinator] min_free_disk_gb and return { ok, free_gb, min_gb }.",
+            "description": "Check free disk space on the workspace partition against [coordinator] min_free_disk_gb and optionally list clean merged git worktrees under `work_dir`.",
             "inputSchema": {"type": "object", "properties": {
-                "path": {"type": "string", "description": "Directory to inspect; defaults to the server's current working directory"}
+                "path": {"type": "string", "description": "Directory to inspect; defaults to the server's current working directory"},
+                "work_dir": {"type": "string", "description": "Optional directory containing git worktrees/clones to scan for clean merged checkouts"}
             }}
         },
         {
@@ -294,6 +298,31 @@ fn thread_arg(args: &Value) -> anyhow::Result<String> {
         .ok_or_else(|| {
             anyhow::anyhow!("no T3 thread: pass `thread` (this session has no T3CODE_THREAD_ID)")
         })
+}
+
+/// Resolve `(current_instance, current_model)` for pool hysteresis/proactive rotation:
+/// explicit `current_model` wins, else prefer the thread's observed model whenever the
+/// observed instance matches `current_instance`, else fall back to the first pool entry.
+fn resolve_current_pool_key(
+    cfg: &agentdeck_coordinator::CoordinatorConfig,
+    args: &Value,
+    observed_inst: Option<&str>,
+    observed_model: Option<&str>,
+) -> Option<(String, String)> {
+    let current_instance = str_arg(args, "current_instance").or(observed_inst)?;
+    let current_model = str_arg(args, "current_model")
+        .or_else(|| {
+            (observed_inst == Some(current_instance))
+                .then_some(observed_model)
+                .flatten()
+        })
+        .or_else(|| {
+            cfg.pool
+                .iter()
+                .find(|e| e.instance_id == current_instance)
+                .map(|e| e.model.as_str())
+        })?;
+    Some((current_instance.to_string(), current_model.to_string()))
 }
 
 fn describe(changes: &[Change]) -> Vec<String> {
@@ -475,24 +504,44 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
                 .get("record_checkpoint")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            // Cross-thread protection: a session bound to T3CODE_THREAD_ID must
+            // not mutate another thread's run phase or mandate.
+            if (phase.is_some() || mandate.is_some())
+                && let Some(own_thread) = session_thread()
+                && own_thread != id
+            {
+                anyhow::bail!(
+                    "cannot mutate phase or mandate on thread {id:?} from session thread {own_thread:?}"
+                );
+            }
             let meta_requested =
                 phase.is_some() || mandate.is_some() || sleep_until.is_some() || record_checkpoint;
             if !has_snapshot && !meta_requested {
                 anyhow::bail!("pass state, decision, phase, mandate, sleep_until or record_checkpoint");
             }
+            let (checkpoint_run_count, checkpoint_item_count) = if record_checkpoint {
+                t3r.and_then(|root| observe_thread_sqlite(root, &id).ok().flatten())
+                    .map(|o| (Some(o.run_count), Some(o.item_count)))
+                    .unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
             // ONE atomic locked transaction: snapshot, decision, phase,
-            // mandate, sleep_until and checkpoint commit together (validated
-            // up front, saved once), so concurrent writers cannot interleave.
-            let current = thread_state::apply_update(
+            // mandate, sleep_until and checkpoint baselines commit together.
+            let current = thread_state::apply_state_update(
                 paths,
                 t3r,
                 &id,
-                state,
-                decision,
-                phase,
-                mandate,
-                sleep_until,
-                record_checkpoint,
+                thread_state::StateUpdate {
+                    state,
+                    decision,
+                    phase,
+                    mandate,
+                    sleep_until,
+                    record_checkpoint,
+                    checkpoint_run_count,
+                    checkpoint_item_count,
+                },
             )?;
             let stale = current.state_stale();
             let mut out = json!({
@@ -677,30 +726,26 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
             let reg = Registry::load(paths)?;
             let cfg = cmd_coordinator::coordinator_config(&reg)?;
             let t3_root = agentdeck_core::t3::t3_root().ok();
-            let observed_pair: Option<(String, String)> = (|| {
+            let observed = (|| {
                 let tid = str_arg(args, "thread")
                     .map(str::to_string)
                     .or_else(session_thread)?;
                 let root = t3_root.as_deref()?;
-                let o = observe_thread_sqlite(root, &tid).ok().flatten()?;
-                Some((o.provider_instance_id?, o.model?))
+                observe_thread_sqlite(root, &tid).ok().flatten()
             })();
-            let current_instance = str_arg(args, "current_instance")
-                .map(str::to_string)
-                .or_else(|| observed_pair.as_ref().map(|(i, _)| i.clone()));
-            // The pool model for the instance wins (quota views are keyed by
-            // both); the observed model is the fallback for unconfigured threads.
-            let current_model = current_instance.as_deref().and_then(|c| {
-                cfg.pool
-                    .iter()
-                    .find(|e| e.instance_id == c)
-                    .map(|e| e.model.clone())
-            }).or_else(|| observed_pair.as_ref().map(|(_, m)| m.clone()));
-            let current = match (current_instance.as_deref(), current_model.as_deref()) {
-                (Some(i), Some(m)) => Some((i, m)),
-                _ => None,
-            };
-            let quotas = cmd_coordinator::collect_pool_quotas(&cfg, t3_root.as_deref());
+            let current_pair = resolve_current_pool_key(
+                &cfg,
+                args,
+                observed
+                    .as_ref()
+                    .and_then(|o| o.provider_instance_id.as_deref()),
+                observed.as_ref().and_then(|o| o.model.as_deref()),
+            );
+            let current = current_pair
+                .as_ref()
+                .map(|(i, m)| (i.as_str(), m.as_str()));
+            let quotas =
+                cmd_coordinator::collect_pool_quotas(&cfg, Some(&reg), t3_root.as_deref());
             let now = cmd_coordinator::now_epoch_secs();
             let selection = select_coordinator(&cfg, &quotas, now, current);
             let proactive =
@@ -750,24 +795,19 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
             let observed = t3_root
                 .as_deref()
                 .and_then(|root| observe_thread_sqlite(root, &thread).ok().flatten());
-            let current_instance = str_arg(args, "current_instance")
-                .map(str::to_string)
-                .or_else(|| {
-                    observed
-                        .as_ref()
-                        .and_then(|o| o.provider_instance_id.clone())
-                });
-            let current_model = current_instance.as_deref().and_then(|c| {
-                cfg.pool
-                    .iter()
-                    .find(|e| e.instance_id == c)
-                    .map(|e| e.model.clone())
-            }).or_else(|| observed.as_ref().and_then(|o| o.model.clone()));
-            let current = match (current_instance.as_deref(), current_model.as_deref()) {
-                (Some(i), Some(m)) => Some((i, m)),
-                _ => None,
-            };
-            let quotas = cmd_coordinator::collect_pool_quotas(&cfg, t3_root.as_deref());
+            let current_pair = resolve_current_pool_key(
+                &cfg,
+                args,
+                observed
+                    .as_ref()
+                    .and_then(|o| o.provider_instance_id.as_deref()),
+                observed.as_ref().and_then(|o| o.model.as_deref()),
+            );
+            let current = current_pair
+                .as_ref()
+                .map(|(i, m)| (i.as_str(), m.as_str()));
+            let quotas =
+                cmd_coordinator::collect_pool_quotas(&cfg, Some(&reg), t3_root.as_deref());
             let recommended_target = match select_coordinator(
                 &cfg,
                 &quotas,
@@ -794,18 +834,36 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
                     .map(|o| vec![o.last_message_text.clone()])
                     .unwrap_or_default(),
             };
+            let (base_runs, base_items) = found
+                .as_ref()
+                .map(|f| (f.data.checkpoint_run_count, f.data.checkpoint_item_count))
+                .unwrap_or((0, 0));
             let input = CheckpointInput {
                 run_count_since_checkpoint: args
                     .get("run_count_since_checkpoint")
                     .and_then(Value::as_u64)
-                    .map(|v| v as u32)
-                    .unwrap_or_else(|| observed.as_ref().map(|o| o.run_count as u32).unwrap_or(0)),
+                    .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
+                    .unwrap_or_else(|| {
+                        observed
+                            .as_ref()
+                            .map(|o| {
+                                u32::try_from(o.run_count.saturating_sub(base_runs))
+                                    .unwrap_or(u32::MAX)
+                            })
+                            .unwrap_or(0)
+                    }),
                 item_count_since_checkpoint: args
                     .get("item_count_since_checkpoint")
                     .and_then(Value::as_u64)
-                    .map(|v| v as u32)
+                    .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
                     .unwrap_or_else(|| {
-                        observed.as_ref().map(|o| o.item_count as u32).unwrap_or(0)
+                        observed
+                            .as_ref()
+                            .map(|o| {
+                                u32::try_from(o.item_count.saturating_sub(base_items))
+                                    .unwrap_or(u32::MAX)
+                            })
+                            .unwrap_or(0)
                     }),
                 milestone_just_completed: args
                     .get("milestone_just_completed")
@@ -850,12 +908,21 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
                 None => std::env::current_dir()?,
             };
             let check = check_disk_ok(&dir, cfg.min_free_disk_gb);
-            Ok(json!({
+            let mut out = json!({
                 "ok": check.ok,
                 "free_gb": check.free_gb,
                 "min_gb": check.min_gb,
                 "path": dir,
-            }))
+            });
+            if let Some(wd) = str_arg(args, "work_dir") {
+                let wd_path = Path::new(wd);
+                if !wd_path.is_dir() {
+                    anyhow::bail!("work_dir must be an existing directory: {wd}");
+                }
+                let stale = find_stale_worktrees(wd_path, &HashSet::new());
+                out["stale_worktrees"] = json!(stale);
+            }
+            Ok(out)
         }
         other => anyhow::bail!("unknown tool {other}"),
     }

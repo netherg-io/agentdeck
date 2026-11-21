@@ -1,7 +1,8 @@
 //! `agentdeck coordinator`: Autonomous Run status, Coordinator Pool quota view,
 //! pre-dispatch disk hygiene check, and Checkpoint judge evaluation (ADR-0002).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,7 +10,7 @@ use agentdeck_coordinator::checkpoint::{
     CheckpointInput, CheckpointJudge, HeuristicCheckpointJudge,
 };
 use agentdeck_coordinator::config::{CoordinatorConfig, CoordinatorPoolEntry};
-use agentdeck_coordinator::hygiene::check_disk_ok;
+use agentdeck_coordinator::hygiene::{check_disk_ok, find_stale_worktrees};
 use agentdeck_coordinator::pool::{
     PoolKey, PoolSelection, QuotaWindowView, eligible, pool_key, quota_from_t3_cache,
     select_coordinator, should_proactively_rotate,
@@ -31,14 +32,20 @@ pub enum CoordinatorCmd {
         /// Current T3 provider instance id (for cache-preserving hysteresis & proactive rotation).
         #[arg(long)]
         current: Option<String>,
+        /// Current model id (required when `--current` matches multiple pool entries).
+        #[arg(long)]
+        current_model: Option<String>,
         #[arg(long)]
         json: bool,
     },
-    /// Check free disk space against [coordinator] min_free_disk_gb.
+    /// Check free disk space against [coordinator] min_free_disk_gb and optionally list stale git worktrees.
     Hygiene {
-        /// Directory to inspect (defaults to current working directory).
+        /// Directory to inspect for free disk space (defaults to current working directory).
         #[arg(long)]
         path: Option<PathBuf>,
+        /// Directory containing git worktrees/clones to scan for clean merged checkouts.
+        #[arg(long)]
+        work_dir: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -46,6 +53,19 @@ pub enum CoordinatorCmd {
     Eval {
         #[arg(long)]
         json: bool,
+    },
+    /// Inspect and seal owner_granted=true on a thread's existing Run Mandate.
+    GrantMandate {
+        /// T3 thread id whose Run Mandate to seal.
+        thread_id: String,
+        /// Seal without interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Clear owner_granted on a thread's Run Mandate without modifying its scope.
+    RevokeMandate {
+        /// T3 thread id whose Run Mandate to revoke.
+        thread_id: String,
     },
 }
 
@@ -107,28 +127,64 @@ pub fn coordinator_config(reg: &Registry) -> anyhow::Result<CoordinatorConfig> {
 
 /// Read live `QuotaWindowView` from T3 usage caches for every entry in `cfg.pool`,
 /// keyed by `(instance_id, model)` so two entries on one instance never share a view.
+/// Unknown, removed, or disabled registry/T3 instances fail closed as unhealthy.
 pub fn collect_pool_quotas(
     cfg: &CoordinatorConfig,
+    reg: Option<&Registry>,
     t3_root: Option<&Path>,
 ) -> HashMap<PoolKey, QuotaWindowView> {
     let mut quotas = HashMap::new();
     for entry in &cfg.pool {
-        let view = match t3_root {
-            Some(root) => quota_from_t3_cache(root, &entry.instance_id, &entry.model),
-            None => QuotaWindowView::unknown_healthy(),
+        let reg_allows = match reg {
+            Some(r) if !r.instances.is_empty() => r
+                .get(&entry.instance_id)
+                .is_some_and(|i| i.enabled && i.t3),
+            _ => true,
+        };
+        let view = match (reg_allows, t3_root) {
+            (true, Some(root)) => quota_from_t3_cache(root, &entry.instance_id, &entry.model),
+            _ => QuotaWindowView::default(),
         };
         quotas.insert(pool_key(&entry.instance_id, &entry.model), view);
     }
     quotas
 }
 
-/// Resolve a CLI `--current instance_id` to the pool `(instance_id, model)` key.
-fn current_pool_key<'a>(cfg: &'a CoordinatorConfig, current: Option<&str>) -> Option<(&'a str, &'a str)> {
-    let cur = current?;
-    cfg.pool
+/// Resolve CLI `--current <instance_id>` and optional `--current-model <model>`
+/// to the pool `(instance_id, model)` key, refusing ambiguous multi-model instances.
+fn current_pool_key<'a>(
+    cfg: &'a CoordinatorConfig,
+    current: Option<&'a str>,
+    current_model: Option<&'a str>,
+) -> anyhow::Result<Option<(&'a str, &'a str)>> {
+    let Some(cur) = current.map(str::trim).filter(|s| !s.is_empty()) else {
+        if current_model.is_some_and(|m| !m.trim().is_empty()) {
+            anyhow::bail!("--current-model requires --current <instance_id>");
+        }
+        return Ok(None);
+    };
+    if let Some(model) = current_model.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(Some((cur, model)));
+    }
+    let matches: Vec<&CoordinatorPoolEntry> = cfg
+        .pool
         .iter()
-        .find(|e| e.instance_id == cur)
-        .map(|e| (e.instance_id.as_str(), e.model.as_str()))
+        .filter(|e| e.instance_id == cur)
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some((one.instance_id.as_str(), one.model.as_str()))),
+        many => {
+            let models = many
+                .iter()
+                .map(|e| e.model.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "--current {cur:?} matches multiple pool models ({models}); pass --current-model <model>"
+            );
+        }
+    }
 }
 
 /// True when `current` is thin and a meaningfully fuller pool entry exists.
@@ -164,12 +220,28 @@ pub async fn run(paths: &Paths, cmd: CoordinatorCmd) -> anyhow::Result<i32> {
             status(paths, json)?;
             Ok(0)
         }
-        CoordinatorCmd::Pool { current, json } => {
-            pool(paths, current.as_deref(), json)?;
+        CoordinatorCmd::Pool {
+            current,
+            current_model,
+            json,
+        } => {
+            pool(paths, current.as_deref(), current_model.as_deref(), json)?;
             Ok(0)
         }
-        CoordinatorCmd::Hygiene { path, json } => hygiene(paths, path, json),
+        CoordinatorCmd::Hygiene {
+            path,
+            work_dir,
+            json,
+        } => hygiene(paths, path, work_dir, json),
         CoordinatorCmd::Eval { json } => eval(json).await,
+        CoordinatorCmd::GrantMandate { thread_id, yes } => {
+            grant_mandate(paths, &thread_id, yes)?;
+            Ok(0)
+        }
+        CoordinatorCmd::RevokeMandate { thread_id } => {
+            revoke_mandate(paths, &thread_id)?;
+            Ok(0)
+        }
     }
 }
 
@@ -235,13 +307,18 @@ fn status(paths: &Paths, as_json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn pool(paths: &Paths, current: Option<&str>, as_json: bool) -> anyhow::Result<()> {
+fn pool(
+    paths: &Paths,
+    current: Option<&str>,
+    current_model: Option<&str>,
+    as_json: bool,
+) -> anyhow::Result<()> {
     let reg = Registry::load(paths)?;
     let cfg = coordinator_config(&reg)?;
     let t3_root = t3::t3_root().ok();
-    let quotas = collect_pool_quotas(&cfg, t3_root.as_deref());
+    let quotas = collect_pool_quotas(&cfg, Some(&reg), t3_root.as_deref());
     let now = now_epoch_secs();
-    let current = current_pool_key(&cfg, current);
+    let current = current_pool_key(&cfg, current, current_model)?;
     let selection = select_coordinator(&cfg, &quotas, now, current);
     let proactive = proactive_rotate_recommended(&cfg, &quotas, current);
 
@@ -354,7 +431,12 @@ fn pool(paths: &Paths, current: Option<&str>, as_json: bool) -> anyhow::Result<(
     Ok(())
 }
 
-fn hygiene(paths: &Paths, path_override: Option<PathBuf>, as_json: bool) -> anyhow::Result<i32> {
+fn hygiene(
+    paths: &Paths,
+    path_override: Option<PathBuf>,
+    work_dir: Option<PathBuf>,
+    as_json: bool,
+) -> anyhow::Result<i32> {
     let reg = Registry::load(paths)?;
     let cfg = coordinator_config(&reg)?;
     let dir = match path_override {
@@ -362,16 +444,26 @@ fn hygiene(paths: &Paths, path_override: Option<PathBuf>, as_json: bool) -> anyh
         None => std::env::current_dir()?,
     };
     let check = check_disk_ok(&dir, cfg.min_free_disk_gb);
+    let stale_worktrees = match work_dir.as_deref() {
+        Some(wd) => {
+            if !wd.is_dir() {
+                anyhow::bail!("--work-dir must be an existing directory: {}", wd.display());
+            }
+            Some(find_stale_worktrees(wd, &HashSet::new()))
+        }
+        None => None,
+    };
     if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": check.ok,
-                "free_gb": check.free_gb,
-                "min_gb": check.min_gb,
-                "path": dir,
-            }))?
-        );
+        let mut out = json!({
+            "ok": check.ok,
+            "free_gb": check.free_gb,
+            "min_gb": check.min_gb,
+            "path": dir,
+        });
+        if let Some(stale) = &stale_worktrees {
+            out["stale_worktrees"] = json!(stale);
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         println!(
             "disk {}: {} GB free (min {} GB) at {}",
@@ -380,8 +472,77 @@ fn hygiene(paths: &Paths, path_override: Option<PathBuf>, as_json: bool) -> anyh
             check.min_gb,
             dir.display()
         );
+        if let Some(stale) = &stale_worktrees {
+            if stale.is_empty() {
+                println!("stale worktrees: none");
+            } else {
+                println!("stale worktrees ({}):", stale.len());
+                for p in stale {
+                    println!("  {}", p.display());
+                }
+            }
+        }
     }
     Ok(if check.ok { 0 } else { 1 })
+}
+
+fn print_mandate_scope(thread_id: &str, phase: thread_state::RunPhase, m: &thread_state::RunMandate) {
+    let hosts = if m.allowed_hosts.is_empty() {
+        "(any — unrestricted)".to_string()
+    } else {
+        m.allowed_hosts.join(", ")
+    };
+    let apps = if m.allowed_apps.is_empty() {
+        "(any — unrestricted)".to_string()
+    } else {
+        m.allowed_apps.join(", ")
+    };
+    println!("thread: {thread_id} (phase={})", phase_label(phase));
+    println!(
+        "  project: {}",
+        if m.project.is_empty() { "(none)" } else { &m.project }
+    );
+    println!("  allowed_hosts: {hosts}");
+    println!("  allowed_apps: {apps}");
+    println!("  allow_releases: {}", m.allow_releases);
+    println!("  fix_forward_max: {}", m.fix_forward_max);
+    println!("  review_rounds_max: {}", m.review_rounds_max);
+    if !m.notes.is_empty() {
+        println!("  notes: {}", m.notes);
+    }
+    println!("  owner_granted: {}", m.owner_granted);
+}
+
+fn grant_mandate(paths: &Paths, thread_id: &str, yes: bool) -> anyhow::Result<()> {
+    let found = thread_state::read(paths, None, thread_id)?
+        .ok_or_else(|| anyhow::anyhow!("thread {thread_id:?} has no saved state"))?;
+    if found.data.phase == thread_state::RunPhase::Completed {
+        anyhow::bail!("thread {thread_id:?} is completed: start a new run instead");
+    }
+    let expected = found
+        .data
+        .mandate
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("thread {thread_id:?} has no mandate to grant"))?;
+    print_mandate_scope(thread_id, found.data.phase, &expected);
+    if !yes {
+        print!("Grant this Run Mandate? [y/N]: ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().lock().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            anyhow::bail!("aborted: mandate not granted");
+        }
+    }
+    thread_state::grant_mandate_if_matches(paths, thread_id, &expected)?;
+    println!("granted mandate for {thread_id}");
+    Ok(())
+}
+
+fn revoke_mandate(paths: &Paths, thread_id: &str) -> anyhow::Result<()> {
+    thread_state::revoke_mandate(paths, thread_id)?;
+    println!("revoked mandate for {thread_id}");
+    Ok(())
 }
 
 async fn eval(as_json: bool) -> anyhow::Result<i32> {
