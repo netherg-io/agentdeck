@@ -3,7 +3,10 @@
 
 use std::path::PathBuf;
 
-use agentdeck_core::settings::{self, Settings, UserRuleSource, UserRules};
+use agentdeck_core::settings::{
+    self, ApproverSettings, CoordinatorPoolEntry, CoordinatorSettings, Settings, UserRuleSource,
+    UserRules,
+};
 use agentdeck_core::{Paths, Registry};
 use i18n_embed_fl::fl;
 use iced::widget::{Space, column, pick_list, row, text_input};
@@ -43,6 +46,8 @@ pub struct State {
     pub test: Option<(String, bool)>,
     /// Last outcome (text, is error); the shell turns it into a toast.
     pub result: Option<(String, bool)>,
+    pub approver: ApproverState,
+    pub coord: CoordState,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +69,8 @@ pub enum Msg {
     /// Re-read the assessment file after the page stayed open.
     RefreshHistory,
     HistoryLoaded(History),
+    Approver(Box<ApproverMsg>),
+    Coord(Box<CoordMsg>),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -376,6 +383,8 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
             state.loaded.history = history;
             Task::none()
         }
+        Msg::Approver(inner) => update_approver(&mut state.approver, paths, *inner),
+        Msg::Coord(inner) => update_coord(&mut state.coord, paths, *inner),
     }
 }
 
@@ -732,6 +741,799 @@ pub fn poll_view(state: &State) -> Element<'_, Msg> {
         .push(st::card(form))
         .spacing(st::SPACE_S)
         .into()
+}
+
+// ---- Approver & Coordinator settings (long-horizon units) ----
+
+/// One recent approver audit row: enough to see who decided what, and how.
+#[derive(Debug, Clone, Default)]
+pub struct AuditRow {
+    pub at: String,
+    pub host: String,
+    pub kind: String,
+    pub outcome: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ApproverLoaded {
+    pub cfg: Option<ApproverSettings>,
+    pub audit: Vec<AuditRow>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CoordLoaded {
+    pub cfg: Option<CoordinatorSettings>,
+    pub instances: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// Policy judge backend: blank in storage means the default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JudgeProvider {
+    #[default]
+    Default,
+    OpenRouter,
+    Vercel,
+}
+
+impl std::fmt::Display for JudgeProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => f.write_str(&fl!(loader(), "approver-judge-default")),
+            Self::OpenRouter => f.write_str("OpenRouter"),
+            Self::Vercel => f.write_str("Vercel AI Gateway"),
+        }
+    }
+}
+
+impl JudgeProvider {
+    fn stored(self) -> Option<String> {
+        match self {
+            Self::Default => None,
+            Self::OpenRouter => Some(settings::PROVIDER_OPENROUTER.to_string()),
+            Self::Vercel => Some(settings::PROVIDER_VERCEL.to_string()),
+        }
+    }
+
+    fn from_stored(provider: Option<&str>) -> Self {
+        match provider {
+            Some(p) if p == settings::PROVIDER_VERCEL => Self::Vercel,
+            Some(_) => Self::OpenRouter,
+            None => Self::Default,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct ApproverState {
+    pub loaded: ApproverLoaded,
+    pub auto_timeout: String,
+    pub inter_timeout: String,
+    pub judge: JudgeProvider,
+    pub judge_model: String,
+    pub confidence: String,
+    pub remote_hosts: String,
+    pub socket_path: String,
+    pub deny: String,
+    pub busy: bool,
+    /// Last outcome (text, is error), shown under the form.
+    pub result: Option<(String, bool)>,
+}
+
+#[derive(Default)]
+pub struct CoordState {
+    pub loaded: CoordLoaded,
+    pub entries: Vec<CoordinatorPoolEntry>,
+    /// Kept across saves; the form does not edit it.
+    pub token_file: Option<PathBuf>,
+    pub new_instance: String,
+    pub new_model: String,
+    pub reserve: String,
+    pub proactive: String,
+    pub sleep_buffer: String,
+    pub wake_grace: String,
+    pub soft_runs: String,
+    pub soft_items: String,
+    pub confidence: String,
+    pub min_disk: String,
+    pub t3_endpoint: String,
+    pub judge: JudgeProvider,
+    pub judge_model: String,
+    pub busy: bool,
+    /// Last outcome (text, is error), shown under the form.
+    pub result: Option<(String, bool)>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ApproverMsg {
+    Loaded(ApproverLoaded),
+    AutoTimeout(String),
+    InterTimeout(String),
+    Judge(JudgeProvider),
+    JudgeModel(String),
+    Confidence(String),
+    RemoteHosts(String),
+    SocketPath(String),
+    Deny(String),
+    Save,
+    Done(Result<(), String>),
+    RefreshAudit,
+    AuditLoaded(Vec<AuditRow>),
+}
+
+#[derive(Debug, Clone)]
+pub enum CoordMsg {
+    Loaded(CoordLoaded),
+    NewInstance(String),
+    NewModel(String),
+    Add,
+    Remove(usize),
+    Toggle(usize, bool),
+    Reserve(String),
+    Proactive(String),
+    SleepBuffer(String),
+    WakeGrace(String),
+    SoftRuns(String),
+    SoftItems(String),
+    Confidence(String),
+    MinDisk(String),
+    T3Endpoint(String),
+    Judge(JudgeProvider),
+    JudgeModel(String),
+    Save,
+    Done(Result<(), String>),
+}
+
+fn am(msg: ApproverMsg) -> Msg {
+    Msg::Approver(Box::new(msg))
+}
+
+fn cm(msg: CoordMsg) -> Msg {
+    Msg::Coord(Box::new(msg))
+}
+
+/// Blank means "default"; anything else must be a finite number.
+fn number(raw: &str) -> Result<Option<f64>, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite())
+        .map(Some)
+        .ok_or_else(|| fl!(loader(), "settings-number-invalid"))
+}
+
+/// Blank means "default"; anything else must be a positive whole number.
+fn count(raw: &str) -> Result<Option<u32>, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse::<u32>()
+        .ok()
+        .filter(|n| *n > 0)
+        .map(Some)
+        .ok_or_else(|| fl!(loader(), "settings-number-invalid"))
+}
+
+fn blanked(raw: &str) -> Option<String> {
+    Some(raw.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Last 20 audit records, oldest first; a missing file is an empty list.
+fn read_audit(state_dir: &std::path::Path) -> Vec<AuditRow> {
+    let raw =
+        std::fs::read_to_string(state_dir.join("approver").join("audit.jsonl")).unwrap_or_default();
+    let mut rows: Vec<AuditRow> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .rev()
+        .take(20)
+        .filter_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).ok()?;
+            let s = |key: &str| {
+                v.get(key)
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("—")
+                    .to_string()
+            };
+            Some(AuditRow {
+                at: v
+                    .get("timestamp")
+                    .and_then(|t| t.as_u64())
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "—".into()),
+                host: s("host"),
+                kind: s("kind"),
+                outcome: s("outcome"),
+                source: s("source"),
+            })
+        })
+        .collect();
+    rows.reverse();
+    rows
+}
+
+pub fn load_approver(paths: &Paths) -> Msg {
+    am(ApproverMsg::Loaded(match Registry::load(paths) {
+        Ok(reg) => match settings::read_approver(&reg) {
+            Ok(cfg) => ApproverLoaded {
+                cfg: Some(cfg),
+                audit: read_audit(&paths.state_dir),
+                error: None,
+            },
+            Err(e) => ApproverLoaded {
+                error: Some(format!("{e:#}")),
+                ..Default::default()
+            },
+        },
+        Err(e) => ApproverLoaded {
+            error: Some(format!("{e:#}")),
+            ..Default::default()
+        },
+    }))
+}
+
+pub fn load_coord(paths: &Paths) -> Msg {
+    cm(CoordMsg::Loaded(match Registry::load(paths) {
+        Ok(reg) => match settings::read_coordinator(&reg) {
+            Ok(cfg) => CoordLoaded {
+                cfg: Some(cfg),
+                instances: reg.instances.iter().map(|i| i.id.clone()).collect(),
+                error: None,
+            },
+            Err(e) => CoordLoaded {
+                error: Some(format!("{e:#}")),
+                ..Default::default()
+            },
+        },
+        Err(e) => CoordLoaded {
+            error: Some(format!("{e:#}")),
+            ..Default::default()
+        },
+    }))
+}
+
+fn approver_cfg(s: &ApproverState) -> Result<ApproverSettings, String> {
+    let d = ApproverSettings::default();
+    Ok(ApproverSettings {
+        socket_path: blanked(&s.socket_path).map(PathBuf::from),
+        autonomous_timeout_secs: seconds(&s.auto_timeout)?.unwrap_or(d.autonomous_timeout_secs),
+        interactive_timeout_secs: seconds(&s.inter_timeout)?.unwrap_or(d.interactive_timeout_secs),
+        judge_provider: s.judge.stored(),
+        judge_model: blanked(&s.judge_model),
+        judge_confidence_threshold: number(&s.confidence)?.unwrap_or(d.judge_confidence_threshold),
+        remote_hosts: patterns(&s.remote_hosts),
+        extra_hard_deny_patterns: patterns(&s.deny),
+    })
+}
+
+fn coord_cfg(s: &CoordState) -> Result<CoordinatorSettings, String> {
+    let d = CoordinatorSettings::default();
+    Ok(CoordinatorSettings {
+        pool: s.entries.clone(),
+        min_weekly_reserve_pct: number(&s.reserve)?.unwrap_or(d.min_weekly_reserve_pct),
+        proactive_rotate_below_5h_pct: number(&s.proactive)?.unwrap_or(d.proactive_rotate_below_5h_pct),
+        quota_sleep_buffer_secs: seconds(&s.sleep_buffer)?.unwrap_or(d.quota_sleep_buffer_secs),
+        idle_wake_grace_secs: seconds(&s.wake_grace)?.unwrap_or(d.idle_wake_grace_secs),
+        checkpoint_soft_runs: count(&s.soft_runs)?.unwrap_or(d.checkpoint_soft_runs),
+        checkpoint_soft_items: count(&s.soft_items)?.unwrap_or(d.checkpoint_soft_items),
+        checkpoint_confidence_threshold: number(&s.confidence)?.unwrap_or(d.checkpoint_confidence_threshold),
+        min_free_disk_gb: seconds(&s.min_disk)?.unwrap_or(d.min_free_disk_gb),
+        t3_endpoint: blanked(&s.t3_endpoint),
+        t3_token_file: s.token_file.clone(),
+        judge_provider: s.judge.stored(),
+        judge_model: blanked(&s.judge_model),
+    })
+}
+
+fn update_approver(state: &mut ApproverState, paths: Paths, msg: ApproverMsg) -> Task<Msg> {
+    match msg {
+        ApproverMsg::Loaded(loaded) => {
+            if let Some(cfg) = &loaded.cfg {
+                state.auto_timeout = cfg.autonomous_timeout_secs.to_string();
+                state.inter_timeout = cfg.interactive_timeout_secs.to_string();
+                state.judge = JudgeProvider::from_stored(cfg.judge_provider.as_deref());
+                state.judge_model = cfg.judge_model.clone().unwrap_or_default();
+                state.confidence = cfg.judge_confidence_threshold.to_string();
+                state.remote_hosts = cfg.remote_hosts.join(", ");
+                state.socket_path = cfg
+                    .socket_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                state.deny = cfg.extra_hard_deny_patterns.join(", ");
+            }
+            state.loaded = loaded;
+            Task::none()
+        }
+        ApproverMsg::AutoTimeout(v) => {
+            state.auto_timeout = v;
+            Task::none()
+        }
+        ApproverMsg::InterTimeout(v) => {
+            state.inter_timeout = v;
+            Task::none()
+        }
+        ApproverMsg::Judge(p) => {
+            state.judge = p;
+            Task::none()
+        }
+        ApproverMsg::JudgeModel(v) => {
+            state.judge_model = v;
+            Task::none()
+        }
+        ApproverMsg::Confidence(v) => {
+            state.confidence = v;
+            Task::none()
+        }
+        ApproverMsg::RemoteHosts(v) => {
+            state.remote_hosts = v;
+            Task::none()
+        }
+        ApproverMsg::SocketPath(v) => {
+            state.socket_path = v;
+            Task::none()
+        }
+        ApproverMsg::Deny(v) => {
+            state.deny = v;
+            Task::none()
+        }
+        ApproverMsg::Save => match approver_cfg(state) {
+            Err(e) => {
+                state.result = Some((e, true));
+                Task::none()
+            }
+            Ok(cfg) => {
+                state.busy = true;
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            settings::write_approver(&paths, &cfg, false)
+                                .map(|_| ())
+                                .map_err(|e| format!("{e:#}"))
+                        })
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r)
+                    },
+                    |r| am(ApproverMsg::Done(r)),
+                )
+            }
+        },
+        ApproverMsg::Done(result) => {
+            state.busy = false;
+            state.result = Some(match result {
+                Ok(()) => (fl!(loader(), "settings-saved"), false),
+                Err(e) => (e, true),
+            });
+            Task::done(load_approver(&paths))
+        }
+        ApproverMsg::RefreshAudit => {
+            Task::done(am(ApproverMsg::AuditLoaded(read_audit(&paths.state_dir))))
+        }
+        ApproverMsg::AuditLoaded(audit) => {
+            state.loaded.audit = audit;
+            Task::none()
+        }
+    }
+}
+
+fn update_coord(state: &mut CoordState, paths: Paths, msg: CoordMsg) -> Task<Msg> {
+    match msg {
+        CoordMsg::Loaded(loaded) => {
+            if let Some(cfg) = &loaded.cfg {
+                state.entries = cfg.pool.clone();
+                state.token_file = cfg.t3_token_file.clone();
+                state.reserve = cfg.min_weekly_reserve_pct.to_string();
+                state.proactive = cfg.proactive_rotate_below_5h_pct.to_string();
+                state.sleep_buffer = cfg.quota_sleep_buffer_secs.to_string();
+                state.wake_grace = cfg.idle_wake_grace_secs.to_string();
+                state.soft_runs = cfg.checkpoint_soft_runs.to_string();
+                state.soft_items = cfg.checkpoint_soft_items.to_string();
+                state.confidence = cfg.checkpoint_confidence_threshold.to_string();
+                state.min_disk = cfg.min_free_disk_gb.to_string();
+                state.t3_endpoint = cfg.t3_endpoint.clone().unwrap_or_default();
+                state.judge = JudgeProvider::from_stored(cfg.judge_provider.as_deref());
+                state.judge_model = cfg.judge_model.clone().unwrap_or_default();
+            }
+            state.loaded = loaded;
+            Task::none()
+        }
+        CoordMsg::NewInstance(v) => {
+            state.new_instance = v;
+            Task::none()
+        }
+        CoordMsg::NewModel(v) => {
+            state.new_model = v;
+            Task::none()
+        }
+        CoordMsg::Add => {
+            let (instance, model) = (
+                state.new_instance.trim().to_string(),
+                state.new_model.trim().to_string(),
+            );
+            // The Add button stays disabled until both fields name a new entry.
+            if instance.is_empty()
+                || model.is_empty()
+                || state
+                    .entries
+                    .iter()
+                    .any(|e| e.instance_id == instance && e.model == model)
+            {
+                return Task::none();
+            }
+            state.entries.push(CoordinatorPoolEntry {
+                instance_id: instance,
+                model,
+                options: Default::default(),
+                enabled: true,
+            });
+            state.new_instance.clear();
+            state.new_model.clear();
+            state.result = None;
+            Task::none()
+        }
+        CoordMsg::Remove(i) => {
+            if i < state.entries.len() {
+                state.entries.remove(i);
+            }
+            Task::none()
+        }
+        CoordMsg::Toggle(i, on) => {
+            if let Some(e) = state.entries.get_mut(i) {
+                e.enabled = on;
+            }
+            Task::none()
+        }
+        CoordMsg::Reserve(v) => {
+            state.reserve = v;
+            Task::none()
+        }
+        CoordMsg::Proactive(v) => {
+            state.proactive = v;
+            Task::none()
+        }
+        CoordMsg::SleepBuffer(v) => {
+            state.sleep_buffer = v;
+            Task::none()
+        }
+        CoordMsg::WakeGrace(v) => {
+            state.wake_grace = v;
+            Task::none()
+        }
+        CoordMsg::SoftRuns(v) => {
+            state.soft_runs = v;
+            Task::none()
+        }
+        CoordMsg::SoftItems(v) => {
+            state.soft_items = v;
+            Task::none()
+        }
+        CoordMsg::Confidence(v) => {
+            state.confidence = v;
+            Task::none()
+        }
+        CoordMsg::MinDisk(v) => {
+            state.min_disk = v;
+            Task::none()
+        }
+        CoordMsg::T3Endpoint(v) => {
+            state.t3_endpoint = v;
+            Task::none()
+        }
+        CoordMsg::Judge(p) => {
+            state.judge = p;
+            Task::none()
+        }
+        CoordMsg::JudgeModel(v) => {
+            state.judge_model = v;
+            Task::none()
+        }
+        CoordMsg::Save => match coord_cfg(state) {
+            Err(e) => {
+                state.result = Some((e, true));
+                Task::none()
+            }
+            Ok(cfg) => {
+                state.busy = true;
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            settings::write_coordinator(&paths, &cfg, false)
+                                .map(|_| ())
+                                .map_err(|e| format!("{e:#}"))
+                        })
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r)
+                    },
+                    |r| cm(CoordMsg::Done(r)),
+                )
+            }
+        },
+        CoordMsg::Done(result) => {
+            state.busy = false;
+            state.result = Some(match result {
+                Ok(()) => (fl!(loader(), "settings-saved"), false),
+                Err(e) => (e, true),
+            });
+            Task::done(load_coord(&paths))
+        }
+    }
+}
+
+fn sub_save_row(busy: bool, msg: Msg) -> Element<'static, Msg> {
+    row![
+        iced::widget::Space::new().width(Length::Fill),
+        st::btn(st::Btn::Primary, fl!(loader(), "settings-save"))
+            .on_press_maybe((!busy).then_some(msg)),
+    ]
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn sub_result(result: &Option<(String, bool)>) -> Option<Element<'_, Msg>> {
+    result.as_ref().map(|(text, error)| {
+        if *error {
+            st::body(text.as_str()).into()
+        } else {
+            st::pill(text.clone(), st::Tone::Ok)
+        }
+    })
+}
+
+fn audit_card(state: &ApproverState) -> Element<'_, Msg> {
+    let size = st::look().body;
+    let _ = size;
+    let mut col = column![
+        row![
+            st::caption(fl!(loader(), "approver-audit")),
+            iced::widget::Space::new().width(Length::Fill),
+            st::btn(st::Btn::Quiet, fl!(loader(), "approver-audit-refresh"))
+                .on_press(am(ApproverMsg::RefreshAudit)),
+        ]
+        .align_y(Alignment::Center),
+    ]
+    .spacing(st::SPACE_S);
+    if state.loaded.audit.is_empty() {
+        col = col.push(st::muted(fl!(loader(), "approver-audit-empty")));
+    }
+    for row_ in state.loaded.audit.iter().rev().take(20) {
+        let tone = match row_.outcome.as_str() {
+            o if o.contains("allow") || o == "ok" => st::Tone::Ok,
+            o if o.contains("deny") => st::Tone::Danger,
+            _ => st::Tone::Neutral,
+        };
+        col = col.push(
+            column![
+                row![
+                    st::pill(row_.source.clone(), st::Tone::Neutral),
+                    st::pill(row_.outcome.clone(), tone),
+                    st::mono(row_.kind.clone()),
+                ]
+                .spacing(st::SPACE_S)
+                .align_y(Alignment::Center),
+                st::mono_muted(format!("{} · {}", row_.at, row_.host)),
+            ]
+            .spacing(2),
+        );
+    }
+    st::card(col)
+}
+
+pub fn approver_view(state: &State) -> Element<'_, Msg> {
+    let s = &state.approver;
+    let size = st::look().body;
+    let input = |value: &str, msg: fn(String) -> ApproverMsg| {
+        text_input("", value)
+            .on_input(move |v| am(msg(v)))
+            .on_submit(am(ApproverMsg::Save))
+            .size(size)
+            .width(Length::Fill)
+            .into()
+    };
+    let form = column![
+        field(
+            fl!(loader(), "approver-auto-timeout"),
+            input(&s.auto_timeout, ApproverMsg::AutoTimeout),
+            None,
+        ),
+        field(
+            fl!(loader(), "approver-interactive-timeout"),
+            input(&s.inter_timeout, ApproverMsg::InterTimeout),
+            None,
+        ),
+        field(
+            fl!(loader(), "approver-judge-provider"),
+            iced::widget::pick_list(
+                [
+                    JudgeProvider::Default,
+                    JudgeProvider::OpenRouter,
+                    JudgeProvider::Vercel
+                ],
+                Some(s.judge),
+                |p| am(ApproverMsg::Judge(p)),
+            )
+            .text_size(size)
+            .width(Length::Fill)
+            .into(),
+            None,
+        ),
+        field(
+            fl!(loader(), "approver-judge-model"),
+            input(&s.judge_model, ApproverMsg::JudgeModel),
+            Some(fl!(loader(), "approver-judge-hint")),
+        ),
+        field(
+            fl!(loader(), "approver-confidence"),
+            input(&s.confidence, ApproverMsg::Confidence),
+            None,
+        ),
+        field(
+            fl!(loader(), "approver-remote-hosts"),
+            input(&s.remote_hosts, ApproverMsg::RemoteHosts),
+            Some(fl!(loader(), "approver-remote-hint")),
+        ),
+        field(
+            fl!(loader(), "approver-socket-path"),
+            input(&s.socket_path, ApproverMsg::SocketPath),
+            Some(fl!(loader(), "approver-socket-hint")),
+        ),
+        field(
+            fl!(loader(), "approver-deny"),
+            input(&s.deny, ApproverMsg::Deny),
+            Some(fl!(loader(), "approver-deny-hint")),
+        ),
+        sub_save_row(s.busy, am(ApproverMsg::Save)),
+    ]
+    .spacing(st::SPACE_M);
+    let mut col = column![].spacing(st::SPACE_S);
+    if let Some(e) = &s.loaded.error {
+        col = col.push(st::card(st::muted(fl!(loader(), "load-error", what = e))));
+    }
+    col = col.push(st::card(form));
+    if let Some(result) = sub_result(&s.result) {
+        col = col.push(result);
+    }
+    col.push(audit_card(s)).into()
+}
+
+fn pool_row(entry: &CoordinatorPoolEntry, index: usize) -> Element<'_, Msg> {
+    row![
+        column![
+            st::fit(entry.model.as_str(), st::Role::Body, st::Cut::End),
+            st::mono_muted(entry.instance_id.as_str()),
+        ]
+        .spacing(2)
+        .width(Length::Fill),
+        iced::widget::toggler(entry.enabled)
+            .size(14)
+            .on_toggle(move |on| cm(CoordMsg::Toggle(index, on))),
+        st::btn(st::Btn::Quiet, fl!(loader(), "coord-pool-remove"))
+            .on_press(cm(CoordMsg::Remove(index))),
+    ]
+    .spacing(st::SPACE_S)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+pub fn coord_view(state: &State) -> Element<'_, Msg> {
+    let s = &state.coord;
+    let size = st::look().body;
+    let input = |value: &str, msg: fn(String) -> CoordMsg| {
+        text_input("", value)
+            .on_input(move |v| cm(msg(v)))
+            .on_submit(cm(CoordMsg::Save))
+            .size(size)
+            .width(Length::Fill)
+            .into()
+    };
+    let mut pool = column![st::caption(fl!(loader(), "coord-pool"))].spacing(4);
+    if s.entries.is_empty() {
+        pool = pool.push(st::muted(fl!(loader(), "coord-pool-empty")));
+    }
+    for (i, entry) in s.entries.iter().enumerate() {
+        pool = pool.push(pool_row(entry, i));
+    }
+    pool = pool.push(
+        row![
+            text_input(&fl!(loader(), "coord-pool-instance"), &s.new_instance)
+                .on_input(|v| cm(CoordMsg::NewInstance(v)))
+                .size(size)
+                .width(Length::Fill),
+            text_input(&fl!(loader(), "coord-pool-model"), &s.new_model)
+                .on_input(|v| cm(CoordMsg::NewModel(v)))
+                .on_submit(cm(CoordMsg::Add))
+                .size(size)
+                .width(Length::Fill),
+            st::btn(st::Btn::Quiet, fl!(loader(), "coord-pool-add")).on_press_maybe(
+                (!s.new_instance.trim().is_empty()
+                    && !s.new_model.trim().is_empty()
+                    && !s.entries.iter().any(|e| e.instance_id == s.new_instance.trim()
+                        && e.model == s.new_model.trim()))
+                .then_some(cm(CoordMsg::Add))
+            ),
+        ]
+        .spacing(st::SPACE_S)
+        .align_y(Alignment::Center),
+    );
+    let form = column![
+        field(fl!(loader(), "coord-reserve"), input(&s.reserve, CoordMsg::Reserve), None),
+        field(fl!(loader(), "coord-proactive"), input(&s.proactive, CoordMsg::Proactive), None),
+        field(
+            fl!(loader(), "coord-sleep-buffer"),
+            input(&s.sleep_buffer, CoordMsg::SleepBuffer),
+            None,
+        ),
+        field(
+            fl!(loader(), "coord-wake-grace"),
+            input(&s.wake_grace, CoordMsg::WakeGrace),
+            None,
+        ),
+        field(
+            fl!(loader(), "coord-soft-runs"),
+            input(&s.soft_runs, CoordMsg::SoftRuns),
+            None,
+        ),
+        field(
+            fl!(loader(), "coord-soft-items"),
+            input(&s.soft_items, CoordMsg::SoftItems),
+            None,
+        ),
+        field(
+            fl!(loader(), "coord-confidence"),
+            input(&s.confidence, CoordMsg::Confidence),
+            None,
+        ),
+        field(
+            fl!(loader(), "coord-min-disk"),
+            input(&s.min_disk, CoordMsg::MinDisk),
+            None,
+        ),
+        field(
+            fl!(loader(), "coord-t3-endpoint"),
+            input(&s.t3_endpoint, CoordMsg::T3Endpoint),
+            Some(fl!(loader(), "coord-t3-hint")),
+        ),
+        field(
+            fl!(loader(), "approver-judge-provider"),
+            iced::widget::pick_list(
+                [
+                    JudgeProvider::Default,
+                    JudgeProvider::OpenRouter,
+                    JudgeProvider::Vercel
+                ],
+                Some(s.judge),
+                |p| cm(CoordMsg::Judge(p)),
+            )
+            .text_size(size)
+            .width(Length::Fill)
+            .into(),
+            None,
+        ),
+        field(
+            fl!(loader(), "approver-judge-model"),
+            input(&s.judge_model, CoordMsg::JudgeModel),
+            Some(fl!(loader(), "approver-judge-hint")),
+        ),
+        sub_save_row(s.busy, cm(CoordMsg::Save)),
+    ]
+    .spacing(st::SPACE_M);
+    let mut col = column![].spacing(st::SPACE_S);
+    if let Some(e) = &s.loaded.error {
+        col = col.push(st::card(st::muted(fl!(loader(), "load-error", what = e))));
+    }
+    col = col.push(st::card(pool));
+    col = col.push(st::card(form));
+    if let Some(result) = sub_result(&s.result) {
+        col = col.push(result);
+    }
+    col.into()
 }
 
 #[cfg(test)]

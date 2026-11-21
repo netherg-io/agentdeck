@@ -7,12 +7,13 @@
 use std::path::PathBuf;
 
 use agentdeck_core::processes::{GroupKind, ProcInfo, SessionGroup};
+use agentdeck_core::thread_state::{Assumption, InboxItem, Item, RunMandate, RunPhase, ThreadState};
 use agentdeck_core::usage::{UsageEntry, UsageKind};
 use agentdeck_core::{Paths, PoolEntry};
 use agentdeck_gui::app::{self, Message, Page};
-use agentdeck_gui::data::{Data, InstanceRow, PluginRow, QuotaBar, T3Info, UsageQuotas};
+use agentdeck_gui::data::{CoordRow, Data, InstanceRow, PluginRow, QuotaBar, T3Info, UsageQuotas};
 use agentdeck_gui::pages::add_instance::AddMsg;
-use agentdeck_gui::pages::{drift, harnesses, imagegen, pool, shared, usage};
+use agentdeck_gui::pages::{drift, harnesses, imagegen, pool, settings, shared, usage};
 
 const LONG_ID: &str = "claude-d756536e-very-long-instance-identifier-for-overflow-checks";
 const LONG_NAME: &str =
@@ -113,7 +114,50 @@ fn data() -> Data {
         ],
         error: None,
         auto_apply: true,
-        coordinators: Vec::new(),
+        coordinators: vec![CoordRow {
+            thread: LONG_ID.into(),
+            title: Some(LONG_NAME.into()),
+            state: ThreadState {
+                state: format!("Ship the release {LONG_NAME}"),
+                updated: "2026-11-16T09:05:00Z".into(),
+                checklist: vec![Item {
+                    id: "62".into(),
+                    title: LONG_NAME.into(),
+                    status: "running".into(),
+                    links: vec![format!("gameplay#{LONG_PATH}")],
+                    note: LONG_NAME.into(),
+                }],
+                phase: RunPhase::SleepingForQuota,
+                mandate: Some(RunMandate {
+                    project: LONG_ID.into(),
+                    allowed_hosts: vec![LONG_PATH.into()],
+                    allowed_apps: vec![LONG_NAME.into()],
+                    allow_releases: true,
+                    fix_forward_max: 3,
+                    review_rounds_max: 2,
+                    owner_granted: false,
+                    ..RunMandate::default()
+                }),
+                owner_inbox: vec![InboxItem {
+                    id: "inbox-1".into(),
+                    title: LONG_NAME.into(),
+                    reason: LONG_NAME.into(),
+                    action: LONG_NAME.into(),
+                    blocked_items: vec![LONG_ID.into()],
+                    ..InboxItem::default()
+                }],
+                assumptions: vec![Assumption {
+                    id: "asm-1".into(),
+                    decision: LONG_NAME.into(),
+                    rationale: LONG_NAME.into(),
+                    revert_hint: LONG_PATH.into(),
+                    ..Assumption::default()
+                }],
+                checklist_updates_since_state: 5,
+                sleep_until: Some("2026-11-22T01:00:00Z".into()),
+                ..ThreadState::default()
+            },
+        }],
         backlogs: Vec::new(),
         reports: Vec::new(),
         processes: vec![
@@ -387,6 +431,57 @@ fn every_page_fits_at_min_size_with_long_names() {
         update(&mut state, Message::SelectPage(Page::Modules));
         update(&mut state, Message::PluginDetail("agent-process".into()));
         shot(&state, lang, "modules");
+
+        update(&mut state, Message::SelectPage(Page::Coordinator));
+        shot(&state, lang, "coordinator");
+        update(
+            &mut state,
+            Message::Settings(settings::Msg::Approver(Box::new(
+                settings::ApproverMsg::Loaded(settings::ApproverLoaded {
+                    cfg: Some(agentdeck_core::settings::ApproverSettings {
+                        remote_hosts: vec![LONG_PATH.into()],
+                        extra_hard_deny_patterns: vec![LONG_PATH.into()],
+                        ..Default::default()
+                    }),
+                    audit: vec![settings::AuditRow {
+                        at: "1234567890".into(),
+                        host: LONG_PATH.into(),
+                        kind: "exec".into(),
+                        outcome: "allowed".into(),
+                        source: "PolicyJudge".into(),
+                    }],
+                    error: None,
+                }),
+            ))),
+        );
+        update(&mut state, Message::SelectPage(Page::ApproverSettings));
+        shot(&state, lang, "approver_settings");
+        update(
+            &mut state,
+            Message::Settings(settings::Msg::Coord(Box::new(settings::CoordMsg::Loaded(
+                settings::CoordLoaded {
+                    cfg: Some(agentdeck_core::settings::CoordinatorSettings {
+                        pool: vec![
+                            agentdeck_core::settings::CoordinatorPoolEntry {
+                                instance_id: LONG_ID.into(),
+                                model: format!("model-{LONG_ID}"),
+                                options: Default::default(),
+                                enabled: true,
+                            },
+                        ],
+                        t3_endpoint: Some(format!("http://127.0.0.1:9999/{LONG_ID}")),
+                        ..Default::default()
+                    }),
+                    instances: vec![LONG_ID.into()],
+                    error: None,
+                },
+            )))),
+        );
+        update(
+            &mut state,
+            Message::SelectPage(Page::CoordinatorSettings),
+        );
+        shot(&state, lang, "coordinator_settings");
 
         update(&mut state, Message::SelectPage(Page::Shared));
         let target = |name: &str, status: &str| shared::Target {

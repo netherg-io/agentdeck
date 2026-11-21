@@ -143,6 +143,7 @@ dependencies = [
 name = "agentdeck-applet"
 version = "0.1.23"
 dependencies = [
+ "agentdeck-core",
  "agentdeck-usage",
  "libcosmic",
  "serde_json",
