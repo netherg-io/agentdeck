@@ -9,6 +9,8 @@ use agentdeck_core::settings::{PROVIDER_OPENROUTER, PROVIDER_VERCEL};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+pub const MIN_APPROVAL_TIMEOUT_SECS: u64 = 1;
+pub const MAX_APPROVAL_TIMEOUT_SECS: u64 = 7200;
 pub const DEFAULT_AUTONOMOUS_TIMEOUT_SECS: u64 = 120;
 pub const DEFAULT_INTERACTIVE_TIMEOUT_SECS: u64 = 600;
 pub const DEFAULT_JUDGE_CONFIDENCE_THRESHOLD: f64 = 0.85;
@@ -61,11 +63,21 @@ impl Default for ApproverConfig {
 
 impl ApproverConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.autonomous_timeout_secs == 0 {
-            bail!("autonomous_timeout_secs must be positive");
+        if !(MIN_APPROVAL_TIMEOUT_SECS..=MAX_APPROVAL_TIMEOUT_SECS)
+            .contains(&self.autonomous_timeout_secs)
+        {
+            bail!(
+                "autonomous_timeout_secs must be within {MIN_APPROVAL_TIMEOUT_SECS}..={MAX_APPROVAL_TIMEOUT_SECS}, got {}",
+                self.autonomous_timeout_secs
+            );
         }
-        if self.interactive_timeout_secs == 0 {
-            bail!("interactive_timeout_secs must be positive");
+        if !(MIN_APPROVAL_TIMEOUT_SECS..=MAX_APPROVAL_TIMEOUT_SECS)
+            .contains(&self.interactive_timeout_secs)
+        {
+            bail!(
+                "interactive_timeout_secs must be within {MIN_APPROVAL_TIMEOUT_SECS}..={MAX_APPROVAL_TIMEOUT_SECS}, got {}",
+                self.interactive_timeout_secs
+            );
         }
         if !self.judge_confidence_threshold.is_finite()
             || !(0.0..=1.0).contains(&self.judge_confidence_threshold)
@@ -146,6 +158,21 @@ impl ApproverSecrets {
             return Ok(Self::default());
         }
         Self::load_from_file(&path)
+    }
+
+    /// Read and parse `config_dir/approver.env` without mutating file permissions.
+    /// Returns `Ok(None)` when the file does not exist and `Err` when unreadable or malformed.
+    pub fn inspect_readonly(config_dir: &Path) -> Result<Option<Self>> {
+        let path = Self::secrets_path(config_dir);
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to read secrets file {}", path.display()));
+            }
+        };
+        Self::parse_env(&raw).map(Some)
     }
 
     pub fn load_from_file(path: &Path) -> Result<Self> {
@@ -299,6 +326,48 @@ mod tests {
         assert!(!dbg.contains("gw-key"));
         assert!(!dbg.contains("or-key"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspect_readonly_never_mutates_file_mode_and_distinguishes_missing_from_invalid() {
+        let dir = temp_dir("readonly");
+        assert_eq!(ApproverSecrets::inspect_readonly(&dir).unwrap(), None);
+
+        let path = ApproverSecrets::secrets_path(&dir);
+        fs::write(
+            &path,
+            "TELEGRAM_BOT_TOKEN=tok-ro\nTELEGRAM_OWNER_ID=99\nOPENROUTER_API_KEY=or-ro\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let secrets = ApproverSecrets::inspect_readonly(&dir)
+            .unwrap()
+            .expect("existing secrets file must return Some");
+        assert_eq!(secrets.telegram_bot_token.as_deref(), Some("tok-ro"));
+        assert_eq!(secrets.telegram_owner_id, Some(99));
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "inspect_readonly must not mutate permissions");
+
+        fs::write(&path, "MALFORMED_LINE_WITHOUT_EQUALS\n").unwrap();
+        assert!(ApproverSecrets::inspect_readonly(&dir).is_err());
+        let mode_after_err = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_after_err, 0o644);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_enforces_timeout_bounds() {
+        for bad in [0, MAX_APPROVAL_TIMEOUT_SECS + 1, u64::MAX] {
+            let mut cfg = ApproverConfig {
+                autonomous_timeout_secs: bad,
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_err(), "autonomous={bad}");
+            cfg.autonomous_timeout_secs = DEFAULT_AUTONOMOUS_TIMEOUT_SECS;
+            cfg.interactive_timeout_secs = bad;
+            assert!(cfg.validate().is_err(), "interactive={bad}");
+        }
     }
 
     #[test]

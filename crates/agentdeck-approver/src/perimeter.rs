@@ -11,7 +11,18 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::config::ApproverConfig;
+
 const CP_CONSOLE_LINE_MAX: usize = 1000;
+
+/// Returns `true` for local workstation hosts that do not cross a remote relay boundary.
+pub fn is_local_host(host: &str) -> bool {
+    let h = host.trim();
+    h.eq_ignore_ascii_case("local")
+        || h.eq_ignore_ascii_case("localhost")
+        || h == "127.0.0.1"
+        || h == "::1"
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
@@ -38,6 +49,10 @@ pub struct ApprovalRequest {
     pub timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nonce: Option<String>,
+    /// Authenticated remote peer host set in-process by a trusted transport.
+    /// Never deserialized from untrusted wire JSON.
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub trusted_peer_host: Option<String>,
 }
 
 impl ApprovalRequest {
@@ -407,7 +422,7 @@ pub fn check_perimeter(
     req: &ApprovalRequest,
     mandate: Option<&MandateContext>,
 ) -> PerimeterVerdict {
-    check_perimeter_with_extra(req, mandate, &[])
+    check_perimeter_inner(req, mandate, &[], None)
 }
 
 /// Evaluate the Hard-Deny Perimeter plus any configured `extra_hard_deny_patterns`.
@@ -415,6 +430,30 @@ pub fn check_perimeter_with_extra(
     req: &ApprovalRequest,
     mandate: Option<&MandateContext>,
     extra_patterns: &[String],
+) -> PerimeterVerdict {
+    check_perimeter_inner(req, mandate, extra_patterns, None)
+}
+
+/// Evaluate the Hard-Deny Perimeter enforcing global `config.remote_hosts` and
+/// `config.extra_hard_deny_patterns`.
+pub fn check_perimeter_with_config(
+    req: &ApprovalRequest,
+    mandate: Option<&MandateContext>,
+    config: &ApproverConfig,
+) -> PerimeterVerdict {
+    check_perimeter_inner(
+        req,
+        mandate,
+        &config.extra_hard_deny_patterns,
+        Some(&config.remote_hosts),
+    )
+}
+
+fn check_perimeter_inner(
+    req: &ApprovalRequest,
+    mandate: Option<&MandateContext>,
+    extra_patterns: &[String],
+    remote_hosts: Option<&[String]>,
 ) -> PerimeterVerdict {
     // 1. Secret entry always requires the human owner.
     if req.kind == "secret" {
@@ -436,6 +475,21 @@ pub fn check_perimeter_with_extra(
             return PerimeterVerdict::HardDeny {
                 rule: compiled.rule,
                 detail: compiled.label.to_string(),
+            };
+        }
+    }
+
+    // Global configured remote host allowlist (empty list denies all non-local hosts).
+    if let Some(allowed_remote) = remote_hosts {
+        let effective_host = req.effective_host();
+        if !is_local_host(effective_host)
+            && !allowed_remote
+                .iter()
+                .any(|h| h.trim().eq_ignore_ascii_case(effective_host))
+        {
+            return PerimeterVerdict::HardDeny {
+                rule: "remote_host_not_allowed",
+                detail: format!("remote host {effective_host:?} is outside configured remote_hosts"),
             };
         }
     }
@@ -489,7 +543,7 @@ pub fn check_perimeter_with_extra(
                 detail: "shell expansion requires human confirmation".into(),
             };
         }
-        if !mandate.is_some_and(|m| m.allow_arbitrary_root_scripts) {
+        if mandate.is_some_and(|m| !m.allow_arbitrary_root_scripts) {
             return PerimeterVerdict::HardDeny {
                 rule: "arbitrary_root_script",
                 detail: "arbitrary root scripts require human confirmation".into(),

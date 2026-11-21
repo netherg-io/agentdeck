@@ -9,13 +9,16 @@ use std::time::Duration;
 
 use agentdeck_approver::audit::{AuditSource, audit_log_path, read_recent};
 use agentdeck_approver::broker::{
-    BrokerContext, BrokerOutcome, BrokerTimings, PendingEvent, UnixBrokerServer, evaluate_and_wait,
-    format_wire_result,
+    BrokerContext, BrokerOutcome, BrokerTimings, MandateResolver, PendingEvent, UnixBrokerServer,
+    evaluate_and_wait, format_wire_result,
 };
-use agentdeck_approver::config::ApproverConfig;
+use agentdeck_approver::config::{ApproverConfig, DEFAULT_AUTONOMOUS_TIMEOUT_SECS, DEFAULT_INTERACTIVE_TIMEOUT_SECS};
 use agentdeck_approver::eval::{default_eval_cases, run_perimeter_eval};
-use agentdeck_approver::judge::{JudgeVerdict, PolicyJudge, build_judge_prompt};
-use agentdeck_approver::perimeter::{ApprovalRequest, MandateContext, check_perimeter};
+use agentdeck_approver::judge::{HttpPolicyJudge, JudgeVerdict, PolicyJudge, build_judge_prompt};
+use agentdeck_approver::perimeter::{
+    ApprovalRequest, MandateContext, PerimeterVerdict, check_perimeter,
+    check_perimeter_with_config,
+};
 use agentdeck_approver::telegram::{
     CallbackAction, FINALIZE_APPROVED, FINALIZE_TIMEOUT, HARD_DENY_PREFIX, PendingDecisions,
     TelegramTransport, format_request_message, handle_update,
@@ -130,6 +133,7 @@ struct SentRecord {
     id: String,
     message_id: i64,
     hard_deny: Option<String>,
+    timeout_secs: u64,
     rendered_text: String,
 }
 
@@ -214,6 +218,7 @@ impl TelegramTransport for MockTelegram {
                 id: id.to_string(),
                 message_id,
                 hard_deny: hard_deny.map(str::to_string),
+                timeout_secs,
                 rendered_text,
             });
             guard.len()
@@ -278,11 +283,12 @@ fn sample_valid_approve_req() -> ApprovalRequest {
         title: None,
         target: None,
         line: None,
-        host: Some("homeserver".into()),
+        host: Some("local".into()),
         app: Some("blockfield-staging".into()),
         thread_id: Some("thread-u3".into()),
         timeout_secs: None,
         nonce: Some("abc123nonce".into()),
+        trusted_peer_host: None,
     }
 }
 
@@ -334,6 +340,7 @@ fn prompt_injection_framing_isolates_untrusted_reason_and_comments() {
         thread_id: None,
         timeout_secs: None,
         nonce: None,
+        trusted_peer_host: None,
     };
     let (system, user) = build_judge_prompt(&req, &mandate);
     assert!(system.contains("UNTRUSTED DATA"));
@@ -358,6 +365,7 @@ async fn opaque_approval_wire_output_is_byte_identical_between_judge_and_telegra
     let ctx1 = BrokerContext {
         config: &cfg,
         mandate: Some(&mandate),
+        mandate_resolver: None,
         pending: &pending1,
         audit_path: Some(&audit_path),
         timings: BrokerTimings::default(),
@@ -385,6 +393,7 @@ async fn opaque_approval_wire_output_is_byte_identical_between_judge_and_telegra
     let ctx2 = BrokerContext {
         config: &cfg,
         mandate: None,
+        mandate_resolver: None,
         pending: &pending2,
         audit_path: Some(&audit_path),
         timings: BrokerTimings::default(),
@@ -448,6 +457,7 @@ async fn hard_deny_never_calls_policy_judge_and_escalates_with_hard_deny_prefix(
         thread_id: Some("thread-u3".into()),
         timeout_secs: None,
         nonce: None,
+        trusted_peer_host: None,
     };
 
     let judge = MockJudge::allowing(1.0, "would allow if mistakenly called");
@@ -465,6 +475,7 @@ async fn hard_deny_never_calls_policy_judge_and_escalates_with_hard_deny_prefix(
     let ctx = BrokerContext {
         config: &cfg,
         mandate: Some(&mandate),
+        mandate_resolver: None,
         pending: &pending,
         audit_path: Some(&audit_path),
         timings: BrokerTimings::default(),
@@ -522,6 +533,7 @@ async fn low_confidence_and_error_judge_fail_closed_and_escalate_to_telegram() {
         let ctx = BrokerContext {
             config: &cfg,
             mandate: Some(&mandate),
+            mandate_resolver: None,
             pending: &pending,
             audit_path: None,
             timings: BrokerTimings::default(),
@@ -557,6 +569,7 @@ async fn client_disconnect_before_approval_immediately_cancels_telegram_buttons(
     let ctx = BrokerContext {
         config: &cfg,
         mandate: None,
+        mandate_resolver: None,
         pending: &pending,
         audit_path: Some(&audit_path),
         timings: BrokerTimings::default(),
@@ -607,6 +620,7 @@ async fn approval_timeout_fires_before_execution_and_cancels_telegram_buttons() 
     let ctx = BrokerContext {
         config: &cfg,
         mandate: Some(&mandate),
+        mandate_resolver: None,
         pending: &pending,
         audit_path: Some(&audit_path),
         timings: BrokerTimings {
@@ -801,6 +815,7 @@ async fn unix_broker_socket_end_to_end_opaque_keepalive_and_disconnect_cancel() 
         thread_id: None,
         timeout_secs: None,
         nonce: None,
+        trusted_peer_host: None,
     };
     let secret_line = format!("{}\n", serde_json::to_string(&secret_req).unwrap());
     let tg_bg2 = Arc::clone(&tg);
@@ -957,6 +972,7 @@ async fn judge_requires_a_matching_thread_and_owner_grant() {
         let ctx = BrokerContext {
             config: &cfg,
             mandate: Some(&mandate),
+            mandate_resolver: None,
             pending: &pending,
             audit_path: None,
             timings: BrokerTimings {
@@ -992,6 +1008,7 @@ async fn a_queued_click_cannot_win_against_the_ready_deadline() {
         let ctx = BrokerContext {
             config: &cfg,
             mandate: None,
+            mandate_resolver: None,
             pending: &pending,
             audit_path: None,
             timings: BrokerTimings {
@@ -1032,6 +1049,7 @@ async fn disconnect_invalidates_pending_even_before_delivery_returns_the_card_id
     let ctx = BrokerContext {
         config: &cfg,
         mandate: None,
+        mandate_resolver: None,
         pending: &pending,
         audit_path: None,
         timings: BrokerTimings::default(),
@@ -1069,6 +1087,7 @@ async fn verdict_returns_before_card_cleanup_and_a_failed_edit_is_retried() {
     let ctx = BrokerContext {
         config: &cfg,
         mandate: None,
+        mandate_resolver: None,
         pending: &pending,
         audit_path: None,
         timings: BrokerTimings::default(),
@@ -1092,6 +1111,11 @@ async fn verdict_returns_before_card_cleanup_and_a_failed_edit_is_retried() {
     );
     assert!(tg.finalized_records().is_empty());
     gate.notify_one();
+    tokio::time::advance(Duration::from_millis(500)).await;
+    assert!(
+        tg.finalized_records().is_empty(),
+        "retryable card edit must wait 600ms before retrying"
+    );
     tokio::time::timeout(Duration::from_secs(1), tg.wait_finalized_count(1))
         .await
         .unwrap();
@@ -1157,4 +1181,548 @@ async fn telegram_delivery_error_has_neutral_wire_framing() {
     );
     shutdown_tx.send(true).unwrap();
     server_task.await.unwrap().unwrap();
+}
+
+// --- R2 Security & Correctness Regression Tests ------------------------------
+
+struct GatedJudge {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    verdict: JudgeVerdict,
+    calls: AtomicUsize,
+}
+
+impl PolicyJudge for GatedJudge {
+    async fn evaluate(
+        &self,
+        _req: &ApprovalRequest,
+        _mandate: &MandateContext,
+    ) -> Result<JudgeVerdict> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(self.verdict.clone())
+    }
+}
+
+#[tokio::test]
+async fn concurrent_threads_isolate_grants_and_preserve_interactive_timeout() {
+    let tmp = TempDir::new("multi-thread");
+    let sock_path = tmp.0.join("b.sock");
+    let cfg = ApproverConfig::default();
+
+    let mut thread_a = autonomous_mandate();
+    thread_a.thread_id = Some("thread-A".into());
+    thread_a.owner_granted = true;
+
+    let mut thread_b = autonomous_mandate();
+    thread_b.thread_id = Some("thread-B".into());
+    thread_b.owner_granted = false;
+
+    let mandates = Arc::new(RwLock::new(vec![thread_a, thread_b]));
+    let mandates_for_resolver = Arc::clone(&mandates);
+    let resolver: MandateResolver = Arc::new(move |req| {
+        let tid = req.thread_id.as_deref()?;
+        mandates_for_resolver
+            .read()
+            .unwrap()
+            .iter()
+            .find(|m| m.thread_id.as_deref() == Some(tid))
+            .cloned()
+    });
+
+    let judge = Arc::new(MockJudge::allowing(0.99, "allow"));
+    let tg = Arc::new(MockTelegram::new());
+    let pending = Arc::new(PendingDecisions::new());
+    let server = UnixBrokerServer::bind_with_resolver(
+        sock_path.clone(),
+        cfg,
+        resolver,
+        Arc::clone(&judge),
+        Arc::clone(&tg),
+        Arc::clone(&pending),
+        None,
+    )
+    .unwrap();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server_task = tokio::spawn(server.run(shutdown_rx));
+
+    let send_over_socket = |req: ApprovalRequest| {
+        let sock = sock_path.clone();
+        async move {
+            let mut client = UnixStream::connect(&sock).await.unwrap();
+            let line = format!("{}\n", serde_json::to_string(&req).unwrap());
+            client.write_all(line.as_bytes()).await.unwrap();
+            let mut lines = BufReader::new(client).lines();
+            while let Some(resp) = lines.next_line().await.unwrap() {
+                let v: Value = serde_json::from_str(&resp).unwrap();
+                if v["type"] == "result" {
+                    return v;
+                }
+            }
+            panic!("socket closed before result");
+        }
+    };
+
+    // 1) Granted Thread A auto-approves via Policy Judge.
+    let mut req_a = sample_valid_approve_req();
+    req_a.thread_id = Some("thread-A".into());
+    let res_a = send_over_socket(req_a).await;
+    assert_eq!(res_a["result"], "approved");
+    assert_eq!(judge.call_count(), 1);
+    assert!(tg.sent_records().is_empty());
+
+    // 2) Ungranted Thread B NEVER invokes Policy Judge and receives interactive 600s timeout.
+    let mut req_b = sample_valid_approve_req();
+    req_b.thread_id = Some("thread-B".into());
+    let tg_bg = Arc::clone(&tg);
+    let pending_bg = Arc::clone(&pending);
+    let deny_b = tokio::spawn(async move {
+        tg_bg.wait_sent_count(1).await;
+        let sent = tg_bg.sent_records();
+        assert_eq!(sent[0].timeout_secs, DEFAULT_INTERACTIVE_TIMEOUT_SECS);
+        pending_bg.resolve_callback(&sent[0].id, CallbackAction::Deny);
+    });
+    let res_b = send_over_socket(req_b).await;
+    deny_b.await.unwrap();
+    assert_eq!(res_b["result"], "denied");
+    assert_eq!(judge.call_count(), 1, "ungranted thread must never call judge");
+
+    // 3) Interactive request (thread_id == None) gets 600s timeout and no false hard-deny banner.
+    let interactive_req: ApprovalRequest = serde_json::from_value(json!({
+        "kind": "root",
+        "reason": "Inspect logs",
+        "script": "journalctl -n 20",
+        "host": "local",
+    }))
+    .unwrap();
+    let tg_bg2 = Arc::clone(&tg);
+    let pending_bg2 = Arc::clone(&pending);
+    let approve_interactive = tokio::spawn(async move {
+        tg_bg2.wait_sent_count(2).await;
+        let sent = tg_bg2.sent_records();
+        assert_eq!(sent[1].timeout_secs, DEFAULT_INTERACTIVE_TIMEOUT_SECS);
+        assert_eq!(sent[1].hard_deny, None);
+        assert!(!sent[1].rendered_text.contains(HARD_DENY_PREFIX));
+        pending_bg2.resolve_callback(&sent[1].id, CallbackAction::Approve);
+    });
+    let res_i = send_over_socket(interactive_req).await;
+    approve_interactive.await.unwrap();
+    assert_eq!(res_i["result"], "approved");
+    assert_eq!(judge.call_count(), 1);
+
+    // 4) Wildcard mandate (m.thread_id == None) must NEVER match any request.
+    let mut wildcard = autonomous_mandate();
+    wildcard.thread_id = None;
+    let wildcard_judge = MockJudge::allowing(0.99, "allow");
+    let wildcard_tg = Arc::new(MockTelegram::new());
+    let wildcard_pending = PendingDecisions::new();
+    let wildcard_ctx = BrokerContext {
+        config: &ApproverConfig::default(),
+        mandate: Some(&wildcard),
+        mandate_resolver: None,
+        pending: &wildcard_pending,
+        audit_path: None,
+        timings: BrokerTimings {
+            timeout_override: Some(Duration::from_millis(20)),
+            ..Default::default()
+        },
+    };
+    let wildcard_decision = evaluate_and_wait(
+        &sample_valid_approve_req(),
+        &wildcard_ctx,
+        &wildcard_judge,
+        &wildcard_tg,
+        std::future::pending(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(wildcard_decision.outcome, BrokerOutcome::NeedsOwner);
+    assert_eq!(wildcard_judge.call_count(), 0);
+
+    let _ = shutdown_tx.send(true);
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn mandate_revoked_or_scope_changed_mid_flight_escalates_to_telegram() {
+    let tmp = TempDir::new("midflight");
+    let audit_path = audit_log_path(&tmp.0);
+    let cfg = ApproverConfig::default();
+
+    // Case 1: Revoked while Policy Judge is awaiting -> escalates with interactive 600s timeout.
+    {
+        let state = Arc::new(RwLock::new(Some(autonomous_mandate())));
+        let state_r = Arc::clone(&state);
+        let resolver: MandateResolver = Arc::new(move |_| state_r.read().unwrap().clone());
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let judge = GatedJudge {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            verdict: JudgeVerdict {
+                allow: true,
+                confidence: 0.99,
+                reason: "judge_approved".into(),
+            },
+            calls: AtomicUsize::new(0),
+        };
+        let tg = Arc::new(MockTelegram::new());
+        let pending = Arc::new(PendingDecisions::new());
+        let req = sample_valid_approve_req();
+
+        let state_bg = Arc::clone(&state);
+        let tg_bg = Arc::clone(&tg);
+        let pending_bg = Arc::clone(&pending);
+        let driver = tokio::spawn(async move {
+            entered.notified().await;
+            // Revoke grant while judge HTTP call is in flight.
+            state_bg.write().unwrap().as_mut().unwrap().owner_granted = false;
+            release.notify_one();
+            tg_bg.wait_sent_count(1).await;
+            let sent = tg_bg.sent_records();
+            assert_eq!(sent[0].timeout_secs, DEFAULT_INTERACTIVE_TIMEOUT_SECS);
+            assert_eq!(sent[0].hard_deny, None);
+            pending_bg.resolve_callback(&sent[0].id, CallbackAction::Deny);
+        });
+
+        let ctx = BrokerContext {
+            config: &cfg,
+            mandate: None,
+            mandate_resolver: Some(&resolver),
+            pending: &pending,
+            audit_path: Some(&audit_path),
+            timings: BrokerTimings::default(),
+        };
+        let decision = evaluate_and_wait(&req, &ctx, &judge, &tg, std::future::pending(), None)
+            .await
+            .unwrap();
+        driver.await.unwrap();
+        assert_eq!(judge.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(decision.outcome, BrokerOutcome::Denied);
+        let records = read_recent(&audit_path, 5).unwrap();
+        assert_eq!(records.last().unwrap().source, AuditSource::Denied);
+        assert_eq!(
+            records.last().unwrap().judge_reason.as_deref(),
+            Some("judge_mandate_changed")
+        );
+    }
+
+    // Case 2: Scope narrowed mid-flight -> escalates with updated Hard-Deny perimeter banner.
+    {
+        let state = Arc::new(RwLock::new(Some(autonomous_mandate())));
+        let state_r = Arc::clone(&state);
+        let resolver: MandateResolver = Arc::new(move |_| state_r.read().unwrap().clone());
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let judge = GatedJudge {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            verdict: JudgeVerdict {
+                allow: true,
+                confidence: 0.99,
+                reason: "judge_approved".into(),
+            },
+            calls: AtomicUsize::new(0),
+        };
+        let tg = Arc::new(MockTelegram::new());
+        let pending = Arc::new(PendingDecisions::new());
+        let req = sample_valid_approve_req();
+
+        let state_bg = Arc::clone(&state);
+        let tg_bg = Arc::clone(&tg);
+        let pending_bg = Arc::clone(&pending);
+        let driver = tokio::spawn(async move {
+            entered.notified().await;
+            state_bg.write().unwrap().as_mut().unwrap().allowed_apps = vec!["other-app".into()];
+            release.notify_one();
+            tg_bg.wait_sent_count(1).await;
+            let sent = tg_bg.sent_records();
+            assert_eq!(sent[0].timeout_secs, DEFAULT_AUTONOMOUS_TIMEOUT_SECS);
+            assert_eq!(sent[0].hard_deny.as_deref(), Some("out_of_scope_app"));
+            pending_bg.resolve_callback(&sent[0].id, CallbackAction::Deny);
+        });
+
+        let ctx = BrokerContext {
+            config: &cfg,
+            mandate: None,
+            mandate_resolver: Some(&resolver),
+            pending: &pending,
+            audit_path: Some(&audit_path),
+            timings: BrokerTimings::default(),
+        };
+        let decision = evaluate_and_wait(&req, &ctx, &judge, &tg, std::future::pending(), None)
+            .await
+            .unwrap();
+        driver.await.unwrap();
+        assert_eq!(decision.outcome, BrokerOutcome::Denied);
+        let records = read_recent(&audit_path, 5).unwrap();
+        assert_eq!(records.last().unwrap().perimeter, "hard_deny:out_of_scope_app");
+        assert_eq!(
+            records.last().unwrap().judge_reason.as_deref(),
+            Some("judge_mandate_changed")
+        );
+    }
+}
+
+#[tokio::test]
+async fn remote_hosts_allowlist_and_unauthenticated_remote_peer_fail_closed() {
+    let mandate = autonomous_mandate();
+
+    // Deserialized JSON must never be able to spoof trusted_peer_host.
+    let spoofed: ApprovalRequest = serde_json::from_value(json!({
+        "kind": "confirm",
+        "title": "Redeploy",
+        "text": "staging",
+        "host": "homeserver",
+        "app": "blockfield-staging",
+        "thread_id": "thread-u3",
+        "trusted_peer_host": "homeserver"
+    }))
+    .unwrap();
+    assert_eq!(spoofed.trusted_peer_host, None);
+
+    // 1) Empty remote_hosts denies non-local host.
+    let empty_cfg = ApproverConfig::default();
+    assert_eq!(
+        check_perimeter_with_config(&spoofed, Some(&mandate), &empty_cfg).rule(),
+        Some("remote_host_not_allowed")
+    );
+
+    // 2) Host outside configured remote_hosts is denied.
+    let other_cfg = ApproverConfig {
+        remote_hosts: vec!["staging-box".into()],
+        ..Default::default()
+    };
+    assert_eq!(
+        check_perimeter_with_config(&spoofed, Some(&mandate), &other_cfg).rule(),
+        Some("remote_host_not_allowed")
+    );
+
+    // 3) Host inside remote_hosts but unauthenticated (trusted_peer_host == None)
+    //    clears perimeter yet NEVER auto-approves via Policy Judge -> escalates to Telegram.
+    let allowed_cfg = ApproverConfig {
+        remote_hosts: vec!["homeserver".into()],
+        ..Default::default()
+    };
+    assert_eq!(
+        check_perimeter_with_config(&spoofed, Some(&mandate), &allowed_cfg),
+        PerimeterVerdict::Clear
+    );
+    let judge = MockJudge::allowing(0.99, "would approve");
+    let tg = Arc::new(MockTelegram::new());
+    let pending = Arc::new(PendingDecisions::new());
+    let tg_bg = Arc::clone(&tg);
+    let pending_bg = Arc::clone(&pending);
+    let approve_human = tokio::spawn(async move {
+        tg_bg.wait_sent_count(1).await;
+        let sent = tg_bg.sent_records();
+        assert_eq!(sent[0].hard_deny, None);
+        pending_bg.resolve_callback(&sent[0].id, CallbackAction::Approve);
+    });
+    let ctx = BrokerContext {
+        config: &allowed_cfg,
+        mandate: Some(&mandate),
+        mandate_resolver: None,
+        pending: &pending,
+        audit_path: None,
+        timings: BrokerTimings::default(),
+    };
+    let decision = evaluate_and_wait(&spoofed, &ctx, &judge, &tg, std::future::pending(), None)
+        .await
+        .unwrap();
+    approve_human.await.unwrap();
+    assert_eq!(
+        decision.outcome,
+        BrokerOutcome::Approved { secret_value: None }
+    );
+    assert_eq!(
+        judge.call_count(),
+        0,
+        "unauthenticated remote request must escalate to human without invoking judge"
+    );
+
+    // 4) Explicitly authenticated trusted_peer_host matching host allows Policy Judge.
+    let mut trusted = spoofed.clone();
+    trusted.trusted_peer_host = Some("homeserver".into());
+    let tg2 = Arc::new(MockTelegram::new());
+    let pending2 = PendingDecisions::new();
+    let ctx2 = BrokerContext {
+        config: &allowed_cfg,
+        mandate: Some(&mandate),
+        mandate_resolver: None,
+        pending: &pending2,
+        audit_path: None,
+        timings: BrokerTimings::default(),
+    };
+    let decision2 = evaluate_and_wait(&trusted, &ctx2, &judge, &tg2, std::future::pending(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        decision2.outcome,
+        BrokerOutcome::Approved { secret_value: None }
+    );
+    assert_eq!(judge.call_count(), 1);
+    assert!(tg2.sent_records().is_empty());
+}
+
+#[test]
+fn interactive_root_command_does_not_trigger_arbitrary_root_script_hard_deny() {
+    let benign: ApprovalRequest = serde_json::from_value(json!({
+        "kind": "root",
+        "reason": "Inspect logs",
+        "script": "journalctl -n 20",
+        "host": "local",
+    }))
+    .unwrap();
+    assert_eq!(check_perimeter(&benign, None), PerimeterVerdict::Clear);
+    assert_eq!(check_perimeter(&benign, None).rule(), None);
+
+    // Autonomous mandate without allow_arbitrary_root_scripts still hard-denies.
+    let mut restricted_mandate = autonomous_mandate();
+    restricted_mandate.allowed_apps.clear();
+    restricted_mandate.allow_arbitrary_root_scripts = false;
+    assert_eq!(
+        check_perimeter(&benign, Some(&restricted_mandate)).rule(),
+        Some("arbitrary_root_script")
+    );
+
+    // Built-in dangerous rules stay active even in interactive mode (mandate == None).
+    let dangerous: ApprovalRequest = serde_json::from_value(json!({
+        "kind": "root",
+        "reason": "Check accounts",
+        "script": "cat /etc/shadow",
+        "host": "local",
+    }))
+    .unwrap();
+    assert_eq!(
+        check_perimeter(&dangerous, None).rule(),
+        Some("secret_exfiltration")
+    );
+}
+
+#[tokio::test]
+async fn provider_secret_marker_never_leaks_into_errors_or_audit_jsonl() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let responses = [
+            (
+                "500 Internal Server Error",
+                r#"{"error":"upstream body SECRET_TOKEN_12345"}"#.to_string(),
+            ),
+            (
+                "200 OK",
+                json!({
+                    "answers": {
+                        "permit": {
+                            "score": 1,
+                            "confidence": 0.96,
+                            "reason": "model echoed SECRET_TOKEN_12345"
+                        }
+                    }
+                })
+                .to_string(),
+            ),
+        ];
+        for (status, body) in responses {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut first = String::new();
+            stream.read_line(&mut first).await.unwrap();
+            let mut size = 0usize;
+            loop {
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    size = value.trim().parse().unwrap();
+                }
+            }
+            let mut req_body = vec![0; size];
+            stream.read_exact(&mut req_body).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+
+    let tmp = TempDir::new("sanitize-audit");
+    let audit_path = audit_log_path(&tmp.0);
+    let cfg = ApproverConfig::default();
+    let mandate = autonomous_mandate();
+    let req = sample_valid_approve_req();
+    let judge = HttpPolicyJudge::new(
+        Some("openrouter".into()),
+        Some("~typesafe/jev-latest".into()),
+        "SECRET_TOKEN_12345".into(),
+    )
+    .unwrap()
+    .with_base_url(base);
+
+    // 1) HTTP 500 -> escalates to Telegram, audit records fixed status code with no body leak.
+    let tg1 = Arc::new(MockTelegram::new());
+    let pending1 = Arc::new(PendingDecisions::new());
+    let tg1_bg = Arc::clone(&tg1);
+    let pending1_bg = Arc::clone(&pending1);
+    let deny = tokio::spawn(async move {
+        tg1_bg.wait_sent_count(1).await;
+        let id = tg1_bg.sent_records()[0].id.clone();
+        pending1_bg.resolve_callback(&id, CallbackAction::Deny);
+    });
+    let ctx1 = BrokerContext {
+        config: &cfg,
+        mandate: Some(&mandate),
+        mandate_resolver: None,
+        pending: &pending1,
+        audit_path: Some(&audit_path),
+        timings: BrokerTimings::default(),
+    };
+    let d1 = evaluate_and_wait(&req, &ctx1, &judge, &tg1, std::future::pending(), None)
+        .await
+        .unwrap();
+    deny.await.unwrap();
+    assert_eq!(d1.outcome, BrokerOutcome::Denied);
+
+    // 2) HTTP 200 -> auto-approves, audit records fixed code without model free-text.
+    let tg2 = Arc::new(MockTelegram::new());
+    let pending2 = PendingDecisions::new();
+    let ctx2 = BrokerContext {
+        config: &cfg,
+        mandate: Some(&mandate),
+        mandate_resolver: None,
+        pending: &pending2,
+        audit_path: Some(&audit_path),
+        timings: BrokerTimings::default(),
+    };
+    let d2 = evaluate_and_wait(&req, &ctx2, &judge, &tg2, std::future::pending(), None)
+        .await
+        .unwrap();
+    assert_eq!(d2.outcome, BrokerOutcome::Approved { secret_value: None });
+    server.await.unwrap();
+
+    let raw_audit = fs::read_to_string(&audit_path).unwrap();
+    assert!(
+        !raw_audit.contains("SECRET_TOKEN_12345"),
+        "audit.jsonl must NEVER contain provider secret markers: {raw_audit}"
+    );
+    let records = read_recent(&audit_path, 10).unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].judge_reason.as_deref(), Some("judge_http_status_500"));
+    assert_eq!(records[1].judge_reason.as_deref(), Some("judge_approved"));
 }

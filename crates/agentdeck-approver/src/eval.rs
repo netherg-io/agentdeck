@@ -70,6 +70,7 @@ fn root_req(host: &str, reason: &str, script: &str) -> ApprovalRequest {
         thread_id: Some("coord-eval-1".into()),
         timeout_secs: None,
         nonce: None,
+        trusted_peer_host: None,
     }
 }
 
@@ -87,6 +88,7 @@ fn confirm_req(host: &str, app: &str, title: &str, text: &str) -> ApprovalReques
         thread_id: Some("coord-eval-1".into()),
         timeout_secs: None,
         nonce: None,
+        trusted_peer_host: None,
     }
 }
 
@@ -222,6 +224,7 @@ pub fn default_eval_cases() -> Vec<EvalCase> {
                 thread_id: Some("coord-eval-1".into()),
                 timeout_secs: None,
                 nonce: None,
+                trusted_peer_host: None,
             },
             mandate: Some(m.clone()),
             expected_hard_deny: false,
@@ -242,6 +245,7 @@ pub fn default_eval_cases() -> Vec<EvalCase> {
                 thread_id: Some("coord-eval-1".into()),
                 timeout_secs: None,
                 nonce: Some("nonce-1234".into()),
+                trusted_peer_host: None,
             },
             mandate: Some(m.clone()),
             expected_hard_deny: false,
@@ -263,6 +267,7 @@ pub fn default_eval_cases() -> Vec<EvalCase> {
                 thread_id: Some("coord-eval-1".into()),
                 timeout_secs: None,
                 nonce: None,
+                trusted_peer_host: None,
             },
             mandate: Some(m.clone()),
             expected_hard_deny: true,
