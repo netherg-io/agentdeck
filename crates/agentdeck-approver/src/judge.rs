@@ -19,6 +19,31 @@ use crate::perimeter::{ApprovalRequest, MandateContext};
 pub const JUDGE_TIMEOUT: Duration = Duration::from_secs(20);
 const OPENROUTER_BASE: &str = "https://openrouter.ai";
 const VERCEL_BASE: &str = "https://ai-gateway.vercel.sh";
+
+/// Safe, fixed-code policy judge error that never exposes provider HTTP bodies
+/// or echoed credentials in error messages or audit logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JudgeError {
+    Network,
+    HttpStatus {
+        status: u16,
+        is_language_model: bool,
+    },
+    Parse,
+}
+
+impl fmt::Display for JudgeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Network => write!(f, "judge_error_network"),
+            Self::HttpStatus { status, .. } => write!(f, "judge_http_status_{status}"),
+            Self::Parse => write!(f, "judge_error_parse"),
+        }
+    }
+}
+
+impl std::error::Error for JudgeError {}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JudgeVerdict {
     pub allow: bool,
@@ -131,7 +156,19 @@ impl HttpPolicyJudge {
     }
 
     pub fn with_base_url(mut self, base_url: String) -> Self {
-        self.base_url = Some(base_url.trim_end_matches('/').to_string());
+        let trimmed = base_url.trim_end_matches('/').to_string();
+        let is_loopback = trimmed.starts_with("http://127.0.0.1")
+            || trimmed.starts_with("http://[::1]")
+            || trimmed.starts_with("http://localhost");
+        if is_loopback
+            && let Ok(client) = reqwest::Client::builder()
+                .timeout(self.timeout)
+                .no_proxy()
+                .build()
+        {
+            self.client = client;
+        }
+        self.base_url = Some(trimmed);
         self
     }
 
@@ -161,16 +198,21 @@ impl HttpPolicyJudge {
             .json(body)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("policy judge request failed: {e}"))?;
+            .map_err(|_| JudgeError::Network)?;
         let status = res.status();
         if !status.is_success() {
-            let text = res.text().await.unwrap_or_default();
-            let snippet: String = text.chars().take(300).collect();
-            bail!("policy judge HTTP {}: {}", status.as_u16(), snippet);
+            // Inspect body only for the Vercel chat fallback sentinel; never leak body text.
+            let is_language_model = res
+                .text()
+                .await
+                .is_ok_and(|text| text.contains("is a language model"));
+            return Err(JudgeError::HttpStatus {
+                status: status.as_u16(),
+                is_language_model,
+            }
+            .into());
         }
-        res.json()
-            .await
-            .map_err(|e| anyhow::anyhow!("policy judge returned invalid JSON: {e}"))
+        res.json().await.map_err(|_| JudgeError::Parse.into())
     }
 }
 
@@ -232,17 +274,17 @@ pub fn parse_decisions_verdict(response: &Value) -> Result<JudgeVerdict> {
                 a.get("name").and_then(Value::as_str) == Some("permit")
                     && a.get("type").and_then(Value::as_str) == Some("score")
             })
-            .ok_or_else(|| anyhow::anyhow!("decisions response missing permit answer"))?
+            .ok_or(JudgeError::Parse)?
     } else {
         response
             .pointer("/answers/permit")
-            .ok_or_else(|| anyhow::anyhow!("decisions response missing answers.permit"))?
+            .ok_or(JudgeError::Parse)?
     };
 
     let score = match answer.get("score").and_then(Value::as_f64) {
         Some(0.0) => 0,
         Some(1.0) => 1,
-        _ => bail!("decisions score must be exactly 0 or 1"),
+        _ => return Err(JudgeError::Parse.into()),
     };
     let confidence = if let Some(explicit) = answer.get("confidence") {
         explicit.as_f64()
@@ -255,24 +297,18 @@ pub fn parse_decisions_verdict(response: &Value) -> Result<JudgeVerdict> {
     } else {
         None
     }
-    .ok_or_else(|| anyhow::anyhow!("decisions response missing valid confidence"))?;
+    .ok_or(JudgeError::Parse)?;
 
     if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
-        bail!("decisions confidence out of range [0, 1]: {confidence}");
+        return Err(JudgeError::Parse.into());
     }
 
     let allow = score == 1;
-    let reason = answer
-        .get("reason")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            if allow {
-                "decision model permitted within mandate".to_string()
-            } else {
-                "decision model denied or escalated".to_string()
-            }
-        });
+    let reason = if allow {
+        "judge_approved".to_string()
+    } else {
+        "judge_denied".to_string()
+    };
 
     Ok(JudgeVerdict {
         allow,
@@ -281,27 +317,38 @@ pub fn parse_decisions_verdict(response: &Value) -> Result<JudgeVerdict> {
     })
 }
 
+#[derive(Deserialize)]
+struct RawChatVerdict {
+    allow: bool,
+    confidence: f64,
+}
+
 /// Parse an OpenAI-compatible chat completion JSON verdict; tolerates ```json fences.
+/// Discards free-text model reasons so echoed request data never propagates into logs.
 pub fn parse_chat_verdict(response: &Value) -> Result<JudgeVerdict> {
     let content = response
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("chat completion response missing message content"))?;
+        .ok_or(JudgeError::Parse)?;
     let trimmed = content
         .trim()
         .trim_start_matches("```json")
         .trim_start_matches("```")
         .trim_end_matches("```")
         .trim();
-    let verdict: JudgeVerdict = serde_json::from_str(trimmed)
-        .map_err(|e| anyhow::anyhow!("policy judge chat verdict is not valid JSON: {e}"))?;
+    let verdict: RawChatVerdict = serde_json::from_str(trimmed).map_err(|_| JudgeError::Parse)?;
     if !verdict.confidence.is_finite() || !(0.0..=1.0).contains(&verdict.confidence) {
-        bail!(
-            "policy judge confidence out of range [0, 1]: {}",
-            verdict.confidence
-        );
+        return Err(JudgeError::Parse.into());
     }
-    Ok(verdict)
+    Ok(JudgeVerdict {
+        allow: verdict.allow,
+        confidence: verdict.confidence,
+        reason: if verdict.allow {
+            "judge_approved".to_string()
+        } else {
+            "judge_denied".to_string()
+        },
+    })
 }
 
 impl PolicyJudge for HttpPolicyJudge {
@@ -318,7 +365,16 @@ impl PolicyJudge for HttpPolicyJudge {
             let body = vercel_decisions_body(&self.model, &system, &input);
             match self.post_json(&decisions_url, &body).await {
                 Ok(v) => return parse_decisions_verdict(&v),
-                Err(e) if e.to_string().contains("is a language model") => {}
+                Err(e)
+                    if e.downcast_ref::<JudgeError>().is_some_and(|je| {
+                        matches!(
+                            je,
+                            JudgeError::HttpStatus {
+                                is_language_model: true,
+                                ..
+                            }
+                        )
+                    }) => {}
                 Err(e) => return Err(e),
             }
             let chat_url = format!("{base}/v1/chat/completions");
@@ -467,7 +523,7 @@ mod tests {
         let v3 = parse_chat_verdict(&chat).unwrap();
         assert!(v3.allow);
         assert!((v3.confidence - 0.91).abs() < 1e-9);
-        assert_eq!(v3.reason, "matches staging mandate");
+        assert_eq!(v3.reason, "judge_approved");
 
         // Malformed / missing fails closed.
         assert!(parse_decisions_verdict(&json!({"answers": {}})).is_err());
@@ -475,5 +531,137 @@ mod tests {
             parse_chat_verdict(&json!({"choices": [{"message": {"content": "not json"}}]}))
                 .is_err()
         );
+    }
+
+    async fn mock_judge_server(
+        responses: Vec<(&'static str, String)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut paths = Vec::new();
+            for (status, body) in responses {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut first = String::new();
+                stream.read_line(&mut first).await.unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        size = value.trim().parse().unwrap();
+                    }
+                }
+                let mut req_body = vec![0; size];
+                stream.read_exact(&mut req_body).await.unwrap();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                paths.push(first);
+            }
+            paths
+        });
+        (base, task)
+    }
+
+    #[tokio::test]
+    async fn http_errors_and_model_reasons_never_leak_provider_text() {
+        let (base, server) = mock_judge_server(vec![
+            (
+                "500 Internal Server Error",
+                r#"{"error":"echoed SECRET_TOKEN_12345"}"#.to_string(),
+            ),
+            (
+                "200 OK",
+                json!({
+                    "answers": {
+                        "permit": {
+                            "score": 1,
+                            "confidence": 0.96,
+                            "reason": "approved with SECRET_TOKEN_12345"
+                        }
+                    }
+                })
+                .to_string(),
+            ),
+            (
+                "400 Bad Request",
+                r#"{"error":"model is a language model SECRET_TOKEN_12345"}"#.to_string(),
+            ),
+            (
+                "200 OK",
+                json!({
+                    "choices": [{
+                        "message": {
+                            "content": "{\"allow\": false, \"confidence\": 0.91, \"reason\": \"denied SECRET_TOKEN_12345\"}"
+                        }
+                    }]
+                })
+                .to_string(),
+            ),
+        ])
+        .await;
+
+        let req: ApprovalRequest = serde_json::from_value(json!({
+            "kind": "confirm",
+            "title": "Redeploy",
+            "text": "staging",
+            "host": "local",
+            "thread_id": "t-1"
+        }))
+        .unwrap();
+        let mandate = MandateContext {
+            active_autonomous_run: true,
+            owner_granted: true,
+            thread_id: Some("t-1".into()),
+            ..Default::default()
+        };
+
+        let or_judge = HttpPolicyJudge::new(
+            Some(PROVIDER_OPENROUTER.into()),
+            Some("~typesafe/jev-latest".into()),
+            "test-key".into(),
+        )
+        .unwrap()
+        .with_base_url(base.clone());
+
+        let err = or_judge.evaluate(&req, &mandate).await.unwrap_err();
+        assert_eq!(err.to_string(), "judge_http_status_500");
+        assert!(!err.to_string().contains("SECRET_TOKEN_12345"));
+
+        let ok = or_judge.evaluate(&req, &mandate).await.unwrap();
+        assert!(ok.allow);
+        assert_eq!(ok.reason, "judge_approved");
+        assert!(!ok.reason.contains("SECRET_TOKEN_12345"));
+
+        let vercel_judge = HttpPolicyJudge::new(
+            Some(PROVIDER_VERCEL.into()),
+            Some("openai/gpt-4o-mini".into()),
+            "test-key".into(),
+        )
+        .unwrap()
+        .with_base_url(base);
+        let fallback = vercel_judge.evaluate(&req, &mandate).await.unwrap();
+        assert!(!fallback.allow);
+        assert_eq!(fallback.reason, "judge_denied");
+        assert!(!fallback.reason.contains("SECRET_TOKEN_12345"));
+
+        let paths = server.await.unwrap();
+        assert!(paths[2].contains("/v1/decisions"));
+        assert!(paths[3].contains("/v1/chat/completions"));
     }
 }

@@ -24,10 +24,11 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use crate::audit::{AuditRecord, AuditSource, append_record, unix_timestamp_secs};
-use crate::config::ApproverConfig;
-use crate::judge::{PolicyJudge, is_auto_approved};
+use crate::config::{ApproverConfig, MAX_APPROVAL_TIMEOUT_SECS, MIN_APPROVAL_TIMEOUT_SECS};
+use crate::judge::{JudgeError, PolicyJudge, is_auto_approved};
 use crate::perimeter::{
-    ApprovalRequest, MandateContext, PerimeterVerdict, check_perimeter_with_extra, hex_lower,
+    ApprovalRequest, MandateContext, PerimeterVerdict, check_perimeter_with_config, hex_lower,
+    is_local_host,
 };
 use crate::telegram::{
     FINALIZE_APPROVED, FINALIZE_DENIED, FINALIZE_TIMEOUT, PendingDecisions, TelegramDecision,
@@ -36,8 +37,13 @@ use crate::telegram::{
 
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const CARD_EDIT_RETRY_DELAY: Duration = Duration::from_millis(600);
 const CANCEL_CLIENT_DISCONNECTED: &str = "— отменено (клиент отключился)";
 const CANCEL_BROKER_SHUTDOWN: &str = "— отменено (брокер остановлен)";
+
+/// Per-request mandate lookup used both at request intake and immediately before
+/// emitting a Policy Judge auto-approval.
+pub type MandateResolver = Arc<dyn Fn(&ApprovalRequest) -> Option<MandateContext> + Send + Sync>;
 
 /// Opaque broker outcome. Deliberately omits whether PolicyJudge or Telegram
 /// approved, so wire serialization cannot leak the approval source.
@@ -81,6 +87,7 @@ impl Default for BrokerTimings {
 pub struct BrokerContext<'a> {
     pub config: &'a ApproverConfig,
     pub mandate: Option<&'a MandateContext>,
+    pub mandate_resolver: Option<&'a MandateResolver>,
     pub pending: &'a PendingDecisions,
     pub audit_path: Option<&'a Path>,
     pub timings: BrokerTimings,
@@ -160,18 +167,66 @@ fn resolve_timeout(
     timings: BrokerTimings,
 ) -> (Duration, u64) {
     if let Some(ov) = timings.timeout_override {
-        return (ov, ov.as_secs().max(1));
+        let capped = ov.min(Duration::from_secs(MAX_APPROVAL_TIMEOUT_SECS));
+        return (capped, capped.as_secs().max(MIN_APPROVAL_TIMEOUT_SECS));
     }
     let secs = if autonomous {
+        let cap = config
+            .autonomous_timeout_secs
+            .clamp(MIN_APPROVAL_TIMEOUT_SECS, MAX_APPROVAL_TIMEOUT_SECS);
         req.timeout_secs
-            .map(|t| t.clamp(1, config.autonomous_timeout_secs))
-            .unwrap_or(config.autonomous_timeout_secs)
+            .map(|t| t.clamp(MIN_APPROVAL_TIMEOUT_SECS, cap))
+            .unwrap_or(cap)
     } else {
+        let default_secs = config
+            .interactive_timeout_secs
+            .clamp(MIN_APPROVAL_TIMEOUT_SECS, MAX_APPROVAL_TIMEOUT_SECS);
         req.timeout_secs
-            .map(|t| t.clamp(1, 1800))
-            .unwrap_or(config.interactive_timeout_secs)
+            .map(|t| t.clamp(MIN_APPROVAL_TIMEOUT_SECS, 1800.min(MAX_APPROVAL_TIMEOUT_SECS)))
+            .unwrap_or(default_secs)
     };
     (Duration::from_secs(secs), secs)
+}
+
+fn resolve_active_mandate(
+    req: &ApprovalRequest,
+    raw: Option<MandateContext>,
+) -> Option<MandateContext> {
+    let m = raw?;
+    if !m.active_autonomous_run || !m.owner_granted {
+        return None;
+    }
+    let m_tid = m.thread_id.as_deref().filter(|id| !id.trim().is_empty())?;
+    (req.thread_id.as_deref() == Some(m_tid)).then_some(m)
+}
+
+fn same_mandate_scope(a: &MandateContext, b: &MandateContext) -> bool {
+    a.thread_id == b.thread_id
+        && a.allow_arbitrary_root_scripts == b.allow_arbitrary_root_scripts
+        && a.project == b.project
+        && a.allowed_hosts == b.allowed_hosts
+        && a.allowed_apps == b.allowed_apps
+        && a.allow_releases == b.allow_releases
+        && a.notes == b.notes
+}
+
+fn host_authenticated_for_judge(req: &ApprovalRequest) -> bool {
+    let host = req.effective_host();
+    is_local_host(host)
+        || req
+            .trusted_peer_host
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|peer| !peer.is_empty() && peer.eq_ignore_ascii_case(host))
+}
+
+fn judge_error_code(err: &anyhow::Error) -> String {
+    match err.downcast_ref::<JudgeError>() {
+        Some(JudgeError::HttpStatus { status, .. }) => format!("judge_http_status_{status}"),
+        Some(JudgeError::Parse) => "judge_error_parse".to_string(),
+        Some(JudgeError::Network) => "judge_error_network".to_string(),
+        None => "judge_error_http".to_string(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -254,8 +309,12 @@ where
         id: request_id.clone(),
         elapsed_secs: 0,
     });
-    let step = ctx.timings.keepalive_interval.max(Duration::from_millis(5));
-    let mut keepalive = tokio::time::interval_at(started + step, step);
+    let step = ctx
+        .timings
+        .keepalive_interval
+        .clamp(Duration::from_millis(5), Duration::from_secs(MAX_APPROVAL_TIMEOUT_SECS));
+    let first_tick = started.checked_add(step).unwrap_or(started);
+    let mut keepalive = tokio::time::interval_at(first_tick, step);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tokio::pin!(evaluation);
     loop {
@@ -294,20 +353,27 @@ where
     T: TelegramTransport + 'static,
     F: Future<Output = ()> + Send,
 {
-    let mandate = ctx.mandate.filter(|m| {
-        m.thread_id
-            .as_ref()
-            .is_none_or(|id| !id.trim().is_empty() && req.thread_id.as_ref() == Some(id))
-    });
-    let autonomous = mandate.is_some_and(|m| m.active_autonomous_run);
-    let perimeter = check_perimeter_with_extra(req, mandate, &ctx.config.extra_hard_deny_patterns);
-    let complete = |outcome, source, label, (allow, confidence, reason)| {
+    let resolve_current = || {
+        let raw = match ctx.mandate_resolver {
+            Some(resolver) => resolver(req),
+            None => ctx.mandate.cloned(),
+        };
+        resolve_active_mandate(req, raw)
+    };
+    let mut mandate = resolve_current();
+    let mut autonomous = mandate.is_some();
+    let mut perimeter = check_perimeter_with_config(req, mandate.as_ref(), ctx.config);
+    let complete = |outcome,
+                    source,
+                    label,
+                    perimeter: &PerimeterVerdict,
+                    (allow, confidence, reason)| {
         let elapsed_ms = started.elapsed().as_millis() as u64;
         record_audit(
             ctx.audit_path,
             request_id,
             req,
-            &perimeter,
+            perimeter,
             allow,
             confidence,
             reason,
@@ -323,50 +389,106 @@ where
     };
 
     tokio::pin!(client_disconnected);
-    let mut judge_fields = (None, None, None);
-    if let Some(mandate) =
-        mandate.filter(|m| autonomous && m.owner_granted && !perimeter.is_hard_deny())
+    let mut judge_fields: (Option<bool>, Option<f64>, Option<String>) = (None, None, None);
+    if let Some(initial_mandate) = mandate
+        .as_ref()
+        .filter(|_| autonomous && !perimeter.is_hard_deny() && host_authenticated_for_judge(req))
+        .cloned()
     {
         let result = tokio::select! {
             biased;
             _ = &mut client_disconnected => return complete(
-                BrokerOutcome::ClientCancelled, AuditSource::ClientCancelled, "client_cancelled", judge_fields,
+                BrokerOutcome::ClientCancelled,
+                AuditSource::ClientCancelled,
+                "client_cancelled",
+                &perimeter,
+                judge_fields,
             ),
-            result = judge.evaluate(req, mandate) => result,
+            result = judge.evaluate(req, &initial_mandate) => result,
         };
         match result {
             Ok(verdict) => {
                 let approved = is_auto_approved(&verdict, ctx.config.judge_confidence_threshold);
-                judge_fields = (
-                    Some(verdict.allow),
-                    verdict.confidence.is_finite().then_some(verdict.confidence),
-                    Some(verdict.reason),
-                );
+                let confidence = verdict.confidence.is_finite().then_some(verdict.confidence);
                 if approved {
                     if disconnect_ready(client_disconnected.as_mut()).await {
+                        judge_fields = (
+                            Some(verdict.allow),
+                            confidence,
+                            Some("judge_approved".to_string()),
+                        );
                         return complete(
                             BrokerOutcome::ClientCancelled,
                             AuditSource::ClientCancelled,
                             "client_cancelled",
+                            &perimeter,
                             judge_fields,
                         );
                     }
-                    return complete(
-                        BrokerOutcome::Approved { secret_value: None },
-                        AuditSource::PolicyJudge,
-                        "approved",
-                        judge_fields,
+                    // Re-resolve and revalidate grant + scope immediately before auto-approving.
+                    let current = resolve_current();
+                    let still_valid = current
+                        .as_ref()
+                        .is_some_and(|cur| same_mandate_scope(&initial_mandate, cur));
+                    if still_valid {
+                        judge_fields = (
+                            Some(verdict.allow),
+                            confidence,
+                            Some("judge_approved".to_string()),
+                        );
+                        return complete(
+                            BrokerOutcome::Approved { secret_value: None },
+                            AuditSource::PolicyJudge,
+                            "approved",
+                            &perimeter,
+                            judge_fields,
+                        );
+                    }
+                    mandate = current;
+                    autonomous = mandate.is_some();
+                    perimeter = check_perimeter_with_config(req, mandate.as_ref(), ctx.config);
+                    judge_fields = (
+                        Some(verdict.allow),
+                        confidence,
+                        Some("judge_mandate_changed".to_string()),
                     );
+                } else {
+                    let reason_code = if verdict.allow {
+                        "judge_low_confidence"
+                    } else if verdict.reason == "judge_unconfigured"
+                        || verdict.reason == "policy judge API key not configured"
+                    {
+                        "judge_unconfigured"
+                    } else {
+                        "judge_denied"
+                    };
+                    judge_fields = (
+                        Some(verdict.allow),
+                        confidence,
+                        Some(reason_code.to_string()),
+                    );
+                    if ctx.mandate_resolver.is_some() {
+                        mandate = resolve_current();
+                        autonomous = mandate.is_some();
+                        perimeter = check_perimeter_with_config(req, mandate.as_ref(), ctx.config);
+                    }
                 }
             }
             Err(err) => {
-                judge_fields = (Some(false), Some(0.0), Some(format!("judge_error: {err}")))
+                judge_fields = (Some(false), Some(0.0), Some(judge_error_code(&err)));
+                if ctx.mandate_resolver.is_some() {
+                    mandate = resolve_current();
+                    autonomous = mandate.is_some();
+                    perimeter = check_perimeter_with_config(req, mandate.as_ref(), ctx.config);
+                }
             }
         }
     }
 
     let (timeout, display_secs) = resolve_timeout(req, ctx.config, autonomous, ctx.timings);
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
     let mut rx =
         ctx.pending
             .register_until(request_id.into(), req.kind == "secret", Some(deadline));
@@ -448,6 +570,7 @@ where
             };
             if let Err(err) = edit().await {
                 let result = if retryable_edit_error(&err) {
+                    tokio::time::sleep(CARD_EDIT_RETRY_DELAY).await;
                     edit().await
                 } else {
                     Err(err)
@@ -465,7 +588,7 @@ where
         BrokerOutcome::NeedsOwner => (AuditSource::Timeout, "needs_owner"),
         BrokerOutcome::ClientCancelled => (AuditSource::ClientCancelled, "client_cancelled"),
     };
-    complete(outcome, source, label, judge_fields)
+    complete(outcome, source, label, &perimeter, judge_fields)
 }
 
 /// Returns `true` when the peer has fully closed the Unix stream (`POLLHUP`/`POLLERR`),
@@ -519,7 +642,7 @@ pub struct UnixBrokerServer<J, T> {
     listener: UnixListener,
     socket_path: PathBuf,
     config: ApproverConfig,
-    mandate: Arc<RwLock<Option<MandateContext>>>,
+    mandate_resolver: MandateResolver,
     judge: Arc<J>,
     telegram: Arc<T>,
     pending: Arc<PendingDecisions>,
@@ -537,6 +660,33 @@ where
         socket_path: PathBuf,
         config: ApproverConfig,
         mandate: Arc<RwLock<Option<MandateContext>>>,
+        judge: Arc<J>,
+        telegram: Arc<T>,
+        pending: Arc<PendingDecisions>,
+        audit_path: Option<PathBuf>,
+    ) -> Result<Self> {
+        let resolver: MandateResolver = Arc::new(move |_req| {
+            mandate
+                .read()
+                .expect("mandate rwlock poisoned")
+                .clone()
+        });
+        Self::bind_with_resolver(
+            socket_path,
+            config,
+            resolver,
+            judge,
+            telegram,
+            pending,
+            audit_path,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_with_resolver(
+        socket_path: PathBuf,
+        config: ApproverConfig,
+        mandate_resolver: MandateResolver,
         judge: Arc<J>,
         telegram: Arc<T>,
         pending: Arc<PendingDecisions>,
@@ -594,7 +744,7 @@ where
             listener,
             socket_path,
             config,
-            mandate,
+            mandate_resolver,
             judge,
             telegram,
             pending,
@@ -630,7 +780,7 @@ where
                         }
                     };
                     let config = Arc::clone(&config);
-                    let mandate = Arc::clone(&self.mandate);
+                    let mandate_resolver = Arc::clone(&self.mandate_resolver);
                     let judge = Arc::clone(&self.judge);
                     let telegram = Arc::clone(&self.telegram);
                     let pending = Arc::clone(&self.pending);
@@ -639,7 +789,7 @@ where
                         handle_connection(
                             stream,
                             config,
-                            mandate,
+                            mandate_resolver,
                             judge,
                             telegram,
                             pending,
@@ -668,7 +818,7 @@ async fn write_line(writer: &mut tokio::net::unix::OwnedWriteHalf, line: &str) -
 async fn handle_connection<J, T>(
     stream: UnixStream,
     config: Arc<ApproverConfig>,
-    mandate: Arc<RwLock<Option<MandateContext>>>,
+    mandate_resolver: MandateResolver,
     judge: Arc<J>,
     telegram: Arc<T>,
     pending: Arc<PendingDecisions>,
@@ -764,10 +914,10 @@ async fn handle_connection<J, T>(
         }
     };
 
-    let mandate_snapshot = mandate.read().expect("mandate rwlock poisoned").clone();
     let ctx = BrokerContext {
         config: &config,
-        mandate: mandate_snapshot.as_ref(),
+        mandate: None,
+        mandate_resolver: Some(&mandate_resolver),
         pending: &pending,
         audit_path: audit_path.as_deref(),
         timings,
@@ -823,5 +973,54 @@ mod tests {
         assert!(!disconnect_ready(disconnect.as_mut()).await);
         drop(client);
         assert!(disconnect_ready(disconnect.as_mut()).await);
+    }
+
+    #[test]
+    fn resolve_timeout_clamps_extreme_values_and_never_panics() {
+        let mut req: ApprovalRequest = serde_json::from_value(json!({
+            "kind": "confirm",
+            "title": "Test",
+            "text": "body"
+        }))
+        .unwrap();
+
+        let zero_cfg = ApproverConfig {
+            autonomous_timeout_secs: 0,
+            interactive_timeout_secs: 0,
+            ..Default::default()
+        };
+        let huge_cfg = ApproverConfig {
+            autonomous_timeout_secs: u64::MAX,
+            interactive_timeout_secs: u64::MAX,
+            ..Default::default()
+        };
+
+        for req_timeout in [None, Some(0), Some(60), Some(u64::MAX)] {
+            req.timeout_secs = req_timeout;
+            for cfg in [&zero_cfg, &huge_cfg] {
+                for autonomous in [true, false] {
+                    let (dur, secs) = resolve_timeout(&req, cfg, autonomous, BrokerTimings::default());
+                    assert!(
+                        (MIN_APPROVAL_TIMEOUT_SECS..=MAX_APPROVAL_TIMEOUT_SECS).contains(&secs),
+                        "secs={secs} out of bounds for req={req_timeout:?}, autonomous={autonomous}"
+                    );
+                    assert_eq!(dur, Duration::from_secs(secs));
+                    assert!(Instant::now().checked_add(dur).is_some());
+                }
+            }
+        }
+
+        let (capped, secs) = resolve_timeout(
+            &req,
+            &huge_cfg,
+            false,
+            BrokerTimings {
+                timeout_override: Some(Duration::MAX),
+                ..Default::default()
+            },
+        );
+        assert_eq!(secs, MAX_APPROVAL_TIMEOUT_SECS);
+        assert_eq!(capped, Duration::from_secs(MAX_APPROVAL_TIMEOUT_SECS));
+        assert!(Instant::now().checked_add(capped).is_some());
     }
 }

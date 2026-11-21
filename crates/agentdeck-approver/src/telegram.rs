@@ -19,6 +19,8 @@ pub const FINALIZE_APPROVED: &str = "— разрешено ✅";
 pub const FINALIZE_DENIED: &str = "— отказано ❌";
 pub const FINALIZE_TIMEOUT: &str = "— время вышло ⌛";
 const INLINE_PAYLOAD_MAX: usize = 3000;
+const INLINE_CARD_MAX_UTF16: usize = 3800;
+const ATTACHED_REASON_MAX_CHARS: usize = 2000;
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 const TELEGRAM_CALL_TIMEOUT: Duration = Duration::from_secs(15);
 const TELEGRAM_POLL_TIMEOUT_SECS: u64 = 50;
@@ -220,14 +222,29 @@ fn format_request_card(
     }
     text.push_str(&format!(" ({timeout_secs}s)"));
 
-    let summary = if !req.reason.is_empty() {
-        req.reason.as_str()
-    } else {
-        req.title.as_deref().unwrap_or("")
+    let title = req.title.as_deref().filter(|s| !s.is_empty());
+    let reason = (!req.reason.is_empty()).then_some(req.reason.as_str());
+    let push_summary_line = |buf: &mut String, value: &str, cap: bool| {
+        buf.push('\n');
+        if cap && value.chars().nth(ATTACHED_REASON_MAX_CHARS).is_some() {
+            let truncated: String = value.chars().take(ATTACHED_REASON_MAX_CHARS).collect();
+            buf.push_str(&escape_html(&truncated));
+            buf.push('…');
+        } else {
+            buf.push_str(&escape_html(value));
+        }
     };
-    if !summary.is_empty() {
-        text.push('\n');
-        text.push_str(&escape_html(summary));
+    if matches!(req.kind.as_str(), "confirm" | "secret") {
+        if let Some(t) = title {
+            push_summary_line(&mut text, t, attached);
+        }
+        if let Some(r) = reason
+            && title != Some(r)
+        {
+            push_summary_line(&mut text, r, attached);
+        }
+    } else if let Some(summary) = reason.or(title) {
+        push_summary_line(&mut text, summary, attached);
     }
 
     if attached {
@@ -607,20 +624,25 @@ impl TelegramTransport for BotApiTelegram {
         timeout_secs: u64,
     ) -> Result<i64> {
         let payload = req.canonical_payload();
-        let document_id = if payload.chars().nth(INLINE_PAYLOAD_MAX).is_some() {
+        let inline_card = format_request_card(req, hard_deny, timeout_secs, false);
+        let needs_attachment = payload.chars().nth(INLINE_PAYLOAD_MAX).is_some()
+            || inline_card.encode_utf16().count() > INLINE_CARD_MAX_UTF16;
+        let (document_id, text) = if needs_attachment {
             let filename = if matches!(req.kind.as_str(), "root" | "approve") {
                 "script.sh"
             } else {
                 "request.txt"
             };
-            Some(
-                self.send_document(&payload, filename, &req.payload_sha256())
-                    .await?,
+            let doc_id = self
+                .send_document(&payload, filename, &req.payload_sha256())
+                .await?;
+            (
+                Some(doc_id),
+                format_request_card(req, hard_deny, timeout_secs, true),
             )
         } else {
-            None
+            (None, inline_card)
         };
-        let text = format_request_card(req, hard_deny, timeout_secs, document_id.is_some());
         let inline_keyboard = if req.kind == "secret" {
             json!([[{ "text": "Отказать", "callback_data": format!("deny:{id}") }]])
         } else {
@@ -840,11 +862,71 @@ mod tests {
             thread_id: None,
             timeout_secs: None,
             nonce: None,
+            trusted_peer_host: None,
         };
         let normal = format_request_message(&req, None, 120);
         assert!(!normal.contains(HARD_DENY_PREFIX));
 
         let denied = format_request_message(&req, Some("secret_exfiltration"), 120);
         assert!(denied.starts_with(HARD_DENY_PREFIX));
+    }
+
+    #[test]
+    fn confirm_and_secret_cards_always_show_title_even_when_reason_is_present() {
+        for kind in ["confirm", "secret"] {
+            let req: ApprovalRequest = serde_json::from_value(json!({
+                "kind": kind,
+                "title": "Hashed Action Title",
+                "reason": "Background explanation",
+                "text": "body payload",
+                "host": "local",
+            }))
+            .unwrap();
+            let card = format_request_message(&req, None, 120);
+            assert!(
+                card.contains("Hashed Action Title"),
+                "{kind} card must include title: {card}"
+            );
+            assert!(
+                card.contains("Background explanation"),
+                "{kind} card must include distinct reason: {card}"
+            );
+        }
+
+        // Identical title and reason should not duplicate the line.
+        let dup: ApprovalRequest = serde_json::from_value(json!({
+            "kind": "confirm",
+            "title": "Same summary",
+            "reason": "Same summary",
+            "text": "body",
+        }))
+        .unwrap();
+        let card = format_request_message(&dup, None, 120);
+        assert_eq!(card.matches("Same summary").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn long_reason_plus_medium_script_triggers_send_document_attachment() {
+        let (bot, api) = mock_api(vec![
+            ("200 OK", json!({"ok": true, "result": {"message_id": 61}})),
+            ("200 OK", json!({"ok": true, "result": {"message_id": 62}})),
+        ])
+        .await;
+        let reason = "r".repeat(2000);
+        let script = "s".repeat(2500);
+        let req: ApprovalRequest = serde_json::from_value(json!({
+            "kind": "root",
+            "reason": reason,
+            "script": script,
+        }))
+        .unwrap();
+        assert_eq!(bot.send_request("req-2", &req, None, 90).await.unwrap(), 62);
+        let requests = api.await.unwrap();
+        assert!(requests[0].0.contains("/sendDocument "));
+        assert!(requests[0].1.contains(&format!("\r\n\r\n{script}\r\n--")));
+        assert!(requests[1].0.contains("/sendMessage "));
+        let card: Value = serde_json::from_str(&requests[1].1).unwrap();
+        assert_eq!(card["reply_parameters"]["message_id"], 61);
+        assert!(card["text"].as_str().unwrap().encode_utf16().count() < 4096);
     }
 }
