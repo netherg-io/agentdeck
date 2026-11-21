@@ -4,7 +4,8 @@
 //! across provider switches, handoffs and compaction; a fork without state of
 //! its own reads its parent's, and its first write copies that state over.
 
-use std::fs;
+use std::collections::BTreeSet;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -127,6 +128,10 @@ pub struct RunMandate {
     pub notes: String,
     #[serde(default)]
     pub granted_at: String,
+    /// Set only by the owner's explicit Intake grant; never inherited by a fork
+    /// and never settable as a trusted grant through ordinary state writes.
+    #[serde(default)]
+    pub owner_granted: bool,
 }
 
 impl Default for RunMandate {
@@ -140,6 +145,7 @@ impl Default for RunMandate {
             review_rounds_max: default_review_rounds_max(),
             notes: String::new(),
             granted_at: String::new(),
+            owner_granted: false,
         }
     }
 }
@@ -218,16 +224,52 @@ impl ThreadState {
             || (self.state.trim().is_empty() && !self.checklist.is_empty())
     }
 
+    /// Checkpoint gate: the snapshot must be fresh and non-empty. An empty
+    /// snapshot is refused even with an empty checklist.
+    pub fn can_checkpoint(&self) -> anyhow::Result<()> {
+        if self.state.trim().is_empty() {
+            anyhow::bail!("cannot record a checkpoint on an empty snapshot: write `state` first");
+        }
+        if self.state_stale() {
+            anyhow::bail!(
+                "state is stale (5+ checklist updates since the last state write): \
+                 rewrite `state` first, then record the checkpoint"
+            );
+        }
+        Ok(())
+    }
+
+    /// A fork never inherits an active Run Mandate: without an explicit owner
+    /// grant it starts at Intake with no privileged mandate.
+    fn strip_inherited_mandate(&mut self) {
+        if let Some(m) = self.mandate.as_mut() {
+            m.owner_granted = false;
+        }
+        self.phase = RunPhase::Intake;
+    }
+
     /// Parked Owner Inbox items still waiting on the owner.
     pub fn open_inbox_count(&self) -> usize {
         self.owner_inbox.iter().filter(|i| !i.resolved).count()
     }
 
-    /// True if any checklist item still needs work (not done/held/blocked).
+    /// True if any checklist item still needs work (not done/held/blocked),
+    /// excluding items parked in an unresolved Owner Inbox entry (matched by
+    /// item id, exact title or any link).
     pub fn has_unblocked_work(&self) -> bool {
-        self.checklist
+        let parked: BTreeSet<&str> = self
+            .owner_inbox
             .iter()
-            .any(|i| matches!(i.status.as_str(), "todo" | "running" | "review"))
+            .filter(|i| !i.resolved)
+            .flat_map(|i| i.blocked_items.iter().map(String::as_str))
+            .filter(|s| !s.is_empty())
+            .collect();
+        self.checklist.iter().any(|i| {
+            matches!(i.status.as_str(), "todo" | "running" | "review")
+                && !parked.contains(i.id.as_str())
+                && !parked.contains(i.title.as_str())
+                && !i.links.iter().any(|l| parked.contains(l.as_str()))
+        })
     }
 }
 
@@ -292,7 +334,10 @@ pub fn thread_title(t3_root: Option<&Path>, id: &str) -> Option<String> {
 pub fn read(paths: &Paths, t3_root: Option<&Path>, id: &str) -> anyhow::Result<Option<Found>> {
     let mut cur = id.to_string();
     for depth in 0..=MAX_FORK_DEPTH {
-        if let Some(data) = load(paths, &cur)? {
+        if let Some(mut data) = load(paths, &cur)? {
+            if depth > 0 {
+                data.strip_inherited_mandate();
+            }
             return Ok(Some(Found {
                 thread: id.to_string(),
                 inherited_from: (depth > 0).then_some(cur),
@@ -319,29 +364,7 @@ pub fn write(
     if state.is_none() && decision.is_none() {
         anyhow::bail!("pass state, decision or both");
     }
-    if state.is_some_and(|s| s.len() > MAX_STATE) {
-        anyhow::bail!(
-            "state over {MAX_STATE} bytes: keep it a summary that cites issues and files"
-        );
-    }
-    if decision.is_some_and(|d| d.len() > MAX_DECISION) {
-        anyhow::bail!("decision over {MAX_DECISION} bytes");
-    }
-    mutate(paths, t3_root, id, |data, now| {
-        if let Some(s) = state {
-            data.state = s.to_string();
-            // Fresh snapshot: it reflects all checklist movement so far.
-            data.state_updated_at = now.to_string();
-            data.checklist_updates_since_state = 0;
-        }
-        if let Some(d) = decision {
-            data.decisions.push(Decision {
-                at: now.to_string(),
-                text: d.to_string(),
-            });
-        }
-        Ok(())
-    })
+    apply_update(paths, t3_root, id, state, decision, None, None, None, false)
 }
 
 /// One status change of a checklist item.
@@ -528,9 +551,9 @@ pub fn update_checklist(
 }
 
 /// Set run metadata (phase, mandate, sleep deadline) and optionally record a
-/// Checkpoint. When `record_checkpoint` is true the snapshot must be fresh:
-/// refused while `state_stale()`. `sleep_until`: None leaves the deadline
-/// unchanged, Some(None) clears it, Some(Some(t)) sets it.
+/// Checkpoint. When `record_checkpoint` is true the resulting snapshot must
+/// be fresh and non-empty (see `can_checkpoint`). `sleep_until`: None leaves
+/// the deadline unchanged, Some(None) clears it, Some(Some(t)) sets it.
 pub fn set_run_meta(
     paths: &Paths,
     t3_root: Option<&Path>,
@@ -540,17 +563,62 @@ pub fn set_run_meta(
     sleep_until: Option<Option<String>>,
     record_checkpoint: bool,
 ) -> anyhow::Result<ThreadState> {
-    if record_checkpoint
-        && read(paths, t3_root, id)?
-            .map(|f| f.data.state_stale())
-            .unwrap_or(false)
-    {
+    apply_update(
+        paths,
+        t3_root,
+        id,
+        None,
+        None,
+        phase,
+        mandate,
+        sleep_until,
+        record_checkpoint,
+    )
+}
+
+/// One atomic transaction for every state change: validates sizes, the RFC3339
+/// `sleep_until` deadline and checkpoint freshness under the per-thread lock,
+/// then mutates and saves once. `write` and `set_run_meta` delegate here so
+/// all writers share one locked path.
+// Arity is the union of the two delegating APIs; bundling would churn U5's call sites.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_update(
+    paths: &Paths,
+    t3_root: Option<&Path>,
+    id: &str,
+    state: Option<&str>,
+    decision: Option<&str>,
+    phase: Option<RunPhase>,
+    mandate: Option<RunMandate>,
+    sleep_until: Option<Option<String>>,
+    record_checkpoint: bool,
+) -> anyhow::Result<ThreadState> {
+    if state.is_some_and(|s| s.len() > MAX_STATE) {
         anyhow::bail!(
-            "state is stale (5+ checklist updates since the last state write): \
-             rewrite `state` first, then record the checkpoint"
+            "state over {MAX_STATE} bytes: keep it a summary that cites issues and files"
         );
     }
+    if decision.is_some_and(|d| d.len() > MAX_DECISION) {
+        anyhow::bail!("decision over {MAX_DECISION} bytes");
+    }
+    if let Some(Some(s)) = sleep_until.as_ref()
+        && !valid_sleep_until(s)
+    {
+        anyhow::bail!("sleep_until {s:?} is not RFC3339 (YYYY-MM-DDTHH:MM:SSZ)");
+    }
     mutate(paths, t3_root, id, |data, now| {
+        if let Some(s) = state {
+            data.state = s.to_string();
+            // Fresh snapshot: it reflects all checklist movement so far.
+            data.state_updated_at = now.to_string();
+            data.checklist_updates_since_state = 0;
+        }
+        if let Some(d) = decision {
+            data.decisions.push(Decision {
+                at: now.to_string(),
+                text: d.to_string(),
+            });
+        }
         if let Some(p) = phase {
             data.phase = p;
         }
@@ -561,11 +629,82 @@ pub fn set_run_meta(
             data.sleep_until = s;
         }
         if record_checkpoint {
+            // After the fresh snapshot above, so one call can write state and
+            // record its checkpoint together.
+            data.can_checkpoint()?;
             data.checkpoint_count = data.checkpoint_count.saturating_add(1);
             data.last_checkpoint_at = now.to_string();
         }
         Ok(())
     })
+}
+
+/// Checked RFC3339 deadline (`YYYY-MM-DDTHH:MM:SS[.frac]` with `Z` or a
+/// numeric `±HH:MM` zone); rejects the malformed timestamps that can crash
+/// quota processing. No date crate in scope, so fields are range-checked here.
+fn valid_sleep_until(s: &str) -> bool {
+    let b = s.as_bytes();
+    let dt = if matches!(b.last(), Some(b'Z' | b'z')) {
+        &b[..b.len() - 1]
+    } else {
+        if b.len() < 25 {
+            return false;
+        }
+        let z = &b[b.len() - 6..];
+        if !matches!(z[0], b'+' | b'-') || z[3] != b':' {
+            return false;
+        }
+        let (Some(zh), Some(zm)) = (num(&z[1..3]), num(&z[4..6])) else {
+            return false;
+        };
+        if zh > 23 || zm > 59 {
+            return false;
+        }
+        &b[..b.len() - 6]
+    };
+    if dt.len() < 19 {
+        return false;
+    }
+    if dt[4] != b'-' || dt[7] != b'-' || !matches!(dt[10], b'T' | b't') {
+        return false;
+    }
+    if dt[13] != b':' || dt[16] != b':' {
+        return false;
+    }
+    if !dt[19..].is_empty()
+        && !(dt.len() > 20 && dt[19] == b'.' && dt[20..].iter().all(|c| c.is_ascii_digit()))
+    {
+        return false;
+    }
+    let (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(se)) = (
+        num(&dt[0..4]),
+        num(&dt[5..7]),
+        num(&dt[8..10]),
+        num(&dt[11..13]),
+        num(&dt[14..16]),
+        num(&dt[17..19]),
+    ) else {
+        return false;
+    };
+    if mo == 0 || mo > 12 || h > 23 || mi > 59 || se > 59 {
+        return false;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let dim = match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if leap { 29 } else { 28 }
+        }
+    };
+    d >= 1 && d <= dim
+}
+
+fn num(b: &[u8]) -> Option<u32> {
+    if b.is_empty() || !b.iter().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    std::str::from_utf8(b).ok()?.parse().ok()
 }
 
 fn next_id(prefix: &str, used: &[String]) -> String {
@@ -674,7 +813,9 @@ pub fn assumption_add(
 }
 
 /// Load this thread's state (or seed it from a forked-from ancestor), apply
-/// `f`, stamp it and save atomically.
+/// `f`, stamp it and save atomically. Serialized by an exclusive flock on
+/// `<thread_id>.lock` (same pattern as `backlog::locked`), so concurrent
+/// writers never lose decisions, Inbox entries or checklist updates.
 fn mutate(
     paths: &Paths,
     t3_root: Option<&Path>,
@@ -682,10 +823,25 @@ fn mutate(
     f: impl FnOnce(&mut ThreadState, &str) -> anyhow::Result<()>,
 ) -> anyhow::Result<ThreadState> {
     let path = file(paths, id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _guard = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("lock"))?;
+    _guard.lock()?;
     let mut data = match load(paths, id)? {
         Some(d) => d,
         None => read(paths, t3_root, id)?
-            .map(|f| f.data)
+            .map(|f| {
+                let mut d = f.data;
+                if f.inherited_from.is_some() {
+                    d.strip_inherited_mandate();
+                }
+                d
+            })
             .unwrap_or_default(),
     };
     let now = utc_now();
@@ -1107,6 +1263,147 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.phase, RunPhase::SleepingForQuota);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fork_strips_owner_mandate() {
+        let (dir, paths) = fx("strip");
+        let t3 = t3_with_fork(&dir, "child", "parent");
+        set_run_meta(
+            &paths,
+            None,
+            "parent",
+            Some(RunPhase::Running),
+            Some(RunMandate {
+                project: "blockfield".into(),
+                owner_granted: true,
+                ..RunMandate::default()
+            }),
+            None,
+            false,
+        )
+        .unwrap();
+        let f = read(&paths, Some(&t3), "child").unwrap().unwrap();
+        assert_eq!(f.inherited_from.as_deref(), Some("parent"));
+        assert_eq!(f.data.phase, RunPhase::Intake);
+        assert!(!f.data.mandate.as_ref().unwrap().owner_granted);
+        // First write on the fork persists the stripped mandate.
+        let s = write(&paths, Some(&t3), "child", None, Some("owner: ok")).unwrap();
+        assert_eq!(s.phase, RunPhase::Intake);
+        assert!(!s.mandate.as_ref().unwrap().owner_granted);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unblocked_work_excludes_parked_inbox_items() {
+        let (dir, paths) = fx("parked");
+        let p = |id: &str, title: &str| ItemPatch {
+            id: id.into(),
+            title: Some(title.into()),
+            links: Some(vec![format!("repo#{id}")]),
+            ..ItemPatch::default()
+        };
+        update_checklist(&paths, None, "t", None, &[p("a", "A")], &[]).unwrap();
+        assert!(load(&paths, "t").unwrap().unwrap().has_unblocked_work());
+        // Park by id; title and link matches count too.
+        inbox_add(
+            &paths,
+            None,
+            "t",
+            NewInboxItem {
+                title: "need owner".into(),
+                blocked_items: vec!["a".into(), "A".into(), "repo#a".into()],
+                ..NewInboxItem::default()
+            },
+        )
+        .unwrap();
+        assert!(!load(&paths, "t").unwrap().unwrap().has_unblocked_work());
+        // A fresh todo item outside the inbox still counts.
+        update_checklist(
+            &paths,
+            None,
+            "t",
+            None,
+            &[ItemPatch {
+                id: "b".into(),
+                title: Some("B".into()),
+                ..ItemPatch::default()
+            }],
+            &[],
+        )
+        .unwrap();
+        assert!(load(&paths, "t").unwrap().unwrap().has_unblocked_work());
+        update_checklist(&paths, None, "t", None, &[], &["b".into()]).unwrap();
+        assert!(!load(&paths, "t").unwrap().unwrap().has_unblocked_work());
+        // Resolving the entry restores eligibility.
+        inbox_resolve(&paths, None, "t", "inbox-1").unwrap();
+        assert!(load(&paths, "t").unwrap().unwrap().has_unblocked_work());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn apply_update_validates_sleep_until_and_empty_checkpoint() {
+        let (dir, paths) = fx("apply");
+        // Empty snapshot: checkpoint refused even with an empty checklist.
+        assert!(set_run_meta(&paths, None, "t", None, None, None, true).is_err());
+        // Malformed deadlines refused at the write boundary.
+        for bad in [
+            "2026-11-22",
+            "2026-11-22 00:00:00",
+            "2026-13-01T00:00:00Z",
+            "2026-11-31T00:00:00Z",
+            "2023-02-29T00:00:00Z",
+            "2026-11-22T24:00:00Z",
+            "2026-11-22T00:00Z",
+            "not-a-date",
+            "",
+        ] {
+            assert!(
+                set_run_meta(&paths, None, "t", None, None, Some(Some(bad.into())), false)
+                    .is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        // Valid deadlines (leap day, frac, offset) accepted; clearing works.
+        for good in [
+            "2026-11-22T00:00:00Z",
+            "2024-02-29T12:30:59z",
+            "2026-11-22T00:00:00.5Z",
+            "2026-11-22T00:00:00+02:00",
+        ] {
+            set_run_meta(
+                &paths,
+                None,
+                "t",
+                None,
+                None,
+                Some(Some(good.into())),
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                load(&paths, "t").unwrap().unwrap().sleep_until.as_deref(),
+                Some(good)
+            );
+        }
+        set_run_meta(&paths, None, "t", None, None, Some(None), false).unwrap();
+        assert!(load(&paths, "t").unwrap().unwrap().sleep_until.is_none());
+        // Fresh state + checkpoint in one atomic call succeeds.
+        let s = apply_update(
+            &paths,
+            None,
+            "t",
+            Some("Goal: x"),
+            None,
+            Some(RunPhase::Running),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(s.checkpoint_count, 1);
+        assert!(!s.last_checkpoint_at.is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 

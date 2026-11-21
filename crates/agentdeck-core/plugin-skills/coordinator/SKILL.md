@@ -138,5 +138,8 @@ Each tool call re-reads the whole context; that was about 83% of a coordinator's
   writes. Everything else goes to a child, however small. Pack checks into one Bash call with capped
   output; never paste whole logs, diffs or `application-one` JSON.
 - `t3_thread_read`: `limit` 10 or less, `maxCharsPerItem` 500 or less, tail only. When the thread is
-  very long or a phase ends, write the state and ask the owner to continue in a fresh thread that
-  passes `thread: <this thread id>` to both state tools.
+  very long or a phase ends, run an autonomous **Checkpoint** on this same thread: rewrite the `state`
+  snapshot, call `coordinator_checkpoint_check`, record the checkpoint via `state_write`
+  (`record_checkpoint: true`, refused while `state_stale`), then resume with a fresh provider context
+  (`freshContext`). Liveness stays with the external **Watchdog**; never schedule ad-hoc manual alarms
+  unless the Watchdog is disabled.

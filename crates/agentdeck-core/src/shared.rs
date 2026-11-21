@@ -478,6 +478,18 @@ fn top_key(line: &str) -> Option<(&str, &str)> {
     line.split_once(':').map(|(k, v)| (k.trim(), v.trim()))
 }
 
+/// Trailing YAML `#` comment outside quotes: `true # why` is boolean true.
+/// A `#` without preceding whitespace is not a comment (`true#x` stays as is).
+fn strip_yaml_comment(v: &str) -> &str {
+    if v.starts_with(['"', '\'']) {
+        return v;
+    }
+    match v.find('#') {
+        Some(i) if i == 0 || v.as_bytes()[i - 1].is_ascii_whitespace() => v[..i].trim_end(),
+        _ => v,
+    }
+}
+
 /// `SKILL.md` rewritten for agy; byte-for-byte unchanged unless its
 /// frontmatter has `disable-model-invocation: true`. Idempotent.
 fn agy_skill_md(bytes: Vec<u8>) -> Vec<u8> {
@@ -495,7 +507,7 @@ fn agy_skill_md(bytes: Vec<u8>) -> Vec<u8> {
         |i: usize, key: &str| top_key(lines[i]).is_some_and(|(k, _)| k.eq_ignore_ascii_case(key));
     let Some(flag) = (1..end).find(|&i| {
         is_key(i, "disable-model-invocation")
-            && top_key(lines[i]).is_some_and(|(_, v)| v.eq_ignore_ascii_case("true"))
+            && top_key(lines[i]).is_some_and(|(_, v)| strip_yaml_comment(v).eq_ignore_ascii_case("true"))
     }) else {
         return bytes;
     };
@@ -1663,6 +1675,14 @@ mod tests {
                 format!("---\nname: a\ndescription: \"{UI}Say \\\"hi\\\".\"\n---\n"),
             ),
             (
+                "---\nname: a\ndescription: Grill a plan.\ndisable-model-invocation: true # agy hides this\n---\nbody\n",
+                format!("---\nname: a\ndescription: {UI}Grill a plan.\n---\nbody\n"),
+            ),
+            (
+                "---\ndisable-model-invocation: TRUE\t# tabbed comment\ndescription: d\n---\n",
+                format!("---\ndescription: {UI}d\n---\n"),
+            ),
+            (
                 "---\ndescription: 'It''s here'\ndisable-model-invocation : true\n---\n",
                 format!("---\ndescription: '{UI}It''s here'\n---\n"),
             ),
@@ -1702,6 +1722,8 @@ mod tests {
             "no frontmatter\ndisable-model-invocation: true\n",
             "---\ndisable-model-invocation: true\n",
             "# body\n---\ndisable-model-invocation: true\n---\n",
+            "---\ndisable-model-invocation: true#not-a-comment\ndescription: d\n---\n",
+            "---\ndisable-model-invocation: \"true # quoted\"\ndescription: d\n---\n",
         ] {
             assert_eq!(
                 agy_skill_md(same.as_bytes().to_vec()),
@@ -1718,7 +1740,7 @@ mod tests {
         let fx = skills_fixture();
         let source = fx.home.join(".general/skills/grill");
         let body =
-            "---\nname: grill\ndescription: Grill.\ndisable-model-invocation: true\n---\n# grill\n";
+            "---\nname: grill\ndescription: Grill.\ndisable-model-invocation: true # only when named\n---\n# grill\n";
         write_skill(&fx.home.join(".general/skills"), "grill", body);
         fs::write(source.join("notes.md"), "disable-model-invocation: true\n").unwrap();
         let agy = fx.home.join(".gemini/skills/grill");
