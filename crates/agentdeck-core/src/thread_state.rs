@@ -62,6 +62,144 @@ pub struct ThreadState {
     pub project: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checklist: Vec<Item>,
+    /// Autonomous Run phase (default Intake for pre-existing threads).
+    #[serde(default)]
+    pub phase: RunPhase,
+    /// Structured Run Mandate granted at Intake; None before Intake completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mandate: Option<RunMandate>,
+    /// Owner Inbox: branches parked for the owner during an Autonomous Run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_inbox: Vec<InboxItem>,
+    /// Assumptions: reversible decisions made autonomously, with revert hints.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assumptions: Vec<Assumption>,
+    /// Updated ONLY when `state` text is written, never on `checklist_update`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub state_updated_at: String,
+    /// Incremented on every `checklist_update`, reset when `state` is written.
+    #[serde(default)]
+    pub checklist_updates_since_state: u32,
+    /// RFC3339 UTC timestamp when `phase == SleepingForQuota`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep_until: Option<String>,
+    #[serde(default)]
+    pub checkpoint_count: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_checkpoint_at: String,
+}
+
+/// Autonomous Run phase. `Intake` is the default so legacy threads deserialize.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunPhase {
+    #[default]
+    Intake,
+    Running,
+    SleepingForQuota,
+    Completed,
+}
+
+fn default_fix_forward_max() -> u32 {
+    3
+}
+
+fn default_review_rounds_max() -> u32 {
+    2
+}
+
+/// Explicit scope of authority granted by the owner at Intake.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunMandate {
+    #[serde(default)]
+    pub project: String,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    #[serde(default)]
+    pub allowed_apps: Vec<String>,
+    #[serde(default)]
+    pub allow_releases: bool,
+    #[serde(default = "default_fix_forward_max")]
+    pub fix_forward_max: u32,
+    #[serde(default = "default_review_rounds_max")]
+    pub review_rounds_max: u32,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    pub granted_at: String,
+}
+
+impl Default for RunMandate {
+    fn default() -> Self {
+        Self {
+            project: String::new(),
+            allowed_hosts: Vec::new(),
+            allowed_apps: Vec::new(),
+            allow_releases: false,
+            fix_forward_max: default_fix_forward_max(),
+            review_rounds_max: default_review_rounds_max(),
+            notes: String::new(),
+            granted_at: String::new(),
+        }
+    }
+}
+
+/// One parked Owner Inbox item: a branch needing the owner or out of mandate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct InboxItem {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub blocked_items: Vec<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub resolved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
+}
+
+/// Input for `inbox_add`: `id` is optional, generated as `inbox-N` when absent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NewInboxItem {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub title: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub blocked_items: Vec<String>,
+}
+
+/// One reversible autonomous decision, recorded with a revert hint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Assumption {
+    pub id: String,
+    pub decision: String,
+    #[serde(default)]
+    pub rationale: String,
+    #[serde(default)]
+    pub revert_hint: String,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// Input for `assumption_add`: `id` is optional, generated as `asm-N` when absent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NewAssumption {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub decision: String,
+    #[serde(default)]
+    pub rationale: String,
+    #[serde(default)]
+    pub revert_hint: String,
 }
 
 impl ThreadState {
@@ -70,6 +208,26 @@ impl ThreadState {
         let total = self.checklist.iter().filter(|i| i.status != "held").count();
         let done = self.checklist.iter().filter(|i| i.status == "done").count();
         (done, total)
+    }
+
+    /// True when the snapshot no longer reflects recent checklist movement:
+    /// 5+ checklist updates since the last `state` write, or a non-empty
+    /// checklist with a blank snapshot.
+    pub fn state_stale(&self) -> bool {
+        self.checklist_updates_since_state >= 5
+            || (self.state.trim().is_empty() && !self.checklist.is_empty())
+    }
+
+    /// Parked Owner Inbox items still waiting on the owner.
+    pub fn open_inbox_count(&self) -> usize {
+        self.owner_inbox.iter().filter(|i| !i.resolved).count()
+    }
+
+    /// True if any checklist item still needs work (not done/held/blocked).
+    pub fn has_unblocked_work(&self) -> bool {
+        self.checklist
+            .iter()
+            .any(|i| matches!(i.status.as_str(), "todo" | "running" | "review"))
     }
 }
 
@@ -172,6 +330,9 @@ pub fn write(
     mutate(paths, t3_root, id, |data, now| {
         if let Some(s) = state {
             data.state = s.to_string();
+            // Fresh snapshot: it reflects all checklist movement so far.
+            data.state_updated_at = now.to_string();
+            data.checklist_updates_since_state = 0;
         }
         if let Some(d) = decision {
             data.decisions.push(Decision {
@@ -282,6 +443,9 @@ pub fn update_checklist(
             .iter()
             .map(|i| (i.id.clone(), i.status.clone()))
             .collect();
+        // Snapshot freshness tracking: every checklist change ages `state`.
+        data.checklist_updates_since_state =
+            data.checklist_updates_since_state.saturating_add(1);
         if let Some(p) = project {
             data.project = p.to_string();
         }
@@ -361,6 +525,152 @@ pub fn update_checklist(
         eprintln!("coordinator report not saved: {e:#}");
     }
     Ok((state, Some(report)))
+}
+
+/// Set run metadata (phase, mandate, sleep deadline) and optionally record a
+/// Checkpoint. When `record_checkpoint` is true the snapshot must be fresh:
+/// refused while `state_stale()`. `sleep_until`: None leaves the deadline
+/// unchanged, Some(None) clears it, Some(Some(t)) sets it.
+pub fn set_run_meta(
+    paths: &Paths,
+    t3_root: Option<&Path>,
+    id: &str,
+    phase: Option<RunPhase>,
+    mandate: Option<RunMandate>,
+    sleep_until: Option<Option<String>>,
+    record_checkpoint: bool,
+) -> anyhow::Result<ThreadState> {
+    if record_checkpoint
+        && read(paths, t3_root, id)?
+            .map(|f| f.data.state_stale())
+            .unwrap_or(false)
+    {
+        anyhow::bail!(
+            "state is stale (5+ checklist updates since the last state write): \
+             rewrite `state` first, then record the checkpoint"
+        );
+    }
+    mutate(paths, t3_root, id, |data, now| {
+        if let Some(p) = phase {
+            data.phase = p;
+        }
+        if let Some(m) = mandate {
+            data.mandate = Some(m);
+        }
+        if let Some(s) = sleep_until.clone() {
+            data.sleep_until = s;
+        }
+        if record_checkpoint {
+            data.checkpoint_count = data.checkpoint_count.saturating_add(1);
+            data.last_checkpoint_at = now.to_string();
+        }
+        Ok(())
+    })
+}
+
+fn next_id(prefix: &str, used: &[String]) -> String {
+    let mut n = used.len() + 1;
+    loop {
+        let cand = format!("{prefix}-{n}");
+        if !used.iter().any(|u| u == &cand) {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
+/// Park one branch in the Owner Inbox. The id is caller-provided or `inbox-N`.
+pub fn inbox_add(
+    paths: &Paths,
+    t3_root: Option<&Path>,
+    id: &str,
+    item: NewInboxItem,
+) -> anyhow::Result<InboxItem> {
+    if item.title.trim().is_empty() {
+        anyhow::bail!("inbox item needs a title");
+    }
+    let full = mutate(paths, t3_root, id, |data, now| {
+        let used: Vec<String> = data.owner_inbox.iter().map(|i| i.id.clone()).collect();
+        let item_id = item.id.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| next_id("inbox", &used));
+        if item_id.len() > 64 {
+            anyhow::bail!("inbox id must be 1-64 chars");
+        }
+        if used.iter().any(|u| u == &item_id) {
+            anyhow::bail!("inbox item {item_id:?} already exists");
+        }
+        data.owner_inbox.push(InboxItem {
+            id: item_id,
+            title: item.title.clone(),
+            reason: item.reason.clone(),
+            action: item.action.clone(),
+            blocked_items: item.blocked_items.clone(),
+            created_at: now.to_string(),
+            resolved: false,
+            resolved_at: None,
+        });
+        Ok(())
+    })?;
+    full.owner_inbox
+        .last()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("inbox item was not saved"))
+}
+
+/// Mark one Owner Inbox item resolved (the owner handled it or it lapsed).
+pub fn inbox_resolve(
+    paths: &Paths,
+    t3_root: Option<&Path>,
+    id: &str,
+    item_id: &str,
+) -> anyhow::Result<InboxItem> {
+    let full = mutate(paths, t3_root, id, |data, now| {
+        let item = data
+            .owner_inbox
+            .iter_mut()
+            .find(|i| i.id == item_id)
+            .ok_or_else(|| anyhow::anyhow!("no inbox item {item_id:?}"))?;
+        item.resolved = true;
+        item.resolved_at = Some(now.to_string());
+        Ok(())
+    })?;
+    full.owner_inbox
+        .into_iter()
+        .find(|i| i.id == item_id)
+        .ok_or_else(|| anyhow::anyhow!("no inbox item {item_id:?}"))
+}
+
+/// Record one reversible autonomous decision with a revert hint.
+pub fn assumption_add(
+    paths: &Paths,
+    t3_root: Option<&Path>,
+    id: &str,
+    item: NewAssumption,
+) -> anyhow::Result<Assumption> {
+    if item.decision.trim().is_empty() {
+        anyhow::bail!("assumption needs a decision");
+    }
+    let full = mutate(paths, t3_root, id, |data, now| {
+        let used: Vec<String> = data.assumptions.iter().map(|a| a.id.clone()).collect();
+        let asm_id = item.id.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| next_id("asm", &used));
+        if asm_id.len() > 64 {
+            anyhow::bail!("assumption id must be 1-64 chars");
+        }
+        if used.iter().any(|u| u == &asm_id) {
+            anyhow::bail!("assumption {asm_id:?} already exists");
+        }
+        data.assumptions.push(Assumption {
+            id: asm_id,
+            decision: item.decision.clone(),
+            rationale: item.rationale.clone(),
+            revert_hint: item.revert_hint.clone(),
+            created_at: now.to_string(),
+        });
+        Ok(())
+    })?;
+    full.assumptions
+        .last()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("assumption was not saved"))
 }
 
 /// Load this thread's state (or seed it from a forked-from ancestor), apply
@@ -643,5 +953,188 @@ mod tests {
         assert_eq!(utc(0), "1970-01-01T00:00:00Z");
         assert_eq!(utc(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(utc(1_794_787_199), "2026-11-15T23:59:59Z");
+    }
+
+    #[test]
+    fn legacy_json_without_new_fields_still_loads() {
+        let (dir, paths) = fx("legacy");
+        let legacy = serde_json::json!({
+            "state": "Goal: old",
+            "updated": "2026-01-01T00:00:00Z",
+            "decisions": [],
+            "checklist": [{"id": "a", "title": "A", "status": "todo"}]
+        });
+        let path = paths.state_dir.join("threads").join("old.json");
+        crate::backlog::save_json(&path, &legacy).unwrap();
+        let f = read(&paths, None, "old").unwrap().unwrap();
+        assert_eq!(f.data.phase, RunPhase::Intake);
+        assert!(f.data.mandate.is_none());
+        assert!(f.data.owner_inbox.is_empty());
+        assert!(f.data.sleep_until.is_none());
+        assert_eq!(f.data.checklist_updates_since_state, 0);
+        assert_eq!(f.data.checkpoint_count, 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn freshness_tracks_checklist_updates_until_state_write() {
+        let (dir, paths) = fx("stale");
+        let p = |id: &str, title: Option<&str>| ItemPatch {
+            id: id.into(),
+            title: title.map(Into::into),
+            ..ItemPatch::default()
+        };
+        // Blank snapshot + checklist = stale.
+        update_checklist(&paths, None, "t", None, &[p("a", Some("A"))], &[]).unwrap();
+        let s = load(&paths, "t").unwrap().unwrap();
+        assert!(s.state_stale());
+        assert_eq!(s.checklist_updates_since_state, 1);
+        assert!(s.state_updated_at.is_empty());
+        // A fresh snapshot clears the counter and stamps state_updated_at.
+        let s = write(&paths, None, "t", Some("Goal: x"), None).unwrap();
+        assert!(!s.state_stale());
+        assert_eq!(s.checklist_updates_since_state, 0);
+        assert!(!s.state_updated_at.is_empty());
+        // Five checklist updates without a state write = stale.
+        for _ in 0..5 {
+            let note = ItemPatch {
+                id: "a".into(),
+                note: Some("still running".into()),
+                ..ItemPatch::default()
+            };
+            update_checklist(&paths, None, "t", None, &[note], &[]).unwrap();
+        }
+        let s = load(&paths, "t").unwrap().unwrap();
+        assert_eq!(s.checklist_updates_since_state, 5);
+        assert!(s.state_stale());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn inbox_and_assumptions_round_trip() {
+        let (dir, paths) = fx("inbox");
+        let item = inbox_add(
+            &paths,
+            None,
+            "t",
+            NewInboxItem {
+                title: "Need token".into(),
+                reason: "owner must paste it".into(),
+                action: "paste into chat".into(),
+                blocked_items: vec!["b".into()],
+                ..NewInboxItem::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(item.id, "inbox-1");
+        assert!(!item.resolved);
+        let s = load(&paths, "t").unwrap().unwrap();
+        assert_eq!(s.open_inbox_count(), 1);
+        let done = inbox_resolve(&paths, None, "t", &item.id).unwrap();
+        assert!(done.resolved && done.resolved_at.is_some());
+        assert!(inbox_resolve(&paths, None, "t", "absent").is_err());
+        let asm = assumption_add(
+            &paths,
+            None,
+            "t",
+            NewAssumption {
+                decision: "Use X".into(),
+                rationale: "fits".into(),
+                revert_hint: "switch to Y".into(),
+                ..NewAssumption::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(asm.id, "asm-1");
+        assert!(inbox_add(&paths, None, "t", NewInboxItem {
+            id: Some(item.id.clone()),
+            title: "dup".into(),
+            ..NewInboxItem::default()
+        })
+        .is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_meta_sets_fields_and_gates_checkpoints_on_freshness() {
+        let (dir, paths) = fx("meta");
+        write(&paths, None, "t", Some("Goal: x"), None).unwrap();
+        let s = set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::Running),
+            Some(RunMandate {
+                project: "blockfield".into(),
+                ..RunMandate::default()
+            }),
+            Some(Some("2026-11-22T00:00:00Z".into())),
+            true,
+        )
+        .unwrap();
+        assert_eq!(s.phase, RunPhase::Running);
+        assert_eq!(s.mandate.as_ref().unwrap().fix_forward_max, 3);
+        assert_eq!(s.checkpoint_count, 1);
+        assert!(!s.last_checkpoint_at.is_empty());
+        // Age the snapshot, then a checkpoint must be refused.
+        let p = |id: &str, title: Option<&str>| ItemPatch {
+            id: id.into(),
+            title: title.map(Into::into),
+            ..ItemPatch::default()
+        };
+        update_checklist(&paths, None, "t", None, &[p("a", Some("A"))], &[]).unwrap();
+        for _ in 0..4 {
+            let note = ItemPatch {
+                id: "a".into(),
+                note: Some("n".into()),
+                ..ItemPatch::default()
+            };
+            update_checklist(&paths, None, "t", None, &[note], &[]).unwrap();
+        }
+        assert!(
+            set_run_meta(&paths, None, "t", None, None, None, true).is_err(),
+            "stale checkpoint must be refused"
+        );
+        // Non-checkpoint meta changes still work while stale.
+        let s = set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::SleepingForQuota),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(s.phase, RunPhase::SleepingForQuota);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unblocked_work_ignores_done_held_blocked() {
+        let (dir, paths) = fx("unblocked");
+        let p = |id: &str, title: &str, status: &str| ItemPatch {
+            id: id.into(),
+            title: Some(title.into()),
+            status: Some(status.into()),
+            ..ItemPatch::default()
+        };
+        update_checklist(
+            &paths,
+            None,
+            "t",
+            None,
+            &[
+                p("a", "A", "done"),
+                p("b", "B", "held"),
+                p("c", "C", "blocked"),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert!(!load(&paths, "t").unwrap().unwrap().has_unblocked_work());
+        update_checklist(&paths, None, "t", None, &[p("d", "D", "review")], &[]).unwrap();
+        assert!(load(&paths, "t").unwrap().unwrap().has_unblocked_work());
+        let _ = fs::remove_dir_all(dir);
     }
 }
