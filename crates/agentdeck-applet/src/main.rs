@@ -16,6 +16,7 @@ use std::{
 };
 
 // Reuse the backend's schema so provider changes remain compatible with both desktops.
+use agentdeck_core::thread_state::{self, RunPhase};
 use agentdeck_usage::model::{self, AccountState, AppState, QuotaWindow};
 use agentdeck_usage::visibility::Prefs;
 
@@ -443,9 +444,66 @@ fn read_state() -> Result<AppState, String> {
     Ok(state)
 }
 
+/// One coordinator thread for the popup: phase, open inbox count, wake time.
+struct CoordSummary {
+    thread: String,
+    phase: RunPhase,
+    inbox: usize,
+    sleep_until: Option<String>,
+}
+
+fn load_coords() -> Vec<CoordSummary> {
+    let Ok(paths) = agentdeck_core::Paths::from_env() else {
+        return Vec::new();
+    };
+    summarize_coords(thread_state::list(&paths))
+}
+
+/// Completed runs stay out of the popup and the inbox badge: a finished run
+/// with a legacy open item must not sort above live work or inflate the count.
+fn summarize_coords(
+    rows: Vec<(String, agentdeck_core::thread_state::ThreadState)>,
+) -> Vec<CoordSummary> {
+    let mut coords: Vec<CoordSummary> = rows
+        .into_iter()
+        .filter(|(_, state)| !matches!(state.phase, RunPhase::Completed))
+        .map(|(thread, state)| CoordSummary {
+            thread,
+            phase: state.phase,
+            inbox: state.open_inbox_count(),
+            sleep_until: state.sleep_until.clone(),
+        })
+        .collect();
+    coords.sort_by(|a, b| b.inbox.cmp(&a.inbox).then_with(|| a.thread.cmp(&b.thread)));
+    coords
+}
+
+fn phase_label(phase: &RunPhase) -> &'static str {
+    match phase {
+        RunPhase::Intake => "Приём",
+        RunPhase::Running => "Работа",
+        RunPhase::SleepingForQuota => "Сон по квоте",
+        RunPhase::Completed => "Готов",
+    }
+}
+
+fn coord_line(c: &CoordSummary) -> String {
+    let mut line = format!("{}: {}", c.thread, phase_label(&c.phase));
+    if c.phase == RunPhase::SleepingForQuota
+        && let Some(until) = &c.sleep_until
+    {
+        line.push_str(&format!(" до {until}"));
+    }
+    if c.inbox > 0 {
+        line.push_str(&format!(" · Входящие: {}", c.inbox));
+    }
+    line
+}
+
 struct App {
     core: app::Core,
     state: Result<AppState, String>,
+    coords: Vec<CoordSummary>,
     popup: Option<window::Id>,
     revealed: HashSet<String>,
     prefs: Prefs,
@@ -489,6 +547,7 @@ impl cosmic::Application for App {
         let mut app = Self {
             core,
             state: read_state(),
+            coords: load_coords(),
             popup: None,
             revealed: HashSet::new(),
             prefs: Prefs::default(),
@@ -512,6 +571,7 @@ impl cosmic::Application for App {
         match message {
             Message::Tick => {
                 self.state = read_state();
+                self.coords = load_coords();
                 self.reload_visibility();
             }
             Message::Reveal(id) => {
@@ -686,6 +746,18 @@ impl cosmic::Application for App {
         if let Some(error) = &self.prefs_error {
             content = content.push(widget::text(error.clone()).size(13));
         }
+        if !self.coords.is_empty() {
+            content = content.push(widget::divider::horizontal::default());
+            let waiting: usize = self.coords.iter().map(|c| c.inbox).sum();
+            let mut title = String::from("Координатор");
+            if waiting > 0 {
+                title.push_str(&format!(" · Входящие: {waiting}"));
+            }
+            content = content.push(widget::text::title4(title));
+            for c in &self.coords {
+                content = content.push(widget::text(coord_line(c)).size(14));
+            }
+        }
         self.core
             .applet
             .popup_container(
@@ -795,6 +867,56 @@ mod tests {
             panel_scroll_offset(mouse::ScrollDelta::Pixels { x: 0.0, y: 0.0 }),
             None
         );
+    }
+
+    #[test]
+    fn coordinator_rows_show_phase_wake_time_and_inbox() {
+        assert_eq!(phase_label(&RunPhase::Intake), "Приём");
+        assert_eq!(phase_label(&RunPhase::Running), "Работа");
+        assert_eq!(phase_label(&RunPhase::SleepingForQuota), "Сон по квоте");
+        assert_eq!(phase_label(&RunPhase::Completed), "Готов");
+        let sleeping = CoordSummary {
+            thread: "t1".into(),
+            phase: RunPhase::SleepingForQuota,
+            inbox: 2,
+            sleep_until: Some("2026-11-22T01:00:00Z".into()),
+        };
+        assert_eq!(
+            coord_line(&sleeping),
+            "t1: Сон по квоте до 2026-11-22T01:00:00Z · Входящие: 2"
+        );
+        let running = CoordSummary {
+            thread: "t2".into(),
+            phase: RunPhase::Running,
+            inbox: 0,
+            sleep_until: None,
+        };
+        assert_eq!(coord_line(&running), "t2: Работа");
+        // Open inbox items sort above quiet threads so the badge is visible.
+        let mut coords = vec![running, sleeping];
+        coords.sort_by(|a, b| b.inbox.cmp(&a.inbox).then_with(|| a.thread.cmp(&b.thread)));
+        assert_eq!(coords[0].thread, "t1");
+    }
+
+    #[test]
+    fn completed_runs_stay_out_of_rows_and_badge() {
+        use agentdeck_core::thread_state::{InboxItem, ThreadState};
+        let open = |id: &str| InboxItem {
+            id: id.into(),
+            title: "stale item".into(),
+            resolved: false,
+            ..InboxItem::default()
+        };
+        let mut done = ThreadState::default();
+        done.phase = RunPhase::Completed;
+        done.owner_inbox = vec![open("legacy")];
+        let mut running = ThreadState::default();
+        running.phase = RunPhase::Running;
+        running.owner_inbox = vec![open("live")];
+        let coords = summarize_coords(vec![("done".into(), done), ("live".into(), running)]);
+        assert_eq!(coords.len(), 1);
+        assert_eq!(coords[0].thread, "live");
+        assert_eq!(coords.iter().map(|c| c.inbox).sum::<usize>(), 1);
     }
 
     #[test]

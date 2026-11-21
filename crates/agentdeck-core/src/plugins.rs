@@ -18,13 +18,15 @@ pub const PLUGIN_ROUTER: &str = "router";
 pub const PLUGIN_IMAGEGEN: &str = "imagegen";
 pub const PLUGIN_MCP_SERVER: &str = "mcp-server";
 pub const PLUGIN_COORDINATOR: &str = "coordinator";
-pub const PLUGINS: [&str; 6] = [
+pub const PLUGIN_APPROVER: &str = "approver";
+pub const PLUGINS: [&str; 7] = [
     PLUGIN_AGENT_PROCESS,
     PLUGIN_AI_USAGE,
     PLUGIN_ROUTER,
     PLUGIN_IMAGEGEN,
     PLUGIN_MCP_SERVER,
     PLUGIN_COORDINATOR,
+    PLUGIN_APPROVER,
 ];
 
 /// agent-process instruction block. Every mention of the launcher lives here
@@ -39,7 +41,7 @@ pub fn is_known(name: &str) -> bool {
 fn check_name(name: &str) -> anyhow::Result<()> {
     if !is_known(name) {
         anyhow::bail!(
-            "unknown plugin {name:?}: expected agent-process, ai-usage, router, imagegen, mcp-server or coordinator"
+            "unknown plugin {name:?}: expected agent-process, ai-usage, router, imagegen, mcp-server, coordinator or approver"
         );
     }
     Ok(())
@@ -362,7 +364,7 @@ const PLUGIN_SKILLS: [(&str, &[(&str, &str)]); 3] = [
 /// (`shipped_skills_revision_is_bumped` pins the content hash). A build never
 /// rewrites skills that a build with a higher revision wrote, so a stale
 /// daemon or MCP server left running after an upgrade cannot roll them back.
-pub const PLUGIN_SKILLS_REV: u64 = 7;
+pub const PLUGIN_SKILLS_REV: u64 = 9;
 const PLUGIN_SKILLS_REV_FILE: &str = ".rev";
 
 fn stored_plugin_skills_rev(dir: &Path) -> u64 {
@@ -914,6 +916,41 @@ pub fn status(paths: &Paths, home: &Path, exe: &Path) -> Vec<PluginStatus> {
             format!("open backlog items: {open}"),
         ],
     });
+    let app = crate::settings::read_approver(&reg);
+    let tg = crate::settings::approver_env_status(&paths.config_dir);
+    // Strictly read-only: an invalid `[approver]` is reported as invalid
+    // (never silently replaced by defaults), and a malformed `approver.env`
+    // is never reported as configured.
+    let approver_detail = match &app {
+        Ok(app) => vec![
+            format!("socket: {}", app.resolved_socket_path().display()),
+            format!("telegram: {}", tg.as_str()),
+            format!(
+                "timeouts: {}s autonomous / {}s interactive",
+                app.autonomous_timeout_secs, app.interactive_timeout_secs
+            ),
+            format!(
+                "judge: {} {} (threshold {:.2})",
+                app.judge_provider
+                    .as_deref()
+                    .unwrap_or(crate::settings::PROVIDER_OPENROUTER),
+                app.judge_model
+                    .as_deref()
+                    .unwrap_or(crate::settings::DEFAULT_DECISION_MODEL),
+                app.judge_confidence_threshold,
+            ),
+        ],
+        Err(e) => vec![
+            format!("config: invalid ({e:#})"),
+            format!("telegram: {}", tg.as_str()),
+        ],
+    };
+    out.push(PluginStatus {
+        name: PLUGIN_APPROVER,
+        enabled: plugin_enabled(&reg, PLUGIN_APPROVER),
+        available: true,
+        detail: approver_detail,
+    });
     out.push(PluginStatus {
         name: PLUGIN_MCP_SERVER,
         enabled: plugin_enabled(&reg, PLUGIN_MCP_SERVER),
@@ -1090,7 +1127,7 @@ pub fn plan_enable(
         PLUGIN_AI_USAGE => plan_enable_ai_usage(paths, home)?,
         PLUGIN_ROUTER => plan_enable_router(paths, home, files, exe, replace)?,
         // Only the flag and its skill (synced after apply).
-        PLUGIN_IMAGEGEN | PLUGIN_COORDINATOR => Vec::new(),
+        PLUGIN_IMAGEGEN | PLUGIN_COORDINATOR | PLUGIN_APPROVER => Vec::new(),
         PLUGIN_MCP_SERVER => {
             let mut c = crate::manage::plan_register(paths, home, exe, true)?.0;
             c.extend(plan_marker_files(
@@ -1135,7 +1172,7 @@ pub fn plan_disable(
         PLUGIN_AGENT_PROCESS => plan_disable_agent_process(home, files, exe, &paths.state_dir)?,
         PLUGIN_AI_USAGE => plan_disable_ai_usage(paths, home)?,
         PLUGIN_ROUTER => plan_disable_router(paths, home, files, exe)?,
-        PLUGIN_IMAGEGEN | PLUGIN_COORDINATOR => Vec::new(),
+        PLUGIN_IMAGEGEN | PLUGIN_COORDINATOR | PLUGIN_APPROVER => Vec::new(),
         PLUGIN_MCP_SERVER => {
             let mut c = crate::manage::plan_register(paths, home, exe, false)?.0;
             c.extend(plan_marker_files(
@@ -1165,7 +1202,9 @@ pub fn plan_disable(
 }
 
 /// Apply enable/disable changes (files, symlink, registry). Service reloads
-/// ride along with their own changes; nothing is ever started.
+/// ride along with their own changes; nothing is ever started. The registry
+/// flag goes through a locked key update (not the planned whole-image bytes),
+/// so a settings edit that landed after the plan is never overwritten.
 pub fn apply_all(
     paths: &Paths,
     name: &str,
@@ -1196,7 +1235,9 @@ pub fn apply_all(
     } else {
         apply_changes(&file_changes)?;
     }
-    apply_changes(&reg_changes)?;
+    if !reg_changes.is_empty() {
+        Registry::update(paths, |reg| set_plugin_flag(reg, name, enable))?;
+    }
     Ok(())
 }
 
@@ -1306,7 +1347,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!((PLUGIN_SKILLS_REV, hash), (7, 0x36f5_23cb_1a0d_cd20));
+        assert_eq!((PLUGIN_SKILLS_REV, hash), (9, 0xfcc7_7ee8_837e_e9c6));
     }
 
     /// Every file, link and dir under `root` except agentdeck's own config
@@ -1408,12 +1449,24 @@ mod tests {
             ];
             let before = tree(&g.0, &skip);
             let on = plan_enable(&paths, &home, &files, &exe, name, false).unwrap();
+            assert!(!on.is_empty(), "{name}: enable planned no changes");
             apply_all(&paths, name, true, &on).unwrap();
             sync_plugin_skills(&paths, &home).unwrap();
-            assert_ne!(tree(&g.0, &skip), before, "{name}: enable changed nothing");
+            assert!(
+                plugin_enabled(&Registry::load(&paths).unwrap(), name),
+                "{name}: not enabled in registry"
+            );
+            // approver lives purely inside agentdeck's own config/state dirs (in `skip`).
+            if name != PLUGIN_APPROVER {
+                assert_ne!(tree(&g.0, &skip), before, "{name}: enable changed nothing");
+            }
             let off = plan_disable(&paths, &home, &files, &exe, name).unwrap();
             apply_all(&paths, name, false, &off).unwrap();
             sync_plugin_skills(&paths, &home).unwrap();
+            assert!(
+                !plugin_enabled(&Registry::load(&paths).unwrap(), name),
+                "{name}: still enabled after disable"
+            );
             let after = tree(&g.0, &skip);
             let diff: Vec<String> = before
                 .keys()
@@ -1920,5 +1973,77 @@ mod tests {
         assert!(plan_enable_agent_process(&home, &files, &exe, false, &paths.state_dir).is_err());
         assert!(!agent_process_link(&home).exists());
         assert_eq!(fs::read(&files[0]).unwrap(), b"ok\n");
+    }
+
+    #[test]
+    fn plugin_toggle_preserves_concurrent_settings_edit() {
+        let _env = test_env_lock();
+        let (_g, home, paths, files, exe) = setup("toggle-race");
+        // Plan the toggle against a snapshot, then land an approver edit
+        // before applying: the stale plan must not clobber it.
+        let planned = plan_enable(&paths, &home, &files, &exe, PLUGIN_COORDINATOR, false).unwrap();
+        assert!(!planned.is_empty());
+        crate::settings::write_approver(
+            &paths,
+            &crate::settings::ApproverSettings {
+                autonomous_timeout_secs: 90,
+                interactive_timeout_secs: 300,
+                ..crate::settings::ApproverSettings::default()
+            },
+            false,
+        )
+        .unwrap();
+        apply_all(&paths, PLUGIN_COORDINATOR, true, &planned).unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        assert!(plugin_enabled(&reg, PLUGIN_COORDINATOR));
+        assert_eq!(
+            crate::settings::read_approver(&reg)
+                .unwrap()
+                .autonomous_timeout_secs,
+            90
+        );
+    }
+
+    #[test]
+    fn approver_status_is_read_only_and_strict() {
+        let _env = test_env_lock();
+        let (_g, home, paths, _files, exe) = setup("approver-status");
+        let detail = |name: &str| {
+            status(&paths, &home, &exe)
+                .into_iter()
+                .find(|s| s.name == name)
+                .unwrap()
+                .detail
+                .join("\n")
+        };
+        // Absent config and env: defaults plus missing.
+        assert!(detail(PLUGIN_APPROVER).contains("telegram: missing"));
+        // An invalid [approver] is reported, not defaulted.
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::write(
+            paths.registry_file(),
+            "version = 1\n[approver]\nautonomous_timeout_secs = 0\n",
+        )
+        .unwrap();
+        assert!(detail(PLUGIN_APPROVER).contains("config: invalid"));
+        // A malformed approver.env is invalid, never configured.
+        fs::write(
+            paths.config_dir.join("approver.env"),
+            "TELEGRAM_BOT_TOKEN=x\nTELEGRAM_OWNER_ID=not-a-number\n",
+        )
+        .unwrap();
+        let d = detail(PLUGIN_APPROVER);
+        assert!(d.contains("telegram: invalid"), "{d}");
+        assert!(!d.contains("configured"), "{d}");
+        fs::write(
+            paths.config_dir.join("approver.env"),
+            "TELEGRAM_BOT_TOKEN=x\nTELEGRAM_OWNER_ID=42\n",
+        )
+        .unwrap();
+        assert!(detail(PLUGIN_APPROVER).contains("telegram: configured"));
+        // Status never writes: the registry bytes are untouched by the calls above.
+        let snap = fs::read(paths.registry_file()).unwrap();
+        let _ = detail(PLUGIN_APPROVER);
+        assert_eq!(fs::read(paths.registry_file()).unwrap(), snap);
     }
 }

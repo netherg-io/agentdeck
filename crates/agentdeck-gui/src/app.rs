@@ -33,6 +33,8 @@ pub enum Page {
     Pool,
     Shared,
     Harnesses,
+    ApproverSettings,
+    CoordinatorSettings,
 }
 
 impl Page {
@@ -50,6 +52,8 @@ impl Page {
             Self::Modules => fl!(loader(), "nav-modules"),
             Self::Processes => fl!(loader(), "nav-processes"),
             Self::Coordinator => fl!(loader(), "nav-coordinator"),
+            Self::ApproverSettings => fl!(loader(), "nav-approver-settings"),
+            Self::CoordinatorSettings => fl!(loader(), "nav-coord-settings"),
             Self::Pool => fl!(loader(), "nav-pool"),
             Self::Shared => fl!(loader(), "nav-shared"),
             Self::Harnesses => fl!(loader(), "nav-harnesses"),
@@ -107,6 +111,16 @@ pub enum Message {
     Pool(pages::pool::Msg),
     Shared(pages::shared::Msg),
     Harnesses(pages::harnesses::Msg),
+    CoordMandate {
+        thread: String,
+        expected: agentdeck_core::thread_state::RunMandate,
+        grant: bool,
+    },
+    CoordResolve {
+        thread: String,
+        item: String,
+    },
+    CoordDone(Result<(), String>),
     Usage(usage::Msg),
     Settings(settings::Msg),
     Imagegen(imagegen::Msg),
@@ -322,6 +336,14 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 (Page::UsagePoll | Page::RouterSettings, Some(paths)) => {
                     Task::perform(async move { settings::load(&paths) }, Message::Settings)
                 }
+                (Page::ApproverSettings, Some(paths)) => Task::perform(
+                    async move { settings::load_approver(&paths) },
+                    Message::Settings,
+                ),
+                (Page::CoordinatorSettings, Some(paths)) => Task::perform(
+                    async move { settings::load_coord(&paths) },
+                    Message::Settings,
+                ),
                 (Page::ImagegenSettings, Some(paths)) => {
                     Task::perform(async move { imagegen::load(&paths) }, Message::Imagegen)
                 }
@@ -869,6 +891,66 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+        // The owner's Grant/Revoke click seals the Run Mandate outside
+        // agent-writable MCP: Grant writes only when the on-disk scope still
+        // matches the displayed snapshot, Revoke clears just the grant flag.
+        Message::CoordMandate {
+            thread,
+            expected,
+            grant,
+        } => match state.paths.clone() {
+            Some(paths) => Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        if grant {
+                            agentdeck_core::thread_state::grant_mandate_if_matches(
+                                &paths, &thread, &expected,
+                            )
+                        } else {
+                            agentdeck_core::thread_state::revoke_mandate(&paths, &thread)
+                        }
+                        .map(|_| ())
+                        .map_err(|e| format!("{e:#}"))
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r)
+                },
+                Message::CoordDone,
+            ),
+            None => Task::none(),
+        },
+        Message::CoordResolve { thread, item } => match state.paths.clone() {
+            Some(paths) => Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        let t3_root = agentdeck_core::t3::t3_root().ok();
+                        agentdeck_core::thread_state::inbox_resolve(
+                            &paths,
+                            t3_root.as_deref(),
+                            &thread,
+                            &item,
+                        )
+                        .map(|_| ())
+                        .map_err(|e| format!("{e:#}"))
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r)
+                },
+                Message::CoordDone,
+            ),
+            None => Task::none(),
+        },
+        Message::CoordDone(result) => {
+            if let Err(error) = result {
+                state.toast(error, true);
+            }
+            match state.paths.clone() {
+                Some(paths) => load_data(paths),
+                None => Task::none(),
+            }
+        }
     }
 }
 
@@ -976,6 +1058,8 @@ fn modal(state: &State) -> Option<Modal<'_, Message>> {
         | Page::RouterSettings
         | Page::ImagegenSettings
         | Page::Coordinator
+        | Page::ApproverSettings
+        | Page::CoordinatorSettings
         | Page::Modules => None,
     }
 }
@@ -1075,7 +1159,15 @@ fn sidebar(state: &State) -> Element<'_, Message> {
         module(
             fl!(loader(), "nav-group-coordinator"),
             agentdeck_core::plugins::PLUGIN_COORDINATOR,
-            &[(Page::Coordinator, st::Icon::CircleCheck)],
+            &[
+                (Page::Coordinator, st::Icon::CircleCheck),
+                (Page::CoordinatorSettings, st::Icon::Wrench),
+            ],
+        ),
+        module(
+            fl!(loader(), "nav-group-approver"),
+            agentdeck_core::plugins::PLUGIN_APPROVER,
+            &[(Page::ApproverSettings, st::Icon::Plug)],
         ),
         module(
             fl!(loader(), "nav-group-agents"),
@@ -1172,6 +1264,8 @@ fn header(state: &State) -> Element<'_, Message> {
         Page::Shared => (t("shared-title"), None),
         Page::Harnesses => (t("harness-title"), None),
         Page::Coordinator => (t("nav-group-coordinator"), None),
+        Page::ApproverSettings => (t("approver-settings-title"), None),
+        Page::CoordinatorSettings => (t("coord-settings-title"), None),
         Page::Processes => (
             t("processes-title"),
             Some(pages::processes::filter_input(&state.proc_ui)),
@@ -1195,6 +1289,8 @@ pub fn view(state: &State) -> Element<'_, Message> {
         Page::Modules => pages::plugins::view(&state.data, &state.plugin_open),
         Page::Processes => pages::processes::view(&state.data, &state.proc_ui),
         Page::Coordinator => pages::coordinator::view(&state.data),
+        Page::ApproverSettings => settings::approver_view(&state.settings).map(Message::Settings),
+        Page::CoordinatorSettings => settings::coord_view(&state.settings).map(Message::Settings),
         Page::Pool => pool::view(&state.pool).map(Message::Pool),
         Page::Shared => shared::view(&state.shared).map(Message::Shared),
         Page::Harnesses => harnesses::view(&state.harnesses).map(Message::Harnesses),

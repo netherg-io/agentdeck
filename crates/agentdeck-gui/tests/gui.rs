@@ -634,7 +634,7 @@ fn module_switch_preview_cancel_and_snapshots() {
         std::env::set_var("AGENTDECK_SYSTEMCTL", "/bin/false");
     }
     let (data, paths, _guard) = load_with_fixtures("plugins", &env);
-    assert_eq!(data.plugins.len(), 6);
+    assert_eq!(data.plugins.len(), 7);
     std::fs::create_dir_all(SNAPSHOTS).unwrap();
     let home = fakehome;
 
@@ -647,16 +647,19 @@ fn module_switch_preview_cancel_and_snapshots() {
     );
     {
         let mut ui = iced_test::simulator(app::view(&state));
-        for name in ["ai-usage", "router", "agent-process"] {
+        for name in ["ai-usage", "router", "agent-process", "approver"] {
             ui.find(name).expect("module status card");
         }
+        ui.find("Approves in-scope requests and sends the rest to Telegram.")
+            .expect("approver description");
     }
     let _ = app::update(&mut state, app::Message::PluginDetail("router".into()));
     for (lang, stem) in [("en", "modules_en"), ("ru", "modules_ru")] {
         agentdeck_gui::i18n::set_language(lang);
+        // Minimum window size keeps the 7-card golden under the size budget.
         let mut ui = iced_test::Simulator::with_size(
             iced::Settings::default(),
-            (960.0, 600.0),
+            (900.0, 560.0),
             app::view(&state),
         );
         let snapshot = ui

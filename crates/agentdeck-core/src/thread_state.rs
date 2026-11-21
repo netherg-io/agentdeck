@@ -4,7 +4,8 @@
 //! across provider switches, handoffs and compaction; a fork without state of
 //! its own reads its parent's, and its first write copies that state over.
 
-use std::fs;
+use std::collections::BTreeSet;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -62,6 +63,155 @@ pub struct ThreadState {
     pub project: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checklist: Vec<Item>,
+    /// Autonomous Run phase (default Intake for pre-existing threads).
+    #[serde(default)]
+    pub phase: RunPhase,
+    /// Structured Run Mandate granted at Intake; None before Intake completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mandate: Option<RunMandate>,
+    /// Owner Inbox: branches parked for the owner during an Autonomous Run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_inbox: Vec<InboxItem>,
+    /// Assumptions: reversible decisions made autonomously, with revert hints.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assumptions: Vec<Assumption>,
+    /// Updated ONLY when `state` text is written, never on `checklist_update`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub state_updated_at: String,
+    /// Incremented on every `checklist_update`, reset when `state` is written.
+    #[serde(default)]
+    pub checklist_updates_since_state: u32,
+    /// RFC3339 UTC timestamp when `phase == SleepingForQuota`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep_until: Option<String>,
+    #[serde(default)]
+    pub checkpoint_count: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_checkpoint_at: String,
+    /// Cumulative T3 run/item totals at the last Checkpoint: the Watchdog
+    /// subtracts these baselines so only work since the Checkpoint counts.
+    #[serde(default)]
+    pub checkpoint_run_count: u64,
+    #[serde(default)]
+    pub checkpoint_item_count: u64,
+}
+
+/// Autonomous Run phase. `Intake` is the default so legacy threads deserialize.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunPhase {
+    #[default]
+    Intake,
+    Running,
+    SleepingForQuota,
+    Completed,
+}
+
+fn default_fix_forward_max() -> u32 {
+    3
+}
+
+fn default_review_rounds_max() -> u32 {
+    2
+}
+
+/// Explicit scope of authority granted by the owner at Intake.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunMandate {
+    #[serde(default)]
+    pub project: String,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    #[serde(default)]
+    pub allowed_apps: Vec<String>,
+    #[serde(default)]
+    pub allow_releases: bool,
+    #[serde(default = "default_fix_forward_max")]
+    pub fix_forward_max: u32,
+    #[serde(default = "default_review_rounds_max")]
+    pub review_rounds_max: u32,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    pub granted_at: String,
+    /// Set only by the owner's explicit Intake grant; never inherited by a fork
+    /// and never settable as a trusted grant through ordinary state writes.
+    #[serde(default)]
+    pub owner_granted: bool,
+}
+
+impl Default for RunMandate {
+    fn default() -> Self {
+        Self {
+            project: String::new(),
+            allowed_hosts: Vec::new(),
+            allowed_apps: Vec::new(),
+            allow_releases: false,
+            fix_forward_max: default_fix_forward_max(),
+            review_rounds_max: default_review_rounds_max(),
+            notes: String::new(),
+            granted_at: String::new(),
+            owner_granted: false,
+        }
+    }
+}
+
+/// One parked Owner Inbox item: a branch needing the owner or out of mandate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct InboxItem {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub blocked_items: Vec<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub resolved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
+}
+
+/// Input for `inbox_add`: `id` is optional, generated as `inbox-N` when absent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NewInboxItem {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub title: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub blocked_items: Vec<String>,
+}
+
+/// One reversible autonomous decision, recorded with a revert hint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Assumption {
+    pub id: String,
+    pub decision: String,
+    #[serde(default)]
+    pub rationale: String,
+    #[serde(default)]
+    pub revert_hint: String,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// Input for `assumption_add`: `id` is optional, generated as `asm-N` when absent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NewAssumption {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub decision: String,
+    #[serde(default)]
+    pub rationale: String,
+    #[serde(default)]
+    pub revert_hint: String,
 }
 
 impl ThreadState {
@@ -70,6 +220,62 @@ impl ThreadState {
         let total = self.checklist.iter().filter(|i| i.status != "held").count();
         let done = self.checklist.iter().filter(|i| i.status == "done").count();
         (done, total)
+    }
+
+    /// True when the snapshot no longer reflects recent checklist movement:
+    /// 5+ checklist updates since the last `state` write, or a non-empty
+    /// checklist with a blank snapshot.
+    pub fn state_stale(&self) -> bool {
+        self.checklist_updates_since_state >= 5
+            || (self.state.trim().is_empty() && !self.checklist.is_empty())
+    }
+
+    /// Checkpoint gate: the snapshot must be fresh and non-empty. An empty
+    /// snapshot is refused even with an empty checklist.
+    pub fn can_checkpoint(&self) -> anyhow::Result<()> {
+        if self.state.trim().is_empty() {
+            anyhow::bail!("cannot record a checkpoint on an empty snapshot: write `state` first");
+        }
+        if self.state_stale() {
+            anyhow::bail!(
+                "state is stale (5+ checklist updates since the last state write): \
+                 rewrite `state` first, then record the checkpoint"
+            );
+        }
+        Ok(())
+    }
+
+    /// A fork never inherits an active Run Mandate: without an explicit owner
+    /// grant it starts at Intake with no privileged mandate.
+    fn strip_inherited_mandate(&mut self) {
+        if let Some(m) = self.mandate.as_mut() {
+            m.owner_granted = false;
+        }
+        self.phase = RunPhase::Intake;
+    }
+
+    /// Parked Owner Inbox items still waiting on the owner.
+    pub fn open_inbox_count(&self) -> usize {
+        self.owner_inbox.iter().filter(|i| !i.resolved).count()
+    }
+
+    /// True if any checklist item still needs work (not done/held/blocked),
+    /// excluding items parked in an unresolved Owner Inbox entry (matched by
+    /// item id, exact title or any link).
+    pub fn has_unblocked_work(&self) -> bool {
+        let parked: BTreeSet<&str> = self
+            .owner_inbox
+            .iter()
+            .filter(|i| !i.resolved)
+            .flat_map(|i| i.blocked_items.iter().map(String::as_str))
+            .filter(|s| !s.is_empty())
+            .collect();
+        self.checklist.iter().any(|i| {
+            matches!(i.status.as_str(), "todo" | "running" | "review")
+                && !parked.contains(i.id.as_str())
+                && !parked.contains(i.title.as_str())
+                && !i.links.iter().any(|l| parked.contains(l.as_str()))
+        })
     }
 }
 
@@ -134,7 +340,10 @@ pub fn thread_title(t3_root: Option<&Path>, id: &str) -> Option<String> {
 pub fn read(paths: &Paths, t3_root: Option<&Path>, id: &str) -> anyhow::Result<Option<Found>> {
     let mut cur = id.to_string();
     for depth in 0..=MAX_FORK_DEPTH {
-        if let Some(data) = load(paths, &cur)? {
+        if let Some(mut data) = load(paths, &cur)? {
+            if depth > 0 {
+                data.strip_inherited_mandate();
+            }
             return Ok(Some(Found {
                 thread: id.to_string(),
                 inherited_from: (depth > 0).then_some(cur),
@@ -161,26 +370,7 @@ pub fn write(
     if state.is_none() && decision.is_none() {
         anyhow::bail!("pass state, decision or both");
     }
-    if state.is_some_and(|s| s.len() > MAX_STATE) {
-        anyhow::bail!(
-            "state over {MAX_STATE} bytes: keep it a summary that cites issues and files"
-        );
-    }
-    if decision.is_some_and(|d| d.len() > MAX_DECISION) {
-        anyhow::bail!("decision over {MAX_DECISION} bytes");
-    }
-    mutate(paths, t3_root, id, |data, now| {
-        if let Some(s) = state {
-            data.state = s.to_string();
-        }
-        if let Some(d) = decision {
-            data.decisions.push(Decision {
-                at: now.to_string(),
-                text: d.to_string(),
-            });
-        }
-        Ok(())
-    })
+    apply_update(paths, t3_root, id, state, decision, None, None, None, false)
 }
 
 /// One status change of a checklist item.
@@ -229,6 +419,16 @@ fn reports_file(paths: &Paths) -> PathBuf {
 }
 
 fn append_report(paths: &Paths, r: &Report) -> anyhow::Result<()> {
+    // Serialized by an exclusive flock so concurrent checklist updates from
+    // several threads never race on the shared temp path or truncate lines.
+    let dir = paths.state_dir.join("coordinator");
+    fs::create_dir_all(&dir)?;
+    let _guard = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("reports.lock"))?;
+    _guard.lock()?;
     let path = reports_file(paths);
     let mut lines: Vec<String> = fs::read_to_string(&path)
         .unwrap_or_default()
@@ -282,6 +482,8 @@ pub fn update_checklist(
             .iter()
             .map(|i| (i.id.clone(), i.status.clone()))
             .collect();
+        // Snapshot freshness tracking: every checklist change ages `state`.
+        data.checklist_updates_since_state = data.checklist_updates_since_state.saturating_add(1);
         if let Some(p) = project {
             data.project = p.to_string();
         }
@@ -363,21 +565,460 @@ pub fn update_checklist(
     Ok((state, Some(report)))
 }
 
+/// Set run metadata (phase, mandate, sleep deadline) and optionally record a
+/// Checkpoint. When `record_checkpoint` is true the resulting snapshot must
+/// be fresh and non-empty (see `can_checkpoint`). `sleep_until`: None leaves
+/// the deadline unchanged, Some(None) clears it, Some(Some(t)) sets it.
+pub fn set_run_meta(
+    paths: &Paths,
+    t3_root: Option<&Path>,
+    id: &str,
+    phase: Option<RunPhase>,
+    mandate: Option<RunMandate>,
+    sleep_until: Option<Option<String>>,
+    record_checkpoint: bool,
+) -> anyhow::Result<ThreadState> {
+    apply_update(
+        paths,
+        t3_root,
+        id,
+        None,
+        None,
+        phase,
+        mandate,
+        sleep_until,
+        record_checkpoint,
+    )
+}
+
+/// Partial state write; absent fields keep their value. `sleep_until`: None
+/// leaves the deadline unchanged, Some(None) clears it, Some(Some(t)) sets
+/// it. `checkpoint_run_count` / `checkpoint_item_count` are cumulative T3
+/// totals stored only when `record_checkpoint` succeeds (the Watchdog
+/// subtracts them so only work since the Checkpoint counts).
+#[derive(Debug, Clone, Default)]
+pub struct StateUpdate<'a> {
+    pub state: Option<&'a str>,
+    pub decision: Option<&'a str>,
+    pub phase: Option<RunPhase>,
+    pub mandate: Option<RunMandate>,
+    pub sleep_until: Option<Option<String>>,
+    pub record_checkpoint: bool,
+    pub checkpoint_run_count: Option<u64>,
+    pub checkpoint_item_count: Option<u64>,
+}
+
+/// One atomic transaction for every state change: validates sizes, the RFC3339
+/// `sleep_until` deadline and checkpoint freshness under the per-thread lock,
+/// then mutates and saves once. `write` and `set_run_meta` delegate here so
+/// all writers share one locked path.
+// Arity is the union of the two delegating APIs; bundling would churn U5's call sites.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_update(
+    paths: &Paths,
+    t3_root: Option<&Path>,
+    id: &str,
+    state: Option<&str>,
+    decision: Option<&str>,
+    phase: Option<RunPhase>,
+    mandate: Option<RunMandate>,
+    sleep_until: Option<Option<String>>,
+    record_checkpoint: bool,
+) -> anyhow::Result<ThreadState> {
+    apply_state_update(
+        paths,
+        t3_root,
+        id,
+        StateUpdate {
+            state,
+            decision,
+            phase,
+            mandate,
+            sleep_until,
+            record_checkpoint,
+            checkpoint_run_count: None,
+            checkpoint_item_count: None,
+        },
+    )
+}
+
+/// Same locked transaction as [`apply_update`], but also records cumulative
+/// T3 run/item baselines when `update.record_checkpoint` succeeds.
+pub fn apply_state_update(
+    paths: &Paths,
+    t3_root: Option<&Path>,
+    id: &str,
+    update: StateUpdate<'_>,
+) -> anyhow::Result<ThreadState> {
+    if update.state.is_some_and(|s| s.len() > MAX_STATE) {
+        anyhow::bail!(
+            "state over {MAX_STATE} bytes: keep it a summary that cites issues and files"
+        );
+    }
+    if update.decision.is_some_and(|d| d.len() > MAX_DECISION) {
+        anyhow::bail!("decision over {MAX_DECISION} bytes");
+    }
+    if let Some(Some(s)) = update.sleep_until.as_ref()
+        && !valid_sleep_until(s)
+    {
+        anyhow::bail!("sleep_until {s:?} is not RFC3339 (YYYY-MM-DDTHH:MM:SSZ)");
+    }
+    mutate(paths, t3_root, id, |data, now| {
+        if let Some(s) = update.state {
+            data.state = s.to_string();
+            // Fresh snapshot: it reflects all checklist movement so far.
+            data.state_updated_at = now.to_string();
+            data.checklist_updates_since_state = 0;
+        }
+        if let Some(d) = update.decision {
+            data.decisions.push(Decision {
+                at: now.to_string(),
+                text: d.to_string(),
+            });
+        }
+        if let Some(p) = update.phase {
+            data.phase = p;
+        }
+        if let Some(m) = update.mandate {
+            data.mandate = Some(m);
+        }
+        // A finished or reset run never keeps a live owner grant: a later
+        // `Running` write without a fresh grant stays ungranted.
+        if matches!(data.phase, RunPhase::Completed | RunPhase::Intake)
+            && let Some(m) = data.mandate.as_mut()
+        {
+            m.owner_granted = false;
+        }
+        if let Some(s) = update.sleep_until.clone() {
+            data.sleep_until = s;
+        }
+        if update.record_checkpoint {
+            // After the fresh snapshot above, so one call can write state and
+            // record its checkpoint together.
+            data.can_checkpoint()?;
+            data.checkpoint_count = data.checkpoint_count.saturating_add(1);
+            data.last_checkpoint_at = now.to_string();
+            if let Some(n) = update.checkpoint_run_count {
+                data.checkpoint_run_count = n;
+            }
+            if let Some(n) = update.checkpoint_item_count {
+                data.checkpoint_item_count = n;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Owner Grant sealed under the per-thread lock: requires an existing mandate
+/// matching `expected` (scope fields only; `owner_granted` is ignored),
+/// rejects completed runs, and flips ONLY `owner_granted` on (scope untouched).
+/// Intake, Running and SleepingForQuota are all grantable.
+pub fn grant_mandate_if_matches(
+    paths: &Paths,
+    thread_id: &str,
+    expected: &RunMandate,
+) -> anyhow::Result<ThreadState> {
+    mutate(paths, None, thread_id, |data, _| {
+        let m = data
+            .mandate
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("thread {thread_id:?} has no mandate to grant"))?;
+        if data.phase == RunPhase::Completed {
+            anyhow::bail!("thread {thread_id:?} is completed: start a new run instead");
+        }
+        if m.project != expected.project
+            || m.allowed_hosts != expected.allowed_hosts
+            || m.allowed_apps != expected.allowed_apps
+            || m.allow_releases != expected.allow_releases
+            || m.fix_forward_max != expected.fix_forward_max
+            || m.review_rounds_max != expected.review_rounds_max
+            || m.notes != expected.notes
+        {
+            anyhow::bail!(
+                "thread {thread_id:?} mandate changed since it was shown: re-check before granting"
+            );
+        }
+        m.owner_granted = true;
+        Ok(())
+    })
+}
+
+/// Owner Revoke under the per-thread lock: clears ONLY `owner_granted` on the
+/// existing mandate without replacing scope.
+pub fn revoke_mandate(paths: &Paths, thread_id: &str) -> anyhow::Result<ThreadState> {
+    mutate(paths, None, thread_id, |data, _| {
+        let m = data
+            .mandate
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("thread {thread_id:?} has no mandate to revoke"))?;
+        m.owner_granted = false;
+        Ok(())
+    })
+}
+
+/// Atomic compare-and-swap of run phase for the Watchdog: under the
+/// per-thread lock, returns `Ok(None)` without writing when the current
+/// `phase` or `sleep_until` deadline differs from the expected pair;
+/// otherwise writes the new phase/deadline (revoking `owner_granted` on
+/// `Completed`/`Intake`) and returns the saved state.
+pub fn transition_phase_if(
+    paths: &Paths,
+    thread_id: &str,
+    expected_phase: RunPhase,
+    expected_sleep_until: Option<&str>,
+    new_phase: RunPhase,
+    new_sleep_until: Option<Option<String>>,
+) -> anyhow::Result<Option<ThreadState>> {
+    let (path, _guard) = thread_lock(paths, thread_id)?;
+    let mut data = load_or_seed(paths, None, thread_id)?;
+    if data.phase != expected_phase || data.sleep_until.as_deref() != expected_sleep_until {
+        return Ok(None);
+    }
+    data.phase = new_phase;
+    if let Some(s) = new_sleep_until {
+        data.sleep_until = s;
+    }
+    if matches!(new_phase, RunPhase::Completed | RunPhase::Intake)
+        && let Some(m) = data.mandate.as_mut()
+    {
+        m.owner_granted = false;
+    }
+    let now = utc_now();
+    data.updated = now;
+    crate::backlog::save_json(&path, &data)?;
+    Ok(Some(data))
+}
+
+/// Checked RFC3339 deadline (`YYYY-MM-DDTHH:MM:SS[.frac]` with `Z` or a
+/// numeric `±HH:MM` zone); rejects the malformed timestamps that can crash
+/// quota processing. No date crate in scope, so fields are range-checked here.
+fn valid_sleep_until(s: &str) -> bool {
+    let b = s.as_bytes();
+    let dt = if matches!(b.last(), Some(b'Z' | b'z')) {
+        &b[..b.len() - 1]
+    } else {
+        if b.len() < 25 {
+            return false;
+        }
+        let z = &b[b.len() - 6..];
+        if !matches!(z[0], b'+' | b'-') || z[3] != b':' {
+            return false;
+        }
+        let (Some(zh), Some(zm)) = (num(&z[1..3]), num(&z[4..6])) else {
+            return false;
+        };
+        if zh > 23 || zm > 59 {
+            return false;
+        }
+        &b[..b.len() - 6]
+    };
+    if dt.len() < 19 {
+        return false;
+    }
+    if dt[4] != b'-' || dt[7] != b'-' || !matches!(dt[10], b'T' | b't') {
+        return false;
+    }
+    if dt[13] != b':' || dt[16] != b':' {
+        return false;
+    }
+    if !dt[19..].is_empty()
+        && !(dt.len() > 20 && dt[19] == b'.' && dt[20..].iter().all(|c| c.is_ascii_digit()))
+    {
+        return false;
+    }
+    let (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(se)) = (
+        num(&dt[0..4]),
+        num(&dt[5..7]),
+        num(&dt[8..10]),
+        num(&dt[11..13]),
+        num(&dt[14..16]),
+        num(&dt[17..19]),
+    ) else {
+        return false;
+    };
+    if mo == 0 || mo > 12 || h > 23 || mi > 59 || se > 59 {
+        return false;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let dim = match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+    };
+    d >= 1 && d <= dim
+}
+
+fn num(b: &[u8]) -> Option<u32> {
+    if b.is_empty() || !b.iter().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    std::str::from_utf8(b).ok()?.parse().ok()
+}
+
+fn next_id(prefix: &str, used: &[String]) -> String {
+    let mut n = used.len() + 1;
+    loop {
+        let cand = format!("{prefix}-{n}");
+        if !used.iter().any(|u| u == &cand) {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
+/// Park one branch in the Owner Inbox. The id is caller-provided or `inbox-N`.
+pub fn inbox_add(
+    paths: &Paths,
+    t3_root: Option<&Path>,
+    id: &str,
+    item: NewInboxItem,
+) -> anyhow::Result<InboxItem> {
+    if item.title.trim().is_empty() {
+        anyhow::bail!("inbox item needs a title");
+    }
+    let full = mutate(paths, t3_root, id, |data, now| {
+        let used: Vec<String> = data.owner_inbox.iter().map(|i| i.id.clone()).collect();
+        let item_id = item
+            .id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| next_id("inbox", &used));
+        if item_id.len() > 64 {
+            anyhow::bail!("inbox id must be 1-64 chars");
+        }
+        if used.iter().any(|u| u == &item_id) {
+            anyhow::bail!("inbox item {item_id:?} already exists");
+        }
+        data.owner_inbox.push(InboxItem {
+            id: item_id,
+            title: item.title.clone(),
+            reason: item.reason.clone(),
+            action: item.action.clone(),
+            blocked_items: item.blocked_items.clone(),
+            created_at: now.to_string(),
+            resolved: false,
+            resolved_at: None,
+        });
+        Ok(())
+    })?;
+    full.owner_inbox
+        .last()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("inbox item was not saved"))
+}
+
+/// Mark one Owner Inbox item resolved (the owner handled it or it lapsed).
+pub fn inbox_resolve(
+    paths: &Paths,
+    t3_root: Option<&Path>,
+    id: &str,
+    item_id: &str,
+) -> anyhow::Result<InboxItem> {
+    let full = mutate(paths, t3_root, id, |data, now| {
+        let item = data
+            .owner_inbox
+            .iter_mut()
+            .find(|i| i.id == item_id)
+            .ok_or_else(|| anyhow::anyhow!("no inbox item {item_id:?}"))?;
+        item.resolved = true;
+        item.resolved_at = Some(now.to_string());
+        Ok(())
+    })?;
+    full.owner_inbox
+        .into_iter()
+        .find(|i| i.id == item_id)
+        .ok_or_else(|| anyhow::anyhow!("no inbox item {item_id:?}"))
+}
+
+/// Record one reversible autonomous decision with a revert hint.
+pub fn assumption_add(
+    paths: &Paths,
+    t3_root: Option<&Path>,
+    id: &str,
+    item: NewAssumption,
+) -> anyhow::Result<Assumption> {
+    if item.decision.trim().is_empty() {
+        anyhow::bail!("assumption needs a decision");
+    }
+    let full = mutate(paths, t3_root, id, |data, now| {
+        let used: Vec<String> = data.assumptions.iter().map(|a| a.id.clone()).collect();
+        let asm_id = item
+            .id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| next_id("asm", &used));
+        if asm_id.len() > 64 {
+            anyhow::bail!("assumption id must be 1-64 chars");
+        }
+        if used.iter().any(|u| u == &asm_id) {
+            anyhow::bail!("assumption {asm_id:?} already exists");
+        }
+        data.assumptions.push(Assumption {
+            id: asm_id,
+            decision: item.decision.clone(),
+            rationale: item.rationale.clone(),
+            revert_hint: item.revert_hint.clone(),
+            created_at: now.to_string(),
+        });
+        Ok(())
+    })?;
+    full.assumptions
+        .last()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("assumption was not saved"))
+}
+
+/// Exclusive flock on `<thread_id>.lock` (same pattern as `backlog::locked`),
+/// so concurrent writers never interleave on one thread's file.
+fn thread_lock(paths: &Paths, id: &str) -> anyhow::Result<(PathBuf, File)> {
+    let path = file(paths, id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let guard = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("lock"))?;
+    guard.lock()?;
+    Ok((path, guard))
+}
+
+/// This thread's state, else a forked-from ancestor's (mandate stripped), else
+/// a blank state.
+fn load_or_seed(paths: &Paths, t3_root: Option<&Path>, id: &str) -> anyhow::Result<ThreadState> {
+    match load(paths, id)? {
+        Some(d) => Ok(d),
+        None => Ok(read(paths, t3_root, id)?
+            .map(|f| {
+                let mut d = f.data;
+                if f.inherited_from.is_some() {
+                    d.strip_inherited_mandate();
+                }
+                d
+            })
+            .unwrap_or_default()),
+    }
+}
+
 /// Load this thread's state (or seed it from a forked-from ancestor), apply
-/// `f`, stamp it and save atomically.
+/// `f`, stamp it and save atomically. Serialized by an exclusive flock on
+/// `<thread_id>.lock` (same pattern as `backlog::locked`), so concurrent
+/// writers never lose decisions, Inbox entries or checklist updates.
 fn mutate(
     paths: &Paths,
     t3_root: Option<&Path>,
     id: &str,
     f: impl FnOnce(&mut ThreadState, &str) -> anyhow::Result<()>,
 ) -> anyhow::Result<ThreadState> {
-    let path = file(paths, id)?;
-    let mut data = match load(paths, id)? {
-        Some(d) => d,
-        None => read(paths, t3_root, id)?
-            .map(|f| f.data)
-            .unwrap_or_default(),
-    };
+    let (path, _guard) = thread_lock(paths, id)?;
+    let mut data = load_or_seed(paths, t3_root, id)?;
     let now = utc_now();
     f(&mut data, &now)?;
     data.updated = now;
@@ -643,5 +1284,706 @@ mod tests {
         assert_eq!(utc(0), "1970-01-01T00:00:00Z");
         assert_eq!(utc(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(utc(1_794_787_199), "2026-11-15T23:59:59Z");
+    }
+
+    #[test]
+    fn legacy_json_without_new_fields_still_loads() {
+        let (dir, paths) = fx("legacy");
+        let legacy = serde_json::json!({
+            "state": "Goal: old",
+            "updated": "2026-01-01T00:00:00Z",
+            "decisions": [],
+            "checklist": [{"id": "a", "title": "A", "status": "todo"}]
+        });
+        let path = paths.state_dir.join("threads").join("old.json");
+        crate::backlog::save_json(&path, &legacy).unwrap();
+        let f = read(&paths, None, "old").unwrap().unwrap();
+        assert_eq!(f.data.phase, RunPhase::Intake);
+        assert!(f.data.mandate.is_none());
+        assert!(f.data.owner_inbox.is_empty());
+        assert!(f.data.sleep_until.is_none());
+        assert_eq!(f.data.checklist_updates_since_state, 0);
+        assert_eq!(f.data.checkpoint_count, 0);
+        assert_eq!(f.data.checkpoint_run_count, 0);
+        assert_eq!(f.data.checkpoint_item_count, 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn freshness_tracks_checklist_updates_until_state_write() {
+        let (dir, paths) = fx("stale");
+        let p = |id: &str, title: Option<&str>| ItemPatch {
+            id: id.into(),
+            title: title.map(Into::into),
+            ..ItemPatch::default()
+        };
+        // Blank snapshot + checklist = stale.
+        update_checklist(&paths, None, "t", None, &[p("a", Some("A"))], &[]).unwrap();
+        let s = load(&paths, "t").unwrap().unwrap();
+        assert!(s.state_stale());
+        assert_eq!(s.checklist_updates_since_state, 1);
+        assert!(s.state_updated_at.is_empty());
+        // A fresh snapshot clears the counter and stamps state_updated_at.
+        let s = write(&paths, None, "t", Some("Goal: x"), None).unwrap();
+        assert!(!s.state_stale());
+        assert_eq!(s.checklist_updates_since_state, 0);
+        assert!(!s.state_updated_at.is_empty());
+        // Five checklist updates without a state write = stale.
+        for _ in 0..5 {
+            let note = ItemPatch {
+                id: "a".into(),
+                note: Some("still running".into()),
+                ..ItemPatch::default()
+            };
+            update_checklist(&paths, None, "t", None, &[note], &[]).unwrap();
+        }
+        let s = load(&paths, "t").unwrap().unwrap();
+        assert_eq!(s.checklist_updates_since_state, 5);
+        assert!(s.state_stale());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn inbox_and_assumptions_round_trip() {
+        let (dir, paths) = fx("inbox");
+        let item = inbox_add(
+            &paths,
+            None,
+            "t",
+            NewInboxItem {
+                title: "Need token".into(),
+                reason: "owner must paste it".into(),
+                action: "paste into chat".into(),
+                blocked_items: vec!["b".into()],
+                ..NewInboxItem::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(item.id, "inbox-1");
+        assert!(!item.resolved);
+        let s = load(&paths, "t").unwrap().unwrap();
+        assert_eq!(s.open_inbox_count(), 1);
+        let done = inbox_resolve(&paths, None, "t", &item.id).unwrap();
+        assert!(done.resolved && done.resolved_at.is_some());
+        assert!(inbox_resolve(&paths, None, "t", "absent").is_err());
+        let asm = assumption_add(
+            &paths,
+            None,
+            "t",
+            NewAssumption {
+                decision: "Use X".into(),
+                rationale: "fits".into(),
+                revert_hint: "switch to Y".into(),
+                ..NewAssumption::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(asm.id, "asm-1");
+        assert!(
+            inbox_add(
+                &paths,
+                None,
+                "t",
+                NewInboxItem {
+                    id: Some(item.id.clone()),
+                    title: "dup".into(),
+                    ..NewInboxItem::default()
+                }
+            )
+            .is_err()
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_meta_sets_fields_and_gates_checkpoints_on_freshness() {
+        let (dir, paths) = fx("meta");
+        write(&paths, None, "t", Some("Goal: x"), None).unwrap();
+        let s = set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::Running),
+            Some(RunMandate {
+                project: "blockfield".into(),
+                ..RunMandate::default()
+            }),
+            Some(Some("2026-11-22T00:00:00Z".into())),
+            true,
+        )
+        .unwrap();
+        assert_eq!(s.phase, RunPhase::Running);
+        assert_eq!(s.mandate.as_ref().unwrap().fix_forward_max, 3);
+        assert_eq!(s.checkpoint_count, 1);
+        assert!(!s.last_checkpoint_at.is_empty());
+        // Age the snapshot, then a checkpoint must be refused.
+        let p = |id: &str, title: Option<&str>| ItemPatch {
+            id: id.into(),
+            title: title.map(Into::into),
+            ..ItemPatch::default()
+        };
+        update_checklist(&paths, None, "t", None, &[p("a", Some("A"))], &[]).unwrap();
+        for _ in 0..4 {
+            let note = ItemPatch {
+                id: "a".into(),
+                note: Some("n".into()),
+                ..ItemPatch::default()
+            };
+            update_checklist(&paths, None, "t", None, &[note], &[]).unwrap();
+        }
+        assert!(
+            set_run_meta(&paths, None, "t", None, None, None, true).is_err(),
+            "stale checkpoint must be refused"
+        );
+        // Non-checkpoint meta changes still work while stale.
+        let s = set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::SleepingForQuota),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(s.phase, RunPhase::SleepingForQuota);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fork_strips_owner_mandate() {
+        let (dir, paths) = fx("strip");
+        let t3 = t3_with_fork(&dir, "child", "parent");
+        set_run_meta(
+            &paths,
+            None,
+            "parent",
+            Some(RunPhase::Running),
+            Some(RunMandate {
+                project: "blockfield".into(),
+                owner_granted: true,
+                ..RunMandate::default()
+            }),
+            None,
+            false,
+        )
+        .unwrap();
+        let f = read(&paths, Some(&t3), "child").unwrap().unwrap();
+        assert_eq!(f.inherited_from.as_deref(), Some("parent"));
+        assert_eq!(f.data.phase, RunPhase::Intake);
+        assert!(!f.data.mandate.as_ref().unwrap().owner_granted);
+        // First write on the fork persists the stripped mandate.
+        let s = write(&paths, Some(&t3), "child", None, Some("owner: ok")).unwrap();
+        assert_eq!(s.phase, RunPhase::Intake);
+        assert!(!s.mandate.as_ref().unwrap().owner_granted);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unblocked_work_excludes_parked_inbox_items() {
+        let (dir, paths) = fx("parked");
+        let p = |id: &str, title: &str| ItemPatch {
+            id: id.into(),
+            title: Some(title.into()),
+            links: Some(vec![format!("repo#{id}")]),
+            ..ItemPatch::default()
+        };
+        update_checklist(&paths, None, "t", None, &[p("a", "A")], &[]).unwrap();
+        assert!(load(&paths, "t").unwrap().unwrap().has_unblocked_work());
+        // Park by id; title and link matches count too.
+        inbox_add(
+            &paths,
+            None,
+            "t",
+            NewInboxItem {
+                title: "need owner".into(),
+                blocked_items: vec!["a".into(), "A".into(), "repo#a".into()],
+                ..NewInboxItem::default()
+            },
+        )
+        .unwrap();
+        assert!(!load(&paths, "t").unwrap().unwrap().has_unblocked_work());
+        // A fresh todo item outside the inbox still counts.
+        update_checklist(
+            &paths,
+            None,
+            "t",
+            None,
+            &[ItemPatch {
+                id: "b".into(),
+                title: Some("B".into()),
+                ..ItemPatch::default()
+            }],
+            &[],
+        )
+        .unwrap();
+        assert!(load(&paths, "t").unwrap().unwrap().has_unblocked_work());
+        update_checklist(&paths, None, "t", None, &[], &["b".into()]).unwrap();
+        assert!(!load(&paths, "t").unwrap().unwrap().has_unblocked_work());
+        // Resolving the entry restores eligibility.
+        inbox_resolve(&paths, None, "t", "inbox-1").unwrap();
+        assert!(load(&paths, "t").unwrap().unwrap().has_unblocked_work());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn apply_update_validates_sleep_until_and_empty_checkpoint() {
+        let (dir, paths) = fx("apply");
+        // Empty snapshot: checkpoint refused even with an empty checklist.
+        assert!(set_run_meta(&paths, None, "t", None, None, None, true).is_err());
+        // Malformed deadlines refused at the write boundary.
+        for bad in [
+            "2026-11-22",
+            "2026-11-22 00:00:00",
+            "2026-13-01T00:00:00Z",
+            "2026-11-31T00:00:00Z",
+            "2023-02-29T00:00:00Z",
+            "2026-11-22T24:00:00Z",
+            "2026-11-22T00:00Z",
+            "not-a-date",
+            "",
+        ] {
+            assert!(
+                set_run_meta(&paths, None, "t", None, None, Some(Some(bad.into())), false).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        // Valid deadlines (leap day, frac, offset) accepted; clearing works.
+        for good in [
+            "2026-11-22T00:00:00Z",
+            "2024-02-29T12:30:59z",
+            "2026-11-22T00:00:00.5Z",
+            "2026-11-22T00:00:00+02:00",
+        ] {
+            set_run_meta(
+                &paths,
+                None,
+                "t",
+                None,
+                None,
+                Some(Some(good.into())),
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                load(&paths, "t").unwrap().unwrap().sleep_until.as_deref(),
+                Some(good)
+            );
+        }
+        set_run_meta(&paths, None, "t", None, None, Some(None), false).unwrap();
+        assert!(load(&paths, "t").unwrap().unwrap().sleep_until.is_none());
+        // Fresh state + checkpoint in one atomic call succeeds.
+        let s = apply_update(
+            &paths,
+            None,
+            "t",
+            Some("Goal: x"),
+            None,
+            Some(RunPhase::Running),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(s.checkpoint_count, 1);
+        assert!(!s.last_checkpoint_at.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unblocked_work_ignores_done_held_blocked() {
+        let (dir, paths) = fx("unblocked");
+        let p = |id: &str, title: &str, status: &str| ItemPatch {
+            id: id.into(),
+            title: Some(title.into()),
+            status: Some(status.into()),
+            ..ItemPatch::default()
+        };
+        update_checklist(
+            &paths,
+            None,
+            "t",
+            None,
+            &[
+                p("a", "A", "done"),
+                p("b", "B", "held"),
+                p("c", "C", "blocked"),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert!(!load(&paths, "t").unwrap().unwrap().has_unblocked_work());
+        update_checklist(&paths, None, "t", None, &[p("d", "D", "review")], &[]).unwrap();
+        assert!(load(&paths, "t").unwrap().unwrap().has_unblocked_work());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn granted_mandate() -> RunMandate {
+        RunMandate {
+            project: "blockfield".into(),
+            allowed_hosts: vec!["staging".into()],
+            allowed_apps: vec!["deploy".into()],
+            owner_granted: true,
+            ..RunMandate::default()
+        }
+    }
+
+    #[test]
+    fn completing_or_intake_revokes_owner_grant() {
+        let (dir, paths) = fx("revoke");
+        write(&paths, None, "t", Some("Goal: x"), None).unwrap();
+        set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::Running),
+            Some(granted_mandate()),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            load(&paths, "t")
+                .unwrap()
+                .unwrap()
+                .mandate
+                .unwrap()
+                .owner_granted
+        );
+        // Completing the run clears the grant ...
+        let s = set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::Completed),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(!s.mandate.as_ref().unwrap().owner_granted);
+        // ... and flipping back to Running does not resurrect it.
+        let s = set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::Running),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(!s.mandate.as_ref().unwrap().owner_granted);
+        // Same for a reset to Intake.
+        set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::Running),
+            Some(granted_mandate()),
+            None,
+            false,
+        )
+        .unwrap();
+        let s = set_run_meta(&paths, None, "t", Some(RunPhase::Intake), None, None, false).unwrap();
+        assert!(!s.mandate.as_ref().unwrap().owner_granted);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn grant_and_revoke_mandate_keep_scope() {
+        let (dir, paths) = fx("grant");
+        write(&paths, None, "t", Some("Goal: x"), None).unwrap();
+        // No mandate: both fail.
+        assert!(grant_mandate_if_matches(&paths, "t", &granted_mandate()).is_err());
+        assert!(revoke_mandate(&paths, "t").is_err());
+        // Intake is grantable, and only the flag flips.
+        set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::Intake),
+            Some(RunMandate {
+                owner_granted: false,
+                ..granted_mandate()
+            }),
+            None,
+            false,
+        )
+        .unwrap();
+        let shown = RunMandate {
+            owner_granted: false,
+            ..granted_mandate()
+        };
+        let s = grant_mandate_if_matches(&paths, "t", &shown).unwrap();
+        let m = s.mandate.unwrap();
+        assert!(m.owner_granted);
+        assert_eq!(
+            (m.project.as_str(), m.allowed_hosts, m.allowed_apps),
+            (
+                "blockfield",
+                vec!["staging".to_string()],
+                vec!["deploy".to_string()]
+            )
+        );
+        // A concurrently modified scope is rejected, grant untouched.
+        let mut changed = shown.clone();
+        changed.allowed_hosts.push("prod".into());
+        set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::Running),
+            Some(changed),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(grant_mandate_if_matches(&paths, "t", &shown).is_err());
+        // Completed runs are never grantable.
+        set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::Completed),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(grant_mandate_if_matches(&paths, "t", &shown).is_err());
+        // Revoke clears only the flag.
+        let s = revoke_mandate(&paths, "t").unwrap();
+        let m = s.mandate.unwrap();
+        assert!(!m.owner_granted);
+        assert_eq!(
+            m.allowed_hosts,
+            vec!["staging".to_string(), "prod".to_string()]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn transition_phase_if_is_a_locked_cas() {
+        let (dir, paths) = fx("cas");
+        write(&paths, None, "t", Some("Goal: x"), None).unwrap();
+        set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::SleepingForQuota),
+            Some(granted_mandate()),
+            Some(Some("2026-11-22T00:00:00Z".into())),
+            false,
+        )
+        .unwrap();
+        // Wrong expected phase: no write.
+        assert!(
+            transition_phase_if(
+                &paths,
+                "t",
+                RunPhase::Running,
+                Some("2026-11-22T00:00:00Z"),
+                RunPhase::Running,
+                Some(None),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            load(&paths, "t").unwrap().unwrap().phase,
+            RunPhase::SleepingForQuota
+        );
+        // Wrong expected deadline: no write.
+        assert!(
+            transition_phase_if(
+                &paths,
+                "t",
+                RunPhase::SleepingForQuota,
+                Some("2026-11-23T00:00:00Z"),
+                RunPhase::Running,
+                Some(None),
+            )
+            .unwrap()
+            .is_none()
+        );
+        // Match: flips phase and clears the deadline.
+        let s = transition_phase_if(
+            &paths,
+            "t",
+            RunPhase::SleepingForQuota,
+            Some("2026-11-22T00:00:00Z"),
+            RunPhase::Running,
+            Some(None),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(s.phase, RunPhase::Running);
+        assert!(s.sleep_until.is_none());
+        assert!(s.mandate.as_ref().unwrap().owner_granted);
+        // A completed thread is never flipped back to Running (stale CAS loses).
+        set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::Completed),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            transition_phase_if(
+                &paths,
+                "t",
+                RunPhase::SleepingForQuota,
+                None,
+                RunPhase::Running,
+                Some(None),
+            )
+            .unwrap()
+            .is_none()
+        );
+        let s = load(&paths, "t").unwrap().unwrap();
+        assert_eq!(s.phase, RunPhase::Completed);
+        assert!(!s.mandate.as_ref().unwrap().owner_granted);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn checkpoint_baselines_recorded_only_on_success() {
+        let (dir, paths) = fx("baselines");
+        write(&paths, None, "t", Some("Goal: x"), None).unwrap();
+        let s = apply_state_update(
+            &paths,
+            None,
+            "t",
+            StateUpdate {
+                record_checkpoint: true,
+                checkpoint_run_count: Some(81),
+                checkpoint_item_count: Some(1501),
+                ..StateUpdate::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                s.checkpoint_count,
+                s.checkpoint_run_count,
+                s.checkpoint_item_count
+            ),
+            (1, 81, 1501)
+        );
+        // A checkpoint without totals leaves the baselines alone.
+        let s = apply_state_update(
+            &paths,
+            None,
+            "t",
+            StateUpdate {
+                record_checkpoint: true,
+                ..StateUpdate::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                s.checkpoint_count,
+                s.checkpoint_run_count,
+                s.checkpoint_item_count
+            ),
+            (2, 81, 1501)
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_checkpoint_rolls_back_decision() {
+        let (dir, paths) = fx("rollback");
+        write(&paths, None, "t", Some("Goal: x"), None).unwrap();
+        // Age the snapshot: 5 note-only checklist updates make it stale.
+        update_checklist(
+            &paths,
+            None,
+            "t",
+            None,
+            &[ItemPatch {
+                id: "a".into(),
+                title: Some("A".into()),
+                ..ItemPatch::default()
+            }],
+            &[],
+        )
+        .unwrap();
+        for _ in 0..5 {
+            update_checklist(
+                &paths,
+                None,
+                "t",
+                None,
+                &[ItemPatch {
+                    id: "a".into(),
+                    note: Some("still running".into()),
+                    ..ItemPatch::default()
+                }],
+                &[],
+            )
+            .unwrap();
+        }
+        let before = load(&paths, "t").unwrap().unwrap();
+        assert!(before.state_stale());
+        assert!(
+            apply_update(
+                &paths,
+                None,
+                "t",
+                None,
+                Some("owner: go"),
+                None,
+                None,
+                None,
+                true,
+            )
+            .is_err()
+        );
+        let after = load(&paths, "t").unwrap().unwrap();
+        assert!(
+            after.decisions.is_empty(),
+            "failed checkpoint must not keep the decision"
+        );
+        assert_eq!(after.decisions, before.decisions);
+        assert_eq!(after.checkpoint_count, before.checkpoint_count);
+        assert_eq!(after.state, before.state);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_reports_all_land() {
+        let (dir, paths) = fx("reports");
+        write(&paths, None, "t", Some("Goal: x"), None).unwrap();
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let p = Paths::new(paths.config_dir.clone(), paths.state_dir.clone());
+                s.spawn(move || {
+                    for i in 0..10 {
+                        update_checklist(
+                            &p,
+                            None,
+                            "t",
+                            None,
+                            &[ItemPatch {
+                                id: format!("t{t}-i{i}"),
+                                title: Some(format!("item {t}-{i}")),
+                                ..ItemPatch::default()
+                            }],
+                            &[],
+                        )
+                        .unwrap();
+                    }
+                });
+            }
+        });
+        let lines = fs::read_to_string(paths.state_dir.join("coordinator/reports.jsonl")).unwrap();
+        assert_eq!(lines.lines().count(), 80);
+        let _ = fs::remove_dir_all(dir);
     }
 }

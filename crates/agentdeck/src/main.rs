@@ -1,8 +1,10 @@
 use agentdeck_core::{AddSpec, Harness, Paths, t3};
 use clap::{Parser, Subcommand, ValueEnum};
 
+mod cmd_approver;
 mod cmd_claude;
 mod cmd_codex;
+mod cmd_coordinator;
 mod cmd_daemon;
 mod cmd_harness;
 mod cmd_imagegen;
@@ -114,10 +116,20 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Enable or disable built-in plugins (agent-process, ai-usage, router, imagegen, mcp-server, coordinator).
+    /// Enable or disable built-in plugins (agent-process, ai-usage, router, imagegen, mcp-server, coordinator, approver).
     Plugin {
         #[command(subcommand)]
         cmd: cmd_plugin::PluginCmd,
+    },
+    /// Local approval broker: status, audit, perimeter eval, socket client, SSH relay and config.
+    Approver {
+        #[command(subcommand)]
+        cmd: cmd_approver::ApproverCmd,
+    },
+    /// Long-horizon coordinator: thread status, pool quotas, hygiene, mandate grants and checkpoint eval.
+    Coordinator {
+        #[command(subcommand)]
+        cmd: cmd_coordinator::CoordinatorCmd,
     },
     /// Generate or edit one image through Vercel AI Gateway or OpenRouter
     /// (plugin imagegen). Prints one JSON line.
@@ -250,7 +262,7 @@ fn main() -> anyhow::Result<()> {
     // Plain CLI output ends quietly at `| head`. Daemon, GUI and the route proxies
     // write to child pipes and must keep handling EPIPE themselves.
     let first = std::env::args().nth(1).unwrap_or_default();
-    let plain = !first.is_empty() && !matches!(first.as_str(), "daemon" | "route")
+    let plain = !first.is_empty() && !matches!(first.as_str(), "daemon" | "route" | "approver")
         || std::env::args().any(|a| a == "--check");
     if plain {
         // SAFETY: single-threaded here; restoring the default disposition.
@@ -325,9 +337,21 @@ async fn async_main(paths: &Paths, cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Ps(args) => cmd_ps::run(args)?,
         Cmd::Service { cmd } => cmd_service::run(paths, cmd)?,
         Cmd::Plugin { cmd } => cmd_plugin::run(paths, cmd)?,
+        Cmd::Approver { cmd } => {
+            let code = cmd_approver::run(paths, cmd).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Cmd::Coordinator { cmd } => {
+            let code = cmd_coordinator::run(paths, cmd).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Cmd::Uninstall { dry_run } => cmd_plugin::uninstall(paths, dry_run)?,
         Cmd::Imagegen(args) => std::process::exit(cmd_imagegen::run(paths, args).await),
-        Cmd::McpServer => cmd_mcp_server::run(paths)?,
+        Cmd::McpServer => cmd_mcp_server::run(paths).await?,
         Cmd::Skills { cmd } => cmd_shared::run_skills(paths, cmd)?,
         Cmd::Instructions { cmd } => cmd_shared::run_instructions(paths, cmd)?,
         Cmd::Mcp { cmd } => cmd_shared::run_mcp(paths, cmd)?,

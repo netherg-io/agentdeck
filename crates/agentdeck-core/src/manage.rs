@@ -63,15 +63,21 @@ pub fn frontmatter(text: &str) -> Frontmatter {
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
-        let value = value
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_string();
+        let value = value.trim();
         match key.trim() {
-            "name" => fm.name = Some(value),
-            "description" => fm.description = value,
-            "disable-model-invocation" => fm.disable_model_invocation = value == "true",
+            "name" => fm.name = Some(value.trim_matches('"').trim_matches('\'').to_string()),
+            "description" => {
+                fm.description = value.trim_matches('"').trim_matches('\'').to_string()
+            }
+            // Same inline-comment rule as `shared.rs`: `true # why` counts,
+            // `true#x` does not.
+            "disable-model-invocation" => {
+                fm.disable_model_invocation = crate::shared::strip_yaml_comment(value)
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .eq_ignore_ascii_case("true")
+            }
             _ => {}
         }
     }
@@ -1151,6 +1157,29 @@ mod tests {
         assert_eq!(fm.description, "A: b");
         assert!(fm.disable_model_invocation);
         assert_eq!(frontmatter("no frontmatter"), Frontmatter::default());
+    }
+
+    #[test]
+    fn frontmatter_invocation_matches_shared_comment_rule() {
+        // `true # comment` counts (same as shared.rs); case is ignored.
+        for raw in [
+            "disable-model-invocation: true # comment",
+            "disable-model-invocation: True",
+            "disable-model-invocation: TRUE  ",
+        ] {
+            let fm = frontmatter(&format!("---\nname: x\ndescription: d\n{raw}\n---\nbody"));
+            assert!(fm.disable_model_invocation, "{raw}");
+        }
+        // `#` without preceding whitespace is not a comment; other values
+        // stay user-invoked.
+        for raw in [
+            "disable-model-invocation: true#x",
+            "disable-model-invocation: false",
+            "disable-model-invocation: yes",
+        ] {
+            let fm = frontmatter(&format!("---\nname: x\ndescription: d\n{raw}\n---\nbody"));
+            assert!(!fm.disable_model_invocation, "{raw}");
+        }
     }
 
     #[test]

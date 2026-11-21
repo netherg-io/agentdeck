@@ -432,10 +432,9 @@ fn copy_is_current(src: &Path, dst: &Path) -> bool {
     if marker.map(|b| b != marker_bytes(src)).unwrap_or(true) {
         return false;
     }
-    let mut src_files = Vec::new();
-    if !collect_files(src, src, &mut src_files) {
+    let Some(src_files) = copy_files(src) else {
         return false;
-    }
+    };
     for (rel, bytes) in &src_files {
         if fs::read(dst.join(rel)).ok().as_deref() != Some(bytes.as_slice()) {
             return false;
@@ -450,6 +449,101 @@ fn copy_is_current(src: &Path, dst: &Path) -> bool {
     dst_files
         .iter()
         .all(|(r, _)| r == Path::new(SKILL_MARKER) || src_names.contains(r.as_path()))
+}
+
+/// Prepended to the agy description of a user-invoked skill.
+const USER_INVOKED: &str = "User-invoked only (load only when explicitly named by the user). ";
+
+/// Source files as an agy copy holds them. Copy targets are all agy, which
+/// hides `disable-model-invocation: true` skills from its skill list, so the
+/// copy drops that flag and marks the description user-invoked instead.
+fn copy_files(src: &Path) -> Option<Vec<(PathBuf, Vec<u8>)>> {
+    let mut files = Vec::new();
+    if !collect_files(src, src, &mut files) {
+        return None;
+    }
+    for (rel, bytes) in &mut files {
+        if rel == Path::new("SKILL.md") {
+            *bytes = agy_skill_md(std::mem::take(bytes));
+        }
+    }
+    Some(files)
+}
+
+/// Top-level `key: value` of a frontmatter line, value trimmed.
+fn top_key(line: &str) -> Option<(&str, &str)> {
+    if line.starts_with([' ', '\t']) {
+        return None;
+    }
+    line.split_once(':').map(|(k, v)| (k.trim(), v.trim()))
+}
+
+/// Trailing YAML `#` comment outside quotes: `true # why` is boolean true.
+/// A `#` without preceding whitespace is not a comment (`true#x` stays as is).
+pub(crate) fn strip_yaml_comment(v: &str) -> &str {
+    if v.starts_with(['"', '\'']) {
+        return v;
+    }
+    match v.find('#') {
+        Some(i) if i == 0 || v.as_bytes()[i - 1].is_ascii_whitespace() => v[..i].trim_end(),
+        _ => v,
+    }
+}
+
+/// `SKILL.md` rewritten for agy; byte-for-byte unchanged unless its
+/// frontmatter has `disable-model-invocation: true`. Idempotent.
+fn agy_skill_md(bytes: Vec<u8>) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return bytes;
+    };
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    if lines.first().map(|l| l.trim_end()) != Some("---") {
+        return bytes;
+    }
+    let Some(end) = (1..lines.len()).find(|&i| lines[i].trim_end() == "---") else {
+        return bytes;
+    };
+    let is_key =
+        |i: usize, key: &str| top_key(lines[i]).is_some_and(|(k, _)| k.eq_ignore_ascii_case(key));
+    let Some(flag) = (1..end).find(|&i| {
+        is_key(i, "disable-model-invocation")
+            && top_key(lines[i])
+                .is_some_and(|(_, v)| strip_yaml_comment(v).eq_ignore_ascii_case("true"))
+    }) else {
+        return bytes;
+    };
+    let eol = if lines[flag].ends_with("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let plain = format!("description: {}{eol}", USER_INVOKED.trim_end());
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    out[flag].clear();
+    let Some(d) = (1..end).find(|&i| is_key(i, "description")) else {
+        out[flag] = plain;
+        return out.concat().into_bytes();
+    };
+    let line = lines[d];
+    let value = line[line.find(':').unwrap() + 1..].trim_start();
+    // (line, byte offset) where the description text starts.
+    let at = if value.starts_with(['"', '\'']) {
+        Some((d, line.len() - value.len() + 1))
+    } else if value.is_empty() || value.starts_with(['>', '|']) {
+        // Block or multi-line scalar: its first indented content line.
+        (d + 1..end)
+            .take_while(|&i| lines[i].starts_with([' ', '\t']) || lines[i].trim().is_empty())
+            .find(|&i| !lines[i].trim().is_empty())
+            .map(|i| (i, lines[i].len() - lines[i].trim_start().len()))
+    } else {
+        Some((d, line.len() - value.len()))
+    };
+    match at {
+        Some((i, pos)) if lines[i][pos..].starts_with(USER_INVOKED) => {}
+        Some((i, pos)) => out[i].insert_str(pos, USER_INVOKED),
+        None => out[d] = plain,
+    }
+    out.concat().into_bytes()
 }
 
 fn marker_bytes(src: &Path) -> Vec<u8> {
@@ -484,10 +578,9 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) -> 
 /// `Mkdir` + one `WriteFile` per file plus the marker. Copies never carry a
 /// per-file backup (they are generated); the replaced dir is backed up first.
 fn plan_copy(src: &Path, dst: &Path) -> anyhow::Result<Vec<Change>> {
-    let mut files = Vec::new();
-    if !collect_files(src, src, &mut files) {
+    let Some(mut files) = copy_files(src) else {
         anyhow::bail!("cannot read skill source {}", src.display());
-    }
+    };
     let mut changes = vec![Change::Mkdir {
         path: dst.to_path_buf(),
     }];
@@ -1566,6 +1659,124 @@ mod tests {
                 .modified()
                 .unwrap(),
             before
+        );
+    }
+
+    const UI: &str = "User-invoked only (load only when explicitly named by the user). ";
+
+    #[test]
+    fn agy_skill_md_marks_user_invoked_skills() {
+        let cases = [
+            (
+                "---\nname: a\ndescription: Grill a plan.\ndisable-model-invocation: true\n---\nbody\n",
+                format!("---\nname: a\ndescription: {UI}Grill a plan.\n---\nbody\n"),
+            ),
+            (
+                "---\nname: a\ndisable-model-invocation:   TRUE\ndescription: \"Say \\\"hi\\\".\"\n---\n",
+                format!("---\nname: a\ndescription: \"{UI}Say \\\"hi\\\".\"\n---\n"),
+            ),
+            (
+                "---\nname: a\ndescription: Grill a plan.\ndisable-model-invocation: true # agy hides this\n---\nbody\n",
+                format!("---\nname: a\ndescription: {UI}Grill a plan.\n---\nbody\n"),
+            ),
+            (
+                "---\ndisable-model-invocation: TRUE\t# tabbed comment\ndescription: d\n---\n",
+                format!("---\ndescription: {UI}d\n---\n"),
+            ),
+            (
+                "---\ndescription: 'It''s here'\ndisable-model-invocation : true\n---\n",
+                format!("---\ndescription: '{UI}It''s here'\n---\n"),
+            ),
+            (
+                "---\ndescription: >-\n  Folded\n  text.\ndisable-model-invocation: true\nname: a\n---\n",
+                format!("---\ndescription: >-\n  {UI}Folded\n  text.\nname: a\n---\n"),
+            ),
+            (
+                "---\ndescription: |\n\n    Literal\ndisable-model-invocation: true\n---\n",
+                format!("---\ndescription: |\n\n    {UI}Literal\n---\n"),
+            ),
+            (
+                "---\r\nname: a\r\ndisable-model-invocation: true\r\n---\r\n",
+                format!(
+                    "---\r\nname: a\r\ndescription: {}\r\n---\r\n",
+                    UI.trim_end()
+                ),
+            ),
+            (
+                "---\ndescription: >\ndisable-model-invocation: true\n---\n",
+                format!("---\ndescription: {}\n---\n", UI.trim_end()),
+            ),
+            (
+                &format!("---\ndescription: {UI}x\ndisable-model-invocation: true\n---\n"),
+                format!("---\ndescription: {UI}x\n---\n"),
+            ),
+        ];
+        for (input, want) in &cases {
+            let once = agy_skill_md(input.as_bytes().to_vec());
+            assert_eq!(String::from_utf8(once.clone()).unwrap(), *want, "{input:?}");
+            assert_eq!(agy_skill_md(once.clone()), once, "idempotent: {input:?}");
+        }
+        for same in [
+            "---\nname: a\ndescription: d\n---\n",
+            "---\ndisable-model-invocation: false\ndescription: d\n---\n",
+            "---\nmeta:\n  disable-model-invocation: true\n---\n",
+            "no frontmatter\ndisable-model-invocation: true\n",
+            "---\ndisable-model-invocation: true\n",
+            "# body\n---\ndisable-model-invocation: true\n---\n",
+            "---\ndisable-model-invocation: true#not-a-comment\ndescription: d\n---\n",
+            "---\ndisable-model-invocation: \"true # quoted\"\ndescription: d\n---\n",
+        ] {
+            assert_eq!(
+                agy_skill_md(same.as_bytes().to_vec()),
+                same.as_bytes(),
+                "{same:?}"
+            );
+        }
+        let binary = b"---\ndisable-model-invocation: true\n\xff\n---\n".to_vec();
+        assert_eq!(agy_skill_md(binary.clone()), binary);
+    }
+
+    #[test]
+    fn agy_copy_of_user_invoked_skill_syncs_without_drift() {
+        let fx = skills_fixture();
+        let source = fx.home.join(".general/skills/grill");
+        let body = "---\nname: grill\ndescription: Grill.\ndisable-model-invocation: true # only when named\n---\n# grill\n";
+        write_skill(&fx.home.join(".general/skills"), "grill", body);
+        fs::write(source.join("notes.md"), "disable-model-invocation: true\n").unwrap();
+        let agy = fx.home.join(".gemini/skills/grill");
+        assert!(
+            skills_status(&fx.home, &fx.paths)
+                .iter()
+                .any(|s| s.skill == "grill" && matches!(s.state, SkillState::Missing))
+        );
+        sync(&fx);
+        assert_eq!(
+            fs::read_to_string(agy.join("SKILL.md")).unwrap(),
+            format!("---\nname: grill\ndescription: {UI}Grill.\n---\n# grill\n")
+        );
+        assert_eq!(
+            fs::read(agy.join("notes.md")).unwrap(),
+            b"disable-model-invocation: true\n"
+        );
+        // Link targets keep pointing at the untouched source.
+        assert_eq!(
+            fs::read_link(fx.home.join(".claude/skills/grill")).unwrap(),
+            source
+        );
+        assert_eq!(fs::read_to_string(source.join("SKILL.md")).unwrap(), body);
+        assert!(plan_skills_sync(&fx.home, &fx.paths).unwrap().is_empty());
+        assert!(
+            skills_status(&fx.home, &fx.paths)
+                .iter()
+                .filter(|s| s.skill == "grill")
+                .all(|s| matches!(s.state, SkillState::Ok))
+        );
+        // A hand-edited agy copy is drift again.
+        fs::write(agy.join("SKILL.md"), body).unwrap();
+        assert!(
+            skills_status(&fx.home, &fx.paths)
+                .iter()
+                .any(|s| s.skill == "grill" && matches!(s.state, SkillState::StaleCopy))
         );
     }
 
