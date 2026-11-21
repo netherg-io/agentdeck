@@ -18,13 +18,15 @@ pub const PLUGIN_ROUTER: &str = "router";
 pub const PLUGIN_IMAGEGEN: &str = "imagegen";
 pub const PLUGIN_MCP_SERVER: &str = "mcp-server";
 pub const PLUGIN_COORDINATOR: &str = "coordinator";
-pub const PLUGINS: [&str; 6] = [
+pub const PLUGIN_APPROVER: &str = "approver";
+pub const PLUGINS: [&str; 7] = [
     PLUGIN_AGENT_PROCESS,
     PLUGIN_AI_USAGE,
     PLUGIN_ROUTER,
     PLUGIN_IMAGEGEN,
     PLUGIN_MCP_SERVER,
     PLUGIN_COORDINATOR,
+    PLUGIN_APPROVER,
 ];
 
 /// agent-process instruction block. Every mention of the launcher lives here
@@ -39,7 +41,7 @@ pub fn is_known(name: &str) -> bool {
 fn check_name(name: &str) -> anyhow::Result<()> {
     if !is_known(name) {
         anyhow::bail!(
-            "unknown plugin {name:?}: expected agent-process, ai-usage, router, imagegen, mcp-server or coordinator"
+            "unknown plugin {name:?}: expected agent-process, ai-usage, router, imagegen, mcp-server, coordinator or approver"
         );
     }
     Ok(())
@@ -362,7 +364,7 @@ const PLUGIN_SKILLS: [(&str, &[(&str, &str)]); 3] = [
 /// (`shipped_skills_revision_is_bumped` pins the content hash). A build never
 /// rewrites skills that a build with a higher revision wrote, so a stale
 /// daemon or MCP server left running after an upgrade cannot roll them back.
-pub const PLUGIN_SKILLS_REV: u64 = 7;
+pub const PLUGIN_SKILLS_REV: u64 = 8;
 const PLUGIN_SKILLS_REV_FILE: &str = ".rev";
 
 fn stored_plugin_skills_rev(dir: &Path) -> u64 {
@@ -914,6 +916,31 @@ pub fn status(paths: &Paths, home: &Path, exe: &Path) -> Vec<PluginStatus> {
             format!("open backlog items: {open}"),
         ],
     });
+    let app = crate::settings::read_approver(&reg).unwrap_or_default();
+    let tg_ok = crate::settings::approver_telegram_configured(&paths.config_dir);
+    out.push(PluginStatus {
+        name: PLUGIN_APPROVER,
+        enabled: plugin_enabled(&reg, PLUGIN_APPROVER),
+        available: true,
+        detail: vec![
+            format!("socket: {}", app.resolved_socket_path().display()),
+            format!("telegram: {}", if tg_ok { "configured" } else { "missing" }),
+            format!(
+                "timeouts: {}s autonomous / {}s interactive",
+                app.autonomous_timeout_secs, app.interactive_timeout_secs
+            ),
+            format!(
+                "judge: {} {} (threshold {:.2})",
+                app.judge_provider
+                    .as_deref()
+                    .unwrap_or(crate::settings::PROVIDER_OPENROUTER),
+                app.judge_model
+                    .as_deref()
+                    .unwrap_or(crate::settings::DEFAULT_DECISION_MODEL),
+                app.judge_confidence_threshold,
+            ),
+        ],
+    });
     out.push(PluginStatus {
         name: PLUGIN_MCP_SERVER,
         enabled: plugin_enabled(&reg, PLUGIN_MCP_SERVER),
@@ -1090,7 +1117,7 @@ pub fn plan_enable(
         PLUGIN_AI_USAGE => plan_enable_ai_usage(paths, home)?,
         PLUGIN_ROUTER => plan_enable_router(paths, home, files, exe, replace)?,
         // Only the flag and its skill (synced after apply).
-        PLUGIN_IMAGEGEN | PLUGIN_COORDINATOR => Vec::new(),
+        PLUGIN_IMAGEGEN | PLUGIN_COORDINATOR | PLUGIN_APPROVER => Vec::new(),
         PLUGIN_MCP_SERVER => {
             let mut c = crate::manage::plan_register(paths, home, exe, true)?.0;
             c.extend(plan_marker_files(
@@ -1135,7 +1162,7 @@ pub fn plan_disable(
         PLUGIN_AGENT_PROCESS => plan_disable_agent_process(home, files, exe, &paths.state_dir)?,
         PLUGIN_AI_USAGE => plan_disable_ai_usage(paths, home)?,
         PLUGIN_ROUTER => plan_disable_router(paths, home, files, exe)?,
-        PLUGIN_IMAGEGEN | PLUGIN_COORDINATOR => Vec::new(),
+        PLUGIN_IMAGEGEN | PLUGIN_COORDINATOR | PLUGIN_APPROVER => Vec::new(),
         PLUGIN_MCP_SERVER => {
             let mut c = crate::manage::plan_register(paths, home, exe, false)?.0;
             c.extend(plan_marker_files(
@@ -1306,7 +1333,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!((PLUGIN_SKILLS_REV, hash), (7, 0x36f5_23cb_1a0d_cd20));
+        assert_eq!((PLUGIN_SKILLS_REV, hash), (8, 0xffce_0560_5220_0349));
     }
 
     /// Every file, link and dir under `root` except agentdeck's own config
@@ -1408,12 +1435,24 @@ mod tests {
             ];
             let before = tree(&g.0, &skip);
             let on = plan_enable(&paths, &home, &files, &exe, name, false).unwrap();
+            assert!(!on.is_empty(), "{name}: enable planned no changes");
             apply_all(&paths, name, true, &on).unwrap();
             sync_plugin_skills(&paths, &home).unwrap();
-            assert_ne!(tree(&g.0, &skip), before, "{name}: enable changed nothing");
+            assert!(
+                plugin_enabled(&Registry::load(&paths).unwrap(), name),
+                "{name}: not enabled in registry"
+            );
+            // approver lives purely inside agentdeck's own config/state dirs (in `skip`).
+            if name != PLUGIN_APPROVER {
+                assert_ne!(tree(&g.0, &skip), before, "{name}: enable changed nothing");
+            }
             let off = plan_disable(&paths, &home, &files, &exe, name).unwrap();
             apply_all(&paths, name, false, &off).unwrap();
             sync_plugin_skills(&paths, &home).unwrap();
+            assert!(
+                !plugin_enabled(&Registry::load(&paths).unwrap(), name),
+                "{name}: still enabled after disable"
+            );
             let after = tree(&g.0, &skip);
             let diff: Vec<String> = before
                 .keys()

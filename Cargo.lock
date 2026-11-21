@@ -119,6 +119,8 @@ name = "agentdeck"
 version = "0.1.23"
 dependencies = [
  "agent-process",
+ "agentdeck-approver",
+ "agentdeck-coordinator",
  "agentdeck-core",
  "agentdeck-gui",
  "agentdeck-router",
@@ -144,6 +146,21 @@ dependencies = [
  "agentdeck-usage",
  "libcosmic",
  "serde_json",
+]
+
+[[package]]
+name = "agentdeck-approver"
+version = "0.1.23"
+dependencies = [
+ "agentdeck-core",
+ "anyhow",
+ "libc",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
 ]
 
 [[package]]
