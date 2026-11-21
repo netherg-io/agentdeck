@@ -40,8 +40,10 @@ COSMIC applet (separate binary, libcosmic required):
 cargo install --locked --path crates/agentdeck-applet
 ```
 
-Then add **agentdeck** in the COSMIC panel settings. The applet reads the same
-`state.json` the daemon publishes; no network calls, no credentials.
+Then add **agentdeck** in the COSMIC panel settings. The applet is strictly for
+AI usage quotas and balances (never Coordinator, Approver, or other modules); it
+reads only the `state.json` the daemon publishes, with no network calls and no
+credentials.
 
 After installing a new build, running processes keep the old binary:
 
