@@ -447,9 +447,10 @@ fn every_page_fits_at_min_size_with_long_names() {
                         at: "1234567890".into(),
                         host: LONG_PATH.into(),
                         kind: "exec".into(),
-                        outcome: "allowed".into(),
+                        outcome: "approved".into(),
                         source: "PolicyJudge".into(),
                     }],
+                    audit_error: None,
                     error: None,
                 }),
             ))),
@@ -559,6 +560,49 @@ fn every_page_fits_at_min_size_with_long_names() {
         update(&mut state, Message::SelectPage(Page::Processes));
         update(&mut state, Message::ProcStop(0));
         shot(&state, lang, "stop_modal");
+    }
+    agentdeck_gui::i18n::set_language("en");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The coordinator header never clips at the minimum window size: the title
+/// row holds title, progress and timestamp, while the wrapping status strip
+/// keeps the phase, inbox and concise stale badges visible in both locales.
+/// The fixture already carries `SleepingForQuota`, a stale snapshot, an open
+/// inbox item and an ungranted mandate, so every badge shows at once.
+#[test]
+fn coordinator_header_never_clips_at_min_size() {
+    let dir = std::env::temp_dir().join(format!(
+        "agentdeck-gui-overflow-hdr-{}",
+        std::process::id()
+    ));
+    let paths = Paths::new(dir.join("config"), dir.join("state"));
+    for lang in ["en", "ru"] {
+        let mut state = app::State::for_tests(paths.clone(), data());
+        update(&mut state, Message::SelectPage(Page::Coordinator));
+        agentdeck_gui::i18n::set_language(lang);
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            (900.0, 560.0),
+            app::view(&state),
+        );
+        let (stale, inbox, grant) = if lang == "ru" {
+            ("Снапшот устарел", "Входящие: 1", "Выдать мандат")
+        } else {
+            ("Stale state", "Inbox: 1", "Grant mandate")
+        };
+        let goal = format!("Ship the release {LONG_NAME}");
+        for text in [goal.as_str(), stale, inbox] {
+            let found = ui
+                .find(text)
+                .unwrap_or_else(|_| panic!("{lang} header shows {text:?}"));
+            assert!(
+                found.visible_bounds().is_some(),
+                "{lang} {text:?} is clipped"
+            );
+        }
+        ui.find(grant)
+            .unwrap_or_else(|_| panic!("{lang} shows the grant button"));
     }
     agentdeck_gui::i18n::set_language("en");
     let _ = std::fs::remove_dir_all(&dir);

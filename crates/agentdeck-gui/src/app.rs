@@ -111,7 +111,11 @@ pub enum Message {
     Pool(pages::pool::Msg),
     Shared(pages::shared::Msg),
     Harnesses(pages::harnesses::Msg),
-    CoordMandate { thread: String, grant: bool },
+    CoordMandate {
+        thread: String,
+        expected: agentdeck_core::thread_state::RunMandate,
+        grant: bool,
+    },
     CoordResolve { thread: String, item: String },
     CoordDone(Result<(), String>),
     Usage(usage::Msg),
@@ -883,30 +887,23 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             Task::none()
         }
         // The owner's Grant/Revoke click seals the Run Mandate outside
-        // agent-writable MCP: only this path flips `owner_granted`.
-        Message::CoordMandate { thread, grant } => match state.paths.clone() {
+        // agent-writable MCP: Grant writes only when the on-disk scope still
+        // matches the displayed snapshot, Revoke clears just the grant flag.
+        Message::CoordMandate {
+            thread,
+            expected,
+            grant,
+        } => match state.paths.clone() {
             Some(paths) => Task::perform(
                 async move {
                     tokio::task::spawn_blocking(move || {
-                        let t3_root = agentdeck_core::t3::t3_root().ok();
-                        let found = agentdeck_core::thread_state::read(
-                            &paths,
-                            t3_root.as_deref(),
-                            &thread,
-                        )
-                        .map_err(|e| format!("{e:#}"))?
-                        .ok_or_else(|| format!("no thread {thread:?}"))?;
-                        let mut mandate = found.data.mandate.unwrap_or_default();
-                        mandate.owner_granted = grant;
-                        agentdeck_core::thread_state::set_run_meta(
-                            &paths,
-                            t3_root.as_deref(),
-                            &thread,
-                            None,
-                            Some(mandate),
-                            None,
-                            false,
-                        )
+                        if grant {
+                            agentdeck_core::thread_state::grant_mandate_if_matches(
+                                &paths, &thread, &expected,
+                            )
+                        } else {
+                            agentdeck_core::thread_state::revoke_mandate(&paths, &thread)
+                        }
                         .map(|_| ())
                         .map_err(|e| format!("{e:#}"))
                     })

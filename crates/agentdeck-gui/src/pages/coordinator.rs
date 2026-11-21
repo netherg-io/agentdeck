@@ -110,89 +110,107 @@ fn item_row(i: &Item) -> Element<'_, Message> {
     .into()
 }
 
-fn list_or_dash(items: &[String]) -> String {
+fn list_or_any(items: &[String]) -> String {
     if items.is_empty() {
-        "—".to_string()
+        loader().get("coord-mandate-any")
     } else {
         items.join(", ")
     }
 }
 
 /// Structured Run Mandate summary plus the owner's Grant/Revoke button. The
-/// button writes `owner_granted` directly: only the owner seals the mandate.
-fn mandate_block<'a>(thread: &'a str, mandate: Option<&'a RunMandate>) -> Element<'a, Message> {
+/// button carries the exact displayed scope: Grant seals it only when the
+/// on-disk mandate still matches, Revoke clears just `owner_granted`.
+fn mandate_block<'a>(
+    phase: &RunPhase,
+    thread: &'a str,
+    mandate: Option<&'a RunMandate>,
+) -> Element<'a, Message> {
     let mut col = column![st::caption(fl!(loader(), "coord-mandate"))].spacing(4);
-    match mandate {
-        None => {
-            col = col.push(st::muted(fl!(loader(), "coord-mandate-none")));
-            col = col.push(
-                st::btn(st::Btn::Primary, fl!(loader(), "coord-grant"))
-                    .on_press(Message::CoordMandate {
-                        thread: thread.to_string(),
-                        grant: true,
-                    }),
-            );
-        }
-        Some(m) => {
-            let (state, tone) = if m.owner_granted {
-                (fl!(loader(), "coord-mandate-granted"), st::Tone::Ok)
+    let Some(m) = mandate else {
+        // No scope to show, and nothing safe to grant.
+        col = col.push(st::muted(fl!(loader(), "coord-mandate-none")));
+        return col.into();
+    };
+    let (state, tone) = if m.owner_granted {
+        (fl!(loader(), "coord-mandate-granted"), st::Tone::Ok)
+    } else {
+        (fl!(loader(), "coord-mandate-pending"), st::Tone::Warn)
+    };
+    let mut status = row![
+        st::pill(state, tone),
+        iced::widget::Space::new().width(Length::Fill),
+    ]
+    .spacing(st::SPACE_S)
+    .align_y(Alignment::Center);
+    if m.owner_granted {
+        status = status.push(
+            st::btn(st::Btn::Quiet, fl!(loader(), "coord-revoke")).on_press(
+                Message::CoordMandate {
+                    thread: thread.to_string(),
+                    expected: m.clone(),
+                    grant: false,
+                },
+            ),
+        );
+    } else if !matches!(phase, RunPhase::Completed) {
+        status = status.push(
+            st::btn(st::Btn::Quiet, fl!(loader(), "coord-grant")).on_press(
+                Message::CoordMandate {
+                    thread: thread.to_string(),
+                    expected: m.clone(),
+                    grant: true,
+                },
+            ),
+        );
+    }
+    col = col.push(status);
+    for (label, value) in [
+        (
+            fl!(loader(), "coord-mandate-project"),
+            m.project.clone(),
+        ),
+        (
+            fl!(loader(), "coord-mandate-hosts"),
+            list_or_any(&m.allowed_hosts),
+        ),
+        (
+            fl!(loader(), "coord-mandate-apps"),
+            list_or_any(&m.allowed_apps),
+        ),
+        (
+            fl!(loader(), "coord-mandate-releases"),
+            if m.allow_releases {
+                loader().get("coord-mandate-releases-allowed")
             } else {
-                (fl!(loader(), "coord-mandate-pending"), st::Tone::Warn)
-            };
-            col = col.push(
-                row![
-                    st::pill(state, tone),
-                    iced::widget::Space::new().width(Length::Fill),
-                    st::btn(
-                        st::Btn::Quiet,
-                        if m.owner_granted {
-                            fl!(loader(), "coord-revoke")
-                        } else {
-                            fl!(loader(), "coord-grant")
-                        }
-                    )
-                    .on_press(Message::CoordMandate {
-                        thread: thread.to_string(),
-                        grant: !m.owner_granted,
-                    }),
-                ]
-                .spacing(st::SPACE_S)
-                .align_y(Alignment::Center),
-            );
-            for (label, value) in [
-                (
-                    fl!(loader(), "coord-mandate-hosts"),
-                    list_or_dash(&m.allowed_hosts),
-                ),
-                (
-                    fl!(loader(), "coord-mandate-apps"),
-                    list_or_dash(&m.allowed_apps),
-                ),
-                (
-                    fl!(loader(), "coord-mandate-releases"),
-                    if m.allow_releases {
-                        loader().get("coord-mandate-releases-allowed")
-                    } else {
-                        loader().get("coord-mandate-releases-blocked")
-                    },
-                ),
-            ] {
-                col = col.push(
-                    row![
-                        container(st::caption(label)).width(96),
-                        st::fit(value, st::Role::Body, st::Cut::End),
-                    ]
-                    .spacing(st::SPACE_S)
-                    .align_y(Alignment::Center),
-                );
-            }
-            col = col.push(st::mono_muted(plain(fl!(
-                loader(),
-                "coord-mandate-caps",
-                fix = m.fix_forward_max,
-                rev = m.review_rounds_max
-            ))));
-        }
+                loader().get("coord-mandate-releases-blocked")
+            },
+        ),
+    ] {
+        col = col.push(
+            row![
+                container(st::caption(label)).width(96),
+                st::fit(value, st::Role::Body, st::Cut::End),
+            ]
+            .spacing(st::SPACE_S)
+            .align_y(Alignment::Center),
+        );
+    }
+    col = col.push(st::mono_muted(plain(fl!(
+        loader(),
+        "coord-mandate-caps",
+        fix = m.fix_forward_max,
+        rev = m.review_rounds_max
+    ))));
+    if !m.notes.is_empty() {
+        col = col.push(
+            row![
+                container(st::caption(fl!(loader(), "coord-mandate-notes"))).width(96),
+                st::fit(m.notes.clone(), st::Role::Body, st::Cut::End),
+            ]
+            .spacing(st::SPACE_S)
+            .align_y(Alignment::Center),
+        );
     }
     col.into()
 }
@@ -262,6 +280,8 @@ fn assumptions_block(state: &ThreadState) -> Option<Element<'_, Message>> {
 fn thread_card(c: &CoordRow) -> Element<'_, Message> {
     let (done, total) = c.state.progress();
     let name = c.title.clone().unwrap_or_else(|| c.thread.clone());
+    // Row 1 never clips: title takes the free width, progress and timestamp
+    // keep fixed slots at the right.
     let mut head =
         row![container(st::fit(name, st::Role::Heading, st::Cut::End)).width(Length::Fill)]
             .spacing(st::SPACE_S)
@@ -276,26 +296,30 @@ fn thread_card(c: &CoordRow) -> Element<'_, Message> {
             },
         ));
     }
-    head = head.push(phase_pill(&c.state));
-    if c.state.state_stale() {
-        head = head.push(st::pill(fl!(loader(), "coord-stale"), st::Tone::Danger));
-    }
+    head = head.push(st::nowrap(st::caption(stamp(&c.state.updated))));
+    // Row 2 is the wrapping status strip: phase, inbox count and the stale
+    // badge fold onto the next line instead of pushing each other off-screen.
+    let mut strip = row![phase_pill(&c.state)]
+        .spacing(st::SPACE_S)
+        .align_y(Alignment::Center);
     let open = c.state.open_inbox_count();
     if open > 0 {
-        head = head.push(st::pill(
+        strip = strip.push(st::pill(
             plain(fl!(loader(), "coord-inbox-badge", count = open)),
             st::Tone::Warn,
         ));
     }
-    head = head.push(st::nowrap(st::caption(stamp(&c.state.updated))));
-    let mut col = column![head].spacing(st::SPACE_S);
+    if c.state.state_stale() {
+        strip = strip.push(st::pill(fl!(loader(), "coord-stale"), st::Tone::Danger));
+    }
+    let mut col = column![head, strip.wrap()].spacing(st::SPACE_S);
     if let Some(goal) = c.state.state.lines().next().filter(|g| !g.is_empty()) {
         col = col.push(st::muted(goal));
     }
     if total > 0 {
         col = col.push(st::progress(done as f32 * 100.0 / total as f32).length(Length::Fill));
     }
-    col = col.push(mandate_block(&c.thread, c.state.mandate.as_ref()));
+    col = col.push(mandate_block(&c.state.phase, &c.thread, c.state.mandate.as_ref()));
     if let Some(inbox) = inbox_block(&c.thread, &c.state) {
         col = col.push(inbox);
     }
