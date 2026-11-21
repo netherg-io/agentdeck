@@ -108,6 +108,8 @@ fn mandate_from_thread(thread_id: &str, st: &thread_state::ThreadState) -> Optio
     let m = st.mandate.as_ref()?;
     Some(MandateContext {
         active_autonomous_run: true,
+        owner_granted: m.owner_granted,
+        allow_arbitrary_root_scripts: false,
         thread_id: Some(thread_id.to_string()),
         project: if m.project.is_empty() {
             st.project.clone()
@@ -122,40 +124,14 @@ fn mandate_from_thread(thread_id: &str, st: &thread_state::ThreadState) -> Optio
 }
 
 /// Resolve the active `MandateContext` for a specific request from `thread_state::list(paths)`.
-/// Matches `req.thread_id` first (if named, never falls back to another thread's mandate),
-/// otherwise picks the active `Running` thread whose mandate covers `req.host`/`req.app`.
+/// Requires an explicit `req.thread_id` so unrelated callers never borrow another run's mandate.
 fn resolve_request_mandate(paths: &Paths, req: &ApprovalRequest) -> Option<MandateContext> {
+    let tid = req.thread_id.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
     let threads = thread_state::list(paths);
-    if let Some(tid) = req.thread_id.as_deref().filter(|s| !s.is_empty()) {
-        return threads
-            .iter()
-            .find(|(id, _)| id == tid)
-            .and_then(|(id, st)| mandate_from_thread(id, st));
-    }
-    let active: Vec<MandateContext> = threads
+    threads
         .iter()
-        .filter_map(|(id, st)| mandate_from_thread(id, st))
-        .collect();
-    if active.len() <= 1 {
-        return active.into_iter().next();
-    }
-    let host = req.effective_host();
-    let app = req.app.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    active
-        .iter()
-        .find(|m| {
-            let host_ok =
-                m.allowed_hosts.is_empty() || m.allowed_hosts.iter().any(|h| h.eq_ignore_ascii_case(host));
-            let app_ok = match app {
-                None => true,
-                Some(a) => {
-                    m.allowed_apps.is_empty() || m.allowed_apps.iter().any(|x| x.eq_ignore_ascii_case(a))
-                }
-            };
-            host_ok && app_ok
-        })
-        .cloned()
-        .or_else(|| active.into_iter().next())
+        .find(|(id, _)| id == tid)
+        .and_then(|(id, st)| mandate_from_thread(id, st))
 }
 
 /// Snapshot kept in `UnixBrokerServer`'s `RwLock`: exact mandate when 0 or 1
@@ -172,6 +148,8 @@ fn resolve_aggregate_mandate(paths: &Paths) -> Option<MandateContext> {
         many => {
             let mut merged = many[0].clone();
             merged.thread_id = None;
+            merged.owner_granted = many.iter().any(|m| m.owner_granted);
+            merged.allow_releases = many.iter().any(|m| m.allow_releases);
             let any_open_hosts = many.iter().any(|m| m.allowed_hosts.is_empty());
             if any_open_hosts {
                 merged.allowed_hosts.clear();
@@ -824,11 +802,8 @@ mod tests {
         );
         // Explicitly naming a non-running thread must NOT inherit another thread's mandate.
         assert!(resolve_request_mandate(&paths, &mk(Some("t-intake"))).is_none());
-        // Omitting thread_id picks the active running thread matching host.
-        assert_eq!(
-            resolve_request_mandate(&paths, &mk(None)).unwrap().project,
-            "blockfield"
-        );
+        // Omitting thread_id must NOT borrow an active thread's mandate (fail closed).
+        assert!(resolve_request_mandate(&paths, &mk(None)).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
