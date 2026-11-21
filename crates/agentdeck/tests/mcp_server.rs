@@ -16,6 +16,7 @@ fn session_env(dir: &Path, env: &[(&str, &str)], requests: &[Value]) -> Vec<Valu
     let mut child = Command::new(env!("CARGO_BIN_EXE_agentdeck"))
         .arg("mcp-server")
         .env_remove("T3CODE_THREAD_ID")
+        .env_remove("OPENROUTER_API_KEY")
         .env_remove("JEV_OPENROUTER_API_KEY")
         .env_remove("AI_GATEWAY_API_KEY")
         .env("AGENTDECK_T3_DIR", dir.join("no-t3"))
@@ -412,7 +413,13 @@ fn coordinator_pool_checkpoint_and_hygiene_mcp_tools() {
     let t3 = dir.join("t3");
     std::fs::create_dir_all(dir.join("home")).unwrap();
     std::fs::create_dir_all(dir.join("config")).unwrap();
+    std::fs::create_dir_all(t3.join("userdata")).unwrap();
     std::fs::create_dir_all(t3.join("caches")).unwrap();
+    std::fs::write(
+        t3.join("userdata/settings.json"),
+        r#"{"providerInstances":{"claude_a":{"enabled":true},"codex_b":{"enabled":true}}}"#,
+    )
+    .unwrap();
     std::fs::write(
         dir.join("config/instances.toml"),
         "version = 1\n\n\
@@ -421,7 +428,7 @@ fn coordinator_pool_checkpoint_and_hygiene_mcp_tools() {
          coordinator = true\n\n\
          [coordinator]\n\
          min_weekly_reserve_pct = 10.0\n\
-         min_free_disk_gb = 0\n\n\
+         min_free_disk_gb = 1\n\n\
          [[coordinator.pool]]\n\
          instance_id = \"claude_a\"\n\
          model = \"claude-opus-4-6\"\n\
@@ -511,8 +518,12 @@ fn coordinator_pool_checkpoint_and_hygiene_mcp_tools() {
     assert_eq!(milestone["recommended_target"]["instance_id"], "codex_b");
 
     let hyg: Value = serde_json::from_str(&text(&replies[5])).unwrap();
-    assert_eq!(hyg["ok"], true, "{hyg}");
-    assert_eq!(hyg["min_gb"], 0);
+    assert_eq!(hyg["min_gb"], 1, "{hyg}");
+    assert_eq!(
+        hyg["ok"].as_bool().unwrap(),
+        hyg["free_gb"].as_u64().unwrap() >= 1,
+        "{hyg}"
+    );
 
     // 5 checklist updates make state stale -> checkpoint_check must refuse immediately.
     let mut stale_reqs = vec![call(
@@ -553,6 +564,279 @@ fn coordinator_pool_checkpoint_and_hygiene_mcp_tools() {
     let sleep: Value = serde_json::from_str(&text(&sleep_replies[0])).unwrap();
     assert_eq!(sleep["status"], "sleeping_for_quota", "{sleep}");
     assert_eq!(sleep["wake_at"], "2026-11-21T05:02:00Z", "{sleep}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn state_write_blocks_cross_thread_phase_mandate_and_revokes_on_complete() {
+    let dir = std::env::temp_dir().join(format!("agentdeck-mcp-xthread-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("home")).unwrap();
+    std::fs::create_dir_all(dir.join("config")).unwrap();
+    std::fs::write(
+        dir.join("config/instances.toml"),
+        "version = 1\n\n[plugins]\nmcp-server = true\ncoordinator = true\n",
+    )
+    .unwrap();
+
+    // Seed thread-a with an owner-granted mandate.
+    let paths = agentdeck_core::Paths::new(dir.join("config"), dir.join("state"));
+    let mandate = agentdeck_core::thread_state::RunMandate {
+        project: "blockfield".into(),
+        allowed_hosts: vec!["local".into()],
+        ..Default::default()
+    };
+    agentdeck_core::thread_state::set_run_meta(
+        &paths,
+        None,
+        "thread-a",
+        Some(agentdeck_core::thread_state::RunPhase::Running),
+        Some(mandate.clone()),
+        None,
+        false,
+    )
+    .unwrap();
+    agentdeck_core::thread_state::grant_mandate_if_matches(&paths, "thread-a", &mandate).unwrap();
+
+    // Session bound to thread-b cannot mutate phase or mandate on thread-a, but can still read it.
+    let replies = session_env(
+        &dir,
+        &[("T3CODE_THREAD_ID", "thread-b")],
+        &[
+            call(1, "state_write", json!({"thread": "thread-a", "phase": "completed"})),
+            call(
+                2,
+                "state_write",
+                json!({"thread": "thread-a", "mandate": {"project": "hijack"}}),
+            ),
+            call(3, "state_read", json!({"thread": "thread-a"})),
+            call(
+                4,
+                "state_write",
+                json!({"state": "Goal: own thread", "phase": "running"}),
+            ),
+        ],
+    );
+    assert_eq!(replies[0]["result"]["isError"], true);
+    assert!(text(&replies[0]).contains("cannot mutate phase or mandate"), "{}", text(&replies[0]));
+    assert_eq!(replies[1]["result"]["isError"], true);
+    assert!(text(&replies[1]).contains("cannot mutate phase or mandate"), "{}", text(&replies[1]));
+    let read_a: Value = serde_json::from_str(&text(&replies[2])).unwrap();
+    assert_eq!(read_a["phase"], "running");
+    assert_eq!(read_a["mandate"]["owner_granted"], true);
+    assert!(replies[3]["result"].get("isError").is_none(), "{}", text(&replies[3]));
+
+    // Completing own thread revokes owner_granted; later switching back to running does not resurrect it.
+    let replies = session_env(
+        &dir,
+        &[("T3CODE_THREAD_ID", "thread-a")],
+        &[
+            call(10, "state_write", json!({"phase": "completed"})),
+            call(11, "state_write", json!({"phase": "running"})),
+            call(12, "state_read", json!({})),
+        ],
+    );
+    assert!(replies[0]["result"].get("isError").is_none(), "{}", text(&replies[0]));
+    assert!(replies[1]["result"].get("isError").is_none(), "{}", text(&replies[1]));
+    let after: Value = serde_json::from_str(&text(&replies[2])).unwrap();
+    assert_eq!(after["phase"], "running");
+    assert_eq!(after["mandate"]["owner_granted"], false);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn coordinator_mcp_prefers_observed_model_tracks_checkpoint_deltas_and_worktrees() {
+    let dir = std::env::temp_dir().join(format!("agentdeck-mcp-r2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let t3 = dir.join("t3");
+    std::fs::create_dir_all(dir.join("home")).unwrap();
+    std::fs::create_dir_all(dir.join("config")).unwrap();
+    std::fs::create_dir_all(t3.join("userdata")).unwrap();
+    std::fs::create_dir_all(t3.join("caches")).unwrap();
+
+    std::fs::write(
+        dir.join("config/instances.toml"),
+        "version = 1\n\n\
+         [plugins]\n\
+         mcp-server = true\n\
+         coordinator = true\n\n\
+         [coordinator]\n\
+         checkpoint_soft_runs = 5\n\
+         checkpoint_soft_items = 10\n\
+         min_free_disk_gb = 1\n\n\
+         [[coordinator.pool]]\n\
+         instance_id = \"agy\"\n\
+         model = \"claude-sonnet-4-6\"\n\
+         enabled = true\n\n\
+         [[coordinator.pool]]\n\
+         instance_id = \"agy\"\n\
+         model = \"gemini-4-neon\"\n\
+         enabled = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        t3.join("userdata/settings.json"),
+        r#"{"providerInstances":{"agy":{"enabled":true}}}"#,
+    )
+    .unwrap();
+    // 3p (Claude) is at 80% 5h, Gemini is at 79% 5h (within 2% hysteresis).
+    std::fs::write(
+        t3.join("caches/agy.json"),
+        r#"{"status":"ready","usageLimits":{"windows":[
+            {"id":"3p-5h","windowDurationMins":300,"usedPercent":20.0},
+            {"id":"gemini-5h","windowDurationMins":300,"usedPercent":21.0}
+        ]}}"#,
+    )
+    .unwrap();
+
+    // Seed SQLite with thread observed on ("agy", "gemini-4-neon") with 10 runs and 20 items.
+    let db = rusqlite::Connection::open(t3.join("userdata/statev2.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE orchestration_v2_projection_threads (
+           thread_id TEXT PRIMARY KEY, title TEXT, updated_at TEXT, payload_json TEXT, provider_instance_id TEXT
+         );
+         CREATE TABLE orchestration_v2_projection_runs (
+           run_id TEXT PRIMARY KEY, thread_id TEXT, ordinal INTEGER, status TEXT,
+           requested_at TEXT, completed_at TEXT, payload_json TEXT, provider_instance_id TEXT
+         );
+         CREATE TABLE orchestration_v2_projection_turn_items (
+           turn_item_id TEXT PRIMARY KEY, thread_id TEXT, run_id TEXT, ordinal INTEGER,
+           type TEXT, status TEXT, payload_json TEXT
+         );
+         CREATE TABLE orchestration_v2_projection_thread_item_counts (
+           thread_id TEXT PRIMARY KEY, item_count INTEGER
+         );",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO orchestration_v2_projection_threads VALUES ('t-agy','Agy','2026-11-21T01:00:00Z',?1,'agy')",
+        [r#"{"modelSelection":{"instanceId":"agy","model":"gemini-4-neon"}}"#],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO orchestration_v2_projection_thread_item_counts VALUES ('t-agy', 20)",
+        [],
+    )
+    .unwrap();
+    for ord in 1..=10i64 {
+        db.execute(
+            "INSERT INTO orchestration_v2_projection_runs VALUES (?1,'t-agy',?2,'completed','2026-11-21T01:00:00Z','2026-11-21T01:05:00Z','{}','agy')",
+            rusqlite::params![format!("r{ord}"), ord],
+        )
+        .unwrap();
+    }
+    for i in 1..=20i64 {
+        db.execute(
+            "INSERT INTO orchestration_v2_projection_turn_items VALUES (?1,'t-agy','r10',?2,'assistant_message','completed','{\"text\":\"ok\"}')",
+            rusqlite::params![format!("item-{i}"), i],
+        )
+        .unwrap();
+    }
+
+    let t3_str = t3.to_string_lossy().into_owned();
+    let env = [
+        ("T3CODE_THREAD_ID", "t-agy"),
+        ("AGENTDECK_T3_DIR", t3_str.as_str()),
+    ];
+
+    // 1. Observed model ("gemini-4-neon") wins over first pool entry ("claude-sonnet-4-6") for hysteresis.
+    let replies = session_env(
+        &dir,
+        &env,
+        &[
+            call(1, "coordinator_next_target", json!({"current_instance": "agy"})),
+            call(
+                2,
+                "state_write",
+                json!({"state": "Goal: ship\nnext: u2", "phase": "running", "record_checkpoint": true}),
+            ),
+            call(3, "state_read", json!({})),
+        ],
+    );
+    let next: Value = serde_json::from_str(&text(&replies[0])).unwrap();
+    assert_eq!(next["target"]["model"], "gemini-4-neon", "{next}");
+    let saved: Value = serde_json::from_str(&text(&replies[2])).unwrap();
+    assert_eq!(saved["checkpoint_run_count"], 10, "{saved}");
+    assert_eq!(saved["checkpoint_item_count"], 20, "{saved}");
+
+    // 2. Add 1 quiet run + 2 items (cumulative 11/22 > 5/10, but delta 1/2 < 5/10) -> must NOT checkpoint.
+    db.execute(
+        "INSERT INTO orchestration_v2_projection_runs VALUES ('r11','t-agy',11,'completed','2026-11-21T01:10:00Z','2026-11-21T01:11:00Z','{}','agy')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE orchestration_v2_projection_thread_item_counts SET item_count = 22 WHERE thread_id = 't-agy'",
+        [],
+    )
+    .unwrap();
+    for i in 21..=22i64 {
+        db.execute(
+            "INSERT INTO orchestration_v2_projection_turn_items VALUES (?1,'t-agy','r11',?2,'assistant_message','completed','{\"text\":\"quiet\"}')",
+            rusqlite::params![format!("item-{i}"), i],
+        )
+        .unwrap();
+    }
+    drop(db);
+
+    let replies = session_env(
+        &dir,
+        &env,
+        &[
+            call(4, "coordinator_checkpoint_check", json!({})),
+            call(
+                5,
+                "coordinator_next_target",
+                json!({"current_instance": "agy", "current_model": "claude-sonnet-4-6"}),
+            ),
+        ],
+    );
+    let chk: Value = serde_json::from_str(&text(&replies[0])).unwrap();
+    assert_eq!(chk["should_checkpoint"], false, "{chk}");
+    assert_eq!(chk["recommended_target"]["model"], "gemini-4-neon", "{chk}");
+    let explicit: Value = serde_json::from_str(&text(&replies[1])).unwrap();
+    assert_eq!(explicit["target"]["model"], "claude-sonnet-4-6", "{explicit}");
+
+    // 3. coordinator_hygiene_check with work_dir lists stale merged checkout.
+    let work_dir = dir.join("wt");
+    let origin = dir.join("origin.git");
+    let stale_wt = work_dir.join("old-wt");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let git = |cwd: &Path, args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{:?}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&dir, &["init", "--bare", origin.to_str().unwrap()]);
+    git(&dir, &["clone", origin.to_str().unwrap(), stale_wt.to_str().unwrap()]);
+    git(&stale_wt, &["checkout", "-b", "main"]);
+    std::fs::write(stale_wt.join("f.txt"), "x\n").unwrap();
+    git(&stale_wt, &["add", "f.txt"]);
+    git(&stale_wt, &["commit", "-m", "init"]);
+    git(&stale_wt, &["push", "-u", "origin", "main"]);
+
+    let replies = session_env(
+        &dir,
+        &env,
+        &[call(
+            6,
+            "coordinator_hygiene_check",
+            json!({"path": dir, "work_dir": work_dir}),
+        )],
+    );
+    let hyg: Value = serde_json::from_str(&text(&replies[0])).unwrap();
+    let stale = hyg["stale_worktrees"].as_array().unwrap();
+    assert_eq!(stale.len(), 1, "{hyg}");
+    assert!(stale[0].as_str().unwrap().ends_with("old-wt"), "{hyg}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

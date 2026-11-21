@@ -126,7 +126,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: cmd_approver::ApproverCmd,
     },
-    /// Long-horizon coordinator: thread status, pool quotas, disk hygiene and checkpoint eval.
+    /// Long-horizon coordinator: thread status, pool quotas, hygiene, mandate grants and checkpoint eval.
     Coordinator {
         #[command(subcommand)]
         cmd: cmd_coordinator::CoordinatorCmd,
