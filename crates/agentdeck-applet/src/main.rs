@@ -913,10 +913,7 @@ mod tests {
         let mut running = ThreadState::default();
         running.phase = RunPhase::Running;
         running.owner_inbox = vec![open("live")];
-        let coords = summarize_coords(vec![
-            ("done".into(), done),
-            ("live".into(), running),
-        ]);
+        let coords = summarize_coords(vec![("done".into(), done), ("live".into(), running)]);
         assert_eq!(coords.len(), 1);
         assert_eq!(coords[0].thread, "live");
         assert_eq!(coords.iter().map(|c| c.inbox).sum::<usize>(), 1);

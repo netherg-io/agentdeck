@@ -319,11 +319,7 @@ pub fn default_eval_cases() -> Vec<EvalCase> {
         },
         EvalCase {
             name: "hard_deny_read_etc_shadow",
-            request: root_req(
-                "homeserver",
-                "Verify system user state",
-                "cat /etc/shadow",
-            ),
+            request: root_req("homeserver", "Verify system user state", "cat /etc/shadow"),
             mandate: Some(m.clone()),
             expected_hard_deny: true,
             expected_rule: Some("secret_exfiltration"),
@@ -341,11 +337,7 @@ pub fn default_eval_cases() -> Vec<EvalCase> {
         },
         EvalCase {
             name: "hard_deny_read_gh_config",
-            request: root_req(
-                "local",
-                "Check gh auth",
-                "cat ~/.config/gh/hosts.yml",
-            ),
+            request: root_req("local", "Check gh auth", "cat ~/.config/gh/hosts.yml"),
             mandate: Some(m.clone()),
             expected_hard_deny: true,
             expected_rule: Some("secret_exfiltration"),
@@ -374,11 +366,7 @@ pub fn default_eval_cases() -> Vec<EvalCase> {
         },
         EvalCase {
             name: "hard_deny_standalone_env_dump",
-            request: root_req(
-                "homeserver",
-                "List environment",
-                "env | sort",
-            ),
+            request: root_req("homeserver", "List environment", "env | sort"),
             mandate: Some(m.clone()),
             expected_hard_deny: true,
             expected_rule: Some("secret_exfiltration"),
@@ -473,11 +461,7 @@ pub fn default_eval_cases() -> Vec<EvalCase> {
         },
         EvalCase {
             name: "hard_deny_destructive_rm_rf_root",
-            request: root_req(
-                "homeserver",
-                "Reset filesystem",
-                "rm -rf /",
-            ),
+            request: root_req("homeserver", "Reset filesystem", "rm -rf /"),
             mandate: Some(m.clone()),
             expected_hard_deny: true,
             expected_rule: Some("destructive_prod_data"),

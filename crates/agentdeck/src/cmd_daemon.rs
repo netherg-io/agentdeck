@@ -312,10 +312,7 @@ where
         Some(audit_path),
     )?
     .with_timings(timings);
-    eprintln!(
-        "agentdeck approver: listening on {}",
-        socket_path.display()
-    );
+    eprintln!("agentdeck approver: listening on {}", socket_path.display());
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let poller = start_poller(Arc::clone(&pending), shutdown_rx.clone());
@@ -389,16 +386,16 @@ fn load_approver_spec(paths: &Paths) -> SupervisorState<ApproverSpec> {
             ));
         }
     };
-    let (Some(bot_token), Some(owner_id)) = (secrets.telegram_bot_token.clone(), secrets.telegram_owner_id) else {
+    let (Some(bot_token), Some(owner_id)) = (
+        secrets.telegram_bot_token.clone(),
+        secrets.telegram_owner_id,
+    ) else {
         return SupervisorState::Dormant(format!(
             "agentdeck approver: TELEGRAM_BOT_TOKEN / TELEGRAM_OWNER_ID not configured in {}; broker dormant",
             secrets_path.display()
         ));
     };
-    let provider = cfg
-        .judge_provider
-        .as_deref()
-        .unwrap_or(PROVIDER_OPENROUTER);
+    let provider = cfg.judge_provider.as_deref().unwrap_or(PROVIDER_OPENROUTER);
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let judge_key = secrets
         .judge_api_key(provider)
@@ -612,7 +609,9 @@ async fn watchdog_tick_with_controller<C: T3ThreadController, J: CheckpointJudge
         {
             let input = CheckpointInput {
                 run_count_since_checkpoint: u32::try_from(
-                    observed.run_count.saturating_sub(state.checkpoint_run_count),
+                    observed
+                        .run_count
+                        .saturating_sub(state.checkpoint_run_count),
                 )
                 .unwrap_or(u32::MAX),
                 item_count_since_checkpoint: u32::try_from(
@@ -825,12 +824,13 @@ async fn run_watchdog_task(paths: Paths, mut shutdown: watch::Receiver<bool>) {
             model: cfg.judge_model.clone(),
         };
         if cached_judge.as_ref().is_none_or(|j| j.key != judge_key) {
-            cached_judge = HttpCheckpointJudge::from_env(&cfg)
-                .ok()
-                .map(|judge| CachedCheckpointJudge {
-                    key: judge_key,
-                    judge,
-                });
+            cached_judge =
+                HttpCheckpointJudge::from_env(&cfg)
+                    .ok()
+                    .map(|judge| CachedCheckpointJudge {
+                        key: judge_key,
+                        judge,
+                    });
         }
         watchdog_tick_with_controller(
             &paths,
@@ -971,7 +971,11 @@ mod tests {
             Ok(())
         }
 
-        async fn finalize_request(&self, _message_id: i64, _outcome_text: &str) -> anyhow::Result<()> {
+        async fn finalize_request(
+            &self,
+            _message_id: i64,
+            _outcome_text: &str,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -1021,7 +1025,10 @@ mod tests {
         }
     }
 
-    async fn send_broker_request(socket: &Path, req: serde_json::Value) -> Option<serde_json::Value> {
+    async fn send_broker_request(
+        socket: &Path,
+        req: serde_json::Value,
+    ) -> Option<serde_json::Value> {
         let stream = UnixStream::connect(socket).await.unwrap();
         let (read_half, mut write_half) = stream.into_split();
         let mut line = req.to_string().into_bytes();
@@ -1039,7 +1046,13 @@ mod tests {
         None
     }
 
-    fn seed_wd_db(t3_root: &Path, thread_id: &str, runs: &[(i64, &str, &str)], items: &[(&str, &str, &str, &str)], subagent_status: Option<&str>) {
+    fn seed_wd_db(
+        t3_root: &Path,
+        thread_id: &str,
+        runs: &[(i64, &str, &str)],
+        items: &[(&str, &str, &str, &str)],
+        subagent_status: Option<&str>,
+    ) {
         std::fs::create_dir_all(t3_root.join("userdata")).unwrap();
         std::fs::create_dir_all(t3_root.join("caches")).unwrap();
         let db = rusqlite::Connection::open(t3_root.join("userdata/statev2.sqlite")).unwrap();
@@ -1083,7 +1096,15 @@ mod tests {
         for (idx, (run_id, kind, status, payload)) in items.iter().enumerate() {
             db.execute(
                 "INSERT INTO orchestration_v2_projection_turn_items VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                rusqlite::params![format!("i{idx}"), thread_id, run_id, idx as i64 + 1, kind, status, payload],
+                rusqlite::params![
+                    format!("i{idx}"),
+                    thread_id,
+                    run_id,
+                    idx as i64 + 1,
+                    kind,
+                    status,
+                    payload
+                ],
             )
             .unwrap();
         }
@@ -1100,10 +1121,7 @@ mod tests {
 
     #[tokio::test]
     async fn watchdog_tick_enters_quota_sleep_then_wakes_and_clears_sleep_until() {
-        let dir = std::env::temp_dir().join(format!(
-            "agentdeck-daemon-wd-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("agentdeck-daemon-wd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let paths = Paths::new(dir.join("config"), dir.join("state"));
         let t3_root = dir.join("t3");
@@ -1260,10 +1278,8 @@ mod tests {
             }
         }
 
-        let dir = std::env::temp_dir().join(format!(
-            "agentdeck-daemon-wd-cas-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agentdeck-daemon-wd-cas-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let paths = Paths::new(dir.join("config"), dir.join("state"));
         let t3_root = dir.join("t3");
@@ -1369,10 +1385,8 @@ mod tests {
             }
         }
 
-        let dir = std::env::temp_dir().join(format!(
-            "agentdeck-daemon-wd-chk-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agentdeck-daemon-wd-chk-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let paths = Paths::new(dir.join("config"), dir.join("state"));
         let t3_root = dir.join("t3");
@@ -1498,22 +1512,25 @@ mod tests {
         assert_eq!(seen[0].run_count_since_checkpoint, 2);
         assert_eq!(seen[0].item_count_since_checkpoint, 3);
         let outcomes = std::fs::read_to_string(
-            paths.state_dir.join("coordinator/checkpoint-outcomes.jsonl"),
+            paths
+                .state_dir
+                .join("coordinator/checkpoint-outcomes.jsonl"),
         )
         .unwrap();
         assert!(outcomes.contains("\"runs\":2"), "{outcomes}");
         assert!(outcomes.contains("\"items\":3"), "{outcomes}");
-        assert!(outcomes.contains("\"should_checkpoint\":false"), "{outcomes}");
+        assert!(
+            outcomes.contains("\"should_checkpoint\":false"),
+            "{outcomes}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn resolve_request_mandate_matches_thread_id_and_rejects_non_running() {
-        let dir = std::env::temp_dir().join(format!(
-            "agentdeck-daemon-mandate-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agentdeck-daemon-mandate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let paths = Paths::new(dir.join("config"), dir.join("state"));
         let granted_mandate = thread_state::RunMandate {
@@ -1589,10 +1606,7 @@ mod tests {
 
     #[tokio::test]
     async fn broker_isolates_concurrent_threads_and_interactive_requests() {
-        let dir = std::env::temp_dir().join(format!(
-            "agentdeck-daemon-iso-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("agentdeck-daemon-iso-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let paths = Paths::new(dir.join("config"), dir.join("state"));
 
@@ -1738,10 +1752,8 @@ mod tests {
 
     #[tokio::test]
     async fn broker_revoking_mandate_mid_flight_escalates_to_telegram() {
-        let dir = std::env::temp_dir().join(format!(
-            "agentdeck-daemon-revoke-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agentdeck-daemon-revoke-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let paths = Paths::new(dir.join("config"), dir.join("state"));
 
@@ -1835,10 +1847,7 @@ mod tests {
 
     #[tokio::test]
     async fn approver_supervisor_reloads_stricter_deny_rule_and_cancels_on_disable() {
-        let dir = std::env::temp_dir().join(format!(
-            "agentdeck-daemon-sup-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("agentdeck-daemon-sup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let paths = Paths::new(dir.join("config"), dir.join("state"));
         let sock = PathBuf::from(format!("/tmp/ad-sup-{}.sock", std::process::id()));

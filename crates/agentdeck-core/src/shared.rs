@@ -507,7 +507,8 @@ fn agy_skill_md(bytes: Vec<u8>) -> Vec<u8> {
         |i: usize, key: &str| top_key(lines[i]).is_some_and(|(k, _)| k.eq_ignore_ascii_case(key));
     let Some(flag) = (1..end).find(|&i| {
         is_key(i, "disable-model-invocation")
-            && top_key(lines[i]).is_some_and(|(_, v)| strip_yaml_comment(v).eq_ignore_ascii_case("true"))
+            && top_key(lines[i])
+                .is_some_and(|(_, v)| strip_yaml_comment(v).eq_ignore_ascii_case("true"))
     }) else {
         return bytes;
     };
@@ -1739,8 +1740,7 @@ mod tests {
     fn agy_copy_of_user_invoked_skill_syncs_without_drift() {
         let fx = skills_fixture();
         let source = fx.home.join(".general/skills/grill");
-        let body =
-            "---\nname: grill\ndescription: Grill.\ndisable-model-invocation: true # only when named\n---\n# grill\n";
+        let body = "---\nname: grill\ndescription: Grill.\ndisable-model-invocation: true # only when named\n---\n# grill\n";
         write_skill(&fx.home.join(".general/skills"), "grill", body);
         fs::write(source.join("notes.md"), "disable-model-invocation: true\n").unwrap();
         let agy = fx.home.join(".gemini/skills/grill");

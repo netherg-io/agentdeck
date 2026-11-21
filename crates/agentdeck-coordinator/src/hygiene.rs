@@ -93,11 +93,17 @@ pub fn find_stale_worktrees(work_dir: &Path, active_names: &HashSet<String>) -> 
         if git_out(&path, &["status", "--porcelain"]).is_none_or(|s| !s.is_empty()) {
             continue;
         }
-        let ancestor = git_out(&path, &["merge-base", "--is-ancestor", "HEAD", "origin/main"]).is_some();
+        let ancestor = git_out(
+            &path,
+            &["merge-base", "--is-ancestor", "HEAD", "origin/main"],
+        )
+        .is_some();
         let branch = git_out(&path, &["branch", "--show-current"]).unwrap_or_default();
         let merged = !branch.is_empty()
-            && git_out(&path, &["branch", "--merged", "origin/main"])
-                .is_some_and(|list| list.lines().any(|l| l.trim().trim_start_matches("* ").trim() == branch));
+            && git_out(&path, &["branch", "--merged", "origin/main"]).is_some_and(|list| {
+                list.lines()
+                    .any(|l| l.trim().trim_start_matches("* ").trim() == branch)
+            });
         if ancestor || merged {
             stale.push(path);
         }

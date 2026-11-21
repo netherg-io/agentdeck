@@ -3,9 +3,7 @@
 
 use agentdeck_core::Paths;
 use agentdeck_core::backlog::{self, NewEntry};
-use agentdeck_core::settings::{
-    self, ApproverSettings, CoordinatorPoolEntry, CoordinatorSettings,
-};
+use agentdeck_core::settings::{self, ApproverSettings, CoordinatorPoolEntry, CoordinatorSettings};
 use agentdeck_core::thread_state::{
     self, ItemPatch, NewAssumption, NewInboxItem, RunMandate, RunPhase,
 };
@@ -307,7 +305,8 @@ fn coordinator_phase_mandate_inbox_assumptions_and_owner_actions() {
         ui.find("Mark resolved").expect("resolve button");
         ui.find("Assumptions").expect("assumptions block");
         ui.find("Pinned model to gpt-5").expect("assumption");
-        ui.find("Fix-forward \u{2264} 3 \u{B7} reviews \u{2264} 2").expect("mandate caps");
+        ui.find("Fix-forward \u{2264} 3 \u{B7} reviews \u{2264} 2")
+            .expect("mandate caps");
     }
     std::fs::create_dir_all(SNAPSHOTS).unwrap();
     for lang in ["en", "ru"] {
@@ -325,7 +324,8 @@ fn coordinator_phase_mandate_inbox_assumptions_and_owner_actions() {
     agentdeck_gui::i18n::set_language("ru");
     {
         let mut ui = iced_test::simulator(app::view(&state));
-        ui.find("Сон по квоте · 2026-11-22T01:00:00Z").expect("RU phase");
+        ui.find("Сон по квоте · 2026-11-22T01:00:00Z")
+            .expect("RU phase");
         ui.find("Мандат запуска").expect("RU mandate");
         ui.find("Выдать мандат").expect("RU grant");
         ui.find("Входящие владельца").expect("RU inbox");
@@ -502,7 +502,8 @@ fn approver_plugin_and_settings_round_trip() {
     {
         let mut ui = iced_test::simulator(app::view(&state));
         ui.find("approver").expect("approver module card");
-        ui.find("Approves in-scope requests and sends the rest to Telegram.").expect("approver description");
+        ui.find("Approves in-scope requests and sends the rest to Telegram.")
+            .expect("approver description");
     }
     for out in drain(app::update(
         &mut state,
@@ -515,7 +516,8 @@ fn approver_plugin_and_settings_round_trip() {
     {
         let mut ui = iced_test::simulator(app::view(&state));
         ui.find("Recent decisions").expect("audit card");
-        ui.find("1970-01-01 00:02:03 \u{B7} hosts.example").expect("audit row");
+        ui.find("1970-01-01 00:02:03 \u{B7} hosts.example")
+            .expect("audit row");
         ui.find("Save").expect("approver save");
     }
     for out in drain(app::update(
@@ -629,8 +631,7 @@ fn mandate_grant_revoke_guards_scope_and_phase() {
     )
     .unwrap();
     thread_state::write(&paths, None, "t-race", Some("goal"), None).unwrap();
-    thread_state::set_run_meta(&paths, None, "t-race", None, Some(shown()), None, false)
-        .unwrap();
+    thread_state::set_run_meta(&paths, None, "t-race", None, Some(shown()), None, false).unwrap();
     thread_state::write(&paths, None, "t-done", Some("goal"), None).unwrap();
     thread_state::set_run_meta(
         &paths,
@@ -727,7 +728,8 @@ fn mandate_grant_revoke_guards_scope_and_phase() {
     let _ = app::update(&mut solo, Message::SelectPage(Page::Coordinator));
     {
         let mut ui = iced_test::simulator(app::view(&solo));
-        ui.find("Not granted").expect("completed run stays ungranted");
+        ui.find("Not granted")
+            .expect("completed run stays ungranted");
         assert!(
             ui.find("Grant mandate").is_err(),
             "completed run shows no Grant button"
@@ -814,8 +816,7 @@ fn timeout_only_save_preserves_tricky_deny_patterns() {
             let _ = gsettings::update(&mut sstate, paths.clone(), out2);
         }
     }
-    let back =
-        settings::read_approver(&agentdeck_core::Registry::load(&paths).unwrap()).unwrap();
+    let back = settings::read_approver(&agentdeck_core::Registry::load(&paths).unwrap()).unwrap();
     assert_eq!(back.extra_hard_deny_patterns, tricky);
     assert_eq!(back.autonomous_timeout_secs, 31);
     assert_eq!(sstate.approver.deny, before, "field keeps its escaped form");
@@ -906,9 +907,7 @@ fn settings_forms_guard_save_and_keep_drafts() {
         let _ = gsettings::update(
             &mut sstate,
             paths.clone(),
-            gsettings::Msg::Approver(Box::new(gsettings::ApproverMsg::AutoTimeout(
-                bad.into(),
-            ))),
+            gsettings::Msg::Approver(Box::new(gsettings::ApproverMsg::AutoTimeout(bad.into()))),
         );
         assert!(
             drain(gsettings::update(
@@ -924,8 +923,7 @@ fn settings_forms_guard_save_and_keep_drafts() {
             "out-of-bounds {bad} shows an error"
         );
     }
-    let back =
-        settings::read_approver(&agentdeck_core::Registry::load(&paths).unwrap()).unwrap();
+    let back = settings::read_approver(&agentdeck_core::Registry::load(&paths).unwrap()).unwrap();
     assert_eq!(
         back.autonomous_timeout_secs,
         ApproverSettings::default().autonomous_timeout_secs,
@@ -1030,7 +1028,8 @@ fn audit_viewer_maps_outcomes_and_read_errors() {
             "Client cancelled",
             "2024-07-03 09:46:40 \u{B7} h1",
         ] {
-            ui.find(text).unwrap_or_else(|_| panic!("EN audit shows {text:?}"));
+            ui.find(text)
+                .unwrap_or_else(|_| panic!("EN audit shows {text:?}"));
         }
     }
     agentdeck_gui::i18n::set_language("ru");
@@ -1046,7 +1045,8 @@ fn audit_viewer_maps_outcomes_and_read_errors() {
             "Таймаут",
             "Отменено клиентом",
         ] {
-            ui.find(text).unwrap_or_else(|_| panic!("RU audit shows {text:?}"));
+            ui.find(text)
+                .unwrap_or_else(|_| panic!("RU audit shows {text:?}"));
         }
     }
     agentdeck_gui::i18n::set_language("en");

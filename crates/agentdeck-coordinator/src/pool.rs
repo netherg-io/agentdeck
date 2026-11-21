@@ -129,7 +129,11 @@ pub fn parse_epoch_rfc3339(s: &str) -> Option<i64> {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
         _ => {
-            if leap { 29 } else { 28 }
+            if leap {
+                29
+            } else {
+                28
+            }
         }
     };
     if day > dim {
@@ -226,10 +230,15 @@ pub fn quota_from_t3_cache(t3_root: &Path, instance_id: &str, model: &str) -> Qu
         }
         let remaining = 100.0 - used;
         let resets = w.resets_at.as_deref().and_then(parse_epoch_rfc3339);
-        let text = format!("{} {} {}", w.id, w.kind.as_deref().unwrap_or(""), w.label.as_deref().unwrap_or("")).to_lowercase();
+        let text = format!(
+            "{} {} {}",
+            w.id,
+            w.kind.as_deref().unwrap_or(""),
+            w.label.as_deref().unwrap_or("")
+        )
+        .to_lowercase();
         let is_weekly = w.window_duration_mins == Some(10080)
-            || (w.window_duration_mins.is_none()
-                && (text.contains("week") || text.contains("7d")));
+            || (w.window_duration_mins.is_none() && (text.contains("week") || text.contains("7d")));
         let is_five = w.window_duration_mins == Some(300)
             || (w.window_duration_mins.is_none()
                 && (text.contains("session")
@@ -245,18 +254,28 @@ pub fn quota_from_t3_cache(t3_root: &Path, instance_id: &str, model: &str) -> Qu
         // only the 5h and weekly windows gate rotation.
     }
     // shortcut: unknown windows stay unknown (assumed full), never 0.
-    if let Some(best) = five.iter().min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)) {
+    if let Some(best) = five
+        .iter()
+        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+    {
         view.five_hour_remaining_pct = Some(best.0);
         view.five_hour_resets_at = best.1;
     }
-    if let Some(best) = weekly.iter().min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)) {
+    if let Some(best) = weekly
+        .iter()
+        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+    {
         view.weekly_remaining_pct = Some(best.0);
         view.weekly_resets_at = best.1;
     }
     view
 }
 
-fn view_for(quotas: &HashMap<PoolKey, QuotaWindowView>, instance_id: &str, model: &str) -> QuotaWindowView {
+fn view_for(
+    quotas: &HashMap<PoolKey, QuotaWindowView>,
+    instance_id: &str,
+    model: &str,
+) -> QuotaWindowView {
     quotas
         .get(&pool_key(instance_id, model))
         .cloned()
@@ -284,8 +303,7 @@ pub fn select_coordinator(
     now_epoch_secs: i64,
     current: Option<(&str, &str)>,
 ) -> PoolSelection {
-    let enabled: Vec<&CoordinatorPoolEntry> =
-        cfg.pool.iter().filter(|e| e.enabled).collect();
+    let enabled: Vec<&CoordinatorPoolEntry> = cfg.pool.iter().filter(|e| e.enabled).collect();
     if enabled.is_empty() {
         return PoolSelection::NoPoolConfigured;
     }
@@ -360,8 +378,7 @@ pub fn select_coordinator(
     let mut earliest: Option<(i64, CoordinatorPoolEntry)> = None;
     for (entry, q) in &healthy {
         let blocked_5h = q.five_hour_remaining_pct.unwrap_or(100.0) <= 1.0;
-        let blocked_weekly =
-            q.weekly_remaining_pct.unwrap_or(100.0) < cfg.min_weekly_reserve_pct;
+        let blocked_weekly = q.weekly_remaining_pct.unwrap_or(100.0) < cfg.min_weekly_reserve_pct;
         if !blocked_5h && !blocked_weekly {
             continue;
         }
@@ -404,7 +421,8 @@ pub fn select_coordinator(
             wake_at_epoch_secs: now_epoch_secs.saturating_add(300).min(MAX_UTC_EPOCH),
             earliest_reset_epoch_secs: None,
             next_candidate: None,
-            reason: "no pool entry has a usable future reset; retrying after a bounded refresh".into(),
+            reason: "no pool entry has a usable future reset; retrying after a bounded refresh"
+                .into(),
         },
     }
 }

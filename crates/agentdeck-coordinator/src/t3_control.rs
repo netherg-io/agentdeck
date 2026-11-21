@@ -19,19 +19,27 @@ pub fn check_loopback_url(endpoint: &str) -> anyhow::Result<()> {
 }
 
 fn loopback_addresses(endpoint: &str) -> anyhow::Result<Vec<SocketAddr>> {
-    if endpoint.chars().any(|c| c.is_control() || c == ' ' || c == '\u{7f}') {
+    if endpoint
+        .chars()
+        .any(|c| c.is_control() || c == ' ' || c == '\u{7f}')
+    {
         anyhow::bail!("invalid T3 MCP endpoint: control characters or spaces");
     }
-    let url = reqwest::Url::parse(endpoint)
-        .map_err(|_| anyhow::anyhow!("T3 MCP endpoint must be loopback http:// (got {endpoint:?})"))?;
+    let url = reqwest::Url::parse(endpoint).map_err(|_| {
+        anyhow::anyhow!("T3 MCP endpoint must be loopback http:// (got {endpoint:?})")
+    })?;
     if url.scheme() != "http" {
         anyhow::bail!("T3 MCP endpoint must be loopback http:// (got {endpoint:?})");
     }
     if !url.username().is_empty() || url.password().is_some() {
-        anyhow::bail!("T3 MCP endpoint must be loopback http:// without userinfo, query or fragment");
+        anyhow::bail!(
+            "T3 MCP endpoint must be loopback http:// without userinfo, query or fragment"
+        );
     }
     if url.query().is_some() || url.fragment().is_some() {
-        anyhow::bail!("T3 MCP endpoint must be loopback http:// without userinfo, query or fragment");
+        anyhow::bail!(
+            "T3 MCP endpoint must be loopback http:// without userinfo, query or fragment"
+        );
     }
     match url.host_str() {
         // `host_str` keeps IPv6 brackets: `[::1]` here is the `::1` loopback.
@@ -178,7 +186,10 @@ impl HttpT3Controller {
         {
             anyhow::bail!("T3 MCP rejected the request or returned an invalid response.");
         }
-        if let Some(p) = envelope["result"].get("protocolVersion").and_then(|p| p.as_str()) {
+        if let Some(p) = envelope["result"]
+            .get("protocolVersion")
+            .and_then(|p| p.as_str())
+        {
             *protocol = Some(p.to_string());
         }
         Ok(Some(envelope["result"].clone()))
@@ -202,8 +213,14 @@ impl HttpT3Controller {
             &mut protocol,
         )
         .await?;
-        self.send("notifications/initialized", None, None, &mut session, &mut protocol)
-            .await?;
+        self.send(
+            "notifications/initialized",
+            None,
+            None,
+            &mut session,
+            &mut protocol,
+        )
+        .await?;
         let result = self
             .send(
                 "tools/call",
@@ -473,7 +490,8 @@ fn payload_str(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
 fn payload_u64(payload: &serde_json::Value, keys: &[&str]) -> Option<u64> {
     keys.iter().find_map(|k| {
         payload.get(*k).and_then(|v| {
-            v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         })
     })
 }
@@ -498,7 +516,10 @@ fn payload_epoch(payload: &serde_json::Value, keys: &[&str]) -> Option<i64> {
 /// `Ok(None)` when the db, the table or the thread is absent; unknown
 /// columns/keys degrade to defaults rather than failing the tick. T3's
 /// projection schema drifts between releases, so every probe is best-effort.
-pub fn observe_thread_sqlite(t3_root: &Path, thread_id: &str) -> anyhow::Result<Option<ObservedThread>> {
+pub fn observe_thread_sqlite(
+    t3_root: &Path,
+    thread_id: &str,
+) -> anyhow::Result<Option<ObservedThread>> {
     let Some(conn) = open_state_db(t3_root) else {
         return Ok(None);
     };
@@ -656,7 +677,12 @@ pub fn observe_thread_sqlite(t3_root: &Path, thread_id: &str) -> anyhow::Result<
             });
             observed.last_message_text = payload_str(
                 &payload,
-                &["lastMessage", "last_message", "lastAssistantMessage", "tail"],
+                &[
+                    "lastMessage",
+                    "last_message",
+                    "lastAssistantMessage",
+                    "tail",
+                ],
             )
             .unwrap_or_default();
         }
@@ -713,7 +739,9 @@ pub fn observe_thread_sqlite(t3_root: &Path, thread_id: &str) -> anyhow::Result<
                 .filter_map(|p| v.pointer(p).and_then(serde_json::Value::as_str))
                 .collect::<Vec<_>>()
                 .join("\n");
-            if v.pointer("/failure/class").and_then(serde_json::Value::as_str) == Some("usage_limit")
+            if v.pointer("/failure/class")
+                .and_then(serde_json::Value::as_str)
+                == Some("usage_limit")
                 || is_quota_limit_message(&reason_text)
             {
                 structured_usage_limit = true;
@@ -748,7 +776,12 @@ pub fn observe_thread_sqlite(t3_root: &Path, thread_id: &str) -> anyhow::Result<
     if observed.last_message_text.is_empty() {
         observed.last_message_text = payload_str(
             &thread_payload,
-            &["lastMessage", "last_message", "lastAssistantMessage", "tail"],
+            &[
+                "lastMessage",
+                "last_message",
+                "lastAssistantMessage",
+                "tail",
+            ],
         )
         .unwrap_or_default();
     }

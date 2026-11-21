@@ -322,8 +322,16 @@ fn approver_and_coordinator_cli_subcommands() {
         let mut r = BufReader::new(stream.try_clone().unwrap());
         r.read_line(&mut line).unwrap();
         assert!(line.contains("\"confirm\""));
-        writeln!(stream, r#"{{"type":"pending","id":"abc","elapsed_secs":0}}"#).unwrap();
-        writeln!(stream, r#"{{"type":"pending","id":"abc","elapsed_secs":10}}"#).unwrap();
+        writeln!(
+            stream,
+            r#"{{"type":"pending","id":"abc","elapsed_secs":0}}"#
+        )
+        .unwrap();
+        writeln!(
+            stream,
+            r#"{{"type":"pending","id":"abc","elapsed_secs":10}}"#
+        )
+        .unwrap();
         writeln!(stream, r#"{{"type":"result","result":"approved"}}"#).unwrap();
         stream.flush().unwrap();
     });
@@ -366,10 +374,19 @@ fn approver_and_coordinator_cli_subcommands() {
     assert_eq!(code, Some(0), "{out}{err}");
     assert!(out.contains("no Coordinator Pool"), "{out}");
 
-    let (code, out, err) = run_env(&["coordinator", "hygiene", "--path", dir.to_str().unwrap(), "--json"]);
+    let (code, out, err) = run_env(&[
+        "coordinator",
+        "hygiene",
+        "--path",
+        dir.to_str().unwrap(),
+        "--json",
+    ]);
     assert!(code == Some(0) || code == Some(1), "{out}{err}");
     let hyg: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert!(hyg.get("free_gb").is_some() && hyg.get("min_gb").is_some(), "{hyg}");
+    assert!(
+        hyg.get("free_gb").is_some() && hyg.get("min_gb").is_some(),
+        "{hyg}"
+    );
 
     let (code, out, err) = run_env(&["coordinator", "eval"]);
     assert_eq!(code, Some(0), "{out}{err}");
@@ -492,7 +509,10 @@ fn approver_status_readonly_audit_sanitized_and_config_bounds() {
     assert_eq!(code, Some(0), "{out}{err}");
     let cfg: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(cfg["autonomous_timeout_secs"], 90);
-    assert_eq!(cfg["extra_hard_deny_patterns"], serde_json::json!(["drop-table"]));
+    assert_eq!(
+        cfg["extra_hard_deny_patterns"],
+        serde_json::json!(["drop-table"])
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -633,7 +653,10 @@ fn coordinator_pool_hygiene_and_mandate_cli() {
     .unwrap();
     let (code, out, err) = run_env(&["coordinator", "grant-mandate", "t-cli-mand", "--yes"]);
     assert_eq!(code, Some(0), "{out}{err}");
-    assert!(out.contains("homeserver") && out.contains("granted mandate"), "{out}");
+    assert!(
+        out.contains("homeserver") && out.contains("granted mandate"),
+        "{out}"
+    );
     let st = agentdeck_core::thread_state::read(&paths, None, "t-cli-mand")
         .unwrap()
         .unwrap()
@@ -647,7 +670,10 @@ fn coordinator_pool_hygiene_and_mandate_cli() {
         .unwrap()
         .data;
     assert!(!st.mandate.as_ref().unwrap().owner_granted);
-    assert_eq!(st.mandate.as_ref().unwrap().allowed_hosts, vec!["homeserver"]);
+    assert_eq!(
+        st.mandate.as_ref().unwrap().allowed_hosts,
+        vec!["homeserver"]
+    );
 
     // 3. coordinator hygiene --work-dir discovers clean merged checkout and skips dirty checkout.
     let work_dir = dir.join("worktrees");
@@ -672,14 +698,28 @@ fn coordinator_pool_hygiene_and_mandate_cli() {
         );
     };
     git(&dir, &["init", "--bare", origin.to_str().unwrap()]);
-    git(&dir, &["clone", origin.to_str().unwrap(), clean_wt.to_str().unwrap()]);
+    git(
+        &dir,
+        &[
+            "clone",
+            origin.to_str().unwrap(),
+            clean_wt.to_str().unwrap(),
+        ],
+    );
     git(&clean_wt, &["checkout", "-b", "main"]);
     std::fs::write(clean_wt.join("README.md"), "hi\n").unwrap();
     git(&clean_wt, &["add", "README.md"]);
     git(&clean_wt, &["commit", "-m", "init"]);
     git(&clean_wt, &["push", "-u", "origin", "main"]);
 
-    git(&dir, &["clone", origin.to_str().unwrap(), dirty_wt.to_str().unwrap()]);
+    git(
+        &dir,
+        &[
+            "clone",
+            origin.to_str().unwrap(),
+            dirty_wt.to_str().unwrap(),
+        ],
+    );
     std::fs::write(dirty_wt.join("dirty.txt"), "untracked\n").unwrap();
 
     let (code, out, err) = run_env(&[

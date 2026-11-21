@@ -182,7 +182,12 @@ fn resolve_timeout(
             .interactive_timeout_secs
             .clamp(MIN_APPROVAL_TIMEOUT_SECS, MAX_APPROVAL_TIMEOUT_SECS);
         req.timeout_secs
-            .map(|t| t.clamp(MIN_APPROVAL_TIMEOUT_SECS, 1800.min(MAX_APPROVAL_TIMEOUT_SECS)))
+            .map(|t| {
+                t.clamp(
+                    MIN_APPROVAL_TIMEOUT_SECS,
+                    1800.min(MAX_APPROVAL_TIMEOUT_SECS),
+                )
+            })
             .unwrap_or(default_secs)
     };
     (Duration::from_secs(secs), secs)
@@ -309,10 +314,10 @@ where
         id: request_id.clone(),
         elapsed_secs: 0,
     });
-    let step = ctx
-        .timings
-        .keepalive_interval
-        .clamp(Duration::from_millis(5), Duration::from_secs(MAX_APPROVAL_TIMEOUT_SECS));
+    let step = ctx.timings.keepalive_interval.clamp(
+        Duration::from_millis(5),
+        Duration::from_secs(MAX_APPROVAL_TIMEOUT_SECS),
+    );
     let first_tick = started.checked_add(step).unwrap_or(started);
     let mut keepalive = tokio::time::interval_at(first_tick, step);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -363,30 +368,27 @@ where
     let mut mandate = resolve_current();
     let mut autonomous = mandate.is_some();
     let mut perimeter = check_perimeter_with_config(req, mandate.as_ref(), ctx.config);
-    let complete = |outcome,
-                    source,
-                    label,
-                    perimeter: &PerimeterVerdict,
-                    (allow, confidence, reason)| {
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        record_audit(
-            ctx.audit_path,
-            request_id,
-            req,
-            perimeter,
-            allow,
-            confidence,
-            reason,
-            label,
-            source,
-            elapsed_ms,
-        );
-        Ok(BrokerDecision {
-            request_id: request_id.into(),
-            outcome,
-            elapsed_ms,
-        })
-    };
+    let complete =
+        |outcome, source, label, perimeter: &PerimeterVerdict, (allow, confidence, reason)| {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            record_audit(
+                ctx.audit_path,
+                request_id,
+                req,
+                perimeter,
+                allow,
+                confidence,
+                reason,
+                label,
+                source,
+                elapsed_ms,
+            );
+            Ok(BrokerDecision {
+                request_id: request_id.into(),
+                outcome,
+                elapsed_ms,
+            })
+        };
 
     tokio::pin!(client_disconnected);
     let mut judge_fields: (Option<bool>, Option<f64>, Option<String>) = (None, None, None);
@@ -665,12 +667,8 @@ where
         pending: Arc<PendingDecisions>,
         audit_path: Option<PathBuf>,
     ) -> Result<Self> {
-        let resolver: MandateResolver = Arc::new(move |_req| {
-            mandate
-                .read()
-                .expect("mandate rwlock poisoned")
-                .clone()
-        });
+        let resolver: MandateResolver =
+            Arc::new(move |_req| mandate.read().expect("mandate rwlock poisoned").clone());
         Self::bind_with_resolver(
             socket_path,
             config,
@@ -999,7 +997,8 @@ mod tests {
             req.timeout_secs = req_timeout;
             for cfg in [&zero_cfg, &huge_cfg] {
                 for autonomous in [true, false] {
-                    let (dur, secs) = resolve_timeout(&req, cfg, autonomous, BrokerTimings::default());
+                    let (dur, secs) =
+                        resolve_timeout(&req, cfg, autonomous, BrokerTimings::default());
                     assert!(
                         (MIN_APPROVAL_TIMEOUT_SECS..=MAX_APPROVAL_TIMEOUT_SECS).contains(&secs),
                         "secs={secs} out of bounds for req={req_timeout:?}, autonomous={autonomous}"

@@ -116,7 +116,10 @@ pub enum Message {
         expected: agentdeck_core::thread_state::RunMandate,
         grant: bool,
     },
-    CoordResolve { thread: String, item: String },
+    CoordResolve {
+        thread: String,
+        item: String,
+    },
     CoordDone(Result<(), String>),
     Usage(usage::Msg),
     Settings(settings::Msg),
@@ -333,12 +336,14 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 (Page::UsagePoll | Page::RouterSettings, Some(paths)) => {
                     Task::perform(async move { settings::load(&paths) }, Message::Settings)
                 }
-                (Page::ApproverSettings, Some(paths)) => {
-                    Task::perform(async move { settings::load_approver(&paths) }, Message::Settings)
-                }
-                (Page::CoordinatorSettings, Some(paths)) => {
-                    Task::perform(async move { settings::load_coord(&paths) }, Message::Settings)
-                }
+                (Page::ApproverSettings, Some(paths)) => Task::perform(
+                    async move { settings::load_approver(&paths) },
+                    Message::Settings,
+                ),
+                (Page::CoordinatorSettings, Some(paths)) => Task::perform(
+                    async move { settings::load_coord(&paths) },
+                    Message::Settings,
+                ),
                 (Page::ImagegenSettings, Some(paths)) => {
                     Task::perform(async move { imagegen::load(&paths) }, Message::Imagegen)
                 }

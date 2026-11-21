@@ -489,7 +489,9 @@ fn check_perimeter_inner(
         {
             return PerimeterVerdict::HardDeny {
                 rule: "remote_host_not_allowed",
-                detail: format!("remote host {effective_host:?} is outside configured remote_hosts"),
+                detail: format!(
+                    "remote host {effective_host:?} is outside configured remote_hosts"
+                ),
             };
         }
     }

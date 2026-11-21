@@ -65,19 +65,9 @@ pub fn frontmatter(text: &str) -> Frontmatter {
         };
         let value = value.trim();
         match key.trim() {
-            "name" => {
-                fm.name = Some(
-                    value
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .to_string(),
-                )
-            }
+            "name" => fm.name = Some(value.trim_matches('"').trim_matches('\'').to_string()),
             "description" => {
-                fm.description = value
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string()
+                fm.description = value.trim_matches('"').trim_matches('\'').to_string()
             }
             // Same inline-comment rule as `shared.rs`: `true # why` counts,
             // `true#x` does not.

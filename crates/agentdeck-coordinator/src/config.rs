@@ -58,7 +58,10 @@ impl CoordinatorPoolEntry {
     }
 
     pub fn options_map(&self) -> HashMap<String, serde_json::Value> {
-        self.options.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        self.options
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 }
 

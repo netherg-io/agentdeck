@@ -1997,7 +1997,9 @@ mod tests {
         let reg = Registry::load(&paths).unwrap();
         assert!(plugin_enabled(&reg, PLUGIN_COORDINATOR));
         assert_eq!(
-            crate::settings::read_approver(&reg).unwrap().autonomous_timeout_secs,
+            crate::settings::read_approver(&reg)
+                .unwrap()
+                .autonomous_timeout_secs,
             90
         );
     }

@@ -465,7 +465,9 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
                     v["state_stale"] = json!(stale);
                     Ok(v)
                 }
-                None => Ok(json!({ "thread": id, "state": null, "state_stale": false, "checklist_updates_since_state": 0 })),
+                None => Ok(
+                    json!({ "thread": id, "state": null, "state_stale": false, "checklist_updates_since_state": 0 }),
+                ),
             }
         }
         "state_write" => {
@@ -517,7 +519,9 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
             let meta_requested =
                 phase.is_some() || mandate.is_some() || sleep_until.is_some() || record_checkpoint;
             if !has_snapshot && !meta_requested {
-                anyhow::bail!("pass state, decision, phase, mandate, sleep_until or record_checkpoint");
+                anyhow::bail!(
+                    "pass state, decision, phase, mandate, sleep_until or record_checkpoint"
+                );
             }
             let (checkpoint_run_count, checkpoint_item_count) = if record_checkpoint {
                 t3r.and_then(|root| observe_thread_sqlite(root, &id).ok().flatten())
@@ -554,9 +558,8 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
                 "checkpoint_count": current.checkpoint_count,
             });
             if stale {
-                out["warning"] = json!(
-                    "state is stale: rewrite the snapshot before the next Checkpoint"
-                );
+                out["warning"] =
+                    json!("state is stale: rewrite the snapshot before the next Checkpoint");
             }
             Ok(out)
         }
@@ -646,10 +649,7 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
                 t3.as_deref(),
                 &id,
                 thread_state::NewInboxItem {
-                    id: args
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
+                    id: args.get("id").and_then(Value::as_str).map(str::to_string),
                     title: str_arg(args, "title")
                         .ok_or_else(|| anyhow::anyhow!("title is required"))?
                         .to_string(),
@@ -667,8 +667,7 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
         "owner_inbox_resolve" => {
             let thread = thread_arg(args)?;
             let t3 = agentdeck_core::t3::t3_root().ok();
-            let item_id =
-                str_arg(args, "id").ok_or_else(|| anyhow::anyhow!("id is required"))?;
+            let item_id = str_arg(args, "id").ok_or_else(|| anyhow::anyhow!("id is required"))?;
             let item = thread_state::inbox_resolve(paths, t3.as_deref(), &thread, item_id)?;
             Ok(serde_json::to_value(item)?)
         }
@@ -697,10 +696,7 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
                 t3.as_deref(),
                 &thread,
                 thread_state::NewAssumption {
-                    id: args
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
+                    id: args.get("id").and_then(Value::as_str).map(str::to_string),
                     decision: str_arg(args, "decision")
                         .ok_or_else(|| anyhow::anyhow!("decision is required"))?
                         .to_string(),
@@ -741,15 +737,11 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
                     .and_then(|o| o.provider_instance_id.as_deref()),
                 observed.as_ref().and_then(|o| o.model.as_deref()),
             );
-            let current = current_pair
-                .as_ref()
-                .map(|(i, m)| (i.as_str(), m.as_str()));
-            let quotas =
-                cmd_coordinator::collect_pool_quotas(&cfg, Some(&reg), t3_root.as_deref());
+            let current = current_pair.as_ref().map(|(i, m)| (i.as_str(), m.as_str()));
+            let quotas = cmd_coordinator::collect_pool_quotas(&cfg, Some(&reg), t3_root.as_deref());
             let now = cmd_coordinator::now_epoch_secs();
             let selection = select_coordinator(&cfg, &quotas, now, current);
-            let proactive =
-                cmd_coordinator::proactive_rotate_recommended(&cfg, &quotas, current);
+            let proactive = cmd_coordinator::proactive_rotate_recommended(&cfg, &quotas, current);
             match selection {
                 PoolSelection::Selected {
                     entry,
@@ -803,20 +795,14 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
                     .and_then(|o| o.provider_instance_id.as_deref()),
                 observed.as_ref().and_then(|o| o.model.as_deref()),
             );
-            let current = current_pair
-                .as_ref()
-                .map(|(i, m)| (i.as_str(), m.as_str()));
-            let quotas =
-                cmd_coordinator::collect_pool_quotas(&cfg, Some(&reg), t3_root.as_deref());
-            let recommended_target = match select_coordinator(
-                &cfg,
-                &quotas,
-                cmd_coordinator::now_epoch_secs(),
-                current,
-            ) {
-                PoolSelection::Selected { entry, .. } => Some(entry),
-                _ => None,
-            };
+            let current = current_pair.as_ref().map(|(i, m)| (i.as_str(), m.as_str()));
+            let quotas = cmd_coordinator::collect_pool_quotas(&cfg, Some(&reg), t3_root.as_deref());
+            let recommended_target =
+                match select_coordinator(&cfg, &quotas, cmd_coordinator::now_epoch_secs(), current)
+                {
+                    PoolSelection::Selected { entry, .. } => Some(entry),
+                    _ => None,
+                };
             if state_stale {
                 return Ok(json!({
                     "should_checkpoint": false,
@@ -890,8 +876,8 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
                 Err(_) => HeuristicCheckpointJudge.judge(&input, &cfg).await?,
             };
             let _ = record_outcome(&paths.state_dir, &input, &verdict);
-            let should_checkpoint =
-                verdict.should_checkpoint && verdict.confidence >= cfg.checkpoint_confidence_threshold;
+            let should_checkpoint = verdict.should_checkpoint
+                && verdict.confidence >= cfg.checkpoint_confidence_threshold;
             Ok(json!({
                 "should_checkpoint": should_checkpoint,
                 "state_stale": state_stale,

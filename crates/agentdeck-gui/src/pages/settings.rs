@@ -1083,12 +1083,14 @@ fn coord_cfg(s: &CoordState) -> Result<CoordinatorSettings, String> {
     let cfg = CoordinatorSettings {
         pool: s.entries.clone(),
         min_weekly_reserve_pct: number(&s.reserve)?.unwrap_or(d.min_weekly_reserve_pct),
-        proactive_rotate_below_5h_pct: number(&s.proactive)?.unwrap_or(d.proactive_rotate_below_5h_pct),
+        proactive_rotate_below_5h_pct: number(&s.proactive)?
+            .unwrap_or(d.proactive_rotate_below_5h_pct),
         quota_sleep_buffer_secs: seconds(&s.sleep_buffer)?.unwrap_or(d.quota_sleep_buffer_secs),
         idle_wake_grace_secs: seconds(&s.wake_grace)?.unwrap_or(d.idle_wake_grace_secs),
         checkpoint_soft_runs: count(&s.soft_runs)?.unwrap_or(d.checkpoint_soft_runs),
         checkpoint_soft_items: count(&s.soft_items)?.unwrap_or(d.checkpoint_soft_items),
-        checkpoint_confidence_threshold: number(&s.confidence)?.unwrap_or(d.checkpoint_confidence_threshold),
+        checkpoint_confidence_threshold: number(&s.confidence)?
+            .unwrap_or(d.checkpoint_confidence_threshold),
         min_free_disk_gb: seconds(&s.min_disk)?.unwrap_or(d.min_free_disk_gb),
         t3_endpoint: blanked(&s.t3_endpoint),
         t3_token_file: s.token_file.clone(),
@@ -1161,27 +1163,27 @@ fn update_approver(state: &mut ApproverState, paths: Paths, msg: ApproverMsg) ->
                 return Task::none();
             }
             match approver_cfg(state) {
-            Err(e) => {
-                state.result = Some((e, true));
-                Task::none()
+                Err(e) => {
+                    state.result = Some((e, true));
+                    Task::none()
+                }
+                Ok(cfg) => {
+                    state.busy = true;
+                    Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                settings::write_approver(&paths, &cfg, false)
+                                    .map(|_| ())
+                                    .map_err(|e| format!("{e:#}"))
+                            })
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r)
+                        },
+                        |r| am(ApproverMsg::Done(r)),
+                    )
+                }
             }
-            Ok(cfg) => {
-                state.busy = true;
-                Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            settings::write_approver(&paths, &cfg, false)
-                                .map(|_| ())
-                                .map_err(|e| format!("{e:#}"))
-                        })
-                        .await
-                        .map_err(|e| e.to_string())
-                        .and_then(|r| r)
-                    },
-                    |r| am(ApproverMsg::Done(r)),
-                )
-            }
-        }
         }
         ApproverMsg::Done(result) => {
             state.busy = false;
@@ -1338,27 +1340,27 @@ fn update_coord(state: &mut CoordState, paths: Paths, msg: CoordMsg) -> Task<Msg
                 return Task::none();
             }
             match coord_cfg(state) {
-            Err(e) => {
-                state.result = Some((e, true));
-                Task::none()
+                Err(e) => {
+                    state.result = Some((e, true));
+                    Task::none()
+                }
+                Ok(cfg) => {
+                    state.busy = true;
+                    Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                settings::write_coordinator(&paths, &cfg, false)
+                                    .map(|_| ())
+                                    .map_err(|e| format!("{e:#}"))
+                            })
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r)
+                        },
+                        |r| cm(CoordMsg::Done(r)),
+                    )
+                }
             }
-            Ok(cfg) => {
-                state.busy = true;
-                Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            settings::write_coordinator(&paths, &cfg, false)
-                                .map(|_| ())
-                                .map_err(|e| format!("{e:#}"))
-                        })
-                        .await
-                        .map_err(|e| e.to_string())
-                        .and_then(|r| r)
-                    },
-                    |r| cm(CoordMsg::Done(r)),
-                )
-            }
-        }
         }
         CoordMsg::Done(result) => {
             state.busy = false;
@@ -1593,8 +1595,11 @@ pub fn coord_view(state: &State) -> Element<'_, Msg> {
             st::btn(st::Btn::Quiet, fl!(loader(), "coord-pool-add")).on_press_maybe(
                 (!s.new_instance.trim().is_empty()
                     && !s.new_model.trim().is_empty()
-                    && !s.entries.iter().any(|e| e.instance_id == s.new_instance.trim()
-                        && e.model == s.new_model.trim()))
+                    && !s
+                        .entries
+                        .iter()
+                        .any(|e| e.instance_id == s.new_instance.trim()
+                            && e.model == s.new_model.trim()))
                 .then_some(cm(CoordMsg::Add))
             ),
         ]
@@ -1602,8 +1607,16 @@ pub fn coord_view(state: &State) -> Element<'_, Msg> {
         .align_y(Alignment::Center),
     );
     let form = column![
-        field(fl!(loader(), "coord-reserve"), input(&s.reserve, CoordMsg::Reserve), None),
-        field(fl!(loader(), "coord-proactive"), input(&s.proactive, CoordMsg::Proactive), None),
+        field(
+            fl!(loader(), "coord-reserve"),
+            input(&s.reserve, CoordMsg::Reserve),
+            None
+        ),
+        field(
+            fl!(loader(), "coord-proactive"),
+            input(&s.proactive, CoordMsg::Proactive),
+            None
+        ),
         field(
             fl!(loader(), "coord-sleep-buffer"),
             input(&s.sleep_buffer, CoordMsg::SleepBuffer),

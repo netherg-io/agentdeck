@@ -12,12 +12,13 @@ use agentdeck_approver::broker::{
     BrokerContext, BrokerOutcome, BrokerTimings, MandateResolver, PendingEvent, UnixBrokerServer,
     evaluate_and_wait, format_wire_result,
 };
-use agentdeck_approver::config::{ApproverConfig, DEFAULT_AUTONOMOUS_TIMEOUT_SECS, DEFAULT_INTERACTIVE_TIMEOUT_SECS};
+use agentdeck_approver::config::{
+    ApproverConfig, DEFAULT_AUTONOMOUS_TIMEOUT_SECS, DEFAULT_INTERACTIVE_TIMEOUT_SECS,
+};
 use agentdeck_approver::eval::{default_eval_cases, run_perimeter_eval};
 use agentdeck_approver::judge::{HttpPolicyJudge, JudgeVerdict, PolicyJudge, build_judge_prompt};
 use agentdeck_approver::perimeter::{
-    ApprovalRequest, MandateContext, PerimeterVerdict, check_perimeter,
-    check_perimeter_with_config,
+    ApprovalRequest, MandateContext, PerimeterVerdict, check_perimeter, check_perimeter_with_config,
 };
 use agentdeck_approver::telegram::{
     CallbackAction, FINALIZE_APPROVED, FINALIZE_TIMEOUT, HARD_DENY_PREFIX, PendingDecisions,
@@ -1287,7 +1288,11 @@ async fn concurrent_threads_isolate_grants_and_preserve_interactive_timeout() {
     let res_b = send_over_socket(req_b).await;
     deny_b.await.unwrap();
     assert_eq!(res_b["result"], "denied");
-    assert_eq!(judge.call_count(), 1, "ungranted thread must never call judge");
+    assert_eq!(
+        judge.call_count(),
+        1,
+        "ungranted thread must never call judge"
+    );
 
     // 3) Interactive request (thread_id == None) gets 600s timeout and no false hard-deny banner.
     let interactive_req: ApprovalRequest = serde_json::from_value(json!({
@@ -1459,7 +1464,10 @@ async fn mandate_revoked_or_scope_changed_mid_flight_escalates_to_telegram() {
         driver.await.unwrap();
         assert_eq!(decision.outcome, BrokerOutcome::Denied);
         let records = read_recent(&audit_path, 5).unwrap();
-        assert_eq!(records.last().unwrap().perimeter, "hard_deny:out_of_scope_app");
+        assert_eq!(
+            records.last().unwrap().perimeter,
+            "hard_deny:out_of_scope_app"
+        );
         assert_eq!(
             records.last().unwrap().judge_reason.as_deref(),
             Some("judge_mandate_changed")
@@ -1723,6 +1731,9 @@ async fn provider_secret_marker_never_leaks_into_errors_or_audit_jsonl() {
     );
     let records = read_recent(&audit_path, 10).unwrap();
     assert_eq!(records.len(), 2);
-    assert_eq!(records[0].judge_reason.as_deref(), Some("judge_http_status_500"));
+    assert_eq!(
+        records[0].judge_reason.as_deref(),
+        Some("judge_http_status_500")
+    );
     assert_eq!(records[1].judge_reason.as_deref(), Some("judge_approved"));
 }

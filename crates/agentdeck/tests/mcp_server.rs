@@ -305,7 +305,11 @@ fn coordinator_run_state_inbox_and_assumptions() {
             call(21, "owner_inbox_resolve", json!({"id": "inbox-1"})),
             call(22, "owner_inbox_list", json!({})),
             call(23, "owner_inbox_list", json!({"include_resolved": true})),
-            call(24, "state_write", json!({"sleep_until": "2026-11-22T00:00:00Z"})),
+            call(
+                24,
+                "state_write",
+                json!({"sleep_until": "2026-11-22T00:00:00Z"}),
+            ),
             call(25, "state_write", json!({"sleep_until": null})),
         ],
     );
@@ -320,9 +324,9 @@ fn coordinator_run_state_inbox_and_assumptions() {
     assert_eq!(all["items"].as_array().unwrap().len(), 1);
     let set: Value = serde_json::from_str(&text(&replies[4])).unwrap();
     assert_eq!(set["state_stale"], false);
-    let read: Value = serde_json::from_str(
-        &text(&session_env(&dir, &env, &[call(26, "state_read", json!({}))])[0]),
-    )
+    let read: Value = serde_json::from_str(&text(
+        &session_env(&dir, &env, &[call(26, "state_read", json!({}))])[0],
+    ))
     .unwrap();
     assert!(read.get("sleep_until").is_none_or(Value::is_null), "{read}");
     let _ = std::fs::remove_dir_all(&dir);
@@ -356,16 +360,28 @@ fn mandate_cannot_self_grant_and_sleep_until_validated() {
             call(5, "state_read", json!({})),
         ],
     );
-    assert!(replies[0]["result"].get("isError").is_none(), "{}", text(&replies[0]));
+    assert!(
+        replies[0]["result"].get("isError").is_none(),
+        "{}",
+        text(&replies[0])
+    );
     // The MCP can never self-grant: owner_granted is forced false.
     let read: Value = serde_json::from_str(&text(&replies[1])).unwrap();
     assert_eq!(read["mandate"]["project"], "blockfield");
     assert_eq!(read["mandate"]["owner_granted"], false);
     // A malformed sleep_until is refused at the write boundary.
     assert_eq!(replies[2]["result"]["isError"], true);
-    assert!(text(&replies[2]).contains("RFC3339"), "{}", text(&replies[2]));
+    assert!(
+        text(&replies[2]).contains("RFC3339"),
+        "{}",
+        text(&replies[2])
+    );
     // A meta-only write preserves the existing mandate instead of clearing it.
-    assert!(replies[3]["result"].get("isError").is_none(), "{}", text(&replies[3]));
+    assert!(
+        replies[3]["result"].get("isError").is_none(),
+        "{}",
+        text(&replies[3])
+    );
     let read: Value = serde_json::from_str(&text(&replies[4])).unwrap();
     assert_eq!(read["phase"], "running");
     assert_eq!(read["mandate"]["project"], "blockfield");
@@ -405,10 +421,7 @@ fn coordinator_tools_refused_without_coordinator_plugin() {
 
 #[test]
 fn coordinator_pool_checkpoint_and_hygiene_mcp_tools() {
-    let dir = std::env::temp_dir().join(format!(
-        "agentdeck-mcp-coord-u5-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("agentdeck-mcp-coord-u5-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let t3 = dir.join("t3");
     std::fs::create_dir_all(dir.join("home")).unwrap();
@@ -483,11 +496,7 @@ fn coordinator_pool_checkpoint_and_hygiene_mcp_tools() {
                 "coordinator_checkpoint_check",
                 json!({"milestone_just_completed": true, "run_count_since_checkpoint": 5, "item_count_since_checkpoint": 50}),
             ),
-            call(
-                6,
-                "coordinator_hygiene_check",
-                json!({"path": dir_str}),
-            ),
+            call(6, "coordinator_hygiene_check", json!({"path": dir_str})),
         ],
     );
     let names: Vec<&str> = replies[0]["result"]["tools"]
@@ -560,7 +569,11 @@ fn coordinator_pool_checkpoint_and_hygiene_mcp_tools() {
         r#"{"status":"ready","usageLimits":{"windows":[{"id":"5h","windowDurationMins":300,"usedPercent":100.0,"resetsAt":"2026-11-21T05:00:00Z"}]}}"#,
     )
     .unwrap();
-    let sleep_replies = session_env(&dir, &env, &[call(20, "coordinator_next_target", json!({}))]);
+    let sleep_replies = session_env(
+        &dir,
+        &env,
+        &[call(20, "coordinator_next_target", json!({}))],
+    );
     let sleep: Value = serde_json::from_str(&text(&sleep_replies[0])).unwrap();
     assert_eq!(sleep["status"], "sleeping_for_quota", "{sleep}");
     assert_eq!(sleep["wake_at"], "2026-11-21T05:02:00Z", "{sleep}");
@@ -604,7 +617,11 @@ fn state_write_blocks_cross_thread_phase_mandate_and_revokes_on_complete() {
         &dir,
         &[("T3CODE_THREAD_ID", "thread-b")],
         &[
-            call(1, "state_write", json!({"thread": "thread-a", "phase": "completed"})),
+            call(
+                1,
+                "state_write",
+                json!({"thread": "thread-a", "phase": "completed"}),
+            ),
             call(
                 2,
                 "state_write",
@@ -619,13 +636,25 @@ fn state_write_blocks_cross_thread_phase_mandate_and_revokes_on_complete() {
         ],
     );
     assert_eq!(replies[0]["result"]["isError"], true);
-    assert!(text(&replies[0]).contains("cannot mutate phase or mandate"), "{}", text(&replies[0]));
+    assert!(
+        text(&replies[0]).contains("cannot mutate phase or mandate"),
+        "{}",
+        text(&replies[0])
+    );
     assert_eq!(replies[1]["result"]["isError"], true);
-    assert!(text(&replies[1]).contains("cannot mutate phase or mandate"), "{}", text(&replies[1]));
+    assert!(
+        text(&replies[1]).contains("cannot mutate phase or mandate"),
+        "{}",
+        text(&replies[1])
+    );
     let read_a: Value = serde_json::from_str(&text(&replies[2])).unwrap();
     assert_eq!(read_a["phase"], "running");
     assert_eq!(read_a["mandate"]["owner_granted"], true);
-    assert!(replies[3]["result"].get("isError").is_none(), "{}", text(&replies[3]));
+    assert!(
+        replies[3]["result"].get("isError").is_none(),
+        "{}",
+        text(&replies[3])
+    );
 
     // Completing own thread revokes owner_granted; later switching back to running does not resurrect it.
     let replies = session_env(
@@ -637,8 +666,16 @@ fn state_write_blocks_cross_thread_phase_mandate_and_revokes_on_complete() {
             call(12, "state_read", json!({})),
         ],
     );
-    assert!(replies[0]["result"].get("isError").is_none(), "{}", text(&replies[0]));
-    assert!(replies[1]["result"].get("isError").is_none(), "{}", text(&replies[1]));
+    assert!(
+        replies[0]["result"].get("isError").is_none(),
+        "{}",
+        text(&replies[0])
+    );
+    assert!(
+        replies[1]["result"].get("isError").is_none(),
+        "{}",
+        text(&replies[1])
+    );
     let after: Value = serde_json::from_str(&text(&replies[2])).unwrap();
     assert_eq!(after["phase"], "running");
     assert_eq!(after["mandate"]["owner_granted"], false);
@@ -746,7 +783,11 @@ fn coordinator_mcp_prefers_observed_model_tracks_checkpoint_deltas_and_worktrees
         &dir,
         &env,
         &[
-            call(1, "coordinator_next_target", json!({"current_instance": "agy"})),
+            call(
+                1,
+                "coordinator_next_target",
+                json!({"current_instance": "agy"}),
+            ),
             call(
                 2,
                 "state_write",
@@ -797,7 +838,10 @@ fn coordinator_mcp_prefers_observed_model_tracks_checkpoint_deltas_and_worktrees
     assert_eq!(chk["should_checkpoint"], false, "{chk}");
     assert_eq!(chk["recommended_target"]["model"], "gemini-4-neon", "{chk}");
     let explicit: Value = serde_json::from_str(&text(&replies[1])).unwrap();
-    assert_eq!(explicit["target"]["model"], "claude-sonnet-4-6", "{explicit}");
+    assert_eq!(
+        explicit["target"]["model"], "claude-sonnet-4-6",
+        "{explicit}"
+    );
 
     // 3. coordinator_hygiene_check with work_dir lists stale merged checkout.
     let work_dir = dir.join("wt");
@@ -814,10 +858,21 @@ fn coordinator_mcp_prefers_observed_model_tracks_checkpoint_deltas_and_worktrees
             .env("GIT_COMMITTER_EMAIL", "test@example.com")
             .output()
             .unwrap();
-        assert!(out.status.success(), "{:?}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     git(&dir, &["init", "--bare", origin.to_str().unwrap()]);
-    git(&dir, &["clone", origin.to_str().unwrap(), stale_wt.to_str().unwrap()]);
+    git(
+        &dir,
+        &[
+            "clone",
+            origin.to_str().unwrap(),
+            stale_wt.to_str().unwrap(),
+        ],
+    );
     git(&stale_wt, &["checkout", "-b", "main"]);
     std::fs::write(stale_wt.join("f.txt"), "x\n").unwrap();
     git(&stale_wt, &["add", "f.txt"]);

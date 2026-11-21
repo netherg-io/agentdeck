@@ -136,9 +136,9 @@ pub fn collect_pool_quotas(
     let mut quotas = HashMap::new();
     for entry in &cfg.pool {
         let reg_allows = match reg {
-            Some(r) if !r.instances.is_empty() => r
-                .get(&entry.instance_id)
-                .is_some_and(|i| i.enabled && i.t3),
+            Some(r) if !r.instances.is_empty() => {
+                r.get(&entry.instance_id).is_some_and(|i| i.enabled && i.t3)
+            }
             _ => true,
         };
         let view = match (reg_allows, t3_root) {
@@ -166,11 +166,8 @@ fn current_pool_key<'a>(
     if let Some(model) = current_model.map(str::trim).filter(|s| !s.is_empty()) {
         return Ok(Some((cur, model)));
     }
-    let matches: Vec<&CoordinatorPoolEntry> = cfg
-        .pool
-        .iter()
-        .filter(|e| e.instance_id == cur)
-        .collect();
+    let matches: Vec<&CoordinatorPoolEntry> =
+        cfg.pool.iter().filter(|e| e.instance_id == cur).collect();
     match matches.as_slice() {
         [] => Ok(None),
         [one] => Ok(Some((one.instance_id.as_str(), one.model.as_str()))),
@@ -486,7 +483,11 @@ fn hygiene(
     Ok(if check.ok { 0 } else { 1 })
 }
 
-fn print_mandate_scope(thread_id: &str, phase: thread_state::RunPhase, m: &thread_state::RunMandate) {
+fn print_mandate_scope(
+    thread_id: &str,
+    phase: thread_state::RunPhase,
+    m: &thread_state::RunMandate,
+) {
     let hosts = if m.allowed_hosts.is_empty() {
         "(any — unrestricted)".to_string()
     } else {
@@ -500,7 +501,11 @@ fn print_mandate_scope(thread_id: &str, phase: thread_state::RunPhase, m: &threa
     println!("thread: {thread_id} (phase={})", phase_label(phase));
     println!(
         "  project: {}",
-        if m.project.is_empty() { "(none)" } else { &m.project }
+        if m.project.is_empty() {
+            "(none)"
+        } else {
+            &m.project
+        }
     );
     println!("  allowed_hosts: {hosts}");
     println!("  allowed_apps: {apps}");
@@ -557,26 +562,74 @@ async fn eval(as_json: bool) -> anyhow::Result<i32> {
         recent_events_tail: events.iter().map(|s| (*s).to_string()).collect(),
     };
     let cases: Vec<(&str, CheckpointInput, bool)> = vec![
-        ("stale_quiet_refused", case(0, 0, false, true, 0, &[]), false),
-        ("stale_milestone_refused", case(0, 0, true, true, 0, &[]), false),
-        ("stale_over_threshold_refused", case(200, 5000, false, true, 0, &[]), false),
-        ("quiet_turn_preserves_cache", case(10, 100, false, false, 0, &[]), false),
-        ("just_under_thresholds", case(79, 1499, false, false, 0, &[]), false),
-        ("at_run_threshold_approved", case(80, 0, false, false, 0, &[]), true),
-        ("at_item_threshold_approved", case(0, 1500, false, false, 0, &[]), true),
-        ("clean_milestone_approved", case(3, 12, true, false, 0, &["shipped U1"]), true),
-        ("active_children_refused", case(200, 5000, true, false, 2, &[]), false),
-        ("merge_conflict_hazard_refused", case(200, 5000, true, false, 0, &["merge conflict"]), false),
-        ("mid_rollback_hazard_refused", case(200, 5000, false, false, 0, &["mid-rollback"]), false),
-        ("in_progress_deploy_refused", case(200, 5000, false, false, 0, &["in-progress deploy"]), false),
+        (
+            "stale_quiet_refused",
+            case(0, 0, false, true, 0, &[]),
+            false,
+        ),
+        (
+            "stale_milestone_refused",
+            case(0, 0, true, true, 0, &[]),
+            false,
+        ),
+        (
+            "stale_over_threshold_refused",
+            case(200, 5000, false, true, 0, &[]),
+            false,
+        ),
+        (
+            "quiet_turn_preserves_cache",
+            case(10, 100, false, false, 0, &[]),
+            false,
+        ),
+        (
+            "just_under_thresholds",
+            case(79, 1499, false, false, 0, &[]),
+            false,
+        ),
+        (
+            "at_run_threshold_approved",
+            case(80, 0, false, false, 0, &[]),
+            true,
+        ),
+        (
+            "at_item_threshold_approved",
+            case(0, 1500, false, false, 0, &[]),
+            true,
+        ),
+        (
+            "clean_milestone_approved",
+            case(3, 12, true, false, 0, &["shipped U1"]),
+            true,
+        ),
+        (
+            "active_children_refused",
+            case(200, 5000, true, false, 2, &[]),
+            false,
+        ),
+        (
+            "merge_conflict_hazard_refused",
+            case(200, 5000, true, false, 0, &["merge conflict"]),
+            false,
+        ),
+        (
+            "mid_rollback_hazard_refused",
+            case(200, 5000, false, false, 0, &["mid-rollback"]),
+            false,
+        ),
+        (
+            "in_progress_deploy_refused",
+            case(200, 5000, false, false, 0, &["in-progress deploy"]),
+            false,
+        ),
     ];
 
     let mut passed = 0usize;
     let mut failures = Vec::new();
     for (name, inp, expected) in &cases {
         let verdict = judge.judge(inp, &cfg).await?;
-        let actual = verdict.should_checkpoint
-            && verdict.confidence >= cfg.checkpoint_confidence_threshold;
+        let actual =
+            verdict.should_checkpoint && verdict.confidence >= cfg.checkpoint_confidence_threshold;
         if actual == *expected {
             passed += 1;
         } else {

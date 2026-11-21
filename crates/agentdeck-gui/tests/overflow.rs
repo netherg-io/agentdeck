@@ -7,7 +7,9 @@
 use std::path::PathBuf;
 
 use agentdeck_core::processes::{GroupKind, ProcInfo, SessionGroup};
-use agentdeck_core::thread_state::{Assumption, InboxItem, Item, RunMandate, RunPhase, ThreadState};
+use agentdeck_core::thread_state::{
+    Assumption, InboxItem, Item, RunMandate, RunPhase, ThreadState,
+};
 use agentdeck_core::usage::{UsageEntry, UsageKind};
 use agentdeck_core::{Paths, PoolEntry};
 use agentdeck_gui::app::{self, Message, Page};
@@ -462,14 +464,12 @@ fn every_page_fits_at_min_size_with_long_names() {
             Message::Settings(settings::Msg::Coord(Box::new(settings::CoordMsg::Loaded(
                 settings::CoordLoaded {
                     cfg: Some(agentdeck_core::settings::CoordinatorSettings {
-                        pool: vec![
-                            agentdeck_core::settings::CoordinatorPoolEntry {
-                                instance_id: LONG_ID.into(),
-                                model: format!("model-{LONG_ID}"),
-                                options: Default::default(),
-                                enabled: true,
-                            },
-                        ],
+                        pool: vec![agentdeck_core::settings::CoordinatorPoolEntry {
+                            instance_id: LONG_ID.into(),
+                            model: format!("model-{LONG_ID}"),
+                            options: Default::default(),
+                            enabled: true,
+                        }],
                         t3_endpoint: Some(format!("http://127.0.0.1:9999/{LONG_ID}")),
                         ..Default::default()
                     }),
@@ -478,10 +478,7 @@ fn every_page_fits_at_min_size_with_long_names() {
                 },
             )))),
         );
-        update(
-            &mut state,
-            Message::SelectPage(Page::CoordinatorSettings),
-        );
+        update(&mut state, Message::SelectPage(Page::CoordinatorSettings));
         shot(&state, lang, "coordinator_settings");
 
         update(&mut state, Message::SelectPage(Page::Shared));
@@ -572,10 +569,8 @@ fn every_page_fits_at_min_size_with_long_names() {
 /// inbox item and an ungranted mandate, so every badge shows at once.
 #[test]
 fn coordinator_header_never_clips_at_min_size() {
-    let dir = std::env::temp_dir().join(format!(
-        "agentdeck-gui-overflow-hdr-{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("agentdeck-gui-overflow-hdr-{}", std::process::id()));
     let paths = Paths::new(dir.join("config"), dir.join("state"));
     for lang in ["en", "ru"] {
         let mut state = app::State::for_tests(paths.clone(), data());

@@ -456,7 +456,9 @@ impl ApproverSettings {
         }
         for pat in &self.extra_hard_deny_patterns {
             if pat.is_empty() {
-                anyhow::bail!("[approver] extra_hard_deny_patterns must not contain empty patterns");
+                anyhow::bail!(
+                    "[approver] extra_hard_deny_patterns must not contain empty patterns"
+                );
             }
             regex::Regex::new(&format!("(?i){pat}")).map_err(|e| {
                 anyhow::anyhow!("[approver] invalid extra_hard_deny_pattern {pat:?}: {e}")
@@ -501,9 +503,8 @@ fn checked_i64(section: &str, key: &str, v: u64) -> anyhow::Result<i64> {
 
 fn apply_approver_to_registry(reg: &mut Registry, cfg: &ApproverSettings) -> anyhow::Result<()> {
     let str_arr = |items: &[String]| {
-        (!items.is_empty()).then(|| {
-            toml::Value::Array(items.iter().cloned().map(toml::Value::String).collect())
-        })
+        (!items.is_empty())
+            .then(|| toml::Value::Array(items.iter().cloned().map(toml::Value::String).collect()))
     };
     set(
         reg,
@@ -751,9 +752,7 @@ pub fn validate_loopback_http(endpoint: &str) -> anyhow::Result<()> {
         .chars()
         .any(|c| c.is_control() || c == ' ' || c == '\u{7f}')
     {
-        anyhow::bail!(
-            "[coordinator] t3_endpoint must not contain spaces or control characters"
-        );
+        anyhow::bail!("[coordinator] t3_endpoint must not contain spaces or control characters");
     }
     let rest = endpoint
         .strip_prefix("http://")
@@ -777,7 +776,9 @@ pub fn validate_loopback_http(endpoint: &str) -> anyhow::Result<()> {
             anyhow::anyhow!("[coordinator] t3_endpoint has a malformed IPv6 host")
         })?;
         if inside != "::1" {
-            anyhow::bail!("[coordinator] t3_endpoint must be loopback (127.0.0.1, localhost or [::1])");
+            anyhow::bail!(
+                "[coordinator] t3_endpoint must be loopback (127.0.0.1, localhost or [::1])"
+            );
         }
         let port = match after {
             "" => None,
@@ -801,9 +802,7 @@ pub fn validate_loopback_http(endpoint: &str) -> anyhow::Result<()> {
         }
     };
     if host != "127.0.0.1" && host != "localhost" && host != "[::1]" {
-        anyhow::bail!(
-            "[coordinator] t3_endpoint must be loopback (127.0.0.1, localhost or [::1])"
-        );
+        anyhow::bail!("[coordinator] t3_endpoint must be loopback (127.0.0.1, localhost or [::1])");
     }
     if let Some(p) = port {
         let n: u32 = p.parse().map_err(|_| {
@@ -879,9 +878,7 @@ impl CoordinatorSettings {
             anyhow::bail!("[coordinator] checkpoint_soft_items must be positive");
         }
         for (i, entry) in self.pool.iter().enumerate() {
-            if entry.instance_id.is_empty()
-                || entry.instance_id.chars().any(char::is_whitespace)
-            {
+            if entry.instance_id.is_empty() || entry.instance_id.chars().any(char::is_whitespace) {
                 anyhow::bail!(
                     "[coordinator] pool entry has invalid instance_id {:?}",
                     entry.instance_id
@@ -894,9 +891,10 @@ impl CoordinatorSettings {
                     entry.model
                 );
             }
-            if self.pool[..i].iter().any(|e| {
-                e.instance_id == entry.instance_id && e.model == entry.model
-            }) {
+            if self.pool[..i]
+                .iter()
+                .any(|e| e.instance_id == entry.instance_id && e.model == entry.model)
+            {
                 anyhow::bail!(
                     "[coordinator] duplicate pool entry ({:?}, {:?})",
                     entry.instance_id,
@@ -1279,10 +1277,8 @@ mod tests {
 
     #[test]
     fn coordinator_settings_round_trip_preserves_unknown_keys_and_validates() {
-        let dir = std::env::temp_dir().join(format!(
-            "agentdeck-settings-coord-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agentdeck-settings-coord-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let paths = Paths::new(dir.join("config"), dir.join("state"));
         assert_eq!(
@@ -1596,10 +1592,8 @@ mod tests {
 
     #[test]
     fn locked_delta_updates_preserve_untouched_fields() {
-        let dir = std::env::temp_dir().join(format!(
-            "agentdeck-settings-delta-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agentdeck-settings-delta-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let paths = Paths::new(dir.join("config"), dir.join("state"));
         update_approver(&paths, |cfg| {
@@ -1641,7 +1635,9 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            read_approver(&Registry::load(&paths).unwrap()).unwrap().autonomous_timeout_secs,
+            read_approver(&Registry::load(&paths).unwrap())
+                .unwrap()
+                .autonomous_timeout_secs,
             90
         );
         let _ = fs::remove_dir_all(&dir);

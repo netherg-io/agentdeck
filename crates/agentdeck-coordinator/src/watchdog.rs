@@ -163,11 +163,7 @@ fn rotate(
     }
 }
 
-fn sleep_action(
-    thread_id: &str,
-    sel: PoolSelection,
-    now_epoch_secs: i64,
-) -> WatchdogAction {
+fn sleep_action(thread_id: &str, sel: PoolSelection, now_epoch_secs: i64) -> WatchdogAction {
     match sel {
         PoolSelection::SleepForQuota {
             wake_at_epoch_secs,
@@ -179,10 +175,13 @@ fn sleep_action(
             reason,
         },
         PoolSelection::NoPoolConfigured => WatchdogAction::Noop {
-            reason: "quota limit hit but no Coordinator Pool is configured; owner must intervene".into(),
+            reason: "quota limit hit but no Coordinator Pool is configured; owner must intervene"
+                .into(),
         },
         PoolSelection::Selected { .. } => WatchdogAction::Noop {
-            reason: format!("quota selection recovered at tick {now_epoch_secs}; re-tick to rotate"),
+            reason: format!(
+                "quota selection recovered at tick {now_epoch_secs}; re-tick to rotate"
+            ),
         },
     }
 }
@@ -237,13 +236,13 @@ pub fn decide_action(
         // The observed failure takes effect BEFORE selection: the just-failed
         // account is ineligible even when its T3 cache is stale.
         let adjusted = with_failed_marked_ineligible(cfg, quotas, observed, now_epoch_secs);
-        return match select_coordinator(
-            cfg,
-            &adjusted,
-            now_epoch_secs,
-            current_key(observed),
-        ) {
-            PoolSelection::Selected { entry, five_hour_pct, weekly_pct, .. } => rotate(
+        return match select_coordinator(cfg, &adjusted, now_epoch_secs, current_key(observed)) {
+            PoolSelection::Selected {
+                entry,
+                five_hour_pct,
+                weekly_pct,
+                ..
+            } => rotate(
                 &run.thread_id,
                 entry.clone(),
                 format!(
@@ -273,9 +272,11 @@ pub fn decide_action(
         && let Some(cur_q) = quotas.get(&pool_key(cur_inst, cur_model))
     {
         let mut best_other: Option<(&CoordinatorPoolEntry, &QuotaWindowView)> = None;
-        for entry in cfg.pool.iter().filter(|e| {
-            e.enabled && (e.instance_id != cur_inst || e.model != cur_model)
-        }) {
+        for entry in cfg
+            .pool
+            .iter()
+            .filter(|e| e.enabled && (e.instance_id != cur_inst || e.model != cur_model))
+        {
             let Some(q) = quotas.get(&pool_key(&entry.instance_id, &entry.model)) else {
                 continue;
             };
@@ -287,9 +288,7 @@ pub fn decide_action(
             let five = q.five_hour_remaining_pct.unwrap_or(100.0);
             let take = match best_other {
                 None => true,
-                Some((_, bq)) => {
-                    five > bq.five_hour_remaining_pct.unwrap_or(100.0)
-                }
+                Some((_, bq)) => five > bq.five_hour_remaining_pct.unwrap_or(100.0),
             };
             if take {
                 best_other = Some((entry, q));
@@ -398,16 +397,25 @@ pub async fn execute_action<C: T3ThreadController>(
             ..
         } => {
             controller
-                .configure_thread(thread_id, &to_entry.instance_id, &to_entry.model, &to_entry.options_map())
+                .configure_thread(
+                    thread_id,
+                    &to_entry.instance_id,
+                    &to_entry.model,
+                    &to_entry.options_map(),
+                )
                 .await?;
-            controller.send_message(thread_id, message, *fresh_context).await?;
+            controller
+                .send_message(thread_id, message, *fresh_context)
+                .await?;
         }
         WatchdogAction::Wake {
             fresh_context,
             message,
             ..
         } => {
-            controller.send_message(thread_id, message, *fresh_context).await?;
+            controller
+                .send_message(thread_id, message, *fresh_context)
+                .await?;
         }
         WatchdogAction::TriggerCheckpoint { target, reason, .. } => {
             let message = match target {
@@ -421,7 +429,9 @@ pub async fn execute_action<C: T3ThreadController>(
             };
             // In-context instruction: the Coordinator needs its context to
             // write state before any reset, so never fresh here.
-            controller.send_message(thread_id, &format!("{message}\nReason: {reason}"), false).await?;
+            controller
+                .send_message(thread_id, &format!("{message}\nReason: {reason}"), false)
+                .await?;
         }
         WatchdogAction::Noop { .. } | WatchdogAction::EnterQuotaSleep { .. } => unreachable!(),
     }

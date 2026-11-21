@@ -155,21 +155,16 @@ fn mandate_block<'a>(
         );
     } else if !matches!(phase, RunPhase::Completed) {
         status = status.push(
-            st::btn(st::Btn::Quiet, fl!(loader(), "coord-grant")).on_press(
-                Message::CoordMandate {
-                    thread: thread.to_string(),
-                    expected: m.clone(),
-                    grant: true,
-                },
-            ),
+            st::btn(st::Btn::Quiet, fl!(loader(), "coord-grant")).on_press(Message::CoordMandate {
+                thread: thread.to_string(),
+                expected: m.clone(),
+                grant: true,
+            }),
         );
     }
     col = col.push(status);
     for (label, value) in [
-        (
-            fl!(loader(), "coord-mandate-project"),
-            m.project.clone(),
-        ),
+        (fl!(loader(), "coord-mandate-project"), m.project.clone()),
         (
             fl!(loader(), "coord-mandate-hosts"),
             list_or_any(&m.allowed_hosts),
@@ -223,7 +218,8 @@ fn inbox_block<'a>(thread: &'a str, state: &'a ThreadState) -> Option<Element<'a
     }
     let mut col = column![st::caption(fl!(loader(), "coord-inbox"))].spacing(4);
     for item in open {
-        let mut text = column![st::fit(item.title.as_str(), st::Role::Body, st::Cut::End)].spacing(2);
+        let mut text =
+            column![st::fit(item.title.as_str(), st::Role::Body, st::Cut::End)].spacing(2);
         if !item.reason.is_empty() {
             text = text.push(st::fit(item.reason.as_str(), st::Role::Muted, st::Cut::End));
         }
@@ -319,7 +315,11 @@ fn thread_card(c: &CoordRow) -> Element<'_, Message> {
     if total > 0 {
         col = col.push(st::progress(done as f32 * 100.0 / total as f32).length(Length::Fill));
     }
-    col = col.push(mandate_block(&c.state.phase, &c.thread, c.state.mandate.as_ref()));
+    col = col.push(mandate_block(
+        &c.state.phase,
+        &c.thread,
+        c.state.mandate.as_ref(),
+    ));
     if let Some(inbox) = inbox_block(&c.thread, &c.state) {
         col = col.push(inbox);
     }

@@ -126,9 +126,7 @@ impl HeuristicCheckpointJudge {
                 return CheckpointVerdict {
                     should_checkpoint: false,
                     confidence: 0.95,
-                    reason: format!(
-                        "mid-flight hazard ({hazard}): checkpoint would strand work"
-                    ),
+                    reason: format!("mid-flight hazard ({hazard}): checkpoint would strand work"),
                 };
             }
         }
@@ -339,9 +337,7 @@ impl CheckpointJudge for HttpCheckpointJudge {
                 return Ok(CheckpointVerdict {
                     should_checkpoint: false,
                     confidence: 0.95,
-                    reason: format!(
-                        "mid-flight hazard ({hazard}): checkpoint would strand work"
-                    ),
+                    reason: format!("mid-flight hazard ({hazard}): checkpoint would strand work"),
                 });
             }
         }
@@ -477,7 +473,9 @@ mod tests {
                 .unwrap();
         assert_eq!(input["state"], openrouter["state"]);
         assert!(vercel.get("state").is_none());
-        let list = vercel["questions"].as_array().expect("vercel questions are an array");
+        let list = vercel["questions"]
+            .as_array()
+            .expect("vercel questions are an array");
         assert_eq!(list.len(), 1);
         assert_eq!(list[0]["name"], "checkpoint_safe");
         assert_eq!(list[0]["type"], "score");

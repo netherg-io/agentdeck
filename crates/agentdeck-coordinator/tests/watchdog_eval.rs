@@ -16,8 +16,8 @@ use agentdeck_coordinator::checkpoint::{
 use agentdeck_coordinator::config::{CoordinatorConfig, CoordinatorPoolEntry};
 use agentdeck_coordinator::hygiene::{check_disk_ok, find_stale_worktrees, free_disk_gb};
 use agentdeck_coordinator::pool::{
-    PoolKey, PoolSelection, QuotaWindowView, parse_epoch_rfc3339, pool_key,
-    quota_from_t3_cache, select_coordinator, should_proactively_rotate,
+    PoolKey, PoolSelection, QuotaWindowView, parse_epoch_rfc3339, pool_key, quota_from_t3_cache,
+    select_coordinator, should_proactively_rotate,
 };
 use agentdeck_coordinator::t3_control::{
     HttpT3Controller, ObservedThread, T3ThreadController, is_quota_limit_message,
@@ -92,9 +92,16 @@ fn observed(thread: &str) -> ObservedThread {
 #[test]
 fn pool_picks_fullest_5h_window() {
     let cfg = cfg_with_pool();
-    let q = quotas(&[("claude_a", view(40.0, 80.0)), ("codex_b", view(75.0, 50.0))]);
+    let q = quotas(&[
+        ("claude_a", view(40.0, 80.0)),
+        ("codex_b", view(75.0, 50.0)),
+    ]);
     match select_coordinator(&cfg, &q, NOW, None) {
-        PoolSelection::Selected { entry, five_hour_pct, .. } => {
+        PoolSelection::Selected {
+            entry,
+            five_hour_pct,
+            ..
+        } => {
             assert_eq!(entry.instance_id, "codex_b");
             assert_eq!(five_hour_pct, 75.0);
         }
@@ -204,7 +211,10 @@ fn pool_sleep_uses_max_of_both_blocking_windows() {
 #[test]
 fn pool_hysteresis_keeps_current_within_2pct() {
     let cfg = cfg_with_pool();
-    let q = quotas(&[("claude_a", view(73.5, 80.0)), ("codex_b", view(75.0, 80.0))]);
+    let q = quotas(&[
+        ("claude_a", view(73.5, 80.0)),
+        ("codex_b", view(75.0, 80.0)),
+    ]);
     match select_coordinator(&cfg, &q, NOW, Some(("claude_a", "claude-opus-4-6"))) {
         PoolSelection::Selected { entry, reason, .. } => {
             assert_eq!(entry.instance_id, "claude_a");
@@ -213,7 +223,10 @@ fn pool_hysteresis_keeps_current_within_2pct() {
         other => panic!("expected hysteresis keep, got {other:?}"),
     }
     // Beyond 2% the best entry wins.
-    let q = quotas(&[("claude_a", view(70.0, 80.0)), ("codex_b", view(75.0, 80.0))]);
+    let q = quotas(&[
+        ("claude_a", view(70.0, 80.0)),
+        ("codex_b", view(75.0, 80.0)),
+    ]);
     match select_coordinator(&cfg, &q, NOW, Some(("claude_a", "claude-opus-4-6"))) {
         PoolSelection::Selected { entry, .. } => assert_eq!(entry.instance_id, "codex_b"),
         other => panic!("expected codex_b, got {other:?}"),
@@ -263,13 +276,29 @@ fn pool_excludes_entries_without_a_quota_view() {
 #[test]
 fn proactive_rotate_needs_thin_current_and_headroom() {
     let cfg = cfg_with_pool();
-    assert!(should_proactively_rotate(&cfg, &view(5.0, 80.0), &view(60.0, 80.0)));
+    assert!(should_proactively_rotate(
+        &cfg,
+        &view(5.0, 80.0),
+        &view(60.0, 80.0)
+    ));
     // Thin is defined by either window: weekly below reserve also qualifies.
-    assert!(should_proactively_rotate(&cfg, &view(50.0, 5.0), &view(80.0, 80.0)));
+    assert!(should_proactively_rotate(
+        &cfg,
+        &view(50.0, 5.0),
+        &view(80.0, 80.0)
+    ));
     // Comfortable current: no rotation.
-    assert!(!should_proactively_rotate(&cfg, &view(50.0, 80.0), &view(90.0, 80.0)));
+    assert!(!should_proactively_rotate(
+        &cfg,
+        &view(50.0, 80.0),
+        &view(90.0, 80.0)
+    ));
     // Less than 15 points of headroom: no flap.
-    assert!(!should_proactively_rotate(&cfg, &view(5.0, 80.0), &view(19.0, 80.0)));
+    assert!(!should_proactively_rotate(
+        &cfg,
+        &view(5.0, 80.0),
+        &view(19.0, 80.0)
+    ));
 }
 
 #[test]
@@ -313,8 +342,14 @@ fn quota_sleep_deadline_cannot_overflow_or_wrap() {
 
 #[test]
 fn rfc3339_parses_t3_shapes() {
-    assert_eq!(parse_epoch_rfc3339("2026-11-13T11:00:00Z"), Some(1_794_567_600));
-    assert_eq!(parse_epoch_rfc3339("2026-11-13T10:00:00.000Z"), Some(1_794_564_000));
+    assert_eq!(
+        parse_epoch_rfc3339("2026-11-13T11:00:00Z"),
+        Some(1_794_567_600)
+    );
+    assert_eq!(
+        parse_epoch_rfc3339("2026-11-13T10:00:00.000Z"),
+        Some(1_794_564_000)
+    );
     assert_eq!(
         parse_epoch_rfc3339("2026-11-13T11:00:00+00:00"),
         Some(1_794_567_600)
@@ -389,29 +424,158 @@ async fn checkpoint_golden_eval() {
     let cfg = CoordinatorConfig::default();
     // (name, input, expected should_checkpoint, required reason substring)
     let cases: Vec<(&str, CheckpointInput, bool, &str)> = vec![
-        ("stale quiet", input(0, 0, false, true, 0, &[]), false, "stale"),
-        ("stale milestone", input(0, 0, true, true, 0, &[]), false, "stale"),
-        ("stale over threshold", input(200, 5000, false, true, 0, &[]), false, "stale"),
-        ("stale with children", input(200, 5000, true, true, 3, &[]), false, "stale"),
-        ("stale beats hazard", input(200, 5000, true, true, 0, &["merge conflict"]), false, "stale"),
-        ("quiet turn", input(0, 0, false, false, 0, &[]), false, "prompt cache"),
-        ("small turn", input(10, 100, false, false, 0, &[]), false, "prompt cache"),
-        ("just under both", input(79, 1499, false, false, 0, &[]), false, "prompt cache"),
-        ("at run threshold", input(80, 0, false, false, 0, &[]), true, "threshold"),
-        ("at item threshold", input(0, 1500, false, false, 0, &[]), true, "threshold"),
-        ("well over", input(200, 5000, false, false, 0, &[]), true, "threshold"),
-        ("clean milestone", input(3, 12, true, false, 0, &["shipped unit U1"]), true, "milestone"),
-        ("over threshold with child", input(200, 5000, false, false, 1, &[]), false, "still running"),
-        ("milestone with children", input(0, 0, true, false, 2, &[]), false, "still running"),
-        ("merge conflict", input(200, 5000, true, false, 0, &["merge conflict in main"]), false, "merge conflict"),
-        ("mid rollback", input(200, 5000, false, false, 0, &["mid-rollback of migration"]), false, "mid-rollback"),
-        ("deploy in flight", input(200, 5000, false, false, 0, &["in progress deploy to prod"]), false, "deploy"),
-        ("half applied", input(200, 5000, false, false, 0, &["half-applied schema change"]), false, "half-applied"),
-        ("rollback failed", input(200, 5000, false, false, 0, &["rollback failed, manual fix needed"]), false, "rollback failed"),
-        ("hazard beats quiet-refuse", input(1, 2, false, false, 0, &["merge conflict"]), false, ""),
-        ("milestone hazard refused", input(0, 0, true, false, 0, &["half-applied migration"]), false, "half-applied"),
-        ("benign tail approved", input(200, 5000, false, false, 0, &["merged PR #12", "tests green"]), true, "threshold"),
-        ("milestone clean events", input(5, 30, true, false, 0, &["eval suite green"]), true, "milestone"),
+        (
+            "stale quiet",
+            input(0, 0, false, true, 0, &[]),
+            false,
+            "stale",
+        ),
+        (
+            "stale milestone",
+            input(0, 0, true, true, 0, &[]),
+            false,
+            "stale",
+        ),
+        (
+            "stale over threshold",
+            input(200, 5000, false, true, 0, &[]),
+            false,
+            "stale",
+        ),
+        (
+            "stale with children",
+            input(200, 5000, true, true, 3, &[]),
+            false,
+            "stale",
+        ),
+        (
+            "stale beats hazard",
+            input(200, 5000, true, true, 0, &["merge conflict"]),
+            false,
+            "stale",
+        ),
+        (
+            "quiet turn",
+            input(0, 0, false, false, 0, &[]),
+            false,
+            "prompt cache",
+        ),
+        (
+            "small turn",
+            input(10, 100, false, false, 0, &[]),
+            false,
+            "prompt cache",
+        ),
+        (
+            "just under both",
+            input(79, 1499, false, false, 0, &[]),
+            false,
+            "prompt cache",
+        ),
+        (
+            "at run threshold",
+            input(80, 0, false, false, 0, &[]),
+            true,
+            "threshold",
+        ),
+        (
+            "at item threshold",
+            input(0, 1500, false, false, 0, &[]),
+            true,
+            "threshold",
+        ),
+        (
+            "well over",
+            input(200, 5000, false, false, 0, &[]),
+            true,
+            "threshold",
+        ),
+        (
+            "clean milestone",
+            input(3, 12, true, false, 0, &["shipped unit U1"]),
+            true,
+            "milestone",
+        ),
+        (
+            "over threshold with child",
+            input(200, 5000, false, false, 1, &[]),
+            false,
+            "still running",
+        ),
+        (
+            "milestone with children",
+            input(0, 0, true, false, 2, &[]),
+            false,
+            "still running",
+        ),
+        (
+            "merge conflict",
+            input(200, 5000, true, false, 0, &["merge conflict in main"]),
+            false,
+            "merge conflict",
+        ),
+        (
+            "mid rollback",
+            input(200, 5000, false, false, 0, &["mid-rollback of migration"]),
+            false,
+            "mid-rollback",
+        ),
+        (
+            "deploy in flight",
+            input(200, 5000, false, false, 0, &["in progress deploy to prod"]),
+            false,
+            "deploy",
+        ),
+        (
+            "half applied",
+            input(200, 5000, false, false, 0, &["half-applied schema change"]),
+            false,
+            "half-applied",
+        ),
+        (
+            "rollback failed",
+            input(
+                200,
+                5000,
+                false,
+                false,
+                0,
+                &["rollback failed, manual fix needed"],
+            ),
+            false,
+            "rollback failed",
+        ),
+        (
+            "hazard beats quiet-refuse",
+            input(1, 2, false, false, 0, &["merge conflict"]),
+            false,
+            "",
+        ),
+        (
+            "milestone hazard refused",
+            input(0, 0, true, false, 0, &["half-applied migration"]),
+            false,
+            "half-applied",
+        ),
+        (
+            "benign tail approved",
+            input(
+                200,
+                5000,
+                false,
+                false,
+                0,
+                &["merged PR #12", "tests green"],
+            ),
+            true,
+            "threshold",
+        ),
+        (
+            "milestone clean events",
+            input(5, 30, true, false, 0, &["eval suite green"]),
+            true,
+            "milestone",
+        ),
     ];
     assert!(cases.len() >= 20, "eval suite needs >= 20 scenarios");
     for (name, inp, want, reason_part) in cases {
@@ -443,7 +607,12 @@ fn checkpoint_outcome_log_appends_jsonl() {
         reason: "test".into(),
     };
     record_outcome(&dir, &input(90, 10, false, false, 0, &[]), &verdict).unwrap();
-    record_outcome(&dir, &input(0, 0, false, true, 0, &[]), &CheckpointVerdict::refuse("x")).unwrap();
+    record_outcome(
+        &dir,
+        &input(0, 0, false, true, 0, &[]),
+        &CheckpointVerdict::refuse("x"),
+    )
+    .unwrap();
     let text = std::fs::read_to_string(dir.join("coordinator/checkpoint-outcomes.jsonl")).unwrap();
     assert_eq!(text.lines().count(), 2);
     let _ = std::fs::remove_dir_all(&dir);
@@ -473,15 +642,26 @@ fn failure1_weekly_limit_rotates_to_healthy_account_overnight() {
     o.hit_quota_limit = true;
     let mut inp = tick_input(r, o);
     inp.quotas = quotas(&[
-        ("claude_a", QuotaWindowView {
-            five_hour_remaining_pct: Some(80.0),
-            weekly_remaining_pct: Some(0.0),
-            ..QuotaWindowView { healthy: true, ..Default::default() }
-        }),
+        (
+            "claude_a",
+            QuotaWindowView {
+                five_hour_remaining_pct: Some(80.0),
+                weekly_remaining_pct: Some(0.0),
+                ..QuotaWindowView {
+                    healthy: true,
+                    ..Default::default()
+                }
+            },
+        ),
         ("codex_b", view(70.0, 60.0)),
     ]);
     match decide(&cfg, &inp) {
-        WatchdogAction::RotateAndWake { to_entry, fresh_context, message, .. } => {
+        WatchdogAction::RotateAndWake {
+            to_entry,
+            fresh_context,
+            message,
+            ..
+        } => {
             assert_eq!(to_entry.instance_id, "codex_b");
             assert!(!fresh_context);
             assert!(message.contains("state_read"));
@@ -510,7 +690,9 @@ fn failure2_all_exhausted_sleeps_cleanly_until_reset_plus_2m() {
     spare.weekly_remaining_pct = Some(60.0);
     inp.quotas = quotas(&[("claude_a", clogged), ("codex_b", spare)]);
     match decide(&cfg, &inp) {
-        WatchdogAction::EnterQuotaSleep { wake_at_epoch_secs, .. } => {
+        WatchdogAction::EnterQuotaSleep {
+            wake_at_epoch_secs, ..
+        } => {
             assert_eq!(wake_at_epoch_secs, NOW + 2000 + 120);
         }
         other => panic!("expected EnterQuotaSleep, got {other:?}"),
@@ -529,7 +711,10 @@ fn sleeping_run_wakes_and_rotates_after_deadline() {
     let mut o = observed("t2b");
     o.provider_instance_id = Some("claude_a".into());
     let mut inp = tick_input(r, o);
-    inp.quotas = quotas(&[("claude_a", view(60.0, 60.0)), ("codex_b", view(70.0, 60.0))]);
+    inp.quotas = quotas(&[
+        ("claude_a", view(60.0, 60.0)),
+        ("codex_b", view(70.0, 60.0)),
+    ]);
     match decide(&cfg, &inp) {
         WatchdogAction::RotateAndWake { .. } => {}
         other => panic!("expected RotateAndWake, got {other:?}"),
@@ -550,7 +735,11 @@ fn failure3_silent_idle_with_open_work_wakes_after_grace() {
     let cfg = cfg_with_pool();
     let inp = tick_input(run("t3"), observed("t3"));
     match decide(&cfg, &inp) {
-        WatchdogAction::Wake { message, fresh_context, .. } => {
+        WatchdogAction::Wake {
+            message,
+            fresh_context,
+            ..
+        } => {
             assert!(!fresh_context);
             assert!(message.contains("state_read"));
         }
@@ -582,16 +771,25 @@ fn watchdog_priorities_running_bg_checkpoint() {
     let mut o = observed("p");
     o.is_running = true;
     o.hit_quota_limit = true;
-    assert!(matches!(decide(&cfg, &tick_input(run("p"), o)), WatchdogAction::Noop { .. }));
+    assert!(matches!(
+        decide(&cfg, &tick_input(run("p"), o)),
+        WatchdogAction::Noop { .. }
+    ));
     // Background tasks beat the idle wake.
     let mut o = observed("p");
     o.pending_background_tasks = 2;
-    assert!(matches!(decide(&cfg, &tick_input(run("p"), o)), WatchdogAction::Noop { .. }));
+    assert!(matches!(
+        decide(&cfg, &tick_input(run("p"), o)),
+        WatchdogAction::Noop { .. }
+    ));
     // Paused / finished runs are never touched.
     for phase in [RunPhase::Paused, RunPhase::Finished] {
         let mut r = run("p");
         r.phase = phase;
-        assert!(matches!(decide(&cfg, &tick_input(r, observed("p"))), WatchdogAction::Noop { .. }));
+        assert!(matches!(
+            decide(&cfg, &tick_input(r, observed("p"))),
+            WatchdogAction::Noop { .. }
+        ));
     }
     // Approved checkpoint beats the plain wake.
     let mut inp = tick_input(run("p"), observed("p"));
@@ -642,9 +840,14 @@ fn reactive_rotation_never_restarts_stale_failed_account() {
     o.model = Some("claude-opus-4-6".into());
     o.hit_quota_limit = true;
     let mut inp = tick_input(r, o);
-    inp.quotas = quotas(&[("claude_a", view(95.0, 80.0)), ("codex_b", view(80.0, 60.0))]);
+    inp.quotas = quotas(&[
+        ("claude_a", view(95.0, 80.0)),
+        ("codex_b", view(80.0, 60.0)),
+    ]);
     match decide(&cfg, &inp) {
-        WatchdogAction::RotateAndWake { to_entry, reason, .. } => {
+        WatchdogAction::RotateAndWake {
+            to_entry, reason, ..
+        } => {
             assert_eq!(to_entry.instance_id, "codex_b", "{reason}");
             assert!(reason.contains("quota limit"), "{reason}");
         }
@@ -735,7 +938,10 @@ fn proactive_rotation_skips_ineligible_alternative() {
 #[test]
 fn sleeping_run_with_no_work_or_active_run_stays_quiet() {
     let cfg = cfg_with_pool();
-    let q = quotas(&[("claude_a", view(60.0, 60.0)), ("codex_b", view(70.0, 60.0))]);
+    let q = quotas(&[
+        ("claude_a", view(60.0, 60.0)),
+        ("codex_b", view(70.0, 60.0)),
+    ]);
     // Past the deadline with an eligible pool, but the work completed while
     // sleeping: Noop, never a wake.
     let r = RunSnapshot {
@@ -820,7 +1026,10 @@ impl T3ThreadController for FakeController {
         model: &str,
         _options: &HashMap<String, serde_json::Value>,
     ) -> anyhow::Result<()> {
-        self.configured.lock().unwrap().push((thread_id.into(), instance_id.into(), model.into()));
+        self.configured
+            .lock()
+            .unwrap()
+            .push((thread_id.into(), instance_id.into(), model.into()));
         Ok(())
     }
 
@@ -831,7 +1040,10 @@ impl T3ThreadController for FakeController {
         fresh_context: bool,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(!self.fail_send.replace(false), "transient T3 failure");
-        self.messaged.lock().unwrap().push((thread_id.into(), message.into(), fresh_context));
+        self.messaged
+            .lock()
+            .unwrap()
+            .push((thread_id.into(), message.into(), fresh_context));
         Ok(())
     }
 }
@@ -848,10 +1060,18 @@ async fn executor_debounces_double_wake_and_reports_sleeps() {
     };
     assert!(execute_action(&c, &wake, &mut debounce, NOW).await.unwrap());
     // Same tick again: debounced, no second T3 call.
-    assert!(!execute_action(&c, &wake, &mut debounce, NOW + 10).await.unwrap());
+    assert!(
+        !execute_action(&c, &wake, &mut debounce, NOW + 10)
+            .await
+            .unwrap()
+    );
     assert_eq!(c.messaged.lock().unwrap().len(), 1);
     // After the window: fires again.
-    assert!(execute_action(&c, &wake, &mut debounce, NOW + 301).await.unwrap());
+    assert!(
+        execute_action(&c, &wake, &mut debounce, NOW + 301)
+            .await
+            .unwrap()
+    );
     // Noop never touches T3; sleep transitions report true without T3 calls.
     let noop = WatchdogAction::Noop { reason: "x".into() };
     assert!(!execute_action(&c, &noop, &mut debounce, NOW).await.unwrap());
@@ -860,7 +1080,11 @@ async fn executor_debounces_double_wake_and_reports_sleeps() {
         wake_at_epoch_secs: NOW + 120,
         reason: "x".into(),
     };
-    assert!(execute_action(&c, &sleep, &mut debounce, NOW).await.unwrap());
+    assert!(
+        execute_action(&c, &sleep, &mut debounce, NOW)
+            .await
+            .unwrap()
+    );
     assert_eq!(c.messaged.lock().unwrap().len(), 2);
 }
 
@@ -923,7 +1147,11 @@ fn quota_limit_messages_cover_all_harnesses() {
     ] {
         assert!(is_quota_limit_message(text), "{text}");
     }
-    for text in ["All tests passed", "error: file not found", "limitless potential"] {
+    for text in [
+        "All tests passed",
+        "error: file not found",
+        "limitless potential",
+    ] {
         assert!(!is_quota_limit_message(text), "{text}");
     }
 }
@@ -985,7 +1213,10 @@ fn quota_view_reads_5h_and_weekly_windows() {
     assert!(v.healthy);
     assert_eq!(v.five_hour_remaining_pct, Some(75.0));
     assert_eq!(v.weekly_remaining_pct, Some(60.0));
-    assert_eq!(v.five_hour_resets_at, parse_epoch_rfc3339("2026-11-13T15:00:00Z"));
+    assert_eq!(
+        v.five_hour_resets_at,
+        parse_epoch_rfc3339("2026-11-13T15:00:00Z")
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1027,7 +1258,11 @@ fn quota_view_distinguishes_known_uncached_instances_from_deleted_ones() {
     assert_eq!(v.five_hour_remaining_pct, None);
     assert!(!quota_from_t3_cache(&dir, "deleted", "m").healthy);
     assert!(!quota_from_t3_cache(&dir, "typo", "m").healthy);
-    write_cache(&dir, "bad", &serde_json::json!({"status": "error", "message": "auth failed"}));
+    write_cache(
+        &dir,
+        "bad",
+        &serde_json::json!({"status": "error", "message": "auth failed"}),
+    );
     let v = quota_from_t3_cache(&dir, "bad", "m");
     assert!(!v.healthy);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1077,11 +1312,7 @@ fn fixture_db(t3: &Path) {
     .unwrap();
     db.execute(
         "INSERT INTO orchestration_v2_projection_threads VALUES (?1, ?2, ?3)",
-        rusqlite::params![
-            "t1",
-            "Coordinator run",
-            r#"{"updatedAt": 1749999900}"#,
-        ],
+        rusqlite::params!["t1", "Coordinator run", r#"{"updatedAt": 1749999900}"#,],
     )
     .unwrap();
     db.execute(
@@ -1106,7 +1337,9 @@ fn fixture_db(t3: &Path) {
 fn observer_reads_run_status_quota_tail_and_children() {
     let dir = tmpdir("sqlite");
     fixture_db(&dir);
-    let o = observe_thread_sqlite(&dir, "t1").unwrap().expect("thread t1");
+    let o = observe_thread_sqlite(&dir, "t1")
+        .unwrap()
+        .expect("thread t1");
     assert_eq!(o.title.as_deref(), Some("Coordinator run"));
     assert!(o.is_running);
     assert_eq!(o.active_run_id.as_deref(), Some("r1"));
@@ -1196,7 +1429,9 @@ fn observer_picks_newest_run_limit_recovery_and_attempt_reason() {
         [r#"{"title":"Run failed","reason":"API rate limit exceeded, try again at 3pm"}"#],
     )
     .unwrap();
-    let o = observe_thread_sqlite(&dir, "t-n").unwrap().expect("thread t-n");
+    let o = observe_thread_sqlite(&dir, "t-n")
+        .unwrap()
+        .expect("thread t-n");
     assert_eq!(o.provider_instance_id.as_deref(), Some("codex_b"));
     assert_eq!(o.model.as_deref(), Some("gpt-6.2-sol"));
     assert_eq!(o.run_count, 2);
@@ -1347,7 +1582,9 @@ fn serve_json_rpc(
         listener.set_nonblocking(false).ok();
         for i in 0..n_requests {
             let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .ok();
             let mut raw = Vec::new();
             let mut buf = [0u8; 4096];
             // Read headers first.
@@ -1379,13 +1616,11 @@ fn serve_json_rpc(
                 }
                 body.extend_from_slice(&buf[..n]);
             }
-            let auth = text
-                .lines()
-                .find_map(|l| {
-                    l.strip_prefix("authorization:")
-                        .or_else(|| l.strip_prefix("Authorization:"))
-                        .map(|v| v.trim().to_string())
-                });
+            let auth = text.lines().find_map(|l| {
+                l.strip_prefix("authorization:")
+                    .or_else(|| l.strip_prefix("Authorization:"))
+                    .map(|v| v.trim().to_string())
+            });
             let req: serde_json::Value = serde_json::from_slice(&body).unwrap();
             seen_clone.bodies.lock().unwrap().push(req.clone());
             seen_clone.auths.lock().unwrap().push(auth);
@@ -1431,7 +1666,11 @@ struct HandshakeSeen {
 /// Mock Streamable HTTP server: answers `initialize` with an
 /// `Mcp-Session-Id` response header and records the session header and tool
 /// arguments of every request.
-fn serve_handshake() -> (std::net::SocketAddr, Arc<HandshakeSeen>, std::thread::JoinHandle<()>) {
+fn serve_handshake() -> (
+    std::net::SocketAddr,
+    Arc<HandshakeSeen>,
+    std::thread::JoinHandle<()>,
+) {
     let seen = Arc::new(HandshakeSeen {
         methods: Mutex::new(Vec::new()),
         sessions: Mutex::new(Vec::new()),
@@ -1443,7 +1682,9 @@ fn serve_handshake() -> (std::net::SocketAddr, Arc<HandshakeSeen>, std::thread::
     let handle = std::thread::spawn(move || {
         for _ in 0..3 {
             let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .ok();
             let mut raw = Vec::new();
             let mut buf = [0u8; 4096];
             loop {
@@ -1479,7 +1720,11 @@ fn serve_handshake() -> (std::net::SocketAddr, Arc<HandshakeSeen>, std::thread::
                 (k.trim().eq_ignore_ascii_case("mcp-session-id")).then(|| v.trim().to_string())
             });
             let req: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("").to_string();
+            let method = req
+                .get("method")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
             if method == "tools/call" {
                 seen_clone.tool_calls.lock().unwrap().push(req.clone());
             }
@@ -1507,7 +1752,9 @@ async fn http_controller_performs_session_handshake() {
     let c = HttpT3Controller::new(&endpoint, None).unwrap();
     let mut options = HashMap::new();
     options.insert("temperature".to_string(), serde_json::json!(0));
-    c.configure_thread("t1", "inst-a", "model-x", &options).await.unwrap();
+    c.configure_thread("t1", "inst-a", "model-x", &options)
+        .await
+        .unwrap();
     handle.join().unwrap();
     // Full handshake: initialize, then notifications/initialized, then the call.
     assert_eq!(
@@ -1638,27 +1885,53 @@ fn disk_check_reports_against_minimum() {
 }
 
 fn git_repo(path: &Path) {
-    std::process::Command::new("git").arg("init").arg("-b").arg("main").arg(path).output().unwrap();
     std::process::Command::new("git")
-        .arg("-C").arg(path)
+        .arg("init")
+        .arg("-b")
+        .arg("main")
+        .arg(path)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
         .args(["config", "user.email", "t@t"])
-        .output().unwrap();
+        .output()
+        .unwrap();
     std::process::Command::new("git")
-        .arg("-C").arg(path)
+        .arg("-C")
+        .arg(path)
         .args(["config", "user.name", "t"])
-        .output().unwrap();
+        .output()
+        .unwrap();
     std::fs::write(path.join("f.txt"), "x").unwrap();
-    std::process::Command::new("git").arg("-C").arg(path).args(["add", "."]).output().unwrap();
-    std::process::Command::new("git").arg("-C").arg(path).args(["commit", "-m", "init"]).output().unwrap();
     std::process::Command::new("git")
-        .arg("-C").arg(path)
+        .arg("-C")
+        .arg(path)
+        .args(["add", "."])
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["commit", "-m", "init"])
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
         .args(["update-ref", "refs/remotes/origin/main", "HEAD"])
-        .output().unwrap();
+        .output()
+        .unwrap();
 }
 
 #[test]
 fn stale_worktree_discovery_flags_only_clean_merged() {
-    if std::process::Command::new("git").arg("--version").output().is_err() {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
         return; // no git on PATH: nothing to discover with.
     }
     let dir = tmpdir("wt");
@@ -1679,7 +1952,11 @@ fn stale_worktree_discovery_flags_only_clean_merged() {
 
 #[test]
 fn stale_worktree_discovery_ignores_plain_subdirectory_of_parent_repo() {
-    if std::process::Command::new("git").arg("--version").output().is_err() {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
         return; // no git on PATH: nothing to discover with.
     }
     // The scanned dir IS a clean merged checkout: its own plain subdir walks
@@ -1688,12 +1965,24 @@ fn stale_worktree_discovery_ignores_plain_subdirectory_of_parent_repo() {
     git_repo(&dir);
     std::fs::create_dir_all(dir.join("inner")).unwrap();
     std::fs::write(dir.join("inner/notes.txt"), "work").unwrap();
-    std::process::Command::new("git").arg("-C").arg(&dir).args(["add", "."]).output().unwrap();
-    std::process::Command::new("git").arg("-C").arg(&dir).args(["commit", "-m", "sub"]).output().unwrap();
     std::process::Command::new("git")
-        .arg("-C").arg(&dir)
+        .arg("-C")
+        .arg(&dir)
+        .args(["add", "."])
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["commit", "-m", "sub"])
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
         .args(["update-ref", "refs/remotes/origin/main", "HEAD"])
-        .output().unwrap();
+        .output()
+        .unwrap();
     // Only the merged checkouts directly under `dir` are candidates; `inner`
     // is not its own checkout even though git probes succeed inside it.
     let stale = find_stale_worktrees(&dir, &HashSet::new());

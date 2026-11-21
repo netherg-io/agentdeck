@@ -164,26 +164,19 @@ fn status(paths: &Paths, as_json: bool) -> anyhow::Result<()> {
     let (telegram_status, secrets_error, secrets) =
         match ApproverSecrets::inspect_readonly(&paths.config_dir) {
             Ok(Some(s)) => {
-                let configured =
-                    s.telegram_bot_token.is_some() && s.telegram_owner_id.is_some();
-                (
-                    if configured { "configured" } else { "missing" },
-                    None,
-                    s,
-                )
+                let configured = s.telegram_bot_token.is_some() && s.telegram_owner_id.is_some();
+                (if configured { "configured" } else { "missing" }, None, s)
             }
             Ok(None) => ("missing", None, ApproverSecrets::default()),
-            Err(e) => ("invalid", Some(format!("{e:#}")), ApproverSecrets::default()),
+            Err(e) => (
+                "invalid",
+                Some(format!("{e:#}")),
+                ApproverSecrets::default(),
+            ),
         };
     let telegram_configured = telegram_status == "configured";
-    let provider = cfg
-        .judge_provider
-        .as_deref()
-        .unwrap_or(PROVIDER_OPENROUTER);
-    let model = cfg
-        .judge_model
-        .as_deref()
-        .unwrap_or(DEFAULT_DECISION_MODEL);
+    let provider = cfg.judge_provider.as_deref().unwrap_or(PROVIDER_OPENROUTER);
+    let model = cfg.judge_model.as_deref().unwrap_or(DEFAULT_DECISION_MODEL);
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let judge_key_present = secrets.judge_api_key(provider).is_some()
         || home
@@ -219,10 +212,7 @@ fn status(paths: &Paths, as_json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!(
-        "enabled: {}",
-        if cfg.enabled { "yes" } else { "no" }
-    );
+    println!("enabled: {}", if cfg.enabled { "yes" } else { "no" });
     println!(
         "socket: {} ({})",
         socket.display(),
@@ -283,7 +273,14 @@ fn audit(paths: &Paths, limit: usize, as_json: bool) -> anyhow::Result<()> {
             .unwrap_or_default();
         println!(
             "{} {} host={} kind={} outcome={} source={:?} perimeter={}{conf} {}ms",
-            r.timestamp, r.request_id, r.host, r.kind, r.outcome, r.source, r.perimeter, r.elapsed_ms
+            r.timestamp,
+            r.request_id,
+            r.host,
+            r.kind,
+            r.outcome,
+            r.source,
+            r.perimeter,
+            r.elapsed_ms
         );
     }
     Ok(())
@@ -359,7 +356,10 @@ async fn client(paths: &Paths, socket_override: Option<PathBuf>) -> anyhow::Resu
     let stream = match UnixStream::connect(&socket).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("approver client: cannot connect to {}: {e}", socket.display());
+            eprintln!(
+                "approver client: cannot connect to {}: {e}",
+                socket.display()
+            );
             return Ok(EXIT_CONNECT_ERROR);
         }
     };

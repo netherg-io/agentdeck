@@ -201,7 +201,10 @@ impl ApproverSecrets {
             }
             let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed).trim();
             let Some((key, value)) = trimmed.split_once('=') else {
-                bail!("malformed line {} in approver.env (expected KEY=VALUE)", idx + 1);
+                bail!(
+                    "malformed line {} in approver.env (expected KEY=VALUE)",
+                    idx + 1
+                );
             };
             let key = key.trim();
             let val = strip_quotes(value.trim());
@@ -313,7 +316,10 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
         let secrets = ApproverSecrets::load(&dir).unwrap();
-        assert_eq!(secrets.telegram_bot_token.as_deref(), Some("tok-secret-123"));
+        assert_eq!(
+            secrets.telegram_bot_token.as_deref(),
+            Some("tok-secret-123")
+        );
         assert_eq!(secrets.telegram_owner_id, Some(4242));
         assert_eq!(secrets.judge_api_key(PROVIDER_VERCEL), Some("gw-key"));
         assert_eq!(secrets.judge_api_key(PROVIDER_OPENROUTER), Some("or-key"));
@@ -378,7 +384,10 @@ mod tests {
             "/run/agent-approver/broker.sock",
         );
         assert!(args.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
-        assert!(args.windows(2).any(|w| w == ["-o", "ExitOnForwardFailure=yes"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-o", "ExitOnForwardFailure=yes"])
+        );
         assert!(args.windows(2).any(|w| {
             w == [
                 "-R",

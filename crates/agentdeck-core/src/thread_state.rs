@@ -483,8 +483,7 @@ pub fn update_checklist(
             .map(|i| (i.id.clone(), i.status.clone()))
             .collect();
         // Snapshot freshness tracking: every checklist change ages `state`.
-        data.checklist_updates_since_state =
-            data.checklist_updates_since_state.saturating_add(1);
+        data.checklist_updates_since_state = data.checklist_updates_since_state.saturating_add(1);
         if let Some(p) = project {
             data.project = p.to_string();
         }
@@ -720,9 +719,10 @@ pub fn grant_mandate_if_matches(
     expected: &RunMandate,
 ) -> anyhow::Result<ThreadState> {
     mutate(paths, None, thread_id, |data, _| {
-        let m = data.mandate.as_mut().ok_or_else(|| {
-            anyhow::anyhow!("thread {thread_id:?} has no mandate to grant")
-        })?;
+        let m = data
+            .mandate
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("thread {thread_id:?} has no mandate to grant"))?;
         if data.phase == RunPhase::Completed {
             anyhow::bail!("thread {thread_id:?} is completed: start a new run instead");
         }
@@ -747,9 +747,10 @@ pub fn grant_mandate_if_matches(
 /// existing mandate without replacing scope.
 pub fn revoke_mandate(paths: &Paths, thread_id: &str) -> anyhow::Result<ThreadState> {
     mutate(paths, None, thread_id, |data, _| {
-        let m = data.mandate.as_mut().ok_or_else(|| {
-            anyhow::anyhow!("thread {thread_id:?} has no mandate to revoke")
-        })?;
+        let m = data
+            .mandate
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("thread {thread_id:?} has no mandate to revoke"))?;
         m.owner_granted = false;
         Ok(())
     })
@@ -843,7 +844,11 @@ fn valid_sleep_until(s: &str) -> bool {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
         _ => {
-            if leap { 29 } else { 28 }
+            if leap {
+                29
+            } else {
+                28
+            }
         }
     };
     d >= 1 && d <= dim
@@ -879,7 +884,11 @@ pub fn inbox_add(
     }
     let full = mutate(paths, t3_root, id, |data, now| {
         let used: Vec<String> = data.owner_inbox.iter().map(|i| i.id.clone()).collect();
-        let item_id = item.id.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| next_id("inbox", &used));
+        let item_id = item
+            .id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| next_id("inbox", &used));
         if item_id.len() > 64 {
             anyhow::bail!("inbox id must be 1-64 chars");
         }
@@ -939,7 +948,11 @@ pub fn assumption_add(
     }
     let full = mutate(paths, t3_root, id, |data, now| {
         let used: Vec<String> = data.assumptions.iter().map(|a| a.id.clone()).collect();
-        let asm_id = item.id.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| next_id("asm", &used));
+        let asm_id = item
+            .id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| next_id("asm", &used));
         if asm_id.len() > 64 {
             anyhow::bail!("assumption id must be 1-64 chars");
         }
@@ -1366,12 +1379,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(asm.id, "asm-1");
-        assert!(inbox_add(&paths, None, "t", NewInboxItem {
-            id: Some(item.id.clone()),
-            title: "dup".into(),
-            ..NewInboxItem::default()
-        })
-        .is_err());
+        assert!(
+            inbox_add(
+                &paths,
+                None,
+                "t",
+                NewInboxItem {
+                    id: Some(item.id.clone()),
+                    title: "dup".into(),
+                    ..NewInboxItem::default()
+                }
+            )
+            .is_err()
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1524,8 +1544,7 @@ mod tests {
             "",
         ] {
             assert!(
-                set_run_meta(&paths, None, "t", None, None, Some(Some(bad.into())), false)
-                    .is_err(),
+                set_run_meta(&paths, None, "t", None, None, Some(Some(bad.into())), false).is_err(),
                 "{bad:?} must be refused"
             );
         }
@@ -1623,14 +1642,37 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(load(&paths, "t").unwrap().unwrap().mandate.unwrap().owner_granted);
+        assert!(
+            load(&paths, "t")
+                .unwrap()
+                .unwrap()
+                .mandate
+                .unwrap()
+                .owner_granted
+        );
         // Completing the run clears the grant ...
-        let s = set_run_meta(&paths, None, "t", Some(RunPhase::Completed), None, None, false)
-            .unwrap();
+        let s = set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::Completed),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         assert!(!s.mandate.as_ref().unwrap().owner_granted);
         // ... and flipping back to Running does not resurrect it.
-        let s =
-            set_run_meta(&paths, None, "t", Some(RunPhase::Running), None, None, false).unwrap();
+        let s = set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::Running),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         assert!(!s.mandate.as_ref().unwrap().owner_granted);
         // Same for a reset to Intake.
         set_run_meta(
@@ -1643,8 +1685,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let s =
-            set_run_meta(&paths, None, "t", Some(RunPhase::Intake), None, None, false).unwrap();
+        let s = set_run_meta(&paths, None, "t", Some(RunPhase::Intake), None, None, false).unwrap();
         assert!(!s.mandate.as_ref().unwrap().owner_granted);
         let _ = fs::remove_dir_all(dir);
     }
@@ -1677,21 +1718,48 @@ mod tests {
         let s = grant_mandate_if_matches(&paths, "t", &shown).unwrap();
         let m = s.mandate.unwrap();
         assert!(m.owner_granted);
-        assert_eq!((m.project.as_str(), m.allowed_hosts, m.allowed_apps), ("blockfield", vec!["staging".to_string()], vec!["deploy".to_string()]));
+        assert_eq!(
+            (m.project.as_str(), m.allowed_hosts, m.allowed_apps),
+            (
+                "blockfield",
+                vec!["staging".to_string()],
+                vec!["deploy".to_string()]
+            )
+        );
         // A concurrently modified scope is rejected, grant untouched.
         let mut changed = shown.clone();
         changed.allowed_hosts.push("prod".into());
-        set_run_meta(&paths, None, "t", Some(RunPhase::Running), Some(changed), None, false)
-            .unwrap();
+        set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::Running),
+            Some(changed),
+            None,
+            false,
+        )
+        .unwrap();
         assert!(grant_mandate_if_matches(&paths, "t", &shown).is_err());
         // Completed runs are never grantable.
-        set_run_meta(&paths, None, "t", Some(RunPhase::Completed), None, None, false).unwrap();
+        set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::Completed),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         assert!(grant_mandate_if_matches(&paths, "t", &shown).is_err());
         // Revoke clears only the flag.
         let s = revoke_mandate(&paths, "t").unwrap();
         let m = s.mandate.unwrap();
         assert!(!m.owner_granted);
-        assert_eq!(m.allowed_hosts, vec!["staging".to_string(), "prod".to_string()]);
+        assert_eq!(
+            m.allowed_hosts,
+            vec!["staging".to_string(), "prod".to_string()]
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1722,7 +1790,10 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        assert_eq!(load(&paths, "t").unwrap().unwrap().phase, RunPhase::SleepingForQuota);
+        assert_eq!(
+            load(&paths, "t").unwrap().unwrap().phase,
+            RunPhase::SleepingForQuota
+        );
         // Wrong expected deadline: no write.
         assert!(
             transition_phase_if(
@@ -1751,7 +1822,16 @@ mod tests {
         assert!(s.sleep_until.is_none());
         assert!(s.mandate.as_ref().unwrap().owner_granted);
         // A completed thread is never flipped back to Running (stale CAS loses).
-        set_run_meta(&paths, None, "t", Some(RunPhase::Completed), None, None, false).unwrap();
+        set_run_meta(
+            &paths,
+            None,
+            "t",
+            Some(RunPhase::Completed),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         assert!(
             transition_phase_if(
                 &paths,
@@ -1786,7 +1866,14 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!((s.checkpoint_count, s.checkpoint_run_count, s.checkpoint_item_count), (1, 81, 1501));
+        assert_eq!(
+            (
+                s.checkpoint_count,
+                s.checkpoint_run_count,
+                s.checkpoint_item_count
+            ),
+            (1, 81, 1501)
+        );
         // A checkpoint without totals leaves the baselines alone.
         let s = apply_state_update(
             &paths,
@@ -1798,7 +1885,14 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!((s.checkpoint_count, s.checkpoint_run_count, s.checkpoint_item_count), (2, 81, 1501));
+        assert_eq!(
+            (
+                s.checkpoint_count,
+                s.checkpoint_run_count,
+                s.checkpoint_item_count
+            ),
+            (2, 81, 1501)
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1852,7 +1946,10 @@ mod tests {
             .is_err()
         );
         let after = load(&paths, "t").unwrap().unwrap();
-        assert!(after.decisions.is_empty(), "failed checkpoint must not keep the decision");
+        assert!(
+            after.decisions.is_empty(),
+            "failed checkpoint must not keep the decision"
+        );
         assert_eq!(after.decisions, before.decisions);
         assert_eq!(after.checkpoint_count, before.checkpoint_count);
         assert_eq!(after.state, before.state);
