@@ -680,7 +680,10 @@ impl cosmic::Application for App {
                             updated_text(account.updated_at, timestamp)
                         )));
                     }
-                    if let Some(error) = &account.error {
+                    // The stale status line already says it; skip the duplicate.
+                    if let Some(error) =
+                        account.error.as_ref().filter(|_| account.status != "stale")
+                    {
                         content = content.push(widget::text(error));
                     }
                 }

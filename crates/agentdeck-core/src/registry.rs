@@ -285,7 +285,7 @@ impl Registry {
         let old = std::mem::replace(&mut inst.display_name, name.to_string());
         for usage in &mut self.usage {
             if usage.instance.as_deref() == Some(id)
-                && (usage.display == old || usage.display == id)
+                && (usage.display == old || usage.display == id || usage.display == usage.id)
             {
                 usage.display = name.to_string();
             }
@@ -714,5 +714,48 @@ mod tests {
         assert_eq!(home, "/fake/gone");
         assert!(remove_instance(&paths, "gone", false).is_err());
         assert!(set_enabled(&paths, "gone", true, false).is_err());
+    }
+
+    #[test]
+    fn rename_updates_default_usage_display_and_keeps_custom() {
+        use crate::usage::{UsageEntry, UsageKind};
+        let (paths, _g) = test_paths("rename-usage");
+        Registry::update(&paths, |r| {
+            r.add(AddSpec {
+                harness: Harness::Agy,
+                display_name: Some("Antigravity".into()),
+                ..spec("antigravity_5")
+            })?;
+            r.add_usage(UsageEntry {
+                id: "antigravity-5".into(),
+                kind: UsageKind::Antigravity,
+                instance: Some("antigravity_5".into()),
+                display: String::new(), // defaults to usage id "antigravity-5"
+                api_key_env: None,
+                db_file: None,
+                extra: Default::default(),
+            })?;
+            r.add(AddSpec {
+                harness: Harness::Agy,
+                display_name: Some("Antigravity".into()),
+                ..spec("antigravity_6")
+            })?;
+            r.add_usage(UsageEntry {
+                id: "antigravity-6".into(),
+                kind: UsageKind::Antigravity,
+                instance: Some("antigravity_6".into()),
+                display: "Custom Label".into(),
+                api_key_env: None,
+                db_file: None,
+                extra: Default::default(),
+            })?;
+            Ok(())
+        })
+        .unwrap();
+        rename_instance(&paths, "antigravity_5", "Antigravity 5", false).unwrap();
+        rename_instance(&paths, "antigravity_6", "Antigravity 6", false).unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        assert_eq!(reg.usage[0].display, "Antigravity 5");
+        assert_eq!(reg.usage[1].display, "Custom Label");
     }
 }

@@ -198,9 +198,10 @@ pub fn restore_blocks(paths: &Paths, home: &Path) -> anyhow::Result<Vec<Change>>
 }
 
 /// Gather global instruction drift, registry instance drift (Claude + Codex),
-/// and newly added enabled T3 instances waiting to be imported (Additive).
-/// T3 provider-instance envelopes (enabled/config) stay explicit (`t3 sync`),
-/// never Drift, so they contribute no badge or notification.
+/// and T3 registry updates waiting to be applied (newly added enabled instances
+/// and T3 displayName renames, both Additive). T3 provider-instance envelopes
+/// (enabled/config) stay explicit (`t3 sync`), never Drift, so they contribute
+/// no badge or notification.
 pub fn gather(paths: &Paths, home: &Path, t3_root: Option<&Path>) -> anyhow::Result<Vec<SyncItem>> {
     let reg = Registry::load(paths)?;
     let mut out = instruction_items(home);
@@ -231,11 +232,16 @@ pub fn gather(paths: &Paths, home: &Path, t3_root: Option<&Path>) -> anyhow::Res
         && let Ok((pending, _)) = crate::t3::import_t3_enabled(paths, root, true)
     {
         for item in pending {
+            let detail = if item.previous_display_name.is_some() {
+                "T3 display name changed (update in registry)"
+            } else {
+                "new T3 instance (import into registry)"
+            };
             out.push(SyncItem::new(
                 &item.id,
                 item.harness.as_str(),
                 ItemKind::Additive,
-                "new T3 instance (import into registry)".to_string(),
+                detail.to_string(),
             ));
         }
     }
@@ -361,7 +367,8 @@ fn classify_codex(id: &str, drift: &codex::Drift) -> SyncItem {
 /// DECISION item are skipped whole (their planners would touch decided
 /// content). Each applied instance is re-checked right before planning, so a
 /// concurrent harness edit cannot slip a decision through. With a T3 root,
-/// newly added enabled T3 instances are imported too (registry, `[[usage]]`,
+/// newly added enabled T3 instances are imported and T3 displayName renames
+/// are synced into existing `t3 = true` instances (registry, `[[usage]]`,
 /// `router.json`; T3 `settings.json` is only read). Idempotent: a clean tree
 /// applies nothing.
 pub fn apply_additive(
@@ -957,6 +964,64 @@ mod tests {
         let u = reg.usage.iter().find(|u| u.id == "antigravity-2").unwrap();
         assert_eq!(u.instance.as_deref(), Some("antigravity_2"));
         assert_eq!(fs::read_to_string(&settings).unwrap(), raw);
+        assert!(
+            apply_additive(&fx.paths, &fx.home, Some(&t3_root))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn additive_apply_syncs_t3_provider_renames() {
+        let fx = fixture();
+        apply_additive(&fx.paths, &fx.home, None).unwrap();
+        let t3_root = fx.dir.join("t3");
+        fs::create_dir_all(t3_root.join("userdata")).unwrap();
+        let settings = t3_root.join("userdata/settings.json");
+        fs::write(
+            &settings,
+            r#"{"providerInstances": {
+                "antigravity_5": {"driver": "antigravity", "displayName": "Antigravity", "enabled": true, "config": {}}
+            }}"#,
+        )
+        .unwrap();
+        apply_additive(&fx.paths, &fx.home, Some(&t3_root)).unwrap();
+        let reg = Registry::load(&fx.paths).unwrap();
+        assert_eq!(
+            reg.get("antigravity_5").unwrap().display_name,
+            "Antigravity"
+        );
+
+        let renamed = r#"{"providerInstances": {
+            "antigravity_5": {"driver": "antigravity", "displayName": "Antigravity 5", "enabled": true, "config": {}}
+        }}"#;
+        fs::write(&settings, renamed).unwrap();
+
+        let pending = gather(&fx.paths, &fx.home, Some(&t3_root)).unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|i| i.instance == "antigravity_5" && i.kind == ItemKind::Additive),
+            "{pending:?}"
+        );
+        assert!(decision_instances(&pending).is_empty(), "{pending:?}");
+
+        let applied = apply_additive(&fx.paths, &fx.home, Some(&t3_root)).unwrap();
+        assert!(
+            applied
+                .iter()
+                .any(|c| matches!(c, Change::WriteFile { path, .. }
+                if *path == fx.paths.registry_file())),
+            "{applied:?}"
+        );
+        let reg = Registry::load(&fx.paths).unwrap();
+        assert_eq!(
+            reg.get("antigravity_5").unwrap().display_name,
+            "Antigravity 5"
+        );
+        let usage = reg.usage.iter().find(|u| u.id == "antigravity-5").unwrap();
+        assert_eq!(usage.display, "Antigravity 5");
+        assert_eq!(fs::read_to_string(&settings).unwrap(), renamed);
         assert!(
             apply_additive(&fx.paths, &fx.home, Some(&t3_root))
                 .unwrap()

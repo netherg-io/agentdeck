@@ -537,7 +537,16 @@ pub fn preview(ctx: &Ctx, group: &str, key: &str, kind: Kind) -> Result<Pending,
                 kind,
                 preview: found
                     .iter()
-                    .map(|f| format!("{} {} {} t3=true", f.id, f.harness.as_str(), f.home))
+                    .map(|f| match &f.previous_display_name {
+                        Some(prev) => format!(
+                            "{} {} rename {:?} -> {:?}",
+                            f.id,
+                            f.harness.as_str(),
+                            prev,
+                            f.display_name
+                        ),
+                        None => format!("{} {} {} t3=true", f.id, f.harness.as_str(), f.home),
+                    })
                     .collect(),
                 confirm_path: None,
                 instruction: None,
@@ -647,7 +656,16 @@ pub fn apply(ctx: &Ctx, pending: &Pending) -> String {
                             .ok_or_else(|| anyhow::anyhow!("T3 unavailable"))?;
                         if pending.kind == Kind::Import {
                             let found = t3::import_t3(&ctx.paths, &root, false)?;
-                            Ok(format!("imported {} instance(s)", found.len()))
+                            let added = found
+                                .iter()
+                                .filter(|f| f.previous_display_name.is_none())
+                                .count();
+                            let renamed = found.len() - added;
+                            Ok(match (added, renamed) {
+                                (a, 0) => format!("imported {a} instance(s)"),
+                                (0, r) => format!("renamed {r} instance(s)"),
+                                (a, r) => format!("imported {a}, renamed {r} instance(s)"),
+                            })
                         } else {
                             let entries = t3::sync_t3(&ctx.paths, &root, false)?;
                             let n = entries.iter().filter(|e| e.action != "unchanged").count();
