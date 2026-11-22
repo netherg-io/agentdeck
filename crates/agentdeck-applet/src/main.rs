@@ -681,7 +681,9 @@ impl cosmic::Application for App {
                         )));
                     }
                     // The stale status line already says it; skip the duplicate.
-                    if let Some(error) = account.error.as_ref().filter(|_| account.status != "stale") {
+                    if let Some(error) =
+                        account.error.as_ref().filter(|_| account.status != "stale")
+                    {
                         content = content.push(widget::text(error));
                     }
                 }
