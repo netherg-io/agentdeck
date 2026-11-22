@@ -127,6 +127,7 @@ fn review_re() -> Regex {
     .clone()
 }
 
+/// Keyword fallback for when Jev gave no usable `review` answer.
 pub fn is_review_task(task: &str) -> bool {
     review_re().is_match(task)
 }
@@ -530,6 +531,40 @@ pub struct QuotaWindow {
     pub resets_at: Option<f64>,
     pub cost_factor: Option<f64>,
     pub pending: f64,
+}
+
+/// Google reports 5-hour and weekly buckets separately; a fresh 5-hour bucket
+/// is unusable while its family's weekly one is exhausted. The usage state
+/// keeps the raw figures for display, so the cap lives here.
+pub fn cap_antigravity_short_windows(windows: &mut [QuotaWindow]) {
+    fn family(key: &str) -> String {
+        let key = key.to_lowercase();
+        ["5h", "five_hour", "five-hour", "weekly", "week"]
+            .iter()
+            .flat_map(|suffix| ['-', '_'].map(|sep| format!("{sep}{suffix}")))
+            .find_map(|suffix| key.strip_suffix(&suffix).map(str::to_string))
+            .unwrap_or(key)
+    }
+    let longer: Vec<(String, f64, f64, Option<f64>)> = windows
+        .iter()
+        .map(|w| {
+            (
+                family(&w.key),
+                w.duration_mins,
+                w.remaining_percent,
+                w.resets_at,
+            )
+        })
+        .collect();
+    for w in windows.iter_mut() {
+        let own = family(&w.key);
+        for (f, mins, remaining, resets) in &longer {
+            if *f == own && *mins > w.duration_mins && *remaining < w.remaining_percent {
+                w.remaining_percent = *remaining;
+                w.resets_at = *resets;
+            }
+        }
+    }
 }
 
 pub fn quota_windows(provider: &str, model: &str, windows: &[QuotaWindow]) -> Vec<QuotaWindow> {
@@ -2020,6 +2055,37 @@ mod antigravity_source_tests {
             antigravity_instance(&settings(), &[format!("GEMINI_HOME=/{codex}")], &[]),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod antigravity_cap_tests {
+    use super::{QuotaWindow, cap_antigravity_short_windows};
+
+    fn w(key: &str, remaining: f64, mins: f64, resets: Option<f64>) -> QuotaWindow {
+        QuotaWindow {
+            key: key.into(),
+            label: None,
+            scope: None,
+            remaining_percent: remaining,
+            duration_mins: mins,
+            resets_at: resets,
+            cost_factor: None,
+            pending: 0.0,
+        }
+    }
+
+    #[test]
+    fn five_hour_never_exceeds_its_family_weekly() {
+        let mut ws = vec![
+            w("gemini-5h", 100.0, 300.0, None),
+            w("gemini-weekly", 0.0, 10080.0, Some(9.0)),
+            w("3p-5h", 60.0, 300.0, None),
+            w("3p-weekly", 80.0, 10080.0, Some(7.0)),
+        ];
+        cap_antigravity_short_windows(&mut ws);
+        assert_eq!((ws[0].remaining_percent, ws[0].resets_at), (0.0, Some(9.0)));
+        assert_eq!((ws[2].remaining_percent, ws[2].resets_at), (60.0, None));
     }
 }
 

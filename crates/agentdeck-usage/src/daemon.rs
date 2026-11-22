@@ -291,6 +291,11 @@ const T3_KICK_AFTER_SECONDS: i64 = 300;
 /// Minimum gap between refresh requests, so a provider T3 cannot refresh does
 /// not turn every cycle into a full T3 probe.
 const T3_KICK_MIN_GAP: Duration = Duration::from_secs(300);
+/// How often a sleeping daemon re-reads the usage sources to notice an edit.
+#[cfg(not(test))]
+const CONFIG_WATCH_INTERVAL: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const CONFIG_WATCH_INTERVAL: Duration = Duration::from_millis(50);
 const T3_KICK_DEADLINE: Duration = Duration::from_secs(90);
 
 /// True when a T3-backed account shows cached limits older than `after`
@@ -359,13 +364,23 @@ pub async fn run_daemon(
             Duration::from_secs(interval)
         };
 
-        tokio::select! {
-            _ = tokio::time::sleep(sleep_duration) => {},
-            _ = terminate.recv() => break,
-            _ = interrupt.recv() => break,
+        // A changed `[[usage]]` list (provider added/removed) ends the sleep, so the
+        // panel drops or shows it within seconds instead of after the full interval.
+        let deadline = tokio::time::sleep(sleep_duration);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                _ = terminate.recv() => return Ok(()),
+                _ = interrupt.recv() => return Ok(()),
+                _ = tokio::time::sleep(CONFIG_WATCH_INTERVAL) => {
+                    if load().is_ok_and(|(fresh, ..)| fresh != accounts) {
+                        break;
+                    }
+                }
+            }
         }
     }
-    Ok(())
 }
 
 async fn refresh_t3_providers(paths: &DaemonPaths) {
@@ -747,6 +762,33 @@ mod tests {
             !paths.lock.exists(),
             "refusal must not create the lock file"
         );
+    }
+
+    #[tokio::test]
+    async fn changed_account_list_ends_the_sleep_early() {
+        let (paths, _g) = temp_paths("watch");
+        let calls = std::cell::Cell::new(0);
+        let added = AccountConfig::Codex {
+            id: "codex-new".into(),
+            name: "Codex".into(),
+            instance: None,
+        };
+        // Refresh interval is an hour: only the list change can start cycle 2.
+        let load = || {
+            calls.set(calls.get() + 1);
+            match calls.get() {
+                1 => Ok((vec![], 3600, 3600)),
+                2 => Ok((vec![added.clone()], 3600, 3600)),
+                _ => Err(anyhow::anyhow!("second cycle reached")),
+            }
+        };
+        let error =
+            tokio::time::timeout(Duration::from_secs(10), run_daemon(&paths, || false, load))
+                .await
+                .expect("daemon kept sleeping after the account list changed")
+                .unwrap_err();
+        assert_eq!(error.to_string(), "second cycle reached");
+        assert!(paths.canonical.exists(), "first cycle writes state");
     }
 
     #[tokio::test]
