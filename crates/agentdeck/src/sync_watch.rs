@@ -364,6 +364,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scan_once_syncs_t3_rename_when_auto_apply_is_on() {
+        let (_g, paths, home) = fixture();
+        let t3 = home.parent().unwrap().join("t3");
+        fs::create_dir_all(t3.join("userdata")).unwrap();
+        let settings = t3.join("userdata/settings.json");
+        fs::write(
+            &settings,
+            r#"{"providerInstances":{"antigravity_5":{"driver":"antigravity","displayName":"Antigravity","enabled":true,"config":{}}}}"#,
+        )
+        .unwrap();
+        sync::set_auto_apply(&paths, true, false).unwrap();
+        let (log, notify) = recorder();
+        assert_eq!(scan_once(&paths, &home, Some(&t3), &notify), 0);
+        assert_eq!(
+            Registry::load(&paths)
+                .unwrap()
+                .get("antigravity_5")
+                .unwrap()
+                .display_name,
+            "Antigravity"
+        );
+
+        fs::write(
+            &settings,
+            r#"{"providerInstances":{"antigravity_5":{"driver":"antigravity","displayName":"Antigravity 5","enabled":true,"config":{}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(scan_once(&paths, &home, Some(&t3), &notify), 0);
+        assert!(log.lock().unwrap().is_empty());
+        let reg = Registry::load(&paths).unwrap();
+        assert_eq!(
+            reg.get("antigravity_5").unwrap().display_name,
+            "Antigravity 5"
+        );
+        assert_eq!(
+            reg.usage
+                .iter()
+                .find(|u| u.instance.as_deref() == Some("antigravity_5"))
+                .unwrap()
+                .display,
+            "Antigravity 5"
+        );
+    }
+
     /// Coalescing primitive behind the watcher: a burst of triggers inside
     /// one quiet window produces a single scan.
     pub async fn coalesce_until_quiet(

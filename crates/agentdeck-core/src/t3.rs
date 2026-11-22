@@ -124,14 +124,25 @@ fn absolute(path: &str) -> String {
     crate::sync::expand_tilde(path, &home).display().to_string()
 }
 
-fn desired_envelope(inst: &Instance, main_codex_home: Option<&str>) -> anyhow::Result<Value> {
-    check_t3_slug(&inst.id)?;
-    let driver = match inst.harness {
+fn t3_driver(harness: Harness) -> &'static str {
+    match harness {
         Harness::Claude => "claudeAgent",
         Harness::Codex => "codex",
         Harness::Opencode => "opencode",
         Harness::Agy => "antigravity",
-    };
+    }
+}
+
+fn t3_display_name(env: &Value) -> Option<&str> {
+    env.get("displayName")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
+}
+
+fn desired_envelope(inst: &Instance, main_codex_home: Option<&str>) -> anyhow::Result<Value> {
+    check_t3_slug(&inst.id)?;
+    let driver = t3_driver(inst.harness);
     let mut config = Map::new();
     match inst.harness {
         Harness::Claude => {
@@ -208,9 +219,12 @@ fn same_home(old: &str, want: &Value) -> bool {
 
 /// Merge desired envelopes into parsed settings: only `providerInstances`
 /// entries for managed ids change, and within an existing envelope only
-/// `driver`/`displayName`/`enabled` plus our own `config` keys. Everything
-/// else (accentColor, customModels, launchArgs, environment, unknown keys,
-/// foreign instances, all other top-level keys) is preserved verbatim.
+/// `driver`/`enabled` plus our own `config` keys (`displayName` is only set
+/// when creating a new T3 envelope; existing T3 names stay authoritative so
+/// bulk sync never overwrites a T3 rename, while explicit Agentdeck renames
+/// write through [`rename_instance`]). Everything else (accentColor,
+/// customModels, launchArgs, environment, unknown keys, foreign instances,
+/// all other top-level keys) is preserved verbatim.
 pub fn merge_settings(old: &Value, desired: &BTreeMap<String, Value>) -> anyhow::Result<Value> {
     let mut new = old.clone();
     let pi = new
@@ -228,10 +242,8 @@ pub fn merge_settings(old: &Value, desired: &BTreeMap<String, Value>) -> anyhow:
                 for key in ["driver", "enabled"] {
                     obj.insert(key.into(), want[key].clone());
                 }
-                // T3 has its own label for a nameless default instance: keep it nameless.
-                if obj.contains_key("displayName") {
-                    obj.insert("displayName".into(), want["displayName"].clone());
-                }
+                // Existing T3 displayName stays authoritative during bulk sync;
+                // explicit Agentdeck renames write through `rename_instance`.
                 let cfg = obj
                     .entry("config")
                     .or_insert_with(|| Value::Object(Map::new()));
@@ -682,6 +694,8 @@ pub struct Imported {
     pub id: String,
     pub harness: Harness,
     pub display_name: String,
+    /// Set when an already-registered T3 instance was renamed from T3's `displayName`.
+    pub previous_display_name: Option<String>,
     pub home: String,
     /// `[[usage]]` id created with the instance (claude/codex/antigravity).
     pub usage_id: Option<String>,
@@ -689,15 +703,18 @@ pub struct Imported {
 
 /// Add T3 instances (`claudeAgent`, `codex`, `opencode`, `antigravity`)
 /// missing from the registry into it (id, harness, display_name, home from
-/// config; t3 = true). Claude/Codex/Antigravity instances also get a
-/// `[[usage]]` entry unless one already binds them; `[[pool]]` is never
-/// touched. `router.json` is refreshed when the router plugin is on.
+/// config; t3 = true), and sync T3 `displayName` renames into existing
+/// `t3 = true` instances (plus linked `[[usage]]` display labels).
+/// Claude/Codex/Antigravity imports also get a `[[usage]]` entry unless one
+/// already binds them; `[[pool]]` is never touched. `router.json` is refreshed
+/// when new instances are added and the router plugin is on.
 pub fn import_t3(paths: &Paths, t3_root: &Path, dry_run: bool) -> anyhow::Result<Vec<Imported>> {
     Ok(import(paths, t3_root, dry_run, false)?.0)
 }
 
-/// Background variant of [`import_t3`]: only instances enabled in T3, so
-/// unused disabled providers stay out. Returns the files it changed.
+/// Background variant of [`import_t3`]: only new instances enabled in T3 are
+/// imported (so unused disabled providers stay out), while existing `t3 = true`
+/// instances still receive T3 `displayName` renames. Returns the files it changed.
 pub fn import_t3_enabled(
     paths: &Paths,
     t3_root: &Path,
@@ -719,16 +736,18 @@ fn import(
         .get("providerInstances")
         .and_then(|v| v.as_object())
         .ok_or_else(|| anyhow::anyhow!("settings.json has no providerInstances object"))?;
-    // Preview first: with nothing to import the registry file is not rewritten.
-    let mut found = add_missing(&mut Registry::load(paths)?, pi, only_enabled)?;
+    // Preview first: with nothing to import or rename the registry file is not rewritten.
+    let mut found = sync_from_t3(&mut Registry::load(paths)?, pi, only_enabled)?;
     if dry_run || found.is_empty() {
         found.sort_by(|a, b| a.id.cmp(&b.id));
         return Ok((found, Vec::new()));
     }
     let old = fs::read(paths.registry_file()).ok();
     Registry::update(paths, |r| {
-        found = add_missing(r, pi, only_enabled)?;
-        if crate::plugins::plugin_enabled(r, crate::plugins::PLUGIN_ROUTER) {
+        found = sync_from_t3(r, pi, only_enabled)?;
+        if crate::plugins::plugin_enabled(r, crate::plugins::PLUGIN_ROUTER)
+            && found.iter().any(|f| f.previous_display_name.is_none())
+        {
             // Validate router JSON before committing so a conflict never half-applies.
             crate::router::router_json_value(r)?;
         }
@@ -740,16 +759,18 @@ fn import(
         crate::changes::plan_write_file(paths.registry_file(), old.as_deref(), &new)
             .into_iter()
             .collect();
-    let reg = Registry::load(paths)?;
-    if crate::plugins::plugin_enabled(&reg, crate::plugins::PLUGIN_ROUTER) {
-        let router = crate::router::plan_router_files(paths, &reg)?;
-        crate::apply_changes(&router)?;
-        changes.extend(router);
+    if found.iter().any(|f| f.previous_display_name.is_none()) {
+        let reg = Registry::load(paths)?;
+        if crate::plugins::plugin_enabled(&reg, crate::plugins::PLUGIN_ROUTER) {
+            let router = crate::router::plan_router_files(paths, &reg)?;
+            crate::apply_changes(&router)?;
+            changes.extend(router);
+        }
     }
     Ok((found, changes))
 }
 
-fn add_missing(
+fn sync_from_t3(
     r: &mut Registry,
     pi: &Map<String, Value>,
     only_enabled: bool,
@@ -758,10 +779,31 @@ fn add_missing(
     use crate::usage::{UsageEntry, UsageKind};
     let mut found = Vec::new();
     for (id, env) in pi {
-        if r.get(id).is_some() {
+        let driver = env.get("driver").and_then(Value::as_str).unwrap_or("");
+        if let Some(inst) = r.get(id) {
+            if !inst.t3 || driver != t3_driver(inst.harness) {
+                continue;
+            }
+            let Some(display_name) = t3_display_name(env) else {
+                continue;
+            };
+            if inst.display_name == display_name {
+                continue;
+            }
+            let harness = inst.harness;
+            let home = inst.home.clone();
+            let prev = inst.display_name.clone();
+            r.rename(id, display_name)?;
+            found.push(Imported {
+                id: id.clone(),
+                harness,
+                display_name: display_name.to_string(),
+                previous_display_name: Some(prev),
+                home,
+                usage_id: None,
+            });
             continue;
         }
-        let driver = env.get("driver").and_then(Value::as_str).unwrap_or("");
         let (harness, kind) = match driver {
             "claudeAgent" => (Harness::Claude, Some(UsageKind::Claude)),
             "codex" => (Harness::Codex, Some(UsageKind::Codex)),
@@ -812,12 +854,7 @@ fn add_missing(
             // R4 drivers carry no home: registry home is the login root.
             Harness::Opencode | Harness::Agy => "~".to_string(),
         };
-        let display_name = env
-            .get("displayName")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(id)
-            .to_string();
+        let display_name = t3_display_name(env).unwrap_or(id).to_string();
         r.add(AddSpec {
             id: id.clone(),
             harness,
@@ -847,6 +884,7 @@ fn add_missing(
             id: id.clone(),
             harness,
             display_name,
+            previous_display_name: None,
             home,
             usage_id,
         });
@@ -1296,9 +1334,9 @@ mod tests {
         let raw = fs::read_to_string(settings_file(&t3)).unwrap();
         let v: Value = serde_json::from_str(&raw).unwrap();
         let cs = &v["providerInstances"]["codex_second"];
-        // Unknown fields preserved.
+        // Unknown fields and existing T3 displayName preserved.
         assert_eq!(cs["accentColor"], Value::String("#123456".into()));
-        assert_eq!(cs["displayName"], Value::String("codex_second".into()));
+        assert_eq!(cs["displayName"], Value::String("Codex 2".into()));
         assert_eq!(cs["config"]["setupMode"], Value::String("existing".into()));
         assert_eq!(cs["config"]["launchArgs"], Value::String("--foo".into()));
         assert!(cs.get("environment").is_some());
@@ -1859,5 +1897,267 @@ mod tests {
 
         fs::write(cache_file(&t3, "broken"), "{\"status\":\"ready\",\"usage").unwrap();
         assert!(read_usage_cache(&t3, "broken").is_err());
+    }
+
+    #[test]
+    fn t3_rename_syncs_into_registry_and_survives_bulk_sync() {
+        use crate::pool::PoolEntry;
+        use crate::usage::{UsageEntry, UsageKind};
+        let initial_t3 = r##"{
+  "favorites": [],
+  "providerInstances": {
+    "antigravity_5": {
+      "driver": "antigravity",
+      "displayName": "Antigravity",
+      "enabled": true,
+      "accentColor": "#336699",
+      "config": {"authMethod": "oauth"}
+    },
+    "codex": {
+      "driver": "codex",
+      "enabled": true,
+      "config": {"homePath": ""}
+    },
+    "local_only": {
+      "driver": "antigravity",
+      "displayName": "T3 Name",
+      "enabled": true,
+      "config": {}
+    }
+  }
+}
+"##;
+        let (paths, t3, _g) = setup("t3-rename-sync", initial_t3);
+        Registry::update(&paths, |r| {
+            r.add(AddSpec {
+                id: "antigravity_5".into(),
+                harness: Harness::Agy,
+                display_name: Some("Antigravity".into()),
+                home: "~".into(),
+                binary: Some("/usr/bin/agy".into()),
+                no_t3: false,
+            })?;
+            r.set_max_parallel("antigravity_5", Some(2))?;
+            r.instances[0]
+                .extra
+                .insert("note".into(), toml::Value::String("keep".into()));
+            r.add_usage(UsageEntry {
+                id: "antigravity-5".into(),
+                kind: UsageKind::Antigravity,
+                instance: Some("antigravity_5".into()),
+                display: "Antigravity".into(),
+                api_key_env: None,
+                db_file: None,
+                extra: Default::default(),
+            })?;
+            r.add_pool(PoolEntry {
+                instance: "antigravity_5".into(),
+                model: "gemini-4-neon".into(),
+                options: Default::default(),
+                enabled: true,
+            })?;
+            r.add(AddSpec {
+                id: "codex".into(),
+                harness: Harness::Codex,
+                display_name: Some("Codex Main".into()),
+                home: "~/.codex".into(),
+                binary: None,
+                no_t3: false,
+            })?;
+            r.add(AddSpec {
+                id: "local_only".into(),
+                harness: Harness::Agy,
+                display_name: Some("Local Custom".into()),
+                home: "~".into(),
+                binary: None,
+                no_t3: true,
+            })?;
+            r.add(AddSpec {
+                id: "claude_new".into(),
+                harness: Harness::Claude,
+                display_name: Some("Claude New".into()),
+                home: "/fake/claude-new".into(),
+                binary: None,
+                no_t3: false,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Owner renames `antigravity_5` in T3 to "Antigravity 5".
+        let renamed_t3 = initial_t3.replace(
+            "\"displayName\": \"Antigravity\"",
+            "\"displayName\": \"Antigravity 5\"",
+        );
+        fs::write(settings_file(&t3), &renamed_t3).unwrap();
+
+        // Stale bulk sync (e.g. syncing a new `claude_new` instance) must NOT
+        // overwrite T3's "Antigravity 5" back to stale "Antigravity", while still
+        // creating `claude_new` with its displayName and keeping unrelated fields.
+        sync_t3(&paths, &t3, false).unwrap();
+        let after_sync: Value =
+            serde_json::from_slice(&fs::read(settings_file(&t3)).unwrap()).unwrap();
+        assert_eq!(
+            after_sync["providerInstances"]["antigravity_5"]["displayName"],
+            Value::String("Antigravity 5".into()),
+            "bulk sync must not clobber T3 rename"
+        );
+        assert_eq!(
+            after_sync["providerInstances"]["antigravity_5"]["accentColor"],
+            Value::String("#336699".into())
+        );
+        assert_eq!(
+            after_sync["providerInstances"]["antigravity_5"]["config"]["authMethod"],
+            Value::String("oauth".into())
+        );
+        assert_eq!(
+            after_sync["providerInstances"]["claude_new"]["displayName"],
+            Value::String("Claude New".into())
+        );
+        assert!(
+            after_sync["providerInstances"]["codex"]
+                .get("displayName")
+                .is_none()
+        );
+
+        // Dry-run previews the T3 rename without modifying the registry.
+        let preview = import_t3(&paths, &t3, true).unwrap();
+        assert_eq!(preview.len(), 1, "{preview:?}");
+        assert_eq!(preview[0].id, "antigravity_5");
+        assert_eq!(preview[0].display_name, "Antigravity 5");
+        assert_eq!(
+            preview[0].previous_display_name.as_deref(),
+            Some("Antigravity")
+        );
+        assert_eq!(
+            Registry::load(&paths)
+                .unwrap()
+                .get("antigravity_5")
+                .unwrap()
+                .display_name,
+            "Antigravity"
+        );
+
+        // Real import pulls the T3 rename into the registry & linked usage entry,
+        // preserving instance id, unrelated fields, nameless default and no_t3 instances.
+        let settings_before_import = fs::read(settings_file(&t3)).unwrap();
+        let applied = import_t3(&paths, &t3, false).unwrap();
+        assert_eq!(applied.len(), 1, "{applied:?}");
+        assert_eq!(applied[0].id, "antigravity_5");
+        assert_eq!(applied[0].display_name, "Antigravity 5");
+        assert_eq!(
+            applied[0].previous_display_name.as_deref(),
+            Some("Antigravity")
+        );
+        assert_eq!(
+            fs::read(settings_file(&t3)).unwrap(),
+            settings_before_import
+        );
+
+        let reg = Registry::load(&paths).unwrap();
+        let agy = reg.get("antigravity_5").unwrap();
+        assert_eq!(agy.id, "antigravity_5");
+        assert_eq!(agy.display_name, "Antigravity 5");
+        assert_eq!(agy.binary.as_deref(), Some("/usr/bin/agy"));
+        assert_eq!(agy.max_parallel, Some(2));
+        assert_eq!(
+            agy.extra.get("note").and_then(toml::Value::as_str),
+            Some("keep")
+        );
+        assert_eq!(reg.usage[0].id, "antigravity-5");
+        assert_eq!(reg.usage[0].display, "Antigravity 5");
+        assert_eq!(reg.pool.len(), 1);
+        assert_eq!(reg.pool[0].instance, "antigravity_5");
+        assert_eq!(reg.get("codex").unwrap().display_name, "Codex Main");
+        assert_eq!(reg.get("local_only").unwrap().display_name, "Local Custom");
+
+        // Second import is a no-op.
+        assert!(import_t3(&paths, &t3, false).unwrap().is_empty());
+
+        // Blank/multiline T3 displayNames are ignored safely without clobbering.
+        let mut bad: Value =
+            serde_json::from_slice(&fs::read(settings_file(&t3)).unwrap()).unwrap();
+        bad["providerInstances"]["antigravity_5"]["displayName"] = Value::String("  \n ".into());
+        fs::write(
+            settings_file(&t3),
+            serde_json::to_string_pretty(&bad).unwrap(),
+        )
+        .unwrap();
+        assert!(import_t3(&paths, &t3, false).unwrap().is_empty());
+        assert_eq!(
+            Registry::load(&paths)
+                .unwrap()
+                .get("antigravity_5")
+                .unwrap()
+                .display_name,
+            "Antigravity 5"
+        );
+
+        // Background sync still syncs renames for already-registered disabled instances
+        // while keeping unregistered disabled instances out.
+        bad["providerInstances"]["antigravity_5"]["enabled"] = Value::Bool(false);
+        bad["providerInstances"]["antigravity_5"]["displayName"] =
+            Value::String("  Antigravity 5 Paused  ".into());
+        bad["providerInstances"]["disabled_new"] = serde_json::json!({
+            "driver": "antigravity",
+            "displayName": "Disabled New",
+            "enabled": false,
+            "config": {}
+        });
+        fs::write(
+            settings_file(&t3),
+            serde_json::to_string_pretty(&bad).unwrap(),
+        )
+        .unwrap();
+        let (bg, bg_changes) = import_t3_enabled(&paths, &t3, false).unwrap();
+        assert_eq!(bg.len(), 1, "{bg:?}");
+        assert_eq!(bg[0].id, "antigravity_5");
+        assert_eq!(bg[0].display_name, "Antigravity 5 Paused");
+        assert_eq!(bg_changes.len(), 1, "{bg_changes:?}");
+        let reg = Registry::load(&paths).unwrap();
+        assert_eq!(
+            reg.get("antigravity_5").unwrap().display_name,
+            "Antigravity 5 Paused"
+        );
+        assert!(reg.get("disabled_new").is_none());
+
+        // Explicit Agentdeck rename still updates both Agentdeck and T3,
+        // and subsequent import/sync remain no-ops.
+        rename_instance(&paths, Some(&t3), "antigravity_5", "Agy Work", false).unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        assert_eq!(reg.get("antigravity_5").unwrap().display_name, "Agy Work");
+        assert_eq!(reg.usage[0].display, "Agy Work");
+        let after_rename: Value =
+            serde_json::from_slice(&fs::read(settings_file(&t3)).unwrap()).unwrap();
+        assert_eq!(
+            after_rename["providerInstances"]["antigravity_5"]["displayName"],
+            Value::String("Agy Work".into())
+        );
+        assert_eq!(
+            after_rename["providerInstances"]["antigravity_5"]["accentColor"],
+            Value::String("#336699".into())
+        );
+        assert!(import_t3_enabled(&paths, &t3, false).unwrap().0.is_empty());
+        // Restore enabled=true in T3 so sync_t3 checks pure unchanged state.
+        let mut synced = after_rename;
+        synced["providerInstances"]["antigravity_5"]["enabled"] = Value::Bool(true);
+        synced["providerInstances"]
+            .as_object_mut()
+            .unwrap()
+            .remove("disabled_new");
+        fs::write(
+            settings_file(&t3),
+            serde_json::to_string_pretty(&synced).unwrap(),
+        )
+        .unwrap();
+        assert!(import_t3(&paths, &t3, false).unwrap().is_empty());
+        let entries = sync_t3(&paths, &t3, true).unwrap();
+        assert!(
+            entries
+                .iter()
+                .find(|e| e.id == "antigravity_5")
+                .is_some_and(|e| e.action == "unchanged"),
+            "{entries:?}"
+        );
     }
 }
