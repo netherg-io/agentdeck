@@ -416,35 +416,6 @@ fn map_windows(provider: &str, raw: Vec<T3UsageWindow>) -> Vec<QuotaWindow> {
             });
         }
         "antigravity" => {
-            // Google reports 5-hour and weekly buckets separately; a fresh 5-hour
-            // bucket is unusable while its family's weekly one is exhausted.
-            let caps: Vec<(String, u64, f64, Option<i64>)> = windows
-                .iter()
-                .filter_map(|w| {
-                    Some((
-                        family_for_key(&w.key),
-                        w.duration_mins?,
-                        w.used_percent,
-                        w.resets_at,
-                    ))
-                })
-                .collect();
-            for w in &mut windows {
-                let Some(own) = w.duration_mins else { continue };
-                let family = family_for_key(&w.key);
-                for (f, d, used, resets) in &caps {
-                    if *f == family && *d > own && *used > w.used_percent {
-                        *w = QuotaWindow::new(
-                            w.key.clone(),
-                            w.label.clone(),
-                            *used,
-                            w.duration_mins,
-                            *resets,
-                        )
-                        .with_scope(w.scope.clone());
-                    }
-                }
-            }
             windows.sort_by(|a, b| {
                 let pa = u8::from(family_for_key(&a.key) != "gemini");
                 let pb = u8::from(family_for_key(&b.key) != "gemini");
@@ -956,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_session_window_never_shows_more_than_its_weekly_window() {
+    fn antigravity_session_window_keeps_its_own_figures() {
         let (t3, _g) = setup("agy-cap", SETTINGS_ALL);
         write_cache(
             &t3,
@@ -985,9 +956,10 @@ mod tests {
             NOW,
         );
         let w = |k: &str| st.windows.iter().find(|w| w.key == k).unwrap().clone();
-        assert_eq!(w("gemini-5h").remaining_percent, 0.0);
-        assert_eq!(w("gemini-5h").resets_at, w("gemini-weekly").resets_at);
-        // a busier 5-hour window keeps its own figure
+        // shown as T3 reports it; the router caps 5-hour by weekly on its own
+        assert_eq!(w("gemini-5h").remaining_percent, 100.0);
+        assert_eq!(w("gemini-5h").resets_at, None);
+        assert_eq!(w("gemini-weekly").remaining_percent, 0.0);
         assert_eq!(w("3p-5h").remaining_percent, 60.0);
         assert_eq!(w("3p-5h").scope.as_deref(), Some("Сторонние модели"));
     }

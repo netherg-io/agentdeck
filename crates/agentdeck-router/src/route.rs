@@ -26,6 +26,12 @@ const DIFFICULTY: [&str; 4] = [
     "hard debugging, ambiguous architecture, security or specialist reasoning",
     "exceptionally difficult work requiring the strongest specialist",
 ];
+const REVIEW: [&str; 4] = [
+    "builds, fixes or changes something; includes acting on findings of an earlier review or audit",
+    "mostly implementation, with some assessment of existing work along the way",
+    "mostly assessing existing work (code, design, UI), with some other work",
+    "only reviews, audits or evaluates existing work and reports findings without changing it",
+];
 const CAPABILITY: [&str; 4] = [
     "Cannot perform the requested task or input modality.",
     "Significant capability gaps; unreliable for the required task.",
@@ -780,6 +786,9 @@ fn quota(
         return unknown_quota("no ai-usage account", !load.known, None);
     };
     let mut acc = acc.clone();
+    if acc.provider == "antigravity" {
+        crate::policy::cap_antigravity_short_windows(&mut acc.windows);
+    }
     // Capture raw live window health before synthesizing resets for elapsed periods
     // so only an actual fresh provider reading can clear a prior quota failure.
     let live_health = if acc.status.as_deref() == Some("ok")
@@ -1725,6 +1734,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     let mut questions = serde_json::Map::new();
     questions.insert("size".into(), serde_json::json!({"type": "score", "instructions": "How much work will the actual delegated task take? Scope is not difficulty. Do not assume a large task from a long prompt, repository name or safeguards.", "criteria": SIZES}));
     questions.insert("difficulty".into(), serde_json::json!({"type": "score", "instructions": "How difficult is the actual task, independently of its volume? Many files, a large repository, long inputs or a request to use Sonnet/Opus do not by themselves make work difficult.", "criteria": DIFFICULTY}));
+    questions.insert("review".into(), serde_json::json!({"type": "score", "instructions": "Is the delegated task itself a review or audit of existing work? Mentioning a review, or fixing what a review found, does not make the task a review.", "criteria": REVIEW}));
     for (k, _) in &criteria {
         questions.insert(
             k.clone(),
@@ -1922,6 +1932,17 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         .unwrap_or(0.0)
         .round() as i64)
         .clamp(0, 3);
+    // Jev's judgment of the task; keywords only when it gave no valid answer.
+    let is_review = match answers.get("review").filter(|a| valid_answer(a, false)) {
+        Some(a) => {
+            a.get("score")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                .round()
+                >= 2.0
+        }
+        None => is_review_task(&task),
+    };
     let failures = read_instance_failures(&env.home.join(".t3/userdata/statev2.sqlite"), now);
     let mut candidates: Vec<Candidate> = vec![];
     for (provider, model, profile) in &favorites {
@@ -1947,7 +1968,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         let no_review = user_rules.is_no_review(model);
         let mut policy_ban = if user_rules.is_denied(model) {
             Some("denied by user rule".to_string())
-        } else if no_review && is_review_task(&task) {
+        } else if no_review && is_review {
             Some(NO_REVIEW_BAN.to_string())
         } else {
             None
@@ -2232,7 +2253,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         );
         let validation = if current_cfg.user_rules.is_denied(&req.model) {
             serde_json::json!({"allowed": false, "reason": "denied by user rule"})
-        } else if current_cfg.user_rules.is_no_review(&req.model) && is_review_task(&task) {
+        } else if current_cfg.user_rules.is_no_review(&req.model) && is_review {
             serde_json::json!({"allowed": false, "reason": NO_REVIEW_BAN})
         } else {
             let v = validate_target(&ranking, &req.provider, &req.model);

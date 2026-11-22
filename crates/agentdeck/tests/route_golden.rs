@@ -1251,3 +1251,47 @@ fn sudden_quota_reset_clears_stale_quota_failure() {
     let recovered = run();
     assert_eq!(recovered["target"]["model"], SOL.1, "{recovered}");
 }
+
+/// Jev's `review` answer, not task keywords, decides whether the no-review
+/// rule applies: fixing review findings may use Argon, a real audit may not.
+#[test]
+fn jev_review_answer_overrides_keywords_for_no_review_models() {
+    let fx = Fixture::new(&[OPUS, SOL]);
+    let validation = |review: Option<f64>, task: &str| {
+        let mut jev = answers_for(
+            &[
+                ("claudeagent_claude_opus_5_5", level(2.4, 0.95)),
+                ("codex_gpt_6_1_sol", level(2.4, 0.95)),
+            ],
+            1.0,
+            1.0,
+        );
+        if let Some(score) = review {
+            jev["answers"]["review"] = serde_json::json!({"score": score, "confidence": 0.9});
+        }
+        let mock = write_mock(&fx, &jev);
+        let (code, out, err) = run_rust(
+            &fx,
+            &[
+                "--source",
+                "claudeAgent",
+                "--validate-target",
+                "antigravity",
+                "gemini-4-argon-high",
+                task,
+            ],
+            &mock,
+            None,
+        );
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        v["validation"]["reason"].as_str().unwrap_or("").to_owned()
+    };
+    let ban = "never for audits or reviews";
+    // Keyword says review, Jev says it is implementation: not banned.
+    assert!(!validation(Some(0.0), "Fix the findings from the code review in a.rs").contains(ban));
+    // No keyword, Jev says audit: banned.
+    assert!(validation(Some(3.0), "Look over the router for gaps and report").contains(ban));
+    // Jev gave no review answer: keyword fallback.
+    assert!(validation(None, "Review the diff of the router").contains(ban));
+}
