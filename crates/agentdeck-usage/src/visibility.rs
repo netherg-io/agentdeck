@@ -9,18 +9,64 @@ use std::path::{Path, PathBuf};
 pub struct Prefs {
     #[serde(default)]
     pub hidden: BTreeSet<String>,
-    /// Account ids, first shown first; unlisted accounts follow in state order.
+    /// Provider names in panel order (first shown first); unlisted providers
+    /// follow in first-seen order. Legacy files with account ids still resolve.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub order: Vec<String>,
 }
 
 impl Prefs {
-    /// Sort key for an account id under [`Prefs::order`]; use with a stable sort.
-    pub fn rank(&self, id: &str) -> usize {
+    /// Sort key for a provider or legacy account id under [`Prefs::order`].
+    pub fn rank(&self, key: &str) -> usize {
         self.order
             .iter()
-            .position(|o| o == id)
+            .position(|o| o == key)
             .unwrap_or(usize::MAX)
+    }
+
+    /// Sort key for a provider group: matches the provider name directly, or
+    /// falls back to the earliest legacy account id belonging to that provider.
+    pub fn provider_rank<'a, T>(
+        &self,
+        provider: &str,
+        items: &'a [T],
+        id: impl Fn(&T) -> &str,
+        item_provider: impl Fn(&'a T) -> &'a str,
+    ) -> usize {
+        let direct = self.rank(provider);
+        if direct != usize::MAX {
+            return direct;
+        }
+        items
+            .iter()
+            .filter(|item| item_provider(item) == provider)
+            .map(|item| self.rank(id(item)))
+            .min()
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Group items by provider in panel order so new instances immediately land
+    /// next to their provider group and moving a group moves all its instances.
+    pub fn group_by_provider<'a, T>(
+        &self,
+        items: &'a [T],
+        id: impl Fn(&T) -> &str,
+        provider: impl Fn(&'a T) -> &'a str,
+    ) -> Vec<(&'a str, Vec<&'a T>)> {
+        let mut groups: Vec<(&'a str, Vec<&'a T>)> = Vec::new();
+        for item in items {
+            let p = provider(item);
+            if let Some((_, list)) = groups.iter_mut().find(|(k, _)| *k == p) {
+                list.push(item);
+            } else {
+                groups.push((p, vec![item]));
+            }
+        }
+        for (_, list) in &mut groups {
+            list.sort_by_key(|item| self.rank(id(item)));
+        }
+        groups.sort_by_key(|(p, _)| self.provider_rank(p, items, &id, &provider));
+        groups
     }
 }
 
@@ -78,5 +124,54 @@ mod tests {
         assert!(load(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{not json");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn groups_new_instances_with_their_provider_and_honors_legacy_id_order() {
+        let items = [
+            ("codex-1", "codex"),
+            ("claude-1", "claude"),
+            ("agy-1", "antigravity"),
+            ("claude-2", "claude"),
+            ("agy-2", "antigravity"),
+        ];
+        // Provider-keyed order moves whole groups and keeps newly added instances in their group.
+        let prefs = Prefs {
+            order: vec!["antigravity".into(), "claude".into()],
+            ..Prefs::default()
+        };
+        let grouped = prefs.group_by_provider(&items, |x| x.0, |x| x.1);
+        let summary: Vec<(&str, Vec<&str>)> = grouped
+            .iter()
+            .map(|(p, list)| (*p, list.iter().map(|x| x.0).collect()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("antigravity", vec!["agy-1", "agy-2"]),
+                ("claude", vec!["claude-1", "claude-2"]),
+                ("codex", vec!["codex-1"]),
+            ]
+        );
+
+        // Legacy account-id order still ranks groups by their earliest member and pulls new
+        // unlisted instances of that provider right into the group.
+        let legacy = Prefs {
+            order: vec!["agy-2".into(), "claude-1".into(), "codex-1".into()],
+            ..Prefs::default()
+        };
+        let grouped = legacy.group_by_provider(&items, |x| x.0, |x| x.1);
+        let summary: Vec<(&str, Vec<&str>)> = grouped
+            .iter()
+            .map(|(p, list)| (*p, list.iter().map(|x| x.0).collect()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("antigravity", vec!["agy-2", "agy-1"]),
+                ("claude", vec!["claude-1", "claude-2"]),
+                ("codex", vec!["codex-1"]),
+            ]
+        );
     }
 }

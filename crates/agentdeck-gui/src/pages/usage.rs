@@ -1,7 +1,6 @@
 //! Quotas module (ai-usage): `[[usage]]` sources with add/remove behind a
 //! change preview, and which providers the COSMIC panel widget shows.
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use agentdeck_core::usage::{self, UsageEntry, UsageKind};
@@ -94,7 +93,7 @@ pub enum Msg {
     Done(Result<(), String>),
     /// Provider, shown.
     Show(String, bool),
-    /// Account id, up: one step in the panel order.
+    /// Provider group, up: one step in the panel order.
     Move(String, bool),
 }
 
@@ -320,12 +319,12 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
             save_prefs(state, &paths, prefs);
             Task::none()
         }
-        Msg::Move(id, up) => {
-            let mut order: Vec<String> = panel_order(&state.data)
+        Msg::Move(provider, up) => {
+            let mut order: Vec<String> = provider_groups(&state.data)
                 .into_iter()
-                .map(|u| u.id.clone())
+                .map(|(p, _)| p.to_owned())
                 .collect();
-            if let Some(i) = order.iter().position(|o| *o == id) {
+            if let Some(i) = order.iter().position(|o| *o == provider) {
                 let j = if up {
                     i.checked_sub(1)
                 } else {
@@ -352,11 +351,24 @@ fn save_prefs(state: &mut State, paths: &Paths, prefs: agentdeck_usage::visibili
     }
 }
 
-/// Sources in the order the panel applet shows them.
-fn panel_order(data: &Loaded) -> Vec<&UsageEntry> {
-    let mut v: Vec<_> = data.sources.iter().collect();
-    v.sort_by_key(|u| data.prefs.rank(&u.id));
-    v
+/// Provider groups and source counts in the order the panel applet shows them.
+fn provider_groups(data: &Loaded) -> Vec<(&str, usize)> {
+    let mut groups: Vec<(&str, usize)> = data
+        .prefs
+        .group_by_provider(&data.sources, |u| u.id.as_str(), |u| u.kind.as_str())
+        .into_iter()
+        .map(|(p, list)| (p, list.len()))
+        .collect();
+    for p in &data.prefs.hidden {
+        if groups.iter().all(|(existing, _)| *existing != p.as_str()) {
+            groups.push((p.as_str(), 0));
+        }
+    }
+    groups.sort_by_key(|(p, _)| {
+        data.prefs
+            .provider_rank(p, &data.sources, |u| u.id.as_str(), |u| u.kind.as_str())
+    });
+    groups
 }
 
 /// The pending add's key env var and the typed key, when one was entered.
@@ -547,85 +559,55 @@ pub fn sources_view<'a>(state: &'a State, data: &'a Data) -> Element<'a, Msg> {
 
 pub fn widget_view(state: &State) -> Element<'_, Msg> {
     let look = st::look();
-    let providers: BTreeSet<&str> = state
-        .data
-        .sources
-        .iter()
-        .map(|u| u.kind.as_str())
-        .chain(state.data.prefs.hidden.iter().map(String::as_str))
-        .collect();
+    let groups = provider_groups(&state.data);
     let mut col =
         column![st::muted(fl!(loader(), "usage-widget-scope"))].spacing(look.gap.max(st::SPACE_S));
     if let Some(e) = &state.data.error {
         col = col.push(st::card(st::muted(fl!(loader(), "load-error", what = e))));
     }
-    if providers.is_empty() {
+    if groups.is_empty() {
         return col
             .push(st::card(st::muted(fl!(loader(), "usage-empty"))))
             .into();
     }
+    let total = groups.len();
     let mut list = column![].spacing(look.row_gap);
-    for (i, p) in providers.into_iter().enumerate() {
+    for (i, (p, count)) in groups.into_iter().enumerate() {
         if i > 0 {
             list = list.push(st::hairline());
         }
-        let count = state
-            .data
-            .sources
-            .iter()
-            .filter(|u| u.kind.as_str() == p)
-            .count();
+        let hidden = state.data.prefs.hidden.contains(p);
         let provider = p.to_string();
         list = list.push(
             row![
-                container(st::fit(p, st::Role::Heading, st::Cut::End)).width(Length::Fill),
+                container(st::fit(
+                    p,
+                    if hidden {
+                        st::Role::Muted
+                    } else {
+                        st::Role::Heading
+                    },
+                    st::Cut::End,
+                ))
+                .width(Length::Fill),
                 st::nowrap(st::caption(fl!(
                     loader(),
                     "usage-sources-count",
                     count = count
                 ))),
-                toggler(!state.data.prefs.hidden.contains(p))
+                st::icon_btn(st::Icon::ChevronUp)
+                    .on_press_maybe((i > 0).then(|| Msg::Move(provider.clone(), true))),
+                st::icon_btn(st::Icon::ChevronDown)
+                    .on_press_maybe((i + 1 < total).then(|| Msg::Move(provider.clone(), false))),
+                toggler(!hidden)
                     .size(16)
                     .on_toggle(move |on| Msg::Show(provider.clone(), on)),
-            ]
-            .spacing(st::SPACE_M)
-            .align_y(Alignment::Center),
-        );
-    }
-    col = col.push(st::card(list));
-    let sources = panel_order(&state.data);
-    let mut order = column![].spacing(look.row_gap);
-    for (i, u) in sources.iter().enumerate() {
-        if i > 0 {
-            order = order.push(st::hairline());
-        }
-        let hidden = state.data.prefs.hidden.contains(u.kind.as_str());
-        let name = st::fit(
-            u.display.as_str(),
-            if hidden {
-                st::Role::Muted
-            } else {
-                st::Role::Body
-            },
-            st::Cut::End,
-        );
-        order = order.push(
-            row![
-                container(name).width(Length::Fill),
-                container(st::pill(u.kind.as_str(), st::Tone::Accent)).width(KIND_W),
-                st::icon_btn(st::Icon::ChevronUp)
-                    .on_press_maybe((i > 0).then(|| Msg::Move(u.id.clone(), true))),
-                st::icon_btn(st::Icon::ChevronDown).on_press_maybe(
-                    (i + 1 < sources.len()).then(|| Msg::Move(u.id.clone(), false))
-                ),
             ]
             .spacing(st::SPACE_S)
             .align_y(Alignment::Center),
         );
     }
-    col.push(st::heading(fl!(loader(), "usage-order-title")))
-        .push(st::card(order))
-        .into()
+    col.push(st::card(list)).into()
 }
 
 #[cfg(test)]

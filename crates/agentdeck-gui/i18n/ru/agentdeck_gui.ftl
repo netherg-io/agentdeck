@@ -244,7 +244,6 @@ usage-instance = Инстанс
 usage-instance-none = Не привязан
 usage-empty = Нет источников квот.
 usage-widget-scope = Скрытые провайдеры пропадают только с панели COSMIC; опрос и роутинг их по-прежнему используют.
-usage-order-title = Порядок на панели
 usage-sources-count = { $count ->
         [one] { $count } источник
         [few] { $count } источника

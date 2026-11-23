@@ -239,7 +239,6 @@ usage-instance = Instance
 usage-instance-none = Not bound
 usage-empty = No quota sources.
 usage-widget-scope = Hidden providers leave the COSMIC panel only; polling and routing still use them.
-usage-order-title = Panel order
 usage-sources-count = { $count ->
         [one] { $count } source
        *[other] { $count } sources
