@@ -7,7 +7,7 @@ use crate::load::{AgentLoad, read_active_agents, read_instance_failures};
 use crate::policy::{
     Candidate, MIN_FIT, ModelCost, NO_REVIEW_BAN, QuotaProvenance, QuotaWindow,
     QuotaWindowEstimate, Ranked, RouterConfig, UsageAccount, UsageSnapshot, budget_allowed,
-    budget_cost_full, enabled_favorites, family_of, hint_of, is_review_task, load_router_json,
+    budget_cost_full, enabled_favorites, family_of, hint_of_on, is_review_task, load_router_json,
     max_burn, owns_usage, quota_windows, rank_candidates, reserve_active_quota, router_config,
     routing_weights, valid_answer, validate_target,
 };
@@ -1698,6 +1698,9 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
             })
             .collect();
         v.push(brief_hint.clone());
+        if let Some(a) = crate::policy::roster()["antigravityBriefHint"].as_str() {
+            v.push(format!("{brief_hint}\n\n{a}"));
+        }
         // Dedupe (first wins), drop empties, longest first.
         let mut seen = std::collections::HashSet::new();
         let mut out: Vec<String> = v
@@ -2180,7 +2183,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         best.map(|b| b.candidate.target.clone())
             .unwrap_or(Value::Null),
     );
-    if let Some(b) = best.and_then(|x| hint_of(&x.candidate.model)) {
+    if let Some(b) = best.and_then(|x| hint_of_on(&x.candidate.provider, &x.candidate.model)) {
         out.insert("briefHint".into(), Value::from(b));
     }
     out.insert(
@@ -2236,7 +2239,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         );
     }
     if let Some(req) = &requested {
-        if let Some(h) = hint_of(&req.model) {
+        if let Some(h) = hint_of_on(&req.provider, &req.model) {
             out.insert("requestedBriefHint".into(), Value::from(h));
         }
         let req_target = ranking

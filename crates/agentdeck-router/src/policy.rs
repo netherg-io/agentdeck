@@ -101,20 +101,31 @@ pub fn roster_brief_hint() -> String {
         .to_string()
 }
 
-pub fn hint_of(model: &str) -> Option<String> {
-    let parts = [
-        Some(roster_brief_hint()),
-        family_of(model).and_then(|f| f.brief_hint),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|s| !s.is_empty())
-    .collect::<Vec<_>>();
+/// Shared policy plus the harness hint on Antigravity instances (their
+/// background-task model differs, so it replaces the family `Turn end` text),
+/// otherwise the family hint.
+pub fn hint_of_on(provider: &str, model: &str) -> Option<String> {
+    let specific = if provider.starts_with("antigravity") {
+        roster()["antigravityBriefHint"]
+            .as_str()
+            .map(str::to_string)
+    } else {
+        family_of(model).and_then(|f| f.brief_hint)
+    };
+    let parts = [Some(roster_brief_hint()), specific]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
     if parts.is_empty() {
         None
     } else {
         Some(parts.join("\n\n"))
     }
+}
+
+pub fn hint_of(model: &str) -> Option<String> {
+    hint_of_on("", model)
 }
 
 fn review_re() -> Regex {

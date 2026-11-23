@@ -175,6 +175,7 @@ Keep prepared payloads and responses private (`umask 077`) until checkpointing/r
 
 `roster.json`:
 - Top-level `briefHint`: required policy for every routed child, composed before any family `briefHint`.
+- Top-level `antigravityBriefHint`: replaces the family `briefHint` for targets whose provider instance id starts with `antigravity` (Antigravity ends the turn and is woken when its background command exits, instead of polling inside the turn); other harnesses keep the family hint.
 - `families`: regex per model family, first match wins. Profiles describe durable family strengths, not versions.
 - `minEffort` (optional, per family): lowest ordinary effort the router selects or the hook accepts for that family (Muse Spark: `high`, user rule 2026-10-10). Difficulty above the floor still raises effort; explicit lower requests are denied with a repaired target.
 - `spendToZero` (optional, per family): ignores any weekly reserve and uses task cost 0 for tie-breaks; the task must still fit the remaining quota (Muse Spark, user rule 2026-10-14).
