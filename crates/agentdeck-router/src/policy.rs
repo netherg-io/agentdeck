@@ -106,7 +106,9 @@ pub fn roster_brief_hint() -> String {
 /// otherwise the family hint.
 pub fn hint_of_on(provider: &str, model: &str) -> Option<String> {
     let specific = if provider.starts_with("antigravity") {
-        roster()["antigravityBriefHint"].as_str().map(str::to_string)
+        roster()["antigravityBriefHint"]
+            .as_str()
+            .map(str::to_string)
     } else {
         family_of(model).and_then(|f| f.brief_hint)
     };

@@ -1060,9 +1060,15 @@ fn turn_end_hint_follows_the_harness() {
     ] {
         let hint = hint_of_on(provider, model).unwrap();
         assert!(hint.starts_with(&shared), "{provider}/{model}");
-        assert!(hint.contains("Turn end (Antigravity)"), "{provider}/{model}");
+        assert!(
+            hint.contains("Turn end (Antigravity)"),
+            "{provider}/{model}"
+        );
         assert!(hint.contains("never poll in a loop"), "{provider}/{model}");
-        assert!(!hint.contains("INSIDE THIS SAME TURN"), "{provider}/{model}");
+        assert!(
+            !hint.contains("INSIDE THIS SAME TURN"),
+            "{provider}/{model}"
+        );
         assert!(!hint.contains("timeout 540"), "{provider}/{model}");
     }
     for (provider, model) in [
@@ -1072,7 +1078,10 @@ fn turn_end_hint_follows_the_harness() {
         ("gemini_cli", "gemini-4-neon"),
     ] {
         let hint = hint_of_on(provider, model).unwrap();
-        assert!(!hint.contains("Turn end (Antigravity)"), "{provider}/{model}");
+        assert!(
+            !hint.contains("Turn end (Antigravity)"),
+            "{provider}/{model}"
+        );
     }
     assert!(
         hint_of_on("gemini_cli", "gemini-4-neon")
