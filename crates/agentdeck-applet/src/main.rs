@@ -9,7 +9,7 @@ use cosmic::iced::core::{
     widget::{Operation, Tree},
 };
 use cosmic::iced::platform_specific::shell::wayland::commands::popup::destroy_popup;
-use cosmic::iced::{Alignment, Length, Rectangle, Subscription, window};
+use cosmic::iced::{Alignment, Length, Point, Rectangle, Subscription, window};
 use cosmic::{Element, Task, app, widget};
 use std::{
     collections::HashSet,
@@ -221,6 +221,212 @@ impl<'a, Message: 'a> From<SmoothScroll<'a, Message>> for Element<'a, Message> {
     }
 }
 
+/// Picks the first progressive collapse stage fitting within `max_width` and
+/// returns `(stage_index, surface_width)`. When constrained, keeps the surface
+/// at `max_width` so `cosmic-panel`'s relax pass does not bounce bounds back.
+fn fit_stage(widths: &[f32], max_width: Option<f32>) -> (usize, f32) {
+    let Some(max_w) = max_width else {
+        return (0, widths[0]);
+    };
+    if widths[0] <= max_w {
+        return (0, widths[0]);
+    }
+    for (idx, &w) in widths.iter().enumerate().skip(1) {
+        if w <= max_w {
+            return (idx, max_w.max(w));
+        }
+    }
+    let last = widths.len() - 1;
+    (last, max_w.max(widths[last]))
+}
+
+/// Measures candidate panel layouts with the real renderer and picks the most
+/// expanded stage that fits inside `max_width` from COSMIC panel bounds.
+struct AdaptivePanel<'a, Message> {
+    candidates: Vec<Element<'a, Message>>,
+    max_width: Option<f32>,
+}
+
+impl<'a, Message> AdaptivePanel<'a, Message> {
+    fn new(candidates: Vec<Element<'a, Message>>, max_width: Option<f32>) -> Self {
+        debug_assert!(!candidates.is_empty());
+        Self {
+            candidates,
+            max_width,
+        }
+    }
+
+    fn active(&self, tree: &Tree) -> usize {
+        (*tree.state.downcast_ref::<usize>()).min(self.candidates.len() - 1)
+    }
+}
+
+impl<Message> Widget<Message, cosmic::Theme, cosmic::Renderer> for AdaptivePanel<'_, Message> {
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Shrink, Length::Shrink)
+    }
+
+    fn tag(&self) -> cosmic::iced::core::widget::tree::Tag {
+        cosmic::iced::core::widget::tree::Tag::of::<usize>()
+    }
+
+    fn state(&self) -> cosmic::iced::core::widget::tree::State {
+        cosmic::iced::core::widget::tree::State::new(0usize)
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        self.candidates.iter().map(Tree::new).collect()
+    }
+
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(&mut self.candidates);
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &cosmic::Renderer,
+        _limits: &layout::Limits,
+    ) -> layout::Node {
+        let unlimited = layout::Limits::NONE;
+        let mut nodes = Vec::with_capacity(self.candidates.len());
+        let mut widths = Vec::with_capacity(self.candidates.len());
+        for (idx, candidate) in self.candidates.iter_mut().enumerate() {
+            let node =
+                candidate
+                    .as_widget_mut()
+                    .layout(&mut tree.children[idx], renderer, &unlimited);
+            let w = node.size().width;
+            nodes.push(node);
+            widths.push(w);
+            if self.max_width.is_none_or(|max_w| w <= max_w) {
+                break;
+            }
+        }
+        let (active, outer_w) = fit_stage(&widths, self.max_width);
+        *tree.state.downcast_mut::<usize>() = active;
+        let node = nodes.swap_remove(active);
+        let child_size = node.size();
+        let offset_x = ((outer_w - child_size.width) / 2.0).max(0.0);
+        let placed = node.move_to(Point::new(offset_x, 0.0));
+        layout::Node::with_children(Size::new(outer_w, child_size.height), vec![placed])
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &cosmic::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        let active = self.active(tree);
+        if let Some(child_layout) = layout.children().next() {
+            self.candidates[active].as_widget_mut().operate(
+                &mut tree.children[active],
+                child_layout.with_virtual_offset(layout.virtual_offset()),
+                renderer,
+                operation,
+            );
+        }
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &cosmic::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        let active = self.active(tree);
+        if let Some(child_layout) = layout.children().next() {
+            self.candidates[active].as_widget_mut().update(
+                &mut tree.children[active],
+                event,
+                child_layout.with_virtual_offset(layout.virtual_offset()),
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &cosmic::Renderer,
+    ) -> mouse::Interaction {
+        let active = self.active(tree);
+        let Some(child_layout) = layout.children().next() else {
+            return mouse::Interaction::default();
+        };
+        self.candidates[active].as_widget().mouse_interaction(
+            &tree.children[active],
+            child_layout.with_virtual_offset(layout.virtual_offset()),
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut cosmic::Renderer,
+        theme: &cosmic::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        let active = self.active(tree);
+        if let Some(child_layout) = layout.children().next() {
+            self.candidates[active].as_widget().draw(
+                &tree.children[active],
+                renderer,
+                theme,
+                style,
+                child_layout.with_virtual_offset(layout.virtual_offset()),
+                cursor,
+                viewport,
+            );
+        }
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &cosmic::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, cosmic::Theme, cosmic::Renderer>> {
+        let active = self.active(tree);
+        let child_layout = layout.children().next()?;
+        self.candidates[active].as_widget_mut().overlay(
+            &mut tree.children[active],
+            child_layout.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+}
+
+impl<'a, Message: 'a> From<AdaptivePanel<'a, Message>> for Element<'a, Message> {
+    fn from(panel: AdaptivePanel<'a, Message>) -> Self {
+        Element::new(panel)
+    }
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -297,6 +503,92 @@ fn headline(account: &AccountState, timestamp: i64) -> String {
     } else {
         "!".into()
     }
+}
+
+fn group_headline(accounts: &[&AccountState], timestamp: i64) -> String {
+    if let [only] = accounts {
+        return headline(only, timestamp);
+    }
+    let mut pct_sum = 0.0;
+    let mut pct_count = 0usize;
+    let mut any_stale = false;
+    for account in accounts {
+        if let Some(w) = panel_window(account, timestamp) {
+            let fresh = account.status != "stale";
+            if !fresh {
+                any_stale = true;
+            }
+            pct_sum += remaining(w, fresh, timestamp);
+            pct_count += 1;
+        }
+    }
+    if pct_count > 0 {
+        let suffix = if any_stale { "~" } else { "" };
+        return format!("{:.0}%{suffix}", pct_sum / pct_count as f64);
+    }
+    let mut currency: Option<&str> = None;
+    let mut total = 0.0;
+    let mut bal_count = 0usize;
+    let mut bal_stale = false;
+    let mut mixed = false;
+    for account in accounts {
+        let Some(b) = account.balances.first() else {
+            continue;
+        };
+        let Ok(n) = b.total.parse::<f64>() else {
+            mixed = true;
+            break;
+        };
+        if !n.is_finite() {
+            mixed = true;
+            break;
+        }
+        match currency {
+            None => currency = Some(&b.currency),
+            Some(c) if c != b.currency => {
+                mixed = true;
+                break;
+            }
+            Some(_) => {}
+        }
+        if account.status == "stale" {
+            bal_stale = true;
+        }
+        total += n;
+        bal_count += 1;
+    }
+    if !mixed
+        && let Some(cur) = currency
+        && bal_count > 0
+    {
+        let suffix = if bal_stale { "~" } else { "" };
+        return format!("{}{suffix}", money(&format!("{total:.4}"), cur));
+    }
+    accounts
+        .iter()
+        .find_map(|a| a.balances.first().map(|_| headline(a, timestamp)))
+        .unwrap_or_else(|| "!".into())
+}
+
+/// Progressive collapse stages: stage 0 expands every instance, each next stage
+/// collapses the next largest multi-account provider group to one combined value.
+fn collapse_stages(groups: &[(&str, Vec<&AccountState>)]) -> Vec<Vec<bool>> {
+    let mut multi: Vec<usize> = groups
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, list))| list.len() > 1)
+        .map(|(i, _)| i)
+        .collect();
+    multi.sort_by(|&a, &b| groups[b].1.len().cmp(&groups[a].1.len()));
+
+    let mut collapsed = vec![false; groups.len()];
+    let mut stages = Vec::with_capacity(multi.len() + 1);
+    stages.push(collapsed.clone());
+    for idx in multi {
+        collapsed[idx] = true;
+        stages.push(collapsed.clone());
+    }
+    stages
 }
 
 fn reset_text(reset: Option<i64>, timestamp: i64) -> String {
@@ -385,13 +677,20 @@ fn provider_icon(provider: &str) -> widget::icon::Handle {
     widget::icon::from_svg_bytes(bytes).symbolic(true)
 }
 
+fn visible_groups<'a>(
+    accounts: &'a [AccountState],
+    prefs: &Prefs,
+) -> Vec<(&'a str, Vec<&'a AccountState>)> {
+    let mut groups = prefs.group_by_provider(accounts, |a| a.id.as_str(), |a| a.provider.as_str());
+    groups.retain(|(provider, _)| !prefs.hidden.contains(*provider));
+    groups
+}
+
 fn visible_accounts<'a>(accounts: &'a [AccountState], prefs: &Prefs) -> Vec<&'a AccountState> {
-    let mut shown: Vec<_> = accounts
-        .iter()
-        .filter(|a| !prefs.hidden.contains(&a.provider))
-        .collect();
-    shown.sort_by_key(|a| prefs.rank(&a.id));
-    shown
+    visible_groups(accounts, prefs)
+        .into_iter()
+        .flat_map(|(_, list)| list)
+        .collect()
 }
 
 fn new_state_path() -> PathBuf {
@@ -566,28 +865,13 @@ impl cosmic::Application for App {
     }
     fn view(&self) -> Element<'_, Message> {
         let timestamp = now();
-        let mut row = widget::row(vec![]).spacing(12).align_y(Alignment::Center);
-        if let Ok(state) = &self.state {
-            let mut shown = 0;
-            for account in visible_accounts(&state.accounts, &self.prefs) {
-                shown += 1;
-                row = row.push(
-                    widget::row(vec![])
-                        .spacing(4)
-                        .align_y(Alignment::Center)
-                        .push(widget::icon(provider_icon(&account.provider)).size(16))
-                        .push(widget::text(headline(account, timestamp)).size(14)),
-                );
-            }
-            if shown == 0 {
-                row = row.push(widget::text("AI —").size(14));
-            }
-        } else {
-            row = row.push(widget::text("AI !").size(14));
-        }
-        widget::autosize::autosize(
+        let pad = self.core.applet.suggested_padding(true).0;
+        fn panel_button<'a>(
+            row: widget::Row<'a, Message, cosmic::Theme>,
+            pad: u16,
+        ) -> Element<'a, Message> {
             widget::button::custom(row)
-                .padding([0, self.core.applet.suggested_padding(true).0])
+                .padding([0, pad])
                 .on_press_with_rectangle(|offset, bounds| {
                     Message::TogglePopup(Rectangle {
                         x: (bounds.x - offset.x) as i32,
@@ -597,10 +881,76 @@ impl cosmic::Application for App {
                     })
                 })
                 .description("AI Usage: открыть подробные квоты и балансы")
-                .class(cosmic::theme::Button::AppletIcon),
-            AUTOSIZE.clone(),
-        )
-        .into()
+                .class(cosmic::theme::Button::AppletIcon)
+                .into()
+        }
+        let panel_item = |provider: &str, text: String| {
+            widget::row(vec![])
+                .spacing(4)
+                .align_y(Alignment::Center)
+                .push(widget::icon(provider_icon(provider)).size(16))
+                .push(widget::text(text).size(14))
+        };
+        let candidates = match &self.state {
+            Ok(state) => {
+                let groups = visible_groups(&state.accounts, &self.prefs);
+                if groups.is_empty() {
+                    vec![panel_button(
+                        widget::row(vec![])
+                            .spacing(12)
+                            .align_y(Alignment::Center)
+                            .push(widget::text("AI —").size(14)),
+                        pad,
+                    )]
+                } else {
+                    collapse_stages(&groups)
+                        .into_iter()
+                        .map(|collapsed| {
+                            let mut row =
+                                widget::row(vec![]).spacing(12).align_y(Alignment::Center);
+                            for ((provider, accounts), is_collapsed) in groups.iter().zip(collapsed)
+                            {
+                                if is_collapsed {
+                                    row = row.push(panel_item(
+                                        provider,
+                                        group_headline(accounts, timestamp),
+                                    ));
+                                } else {
+                                    for account in accounts {
+                                        row = row.push(panel_item(
+                                            &account.provider,
+                                            headline(account, timestamp),
+                                        ));
+                                    }
+                                }
+                            }
+                            panel_button(row, pad)
+                        })
+                        .collect()
+                }
+            }
+            Err(_) => vec![panel_button(
+                widget::row(vec![])
+                    .spacing(12)
+                    .align_y(Alignment::Center)
+                    .push(widget::text("AI !").size(14)),
+                pad,
+            )],
+        };
+        let max_width = self
+            .core
+            .applet
+            .is_horizontal()
+            .then(|| {
+                self.core
+                    .applet
+                    .suggested_bounds
+                    .filter(|s| s.width >= 1.0)
+                    .map(|s| s.width)
+            })
+            .flatten();
+        widget::autosize::autosize(AdaptivePanel::new(candidates, max_width), AUTOSIZE.clone())
+            .into()
     }
     fn view_window(&self, _: window::Id) -> Element<'_, Message> {
         let timestamp = now();
@@ -804,23 +1154,111 @@ mod tests {
     }
 
     #[test]
-    fn hidden_providers_are_filtered() {
+    fn hidden_providers_are_filtered_and_grouped() {
         let accounts = vec![
             test_account("a", "codex"),
             test_account("b", "claude"),
             test_account("c", "codex"),
+            test_account("d", "claude"),
         ];
         let mut prefs = Prefs {
-            order: vec!["c".into()],
+            order: vec!["claude".into(), "codex".into()],
             ..Prefs::default()
         };
         let ids = |v: Vec<&AccountState>| v.iter().map(|a| a.id.clone()).collect::<Vec<_>>();
-        assert_eq!(ids(visible_accounts(&accounts, &prefs)), ["c", "a", "b"]);
+        assert_eq!(
+            ids(visible_accounts(&accounts, &prefs)),
+            ["b", "d", "a", "c"]
+        );
+        // Legacy account-id order still groups new instances with their provider.
+        let legacy = Prefs {
+            order: vec!["c".into()],
+            ..Prefs::default()
+        };
+        assert_eq!(
+            ids(visible_accounts(&accounts, &legacy)),
+            ["c", "a", "b", "d"]
+        );
         prefs.hidden.insert("codex".to_owned());
         let visible = visible_accounts(&accounts, &prefs);
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].provider, "claude");
+        assert_eq!(ids(visible), ["b", "d"]);
         prefs.hidden.insert("claude".to_owned());
         assert!(visible_accounts(&accounts, &prefs).is_empty());
+    }
+
+    fn quota_account(id: &str, provider: &str, remaining_pct: f64, stale: bool) -> AccountState {
+        let mut a = test_account(id, provider);
+        a.status = if stale { "stale" } else { "ok" }.into();
+        a.windows = vec![QuotaWindow::new(
+            "short",
+            "5h",
+            100.0 - remaining_pct,
+            Some(300),
+            Some(2000),
+        )];
+        a
+    }
+
+    #[test]
+    fn group_headline_averages_quotas_and_sums_balances() {
+        let c1 = quota_account("c1", "claude", 63.0, false);
+        let c2 = quota_account("c2", "claude", 0.0, false);
+        let c3 = quota_account("c3", "claude", 0.0, false);
+        assert_eq!(group_headline(&[&c1, &c2, &c3], 1000), "21%");
+
+        let a1 = quota_account("a1", "antigravity", 100.0, false);
+        let a2 = quota_account("a2", "antigravity", 94.0, true);
+        let a3 = quota_account("a3", "antigravity", 2.0, false);
+        let broken = test_account("a4", "antigravity");
+        assert_eq!(group_headline(&[&a1, &a2, &a3, &broken], 1000), "65%~");
+        assert_eq!(group_headline(&[&broken, &broken], 1000), "!");
+
+        let mut b1 = test_account("or1", "openrouter");
+        b1.status = "ok".into();
+        b1.balances.push(model::BalanceInfo {
+            currency: "USD".into(),
+            total: "9.56".into(),
+            granted: None,
+            topped_up: None,
+        });
+        let mut b2 = test_account("or2", "openrouter");
+        b2.status = "stale".into();
+        b2.balances.push(model::BalanceInfo {
+            currency: "USD".into(),
+            total: "4.00".into(),
+            granted: None,
+            topped_up: None,
+        });
+        assert_eq!(group_headline(&[&b1, &b2], 1000), "$13.56~");
+    }
+
+    #[test]
+    fn collapse_stages_and_fit_stage_collapse_largest_groups_first() {
+        let accounts = vec![
+            test_account("cx", "codex"),
+            test_account("cl1", "claude"),
+            test_account("cl2", "claude"),
+            test_account("ag1", "antigravity"),
+            test_account("ag2", "antigravity"),
+            test_account("ag3", "antigravity"),
+        ];
+        let groups = visible_groups(&accounts, &Prefs::default());
+        assert_eq!(
+            collapse_stages(&groups),
+            vec![
+                vec![false, false, false],
+                vec![false, false, true],
+                vec![false, true, true],
+            ]
+        );
+        // Unconstrained or fitting expanded -> natural width of stage 0.
+        assert_eq!(fit_stage(&[950.0, 560.0, 420.0], None), (0, 950.0));
+        assert_eq!(fit_stage(&[950.0, 560.0, 420.0], Some(1000.0)), (0, 950.0));
+        // Tight width -> collapses largest group, holds surface at max_w.
+        assert_eq!(fit_stage(&[950.0, 560.0, 420.0], Some(700.0)), (1, 700.0));
+        // Tighter width -> collapses all multi-account groups, holds surface at max_w.
+        assert_eq!(fit_stage(&[950.0, 560.0, 420.0], Some(500.0)), (2, 500.0));
+        // Narrower than even all-collapsed -> keeps narrowest stage readable.
+        assert_eq!(fit_stage(&[950.0, 560.0, 420.0], Some(300.0)), (2, 420.0));
     }
 }

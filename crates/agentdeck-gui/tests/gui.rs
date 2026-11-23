@@ -1055,6 +1055,12 @@ fn quota_module_hides_providers_and_adds_and_removes_sources() {
             .hidden
             .is_empty()
     );
+    // Moving a provider group saves provider names (not individual account ids).
+    run(&mut state, Msg::Move("openrouter".into(), true));
+    let moved_order = agentdeck_usage::visibility::load(&visibility)
+        .unwrap()
+        .order;
+    assert_eq!(moved_order, vec!["openrouter", "claude"]);
 
     // Add goes through a preview; nothing is written before Apply.
     run(&mut state, Msg::OpenAdd);

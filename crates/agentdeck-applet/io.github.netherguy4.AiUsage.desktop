@@ -6,3 +6,5 @@ Exec=agentdeck-applet
 Icon=utilities-system-monitor-symbolic
 NoDisplay=true
 X-CosmicApplet=true
+X-OverflowPriority=50
+X-OverflowMinSize=2
