@@ -1048,3 +1048,35 @@ fn denial_preflight_reuses_full_task_and_hook_verdict() {
         canon_output(&serde_json::to_vec(&record["ranking"]).unwrap())
     );
 }
+
+#[test]
+fn turn_end_hint_follows_the_harness() {
+    use agentdeck_router::policy::hint_of_on;
+    let shared = shared_hint();
+    for (provider, model) in [
+        ("antigravity", "gemini-4-neon"),
+        ("antigravity_6", "gemini-4-neon"),
+        ("antigravity_2", "claude-sonnet-5-5"),
+    ] {
+        let hint = hint_of_on(provider, model).unwrap();
+        assert!(hint.starts_with(&shared), "{provider}/{model}");
+        assert!(hint.contains("Turn end (Antigravity)"), "{provider}/{model}");
+        assert!(hint.contains("never poll in a loop"), "{provider}/{model}");
+        assert!(!hint.contains("INSIDE THIS SAME TURN"), "{provider}/{model}");
+        assert!(!hint.contains("timeout 540"), "{provider}/{model}");
+    }
+    for (provider, model) in [
+        ("claude_1", "claude-opus-5-5"),
+        ("codex", "gpt-6.1-sol"),
+        ("opencode", "opencode-go/muse-spark-1.3-contributor"),
+        ("gemini_cli", "gemini-4-neon"),
+    ] {
+        let hint = hint_of_on(provider, model).unwrap();
+        assert!(!hint.contains("Turn end (Antigravity)"), "{provider}/{model}");
+    }
+    assert!(
+        hint_of_on("gemini_cli", "gemini-4-neon")
+            .unwrap()
+            .contains("INSIDE THIS SAME TURN")
+    );
+}
