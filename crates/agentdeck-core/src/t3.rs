@@ -594,6 +594,118 @@ pub fn cache_file(t3_root: &Path, id: &str) -> PathBuf {
     caches_dir(t3_root).join(format!("{id}.json"))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AntigravityInstanceConfig {
+    pub enabled: bool,
+    pub auth_method: String,
+    pub binary_path: Option<String>,
+}
+
+/// T3's per-instance Antigravity profile dir:
+/// `<t3_root>/userdata/providers/antigravity/<sha256(id)>`.
+pub fn antigravity_profile_dir(t3_root: &Path, id: &str) -> anyhow::Result<PathBuf> {
+    check_t3_slug(id)?;
+    use sha2::Digest;
+    let hash = format!("{:x}", sha2::Sha256::digest(id.as_bytes()));
+    Ok(t3_root.join("userdata/providers/antigravity").join(hash))
+}
+
+/// Read an Antigravity instance's enabled flag, auth method (default
+/// `"oauth-personal"`), and optional `binaryPath` override from T3
+/// `userdata/settings.json`. Returns `Ok(None)` when absent or a different driver.
+pub fn read_antigravity_instance_config(
+    t3_root: &Path,
+    id: &str,
+) -> anyhow::Result<Option<AntigravityInstanceConfig>> {
+    check_t3_slug(id)?;
+    if !t3_root.exists() {
+        anyhow::bail!(
+            "T3 data directory not found at {}; start T3 Code",
+            t3_root.display()
+        );
+    }
+    let settings_path = settings_file(t3_root);
+    let raw = fs::read(&settings_path)
+        .map_err(|e| anyhow::anyhow!("cannot read T3 {}: {e}", settings_path.display()))?;
+    let settings = parse_settings_strict(&raw)?;
+    let pi = settings
+        .get("providerInstances")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("T3 settings.json has no providerInstances object"))?;
+    let Some(entry) = pi.get(id) else {
+        return Ok(None);
+    };
+    if entry.get("driver").and_then(Value::as_str) != Some("antigravity") {
+        return Ok(None);
+    }
+    let enabled = entry
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let cfg = entry.get("config");
+    let auth_method = cfg
+        .and_then(|c| c.get("authMethod"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("oauth-personal")
+        .to_owned();
+    let binary_path = cfg
+        .and_then(|c| c.get("binaryPath"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    Ok(Some(AntigravityInstanceConfig {
+        enabled,
+        auth_method,
+        binary_path,
+    }))
+}
+
+/// Resolve the Antigravity CLI executable T3 uses: explicit `binaryPath` override
+/// when present and existing, otherwise T3's managed release pointed to by
+/// `<t3_root>/tools/antigravity-acp/<platform-arch>/active.json`.
+pub fn resolve_antigravity_binary(t3_root: &Path, configured: Option<&str>) -> Option<PathBuf> {
+    if let Some(raw) = configured.map(str::trim).filter(|s| !s.is_empty()) {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let path = crate::sync::expand_tilde(raw, &home);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let platform = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "darwin",
+        "windows" => "win32",
+        _ => return None,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        _ => return None,
+    };
+    let exe_name = if platform == "win32" {
+        "agy.exe"
+    } else {
+        "antigravity"
+    };
+    let managed = t3_root
+        .join("tools/antigravity-acp")
+        .join(format!("{platform}-{arch}"));
+    let active: Value =
+        serde_json::from_slice(&fs::read(managed.join("active.json")).ok()?).ok()?;
+    let release_id = active
+        .get("releaseId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.contains('/') && !s.contains('\\') && !s.contains(".."))?;
+    let exe = managed.join("versions").join(release_id).join(exe_name);
+    exe.is_file().then_some(exe)
+}
+
 /// Authoritative enabled flag for one T3 instance from `userdata/settings.json`
 /// (`providerInstances.<id>.enabled`). Returns `Ok(None)` when the instance id is
 /// absent from `providerInstances`; refuses missing/corrupt settings.
@@ -2158,6 +2270,96 @@ mod tests {
                 .find(|e| e.id == "antigravity_5")
                 .is_some_and(|e| e.action == "unchanged"),
             "{entries:?}"
+        );
+    }
+
+    #[test]
+    fn antigravity_profile_config_and_binary_resolution() {
+        let (_paths, t3, _g) = setup(
+            "agy-helpers",
+            r#"{
+              "providerInstances": {
+                "antigravity": {
+                  "driver": "antigravity",
+                  "enabled": true,
+                  "config": { "authMethod": "oauth-business", "binaryPath": "" }
+                },
+                "antigravity_2": {
+                  "driver": "antigravity",
+                  "enabled": true,
+                  "config": {}
+                },
+                "codex": { "driver": "codex", "enabled": true }
+              }
+            }"#,
+        );
+
+        let dir = antigravity_profile_dir(&t3, "antigravity").unwrap();
+        assert!(dir.ends_with(
+            "userdata/providers/antigravity/ac0a3dfd6dddb20962cecff6ee5fe65e19d3923be20e52c5ab52ff877f7e4c32"
+        ));
+        assert!(antigravity_profile_dir(&t3, "../escape").is_err());
+
+        let c1 = read_antigravity_instance_config(&t3, "antigravity")
+            .unwrap()
+            .unwrap();
+        assert!(c1.enabled);
+        assert_eq!(c1.auth_method, "oauth-business");
+        assert_eq!(c1.binary_path, None);
+
+        let c2 = read_antigravity_instance_config(&t3, "antigravity_2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(c2.auth_method, "oauth-personal");
+        assert!(
+            read_antigravity_instance_config(&t3, "codex")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read_antigravity_instance_config(&t3, "missing")
+                .unwrap()
+                .is_none()
+        );
+
+        // Managed binary via active.json, plus traversal rejection and explicit override.
+        let platform = match std::env::consts::OS {
+            "linux" => "linux",
+            "macos" => "darwin",
+            "windows" => "win32",
+            other => panic!("unsupported test os {other}"),
+        };
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "x64",
+            "aarch64" => "arm64",
+            other => panic!("unsupported test arch {other}"),
+        };
+        let exe_name = if platform == "win32" {
+            "agy.exe"
+        } else {
+            "antigravity"
+        };
+        let managed = t3
+            .join("tools/antigravity-acp")
+            .join(format!("{platform}-{arch}"));
+        let rel = managed.join("versions/rel123");
+        fs::create_dir_all(&rel).unwrap();
+        let managed_exe = rel.join(exe_name);
+        fs::write(&managed_exe, b"bin").unwrap();
+        fs::write(managed.join("active.json"), r#"{"releaseId":"../escape"}"#).unwrap();
+        assert_eq!(resolve_antigravity_binary(&t3, None), None);
+
+        fs::write(managed.join("active.json"), r#"{"releaseId":"rel123"}"#).unwrap();
+        assert_eq!(
+            resolve_antigravity_binary(&t3, None).as_deref(),
+            Some(managed_exe.as_path())
+        );
+
+        let custom = t3.join("custom-agy");
+        fs::write(&custom, b"bin").unwrap();
+        assert_eq!(
+            resolve_antigravity_binary(&t3, custom.to_str()).as_deref(),
+            Some(custom.as_path())
         );
     }
 }
