@@ -332,18 +332,31 @@ pub async fn run_daemon(
     let mut consecutive_failures: u32 = 0;
     let mut last_history = None;
     let mut last_t3_kick: Option<Instant> = None;
+    let mut agy_backoff = providers::antigravity::RenewBackoff::default();
     loop {
         let (accounts, refresh_seconds, stale_seconds) = load()?;
         let interval = refresh_seconds.max(crate::config::MIN_REFRESH_SECONDS);
         let previous = read_state(paths);
+        let now = util::unix_now();
+        let t3_root = agentdeck_core::t3::t3_root().ok();
+        let renewed_agy = match t3_root.as_deref() {
+            Some(root) if root.join("userdata/server-runtime.json").exists() => {
+                providers::antigravity::renew_expiring_tokens(root, &accounts, &mut agy_backoff)
+                    .await
+            }
+            _ => 0,
+        };
         // Refresh before polling so this cycle already reads the new caches.
-        if previous.as_ref().is_some_and(|prev| {
-            t3_needs_refresh(
-                prev,
-                util::unix_now(),
-                T3_KICK_AFTER_SECONDS.min(stale_seconds / 2),
-            )
-        }) && last_t3_kick.is_none_or(|at| at.elapsed() >= T3_KICK_MIN_GAP)
+        let needs_t3_kick = previous.as_ref().is_some_and(|prev| {
+            t3_needs_refresh(prev, now, T3_KICK_AFTER_SECONDS.min(stale_seconds / 2))
+                || t3_root.as_deref().is_some_and(|root| {
+                    providers::antigravity::has_fresh_token_with_expired_cache(
+                        root, &accounts, prev, now,
+                    )
+                })
+        });
+        if renewed_agy > 0
+            || (needs_t3_kick && last_t3_kick.is_none_or(|at| at.elapsed() >= T3_KICK_MIN_GAP))
         {
             last_t3_kick = Some(Instant::now());
             refresh_t3_providers(paths).await;
