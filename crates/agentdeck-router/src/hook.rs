@@ -580,41 +580,25 @@ fn run_route(
     task_text: &str,
 ) -> anyhow::Result<Value> {
     let exe = agentdeck_core::current_exe()?;
-    let mut child = std::process::Command::new(exe)
-        .args(route_args(source, validate))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    use std::io::Write;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("no stdin"))?
-        .write_all(task_text.as_bytes())?;
-    let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(ROUTE_TIMEOUT_SECS);
-    let status = loop {
-        match child.try_wait()? {
-            Some(s) => break s,
-            None => {
-                if start.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    anyhow::bail!("route timed out after {ROUTE_TIMEOUT_SECS}s");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(route_args(source, validate));
+    let output = crate::run_piped_with_timeout(
+        &mut cmd,
+        task_text.as_bytes(),
+        std::time::Duration::from_secs(ROUTE_TIMEOUT_SECS),
+        ROUTE_MAX_BYTES,
+    )
+    .map_err(|e| match e {
+        crate::ChildRunError::TimedOut => {
+            anyhow::anyhow!("route timed out after {ROUTE_TIMEOUT_SECS}s")
         }
-    };
-    let output = child.wait_with_output()?;
-    if output.stdout.len() + output.stderr.len() > ROUTE_MAX_BYTES {
-        anyhow::bail!("route output too large");
-    }
-    if !status.success() {
+        crate::ChildRunError::OutputTooLarge => anyhow::anyhow!("route output too large"),
+        crate::ChildRunError::Io(err) => err.into(),
+    })?;
+    if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.trim().chars().take(300).collect::<String>();
-        anyhow::bail!("route exited with {status}: {detail}");
+        anyhow::bail!("route exited with {}: {detail}", output.status);
     }
     Ok(serde_json::from_slice(&output.stdout)?)
 }

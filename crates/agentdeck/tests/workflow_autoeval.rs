@@ -109,13 +109,31 @@ fn run_record(home: &Path, router: &Path, jev: &Path, state: &Path, thread: &str
 }
 
 fn wait_exit(mut child: Child, secs: u64) -> std::process::Output {
+    use std::io::Read;
+    let mut out_pipe = child.stdout.take().unwrap();
+    let mut err_pipe = child.stderr.take().unwrap();
+    let out_t = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        out_pipe.read_to_end(&mut buf).unwrap();
+        buf
+    });
+    let err_t = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        err_pipe.read_to_end(&mut buf).unwrap();
+        buf
+    });
     let until = Instant::now() + Duration::from_secs(secs);
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            return child.wait_with_output().unwrap();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
         }
         assert!(Instant::now() < until, "record did not exit promptly");
         std::thread::sleep(Duration::from_millis(25));
+    };
+    std::process::Output {
+        status,
+        stdout: out_t.join().unwrap(),
+        stderr: err_t.join().unwrap(),
     }
 }
 

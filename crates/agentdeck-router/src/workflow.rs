@@ -529,36 +529,20 @@ pub fn run_router_excluding(task: &str, source: &str, exclude: &[String]) -> any
     for x in exclude {
         cmd.args(["--exclude", x]);
     }
-    let mut child = cmd
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    use std::io::Write;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("no stdin"))?
-        .write_all(task.as_bytes())?;
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait()? {
-            Some(_) => break,
-            None => {
-                if start.elapsed() > std::time::Duration::from_millis(55_000) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    anyhow::bail!("route.mjs timed out");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
+    cmd.arg("-");
+    let out = crate::run_piped_with_timeout(
+        &mut cmd,
+        task.as_bytes(),
+        std::time::Duration::from_millis(55_000),
+        16 << 20,
+    )
+    .map_err(|e| match e {
+        crate::ChildRunError::TimedOut => anyhow::anyhow!("route.mjs timed out"),
+        crate::ChildRunError::OutputTooLarge => {
+            anyhow::anyhow!("route.mjs failed; inspect the router separately")
         }
-    }
-    let out = child.wait_with_output()?;
-    if out.stdout.len() > (16 << 20) {
-        anyhow::bail!("route.mjs failed; inspect the router separately");
-    }
+        crate::ChildRunError::Io(err) => err.into(),
+    })?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         anyhow::bail!("route.mjs failed: {stderr}");
