@@ -1089,3 +1089,73 @@ fn turn_end_hint_follows_the_harness() {
             .contains("INSIDE THIS SAME TURN")
     );
 }
+
+#[test]
+fn hook_drains_route_output_larger_than_pipe_buffer() {
+    // Enough pool entries that `agentdeck route` writes > 70 KiB of pretty JSON
+    // to stdout (exceeding Linux's 64 KiB default pipe buffer as well as the
+    // 4-8 KiB buffer under pipe-user-pages-soft pressure).
+    let owned: Vec<(String, String)> = (0..60)
+        .map(|i| (format!("codex_{i}"), format!("gpt-6.1-sol-{i}")))
+        .collect();
+    let mut pool: Vec<(&str, &str)> = vec![SOL, OPUS];
+    for (p, m) in &owned {
+        pool.push((p.as_str(), m.as_str()));
+    }
+    let mut pairs: Vec<(String, serde_json::Value)> = vec![
+        ("codex_gpt_6_1_sol".into(), level(2.9, 0.95)),
+        ("claudeagent_claude_opus_5_5".into(), level(2.4, 0.95)),
+    ];
+    for i in 0..60 {
+        pairs.push((format!("codex_{i}_gpt_6_1_sol_{i}"), level(1.0, 0.2)));
+    }
+    let pair_refs: Vec<(&str, serde_json::Value)> =
+        pairs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    let fx = Fixture::new(&pool, &answers_for(&pair_refs, 1.0, 1.0), None);
+    let route_out = Command::new(env!("CARGO_BIN_EXE_agentdeck"))
+        .args([
+            "route",
+            "--source",
+            "claudeAgent",
+            "--validate-target",
+            SOL.0,
+            SOL.1,
+            "-",
+        ])
+        .current_dir(&fx.dir)
+        .envs(fx.base_env("rt-rust"))
+        .env("AGENTDECK_ROUTE_MOCK_JEV", &fx.mock_jev)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut route_child = route_out;
+    route_child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"Fix the parser")
+        .unwrap();
+    let route_res = route_child.wait_with_output().unwrap();
+    assert!(route_res.status.success());
+    assert!(
+        route_res.stdout.len() > 65_536,
+        "fixture route stdout must exceed 64 KiB pipe buffer, got {} bytes",
+        route_res.stdout.len()
+    );
+
+    let input = delegate_input(
+        "mcp__t3-code__delegate_task",
+        "Fix the parser",
+        serde_json::json!({"providerInstanceId": SOL.0, "model": SOL.1, "options": {"reasoningEffort": "medium"}}),
+        serde_json::json!({}),
+    );
+    let (code, out, err) = run_rust(&fx, "claude", &input.to_string());
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    let verdict: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        verdict["hookSpecificOutput"]["permissionDecision"], "allow",
+        "unexpected verdict: {verdict}"
+    );
+}

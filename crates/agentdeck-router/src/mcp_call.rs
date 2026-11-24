@@ -7,7 +7,7 @@
 //! needs no file. Exit 2 on usage errors, 1 on failures (like the .mjs).
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
@@ -302,37 +302,15 @@ fn spawn_with_input(
     timeout: Duration,
     max_bytes: usize,
 ) -> anyhow::Result<std::process::Output> {
-    use std::process::Stdio;
-    let mut child = std::process::Command::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("no stdin"))?
-        .write_all(input.as_bytes())?;
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait()? {
-            Some(_) => break,
-            None => {
-                if start.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    anyhow::bail!("timeout");
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    crate::run_piped_with_timeout(&mut cmd, input.as_bytes(), timeout, max_bytes).map_err(|e| {
+        match e {
+            crate::ChildRunError::TimedOut => anyhow::anyhow!("timeout"),
+            crate::ChildRunError::OutputTooLarge => anyhow::anyhow!("output too large"),
+            crate::ChildRunError::Io(err) => err.into(),
         }
-    }
-    let out = child.wait_with_output()?;
-    if out.stdout.len() > max_bytes {
-        anyhow::bail!("output too large");
-    }
-    Ok(out)
+    })
 }
 
 fn this_exe_route(args: &[&str], input: &str, timeout_secs: u64) -> anyhow::Result<String> {
@@ -846,5 +824,22 @@ mod legacy_suite_tests {
         let conn = scoped_connection().unwrap();
         unsafe { std::env::remove_var("T3_SHELL_MCP_SOCKET") };
         assert_eq!(conn.endpoint, "http://127.0.0.1:3773/mcp");
+    }
+
+    #[test]
+    fn spawn_with_input_does_not_deadlock_when_output_exceeds_pipe_buffer() {
+        let out = spawn_with_input(
+            std::ffi::OsStr::new("sh"),
+            &[
+                "-c",
+                "s=0123456789abcdef; i=0; while [ $i -lt 14 ]; do s=$s$s; i=$((i+1)); done; printf '%s' \"$s\"",
+            ],
+            "",
+            Duration::from_secs(2),
+            1024 * 1024,
+        )
+        .expect("must drain >64KiB stdout without timing out");
+        assert!(out.status.success());
+        assert_eq!(out.stdout.len(), 262_144);
     }
 }
