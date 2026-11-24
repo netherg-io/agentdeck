@@ -382,10 +382,11 @@ async fn renew_single_token(
         .await
         .context("не удалось отправить ACP authenticate")?;
     stdin.flush().await?;
-    // Close stdin so an expired/revoked refresh token cancels immediately instead
-    // of blocking on interactive login input.
-    drop(stdin);
+    // Keep stdin open until `authenticate` replies: EOF cancels the in-flight
+    // ACP request (`-32800 Sign-in was cancelled.`). `SSH_CONNECTION` +
+    // `BROWSER=/bin/false` already force a fast error if interactive login is needed.
     read_rpc_response(&mut lines, 2, "authenticate").await?;
+    drop(stdin);
 
     let _ = child.kill().await;
     let _ = child.wait().await;
@@ -479,7 +480,7 @@ mod tests {
 
     fn write_mock_acp(dir: &Path, script: &str) -> PathBuf {
         let path = dir.join("mock-antigravity");
-        fs::write(&path, format!("#!/bin/sh\nset -eu\n{script}\n")).unwrap();
+        fs::write(&path, format!("#!/usr/bin/env bash\nset -eu\n{script}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
@@ -536,6 +537,16 @@ mod tests {
 read -r _init
 printf '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1}}}}\n'
 read -r _auth
+# Regression guard: stdin must stay open while authenticate is in flight
+# (real antigravity acp cancels the RPC on stdin EOF).
+if ! read -t 0.05 -r _eof_check; then
+  # rc=1 means EOF (closed); rc>128 means timeout (still open, expected).
+  rc=$?
+  if [ "$rc" -eq 1 ]; then
+    printf '{{"jsonrpc":"2.0","id":2,"error":{{"code":-32800,"message":"Sign-in was cancelled."}}}}\n'
+    exit 0
+  fi
+fi
 printf '%s' '{}' > "$GEMINI_HOME/antigravity-acp/antigravity-oauth-token"
 printf '{{"jsonrpc":"2.0","id":2,"result":{{"_meta":{{}}}}}}\n'
 "#,
