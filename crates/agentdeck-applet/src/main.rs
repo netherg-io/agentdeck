@@ -456,18 +456,21 @@ fn panel_window(account: &AccountState, timestamp: i64) -> Option<&QuotaWindow> 
         .iter()
         .filter(|w| !general || w.scope.as_deref().is_none_or(str::is_empty))
         .collect();
-    // The binding window is the one with the least left; ties prefer 5h, then weekly.
-    let rank = |w: &QuotaWindow| match w.duration_mins {
-        Some(model::FIVE_HOUR_MINS) => 0,
-        Some(model::WEEKLY_MINS) => 1,
-        _ => 2,
-    };
-    let fresh = account.status != "stale";
-    pool.into_iter().min_by(|a, b| {
-        remaining(a, fresh, timestamp)
-            .total_cmp(&remaining(b, fresh, timestamp))
-            .then(rank(*a).cmp(&rank(*b)))
-    })
+    pool.iter()
+        .copied()
+        // Under 1% counts as exhausted: such a window blocks work long before it reads 0.
+        .find(|w| remaining(w, account.status != "stale", timestamp) < 1.0)
+        .or_else(|| {
+            pool.iter()
+                .copied()
+                .find(|w| w.duration_mins == Some(model::FIVE_HOUR_MINS))
+        })
+        .or_else(|| {
+            pool.iter()
+                .copied()
+                .find(|w| w.duration_mins == Some(model::WEEKLY_MINS))
+        })
+        .or_else(|| pool.first().copied())
 }
 
 fn money(value: &str, currency: &str) -> String {
