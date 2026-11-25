@@ -456,20 +456,18 @@ fn panel_window(account: &AccountState, timestamp: i64) -> Option<&QuotaWindow> 
         .iter()
         .filter(|w| !general || w.scope.as_deref().is_none_or(str::is_empty))
         .collect();
-    pool.iter()
-        .copied()
-        .find(|w| remaining(w, account.status != "stale", timestamp) <= 0.0)
-        .or_else(|| {
-            pool.iter()
-                .copied()
-                .find(|w| w.duration_mins == Some(model::FIVE_HOUR_MINS))
-        })
-        .or_else(|| {
-            pool.iter()
-                .copied()
-                .find(|w| w.duration_mins == Some(model::WEEKLY_MINS))
-        })
-        .or_else(|| pool.first().copied())
+    // The binding window is the one with the least left; ties prefer 5h, then weekly.
+    let rank = |w: &QuotaWindow| match w.duration_mins {
+        Some(model::FIVE_HOUR_MINS) => 0,
+        Some(model::WEEKLY_MINS) => 1,
+        _ => 2,
+    };
+    let fresh = account.status != "stale";
+    pool.into_iter().min_by(|a, b| {
+        remaining(a, fresh, timestamp)
+            .total_cmp(&remaining(b, fresh, timestamp))
+            .then(rank(*a).cmp(&rank(*b)))
+    })
 }
 
 fn money(value: &str, currency: &str) -> String {
@@ -1111,6 +1109,10 @@ mod tests {
         ];
         assert_eq!(headline(&account, 1000), "0%");
         assert_eq!(headline(&account, 1200), "75%");
+        // A nearly exhausted week binds even though it is not exactly zero.
+        account.windows[2] = QuotaWindow::new("week", "week", 99.9, Some(10080), Some(5000));
+        account.windows[0] = QuotaWindow::new("short", "5h", 0.0, Some(300), Some(5000));
+        assert_eq!(headline(&account, 1200), "0%");
         account.status = "stale".into();
         assert_eq!(headline(&account, 1200), "0%~");
         assert_eq!(masked_email("name@example.com"), "n•••@example.com");
