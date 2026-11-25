@@ -109,14 +109,14 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-process"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "agentdeck"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "agent-process",
  "agentdeck-approver",
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "agentdeck-applet"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "agentdeck-usage",
  "libcosmic",
@@ -150,7 +150,7 @@ dependencies = [
 
 [[package]]
 name = "agentdeck-approver"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "agentdeck-core",
  "anyhow",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "agentdeck-coordinator"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "agentdeck-core",
  "anyhow",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "agentdeck-core"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "anyhow",
  "libc",
@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "agentdeck-gui"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "agentdeck-core",
  "agentdeck-router",
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "agentdeck-router"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "agentdeck-core",
  "anyhow",
@@ -235,7 +235,7 @@ dependencies = [
 
 [[package]]
 name = "agentdeck-usage"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "agentdeck-core",
  "anyhow",

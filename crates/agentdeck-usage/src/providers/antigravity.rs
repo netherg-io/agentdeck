@@ -377,10 +377,8 @@ pub(crate) async fn renew_expiring_tokens_at(
             continue;
         };
         let acp_dir = profile.join("antigravity-acp");
-        // Legacy `acp_token.json` carries client_id/client_secret; T3 refreshes it directly.
-        if acp_dir.join("acp_token.json").exists() {
-            continue;
-        }
+        // A legacy `acp_token.json` used to be refreshed by T3's quota probe; T3
+        // 0.1.13-nightly.20261125 removed the probe, so renew those profiles too.
         let token_path = acp_dir.join("antigravity-oauth-token");
         let Ok(live_bytes) = fs::read(&token_path) else {
             continue;
@@ -724,10 +722,16 @@ printf '{{"jsonrpc":"2.0","id":2,"result":{{"_meta":{{}}}}}}\n'
         fs::create_dir_all(&acp_dir).unwrap();
         let tok_path = acp_dir.join("antigravity-oauth-token");
         fs::write(&tok_path, token_json(EXPIRED, "old-access")).unwrap();
+        // Legacy profiles renew too, and their acp_token.json stays untouched.
+        fs::write(acp_dir.join("acp_token.json"), "{}").unwrap();
 
         let mut backoff = RenewBackoff::default();
         let count =
             renew_expiring_tokens_at(&t3, &[agy_account("antigravity_3")], &mut backoff, NOW).await;
+        assert_eq!(
+            fs::read_to_string(acp_dir.join("acp_token.json")).unwrap(),
+            "{}"
+        );
         assert_eq!(count, 1);
 
         let updated: Value = serde_json::from_slice(&fs::read(&tok_path).unwrap()).unwrap();
@@ -742,7 +746,7 @@ printf '{{"jsonrpc":"2.0","id":2,"result":{{"_meta":{{}}}}}}\n'
     }
 
     #[tokio::test]
-    async fn skips_legacy_acp_token_and_non_oauth_methods() {
+    async fn skips_non_oauth_methods() {
         let (t3, _g) = temp_root("skip");
         let marker = t3.join("should-not-run");
         let bin = write_mock_acp(&t3, &format!("touch {}\nexit 1", marker.display()));
@@ -756,16 +760,8 @@ printf '{{"jsonrpc":"2.0","id":2,"result":{{"_meta":{{}}}}}}\n'
             token_json(EXPIRED, "old"),
         )
         .unwrap();
-        fs::write(acp_dir.join("acp_token.json"), "{}").unwrap();
 
         let mut backoff = RenewBackoff::default();
-        assert_eq!(
-            renew_expiring_tokens_at(&t3, &[agy_account("antigravity_4")], &mut backoff, NOW).await,
-            0
-        );
-        assert!(!marker.exists());
-
-        fs::remove_file(acp_dir.join("acp_token.json")).unwrap();
         write_settings(&t3, "antigravity_4", true, "gemini-api-key", &bin);
         assert_eq!(
             renew_expiring_tokens_at(&t3, &[agy_account("antigravity_4")], &mut backoff, NOW).await,
