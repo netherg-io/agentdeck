@@ -93,7 +93,8 @@ fn http() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .connect_timeout(Duration::from_secs(5))
-            .user_agent("antigravity/1.1.9")
+            // The Gemini group (gemini-5h, gemini-weekly) is only returned to `antigravity/cli/*` agents.
+            .user_agent("antigravity/cli/1.5.17")
             .build()
             .expect("не удалось создать HTTP-клиент")
     })
@@ -152,8 +153,8 @@ async fn fetch_direct(t3_root: &Path, instance_id: &str, now: i64) -> Result<Vec
     Ok(windows)
 }
 
-/// Summary buckets (3p-5h, 3p-weekly) plus one Gemini window from the tightest
-/// per-model quota: the summary no longer lists Gemini buckets.
+/// Summary buckets (gemini-*, 3p-*). Without a Gemini group in the summary, one
+/// Gemini window comes from the tightest per-model quota.
 fn quota_windows(summary: &Value, models: &Value, now: i64) -> Vec<T3UsageWindow> {
     // Protobuf JSON omits a zero fraction: an exhausted quota carries only resetTime.
     let used = |q: &Value| {
