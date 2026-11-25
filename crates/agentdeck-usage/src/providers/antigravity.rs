@@ -15,11 +15,12 @@ use tokio::process::Command;
 use tokio::task::JoinSet;
 
 use agentdeck_core::t3::{
-    antigravity_profile_dir, read_antigravity_instance_config, resolve_antigravity_binary,
+    T3UsageWindow, antigravity_profile_dir, read_antigravity_instance_config,
+    resolve_antigravity_binary,
 };
 
 use crate::config::AccountConfig;
-use crate::model::{AccountState, AppState};
+use crate::model::{AccountState, AppState, FIVE_HOUR_MINS, QuotaWindow};
 use crate::providers::t3::{self, T3Source, parse_rfc3339};
 use crate::util;
 
@@ -43,7 +44,7 @@ pub async fn fetch(
     instance: Option<&str>,
     stale_seconds: i64,
 ) -> Result<AccountState> {
-    t3::fetch(
+    let state = t3::fetch(
         T3Source {
             id,
             name,
@@ -53,7 +54,170 @@ pub async fn fetch(
         },
         stale_seconds,
     )
-    .await
+    .await?;
+    if state.status != "waiting" || !state.windows.is_empty() {
+        return Ok(state);
+    }
+    // T3 0.1.13-nightly.20261125 dropped its Antigravity quota probe, so its cache never
+    // gets usageLimits. shortcut: remove the direct poll once T3 fills them again.
+    let (Ok(root), Some(inst)) = (
+        agentdeck_core::t3::t3_root(),
+        t3::resolve_instance_slug("antigravity", instance),
+    ) else {
+        return Ok(state);
+    };
+    let now = util::unix_now();
+    Ok(match fetch_direct(&root, &inst, now).await {
+        Ok(windows) => AccountState {
+            status: "ok".to_owned(),
+            windows,
+            error: None,
+            updated_at: now,
+            ..state
+        },
+        Err(err) => AccountState {
+            error: Some(format!(
+                "{err:#}; T3 cache: {}",
+                state.error.as_deref().unwrap_or("-")
+            )),
+            ..state
+        },
+    })
+}
+
+const QUOTA_BASE: &str = "https://daily-cloudcode-pa.googleapis.com/v1internal:";
+
+fn http() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(5))
+            .user_agent("antigravity/1.1.9")
+            .build()
+            .expect("не удалось создать HTTP-клиент")
+    })
+}
+
+/// Same endpoints the Antigravity CLI uses. Production `cloudcode-pa` answers too, but
+/// with untouched sliding windows; only `daily-` matched T3's last figures (2026-11-25).
+async fn fetch_direct(t3_root: &Path, instance_id: &str, now: i64) -> Result<Vec<QuotaWindow>> {
+    let raw = fs::read(
+        antigravity_profile_dir(t3_root, instance_id)?
+            .join("antigravity-acp/antigravity-oauth-token"),
+    )
+    .context("нет файла OAuth-токена Antigravity")?;
+    // Never propagate serde errors or response bodies: they can quote the token.
+    let token = serde_json::from_slice::<Value>(&raw)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/token/access_token")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .filter(|t| !t.trim().is_empty())
+        .context("файл OAuth-токена Antigravity повреждён")?;
+    if parse_token_meta(&raw)
+        .and_then(|m| m.expiry)
+        .is_none_or(|exp| exp <= now + T3_FRESH_MARGIN_SECS)
+    {
+        bail!("OAuth-токен Antigravity истёк; agentdeck продлит его в следующем цикле");
+    }
+    let post = |method: &'static str| {
+        let req = http()
+            .post(format!("{QUOTA_BASE}{method}"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({}));
+        async move {
+            let res = req
+                .send()
+                .await
+                .map_err(|_| anyhow::anyhow!("Google {method}: сетевая ошибка"))?;
+            if !res.status().is_success() {
+                bail!("Google {method}: HTTP {}", res.status());
+            }
+            res.json::<Value>()
+                .await
+                .map_err(|_| anyhow::anyhow!("Google {method}: некорректный JSON"))
+        }
+    };
+    let (summary, models) = tokio::try_join!(
+        post("retrieveUserQuotaSummary"),
+        post("fetchAvailableModels")
+    )?;
+    let windows = t3::map_windows("antigravity", quota_windows(&summary, &models, now));
+    if windows.is_empty() {
+        bail!("Google не вернул ни одного окна квоты Antigravity");
+    }
+    Ok(windows)
+}
+
+/// Summary buckets (3p-5h, 3p-weekly) plus one Gemini window from the tightest
+/// per-model quota: the summary no longer lists Gemini buckets.
+fn quota_windows(summary: &Value, models: &Value, now: i64) -> Vec<T3UsageWindow> {
+    // Protobuf JSON omits a zero fraction: an exhausted quota carries only resetTime.
+    let used = |q: &Value| {
+        q.get("remainingFraction")
+            .and_then(Value::as_f64)
+            .or_else(|| q.get("resetTime").map(|_| 0.0))
+            .map(|f| (1.0 - f) * 100.0)
+    };
+    let reset = |q: &Value| {
+        q.get("resetTime")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    let window = |id: &str, q: &Value| T3UsageWindow {
+        id: id.to_owned(),
+        kind: None,
+        label: None,
+        window_duration_mins: None,
+        used_percent: used(q),
+        resets_at: reset(q),
+    };
+    let groups = summary.get("groups").and_then(Value::as_array);
+    let mut out: Vec<T3UsageWindow> = summary
+        .get("buckets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .chain(
+            groups
+                .into_iter()
+                .flatten()
+                .filter_map(|g| g.get("buckets")?.as_array())
+                .flatten(),
+        )
+        .filter_map(|b| Some(window(b.get("bucketId")?.as_str()?, b)))
+        .collect();
+    if out.iter().any(|w| w.id.starts_with("gemini")) {
+        return out;
+    }
+    let tightest = models
+        .get("models")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(name, _)| name.starts_with("gemini-"))
+        .filter_map(|(_, m)| m.get("quotaInfo"))
+        .filter(|q| reset(q).is_some())
+        .min_by(|a, b| {
+            used(b)
+                .partial_cmp(&used(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    if let Some(q) = tightest {
+        // shortcut: a weekly quota resetting within 5 h is shown as the 5-hour window.
+        let weekly = reset(q)
+            .as_deref()
+            .and_then(parse_rfc3339)
+            .is_some_and(|r| r - now > (FIVE_HOUR_MINS * 60) as i64);
+        out.push(window(
+            if weekly { "gemini-weekly" } else { "gemini-5h" },
+            q,
+        ));
+    }
+    out
 }
 
 /// Per-instance failure backoff so a revoked refresh token does not respawn
@@ -694,6 +858,44 @@ printf '{{"jsonrpc":"2.0","id":2,"result":{{"_meta":{{}}}}}}\n'
         );
         let live: Value = serde_json::from_slice(&fs::read(&tok_path).unwrap()).unwrap();
         assert_eq!(live["token"]["access_token"], "t3-won");
+    }
+
+    #[test]
+    fn quota_windows_from_daily_endpoints() {
+        // Shapes and figures from the live daily endpoints on 2026-11-25.
+        let summary = serde_json::json!({"groups": [{"buckets": [
+            {"bucketId": "3p-weekly", "remainingFraction": 0, "resetTime": "2026-11-27T23:24:24Z"},
+            {"bucketId": "3p-5h", "remainingFraction": 1}
+        ]}]});
+        let models = serde_json::json!({"models": {
+            "claude-opus-5-5-high": {"quotaInfo": {"remainingFraction": 1, "resetTime": "2026-11-26T01:17:27Z"}},
+            "gemini-2.5-flash": {"quotaInfo": {"remainingFraction": 0.5, "resetTime": "2026-11-30T20:31:15Z"}},
+            "gemini-3.8-flash-tiered": {"quotaInfo": {"remainingFraction": 0.10151518, "resetTime": "2026-11-30T20:31:15Z"}},
+            "tab_flash_lite_preview": {"quotaInfo": {"remainingFraction": 1}}
+        }});
+        let w = quota_windows(&summary, &models, NOW);
+        let get = |id: &str| w.iter().find(|x| x.id == id).unwrap();
+        assert_eq!(w.len(), 3);
+        assert_eq!(get("3p-weekly").used_percent, Some(100.0));
+        assert_eq!(get("3p-5h").used_percent, Some(0.0));
+        assert!((get("gemini-weekly").used_percent.unwrap() - 89.848482).abs() < 1e-6);
+
+        // A Gemini quota resetting within 5 h is the 5-hour window.
+        let soon = serde_json::json!({"models": {"gemini-3-flash": {"quotaInfo":
+            {"remainingFraction": 0.9, "resetTime": "2026-11-24T12:00:00Z"}}}});
+        assert_eq!(
+            quota_windows(&serde_json::json!({}), &soon, NOW)[0].id,
+            "gemini-5h"
+        );
+
+        // Exhausted: the fraction is omitted, only resetTime remains.
+        let spent = serde_json::json!({"models": {"gemini-3-flash": {"quotaInfo":
+            {"resetTime": "2026-11-30T20:03:40Z"}}}});
+        let w = quota_windows(&serde_json::json!({}), &spent, NOW);
+        assert_eq!(
+            (w[0].id.as_str(), w[0].used_percent),
+            ("gemini-weekly", Some(100.0))
+        );
     }
 
     #[test]
