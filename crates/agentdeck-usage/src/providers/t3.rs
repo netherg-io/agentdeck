@@ -394,7 +394,7 @@ fn codex_plan(cache: &T3ProviderCache) -> Option<String> {
     None
 }
 
-fn map_windows(provider: &str, raw: Vec<T3UsageWindow>) -> Vec<QuotaWindow> {
+pub(crate) fn map_windows(provider: &str, raw: Vec<T3UsageWindow>) -> Vec<QuotaWindow> {
     let mut windows: Vec<QuotaWindow> = raw
         .into_iter()
         .filter_map(|w| match provider {
