@@ -436,6 +436,8 @@ fn every_page_fits_at_min_size_with_long_names() {
 
         update(&mut state, Message::SelectPage(Page::Coordinator));
         shot(&state, lang, "coordinator");
+        update(&mut state, Message::SelectPage(Page::Backlog));
+        shot(&state, lang, "backlog");
         update(
             &mut state,
             Message::Settings(settings::Msg::Approver(Box::new(

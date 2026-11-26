@@ -1295,3 +1295,102 @@ fn jev_review_answer_overrides_keywords_for_no_review_models() {
     // Jev gave no review answer: keyword fallback.
     assert!(validation(None, "Review the diff of the router").contains(ban));
 }
+
+#[test]
+fn review_gets_no_cheap_model_bonus() {
+    let fx = Fixture::new(&[OPUS, HAIKU]);
+    let run = |extra: &[&str], review: Option<f64>, task: &str| {
+        let mut jev = answers_for(
+            &[
+                ("claudeagent_claude_opus_5_5", level(2.5, 0.95)),
+                ("claudeagent_claude_haiku_5_5", level(2.4, 0.95)),
+            ],
+            1.0,
+            1.0,
+        );
+        if let Some(score) = review {
+            jev["answers"]["review"] = serde_json::json!({"score": score, "confidence": 0.9});
+        }
+        let mock = write_mock(&fx, &jev);
+        let mut args = vec!["--source", "claudeAgent"];
+        args.extend_from_slice(extra);
+        args.push(task);
+        let (code, out, err) = run_rust(&fx, &args, &mock, None);
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+    let haiku_bonus = |v: &serde_json::Value| {
+        v["ranking"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["model"] == HAIKU.1)
+            .unwrap()["cheapModelBonus"]
+            .as_f64()
+            .unwrap()
+    };
+
+    // Non-review: Haiku gets the cheap-model bonus and beats Opus's small lead.
+    let impl_v = run(&[], Some(0.0), "Fix the typo");
+    assert_eq!(impl_v["target"]["model"], HAIKU.1, "{impl_v}");
+    assert!(haiku_bonus(&impl_v) > 0.0, "{impl_v}");
+
+    // Review via Jev score, keyword fallback, or explicit --review: bonus is 0 and Opus wins.
+    for (extra, review, task) in [
+        (&[][..], Some(3.0), "Check the parser for gaps"),
+        (&[][..], None, "Review the diff of the router"),
+        (&["--review"][..], Some(0.0), "Check the parser for gaps"),
+    ] {
+        let v = run(extra, review, task);
+        assert_eq!(v["target"]["model"], OPUS.1, "{v}");
+        assert_eq!(haiku_bonus(&v), 0.0, "{v}");
+    }
+}
+
+#[test]
+fn exclude_marker_bans_instance_and_reuses_jev_cache() {
+    let fx = Fixture::new(&[SOL, OPUS]);
+    let jev = answers_for(
+        &[
+            ("codex_gpt_6_1_sol", level(2.9, 0.95)),
+            ("claudeagent_claude_opus_5_5", level(2.4, 0.95)),
+        ],
+        1.0,
+        1.0,
+    );
+    let mock = write_mock(&fx, &jev);
+    let (code, out, err) = run_rust(
+        &fx,
+        &["--source", "claudeAgent", "--exclude", "codex", "-"],
+        &mock,
+        Some("Review PR #185"),
+    );
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    let cli: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(cli["target"]["providerInstanceId"], OPUS.0, "{cli}");
+    assert_eq!(cli["jevCache"], "miss");
+
+    // Inline marker produces the same exclusion and hits the Jev cache.
+    let (code, out, err) = run_rust(
+        &fx,
+        &[
+            "--source",
+            "claudeAgent",
+            "--validate-target",
+            SOL.0,
+            SOL.1,
+            "-",
+        ],
+        &mock,
+        Some("[route:exclude=codex] Review PR #185"),
+    );
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    let marked: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(marked["jevCache"], "hit", "{marked}");
+    assert_eq!(marked["target"]["providerInstanceId"], OPUS.0, "{marked}");
+    assert_eq!(marked["validation"]["allowed"], false, "{marked}");
+    assert_eq!(
+        marked["validation"]["reason"], "excluded for this route",
+        "{marked}"
+    );
+}

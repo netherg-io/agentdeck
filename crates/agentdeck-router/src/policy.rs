@@ -10,6 +10,81 @@ pub const MIN_FIT: f64 = 0.7;
 pub const TARGET_MARGIN: f64 = 0.02;
 pub type CostsOf<'a> = dyn Fn(&str, Option<&str>) -> ModelCost + 'a;
 pub const NO_REVIEW_BAN: &str = "never for audits or reviews (user rule 2026-10-17)";
+pub const USER_CHOICE_MARKER: &str = "[route:user-choice]";
+const EXCLUDE_MARKER_PREFIX: &str = "[route:exclude=";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RouteMarkers {
+    pub user_choice: bool,
+    pub exclude: Vec<String>,
+    cleaned: String,
+}
+
+impl RouteMarkers {
+    /// Task text with leading `[route:exclude=...]` tokens stripped so CLI
+    /// `--exclude` and inline markers hit the same Jev cache key.
+    pub fn cleaned_task(&self) -> &str {
+        &self.cleaned
+    }
+}
+
+fn valid_instance_id(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+/// Parse leading `[route:user-choice]` and `[route:exclude=a,b]` markers
+/// (repeatable, in any order). Malformed exclude tokens stay literal.
+pub fn parse_route_markers(task: &str) -> RouteMarkers {
+    let mut user_choice = false;
+    let mut exclude: Vec<String> = Vec::new();
+    let mut had_exclude = false;
+    let mut i = 0;
+    loop {
+        let trimmed = task[i..].trim_start();
+        let ws_end = task.len() - trimmed.len();
+        if let Some(after) = trimmed.strip_prefix(USER_CHOICE_MARKER) {
+            user_choice = true;
+            i = task.len() - after.len();
+            continue;
+        }
+        if let Some(after) = trimmed.strip_prefix(EXCLUDE_MARKER_PREFIX)
+            && let Some(end) = after.find(']')
+            && !after[..end].contains(['[', '\n', '\r'])
+        {
+            let ids: Vec<&str> = after[..end].split(',').map(str::trim).collect();
+            if !ids.is_empty() && ids.iter().all(|id| valid_instance_id(id)) {
+                for id in ids {
+                    if !exclude.iter().any(|x| x == id) {
+                        exclude.push(id.to_string());
+                    }
+                }
+                had_exclude = true;
+                i = task.len() - after[end + 1..].len();
+                continue;
+            }
+        }
+        let tail = &task[ws_end..];
+        let cleaned = if !had_exclude {
+            task.to_string()
+        } else if user_choice {
+            if tail.is_empty() {
+                USER_CHOICE_MARKER.to_string()
+            } else {
+                format!("{USER_CHOICE_MARKER} {tail}")
+            }
+        } else {
+            tail.to_string()
+        };
+        return RouteMarkers {
+            user_choice,
+            exclude,
+            cleaned,
+        };
+    }
+}
 
 const ROSTER_JSON: &str = include_str!("../../../crates/agentdeck-core/assets/router/roster.json");
 
@@ -2131,5 +2206,48 @@ mod neon_family_tests {
                 .unwrap_or_default()
                 .contains("strong implementer")
         );
+    }
+
+    #[test]
+    fn route_markers_parse_excludes_and_user_choice() {
+        use super::parse_route_markers;
+
+        let plain = parse_route_markers("Review PR #185");
+        assert!(!plain.user_choice);
+        assert!(plain.exclude.is_empty());
+        assert_eq!(plain.cleaned_task(), "Review PR #185");
+
+        let uc = parse_route_markers("[route:user-choice] Audit the auth flow");
+        assert!(uc.user_choice);
+        assert!(uc.exclude.is_empty());
+        assert_eq!(uc.cleaned_task(), "[route:user-choice] Audit the auth flow");
+
+        let multi = parse_route_markers(
+            "[route:exclude=antigravity_6, antigravity_3]\n[route:exclude=antigravity_6] Review PR #185",
+        );
+        assert!(!multi.user_choice);
+        assert_eq!(multi.exclude, vec!["antigravity_6", "antigravity_3"]);
+        assert_eq!(multi.cleaned_task(), "Review PR #185");
+
+        let both = parse_route_markers("[route:exclude=codex] [route:user-choice] Review diff");
+        assert!(both.user_choice);
+        assert_eq!(both.exclude, vec!["codex"]);
+        assert_eq!(both.cleaned_task(), "[route:user-choice] Review diff");
+
+        let rev = parse_route_markers("[route:user-choice] [route:exclude=codex] Review diff");
+        assert!(rev.user_choice);
+        assert_eq!(rev.exclude, vec!["codex"]);
+        assert_eq!(rev.cleaned_task(), "[route:user-choice] Review diff");
+
+        // Malformed/flag-like tokens stay literal and are not treated as exclusions.
+        for bad in [
+            "[route:exclude=] Review",
+            "[route:exclude=--effort] Review",
+            "[route:exclude=a;b] Review",
+        ] {
+            let m = parse_route_markers(bad);
+            assert!(m.exclude.is_empty(), "{bad}");
+            assert_eq!(m.cleaned_task(), bad);
+        }
     }
 }
