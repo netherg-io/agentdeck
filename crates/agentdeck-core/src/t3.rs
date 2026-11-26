@@ -882,6 +882,29 @@ fn import(
     Ok((found, changes))
 }
 
+fn place_last_by_t3_order<T>(
+    items: &mut Vec<T>,
+    t3_pos: usize,
+    same_group: impl Fn(&T) -> bool,
+    pos_of: impl Fn(&T) -> Option<usize>,
+) {
+    let len = items.len();
+    if len <= 1 {
+        return;
+    }
+    let existing = &items[..len - 1];
+    let target = existing
+        .iter()
+        .position(|x| same_group(x) && pos_of(x).is_some_and(|p| p > t3_pos))
+        .or_else(|| existing.iter().rposition(&same_group).map(|i| i + 1));
+    if let Some(idx) = target
+        && idx < len - 1
+    {
+        let item = items.pop().expect("len > 1");
+        items.insert(idx, item);
+    }
+}
+
 fn sync_from_t3(
     r: &mut Registry,
     pi: &Map<String, Value>,
@@ -889,8 +912,13 @@ fn sync_from_t3(
 ) -> anyhow::Result<Vec<Imported>> {
     use crate::registry::AddSpec;
     use crate::usage::{UsageEntry, UsageKind};
+    let t3_order: std::collections::HashMap<&str, usize> = pi
+        .keys()
+        .enumerate()
+        .map(|(i, k)| (k.as_str(), i))
+        .collect();
     let mut found = Vec::new();
-    for (id, env) in pi {
+    for (t3_pos, (id, env)) in pi.iter().enumerate() {
         let driver = env.get("driver").and_then(Value::as_str).unwrap_or("");
         if let Some(inst) = r.get(id) {
             if !inst.t3 || driver != t3_driver(inst.harness) {
@@ -976,6 +1004,12 @@ fn sync_from_t3(
             no_t3: false,
         })?;
         r.set_enabled(id, enabled)?;
+        place_last_by_t3_order(
+            &mut r.instances,
+            t3_pos,
+            |i| i.harness == harness,
+            |i| t3_order.get(i.id.as_str()).copied(),
+        );
         let usage_id = match kind {
             Some(kind) => {
                 let uid = free_usage_id(&r.usage, id);
@@ -988,6 +1022,16 @@ fn sync_from_t3(
                     db_file: None,
                     extra: Default::default(),
                 })?;
+                place_last_by_t3_order(
+                    &mut r.usage,
+                    t3_pos,
+                    |u| u.kind == kind,
+                    |u| {
+                        u.instance
+                            .as_deref()
+                            .and_then(|inst| t3_order.get(inst).copied())
+                    },
+                );
                 Some(uid)
             }
             None => None,
@@ -2360,6 +2404,46 @@ mod tests {
         assert_eq!(
             resolve_antigravity_binary(&t3, custom.to_str()).as_deref(),
             Some(custom.as_path())
+        );
+    }
+
+    #[test]
+    fn reimporting_first_t3_instance_preserves_t3_order_among_siblings() {
+        let (paths, t3, _g) = setup(
+            "t3-order",
+            r#"{
+              "providerInstances": {
+                "claudeAgent": { "driver": "claudeAgent", "displayName": "Claude 1", "enabled": false, "config": {} },
+                "codex": { "driver": "codex", "displayName": "Codex 1", "enabled": true, "config": {} },
+                "claude_second": { "driver": "claudeAgent", "displayName": "Claude 2", "enabled": true, "config": {} },
+                "claude_third": { "driver": "claudeAgent", "displayName": "Claude 3", "enabled": true, "config": {} }
+              }
+            }"#,
+        );
+        import_t3_enabled(&paths, &t3, false).unwrap();
+        let before = Registry::load(&paths).unwrap();
+        let ids: Vec<&str> = before.instances.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["codex", "claude_second", "claude_third"]);
+
+        // Re-enable the first Claude instance in T3; import must place it before claude_second.
+        set_instance_enabled(&t3, &paths.backup_dir(), "claudeAgent", true).unwrap();
+        import_t3_enabled(&paths, &t3, false).unwrap();
+        let after = Registry::load(&paths).unwrap();
+        let inst_ids: Vec<&str> = after.instances.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            inst_ids,
+            vec!["codex", "claudeAgent", "claude_second", "claude_third"]
+        );
+        let usage_insts: Vec<Option<&str>> =
+            after.usage.iter().map(|u| u.instance.as_deref()).collect();
+        assert_eq!(
+            usage_insts,
+            vec![
+                Some("codex"),
+                Some("claudeAgent"),
+                Some("claude_second"),
+                Some("claude_third"),
+            ]
         );
     }
 }

@@ -355,7 +355,12 @@ fn save_prefs(state: &mut State, paths: &Paths, prefs: agentdeck_usage::visibili
 fn provider_groups(data: &Loaded) -> Vec<(&str, usize)> {
     let mut groups: Vec<(&str, usize)> = data
         .prefs
-        .group_by_provider(&data.sources, |u| u.id.as_str(), |u| u.kind.as_str())
+        .group_by_provider(
+            &data.sources,
+            |u| u.id.as_str(),
+            |u| u.display.as_str(),
+            |u| u.kind.as_str(),
+        )
         .into_iter()
         .map(|(p, list)| (p, list.len()))
         .collect();
@@ -532,7 +537,7 @@ pub fn sources_view<'a>(state: &'a State, data: &'a Data) -> Element<'a, Msg> {
         let status = status_of(data, &u.id).map(|q| {
             let tone = match q.status.as_str() {
                 "ok" => st::Tone::Ok,
-                "stale" | "waiting" => st::Tone::Neutral,
+                "stale" | "waiting" | "disabled" => st::Tone::Neutral,
                 _ => st::Tone::Warn,
             };
             st::pill(q.status.clone(), tone)
