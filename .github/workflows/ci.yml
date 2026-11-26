@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       # No debug info: much faster links and a smaller cache; CI does not need the symbols.
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -51,7 +51,7 @@ jobs:
 
   msrv:
     name: Build on declared MSRV
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
     steps:
@@ -78,7 +78,7 @@ jobs:
 
   applet:
     name: Check COSMIC applet
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
     steps:
@@ -104,7 +104,7 @@ jobs:
   release-cache:
     name: Warm release cache (${{ matrix.package }})
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     strategy:
       fail-fast: false
       matrix:
