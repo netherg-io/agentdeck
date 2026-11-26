@@ -44,7 +44,7 @@ pub async fn fetch(
     instance: Option<&str>,
     stale_seconds: i64,
 ) -> Result<AccountState> {
-    let state = t3::fetch(
+    let mut state = t3::fetch(
         T3Source {
             id,
             name,
@@ -55,15 +55,20 @@ pub async fn fetch(
         stale_seconds,
     )
     .await?;
+    let profile = agentdeck_core::t3::t3_root()
+        .ok()
+        .zip(t3::resolve_instance_slug("antigravity", instance));
+    if state.email.is_none()
+        && let Some((root, inst)) = profile.as_ref()
+    {
+        state.email = read_profile_email(root, inst);
+    }
     if state.status != "waiting" || !state.windows.is_empty() {
         return Ok(state);
     }
     // T3 0.1.13-nightly.20261125 dropped its Antigravity quota probe, so its cache never
     // gets usageLimits. shortcut: remove the direct poll once T3 fills them again.
-    let (Ok(root), Some(inst)) = (
-        agentdeck_core::t3::t3_root(),
-        t3::resolve_instance_slug("antigravity", instance),
-    ) else {
+    let Some((root, inst)) = profile else {
         return Ok(state);
     };
     let now = util::unix_now();
@@ -257,6 +262,26 @@ impl Drop for TempDirGuard {
 struct TokenMeta {
     has_refresh_token: bool,
     expiry: Option<i64>,
+}
+
+fn parse_token_email(raw: &[u8]) -> Option<String> {
+    // Never propagate serde errors: they can quote pieces of the OAuth secret.
+    let v: Value = serde_json::from_slice(raw).ok()?;
+    v.get("id_token_email")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+fn read_profile_email(t3_root: &Path, instance_id: &str) -> Option<String> {
+    let raw = fs::read(
+        antigravity_profile_dir(t3_root, instance_id)
+            .ok()?
+            .join("antigravity-acp/antigravity-oauth-token"),
+    )
+    .ok()?;
+    parse_token_email(&raw)
 }
 
 fn parse_token_meta(raw: &[u8]) -> Option<TokenMeta> {
@@ -924,5 +949,37 @@ printf '{{"jsonrpc":"2.0","id":2,"result":{{"_meta":{{}}}}}}\n'
         assert!(has_fresh_token_with_expired_cache(
             &t3, &accounts, &prev, NOW
         ));
+    }
+
+    #[test]
+    fn reads_id_token_email_from_profile_token_file() {
+        let (t3, _g) = temp_root("profile-email");
+        let acp_dir = antigravity_profile_dir(&t3, "antigravity_8")
+            .unwrap()
+            .join("antigravity-acp");
+        fs::create_dir_all(&acp_dir).unwrap();
+        let tok_path = acp_dir.join("antigravity-oauth-token");
+
+        assert_eq!(read_profile_email(&t3, "antigravity_8"), None);
+
+        fs::write(
+            &tok_path,
+            serde_json::json!({
+                "token": { "access_token": "tok" },
+                "id_token_email": "  user@example.com  "
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_profile_email(&t3, "antigravity_8").as_deref(),
+            Some("user@example.com")
+        );
+
+        fs::write(&tok_path, r#"{"id_token_email":"   "}"#).unwrap();
+        assert_eq!(read_profile_email(&t3, "antigravity_8"), None);
+
+        fs::write(&tok_path, b"not-json").unwrap();
+        assert_eq!(read_profile_email(&t3, "antigravity_8"), None);
     }
 }

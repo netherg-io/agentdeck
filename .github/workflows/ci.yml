@@ -13,13 +13,13 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # No debug info: much faster links and a smaller cache; CI does not need the symbols.
-  CARGO_PROFILE_DEV_DEBUG: 0
-
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # No debug info: much faster links and a smaller cache; CI does not need the symbols.
+      CARGO_PROFILE_DEV_DEBUG: 0
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v5
 
@@ -35,7 +35,7 @@ jobs:
       - name: Install iced system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev
+          sudo apt-get install -y --no-install-recommends pkg-config libwayland-dev libxkbcommon-dev mold
 
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
@@ -52,6 +52,8 @@ jobs:
   msrv:
     name: Build on declared MSRV
     runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@v5
 
@@ -77,6 +79,8 @@ jobs:
   applet:
     name: Check COSMIC applet
     runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@v5
 
@@ -92,7 +96,41 @@ jobs:
       - name: Install libcosmic system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwayland-dev libxkbcommon-dev pkg-config
+          sudo apt-get install -y --no-install-recommends libwayland-dev libxkbcommon-dev pkg-config
 
       - name: Check applet
         run: cargo check -p agentdeck-applet --locked
+
+  release-cache:
+    name: Warm release cache (${{ matrix.package }})
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [agentdeck, agentdeck-applet]
+    env:
+      # Must match release.yml so rust-cache keys align and tag builds restore main's cache.
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - id: rust-cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-${{ matrix.package }}"
+
+      - name: Install system dependencies
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libwayland-dev libxkbcommon-dev mold
+
+      - name: Warm release dependencies
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: cargo build --release --locked -p ${{ matrix.package }}

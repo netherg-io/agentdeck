@@ -7,7 +7,20 @@ resolver = "2"
 [workspace.package]
 rust-version = "1.93"
 
+# Speed up software rasterization in `iced_test` headless GUI snapshots.
+[profile.dev.package.tiny-skia]
+opt-level = 2
+
+[profile.dev.package.tiny-skia-path]
+opt-level = 2
+
+[profile.dev.package.cosmic-text]
+opt-level = 2
+
+[profile.dev.package.swash]
+opt-level = 2
+
 [profile.release]
+# Keep default codegen-units so ThinLTO parallelizes across CI cores.
 lto = "thin"
-codegen-units = 1
 strip = true

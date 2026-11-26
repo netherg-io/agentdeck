@@ -14,7 +14,15 @@ concurrency:
 
 jobs:
   build:
+    name: Build ${{ matrix.package }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [agentdeck, agentdeck-applet]
+    env:
+      # Must match ci.yml release-cache so tags restore main's compiled release dependencies.
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v5
 
@@ -34,38 +42,42 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-${{ matrix.package }}"
+          # Tag-scoped caches are unreadable by subsequent tags; main's release-cache saves them.
+          save-if: false
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev
+          sudo apt-get install -y --no-install-recommends pkg-config libwayland-dev libxkbcommon-dev mold
 
       - name: Build
         run: |
-          cargo build --release --locked -p agentdeck -p agentdeck-applet
+          cargo build --release --locked -p ${{ matrix.package }}
 
       - name: Package
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          PACKAGE: ${{ matrix.package }}
         run: |
           mkdir -p dist
-          for bin in agentdeck agentdeck-applet; do
-            stage="dist/$bin-$VERSION-x86_64"
-            mkdir -p "$stage"
-            install -m 0755 "target/release/$bin" "$stage/$bin"
-            cp LICENSE README.md "$stage/"
-            tar -C dist -czf "$stage.tar.gz" "$(basename "$stage")"
-            rm -rf "$stage"
-          done
-          cp crates/agentdeck/agentdeck.desktop crates/agentdeck/assets/agentdeck.svg dist/
+          stage="dist/$PACKAGE-$VERSION-x86_64"
+          mkdir -p "$stage"
+          install -m 0755 "target/release/$PACKAGE" "$stage/$PACKAGE"
+          cp LICENSE README.md "$stage/"
+          tar -C dist -czf "$stage.tar.gz" "$(basename "$stage")"
+          rm -rf "$stage"
+          if [[ "$PACKAGE" == "agentdeck" ]]; then
+            cp crates/agentdeck/agentdeck.desktop crates/agentdeck/assets/agentdeck.svg dist/
+          fi
           ls dist/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: agentdeck-x86_64
-          path: |
-            dist/*.tar.gz
-            dist/agentdeck.desktop
-            dist/agentdeck.svg
+          name: ${{ matrix.package }}-x86_64
+          path: dist/*
           if-no-files-found: error
           # Only hands the files to the publish job; the release keeps them.
           retention-days: 1
@@ -76,7 +88,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: agentdeck-x86_64
+          pattern: "*-x86_64"
           path: dist
           merge-multiple: true
 

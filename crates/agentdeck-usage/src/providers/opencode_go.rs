@@ -62,6 +62,7 @@ struct Credential {
     base: &'static str,
     token: String,
     org_id: Option<String>,
+    email: Option<String>,
 }
 
 /// Читает учётные данные OpenCode на месте, без второй копии секрета.
@@ -118,6 +119,7 @@ fn parse_credential(stdout: &[u8], now_ms: i64) -> Result<Credential> {
             base: KEY_BASE,
             token: text("/key").context(missing)?,
             org_id: None,
+            email: text("/metadata/email"),
         });
     }
     // Токен обновляет сам OpenCode при использовании; живёт около месяца.
@@ -131,6 +133,7 @@ fn parse_credential(stdout: &[u8], now_ms: i64) -> Result<Credential> {
         base: CONSOLE_BASE,
         token: text("/access").context(missing)?,
         org_id: text("/metadata/orgID"),
+        email: text("/metadata/email"),
     })
 }
 
@@ -144,11 +147,22 @@ pub async fn fetch(
     db_file: Option<&Path>,
     stale_seconds: i64,
 ) -> Result<AccountState> {
-    let direct = async {
-        let credential = read_credential(db_file.unwrap_or(&default_db_file())).await?;
-        fetch_with_credential(id, name, &credential).await
+    let default_db;
+    let db_path = match db_file {
+        Some(path) => path,
+        None => {
+            default_db = default_db_file();
+            &default_db
+        }
     };
-    match direct.await {
+    let (email, direct) = match read_credential(db_path).await {
+        Ok(credential) => {
+            let email = credential.email.clone();
+            (email, fetch_with_credential(id, name, &credential).await)
+        }
+        Err(err) => (None, Err(err)),
+    };
+    match direct {
         Ok(state) => Ok(state),
         Err(direct_error) => {
             let source = T3Source {
@@ -158,10 +172,12 @@ pub async fn fetch(
                 instance,
                 explicit_plan: None,
             };
-            Ok(with_direct_error(
-                t3::fetch(source, stale_seconds).await?,
-                &direct_error,
-            ))
+            let mut state =
+                with_direct_error(t3::fetch(source, stale_seconds).await?, &direct_error);
+            if state.email.is_none() {
+                state.email = email;
+            }
+            Ok(state)
         }
     }
 }
@@ -232,7 +248,7 @@ async fn fetch_with_credential(
         provider: "opencode-go".to_owned(),
         status: if depleted { "depleted" } else { "ok" }.to_owned(),
         plan: Some("Go".to_owned()),
-        email: None,
+        email: credential.email.clone(),
         model: None,
         windows,
         balances: Vec::new(),
@@ -274,6 +290,7 @@ mod tests {
             base: Box::leak(base.into_boxed_str()),
             token: "st_test".to_owned(),
             org_id: Some("org_1".to_owned()),
+            email: Some("dev@example.com".to_owned()),
         }
     }
 
@@ -294,6 +311,7 @@ mod tests {
         assert_eq!(state.windows[0].resets_at, Some(1_791_720_000));
         assert_eq!(state.windows[2].duration_mins, Some(MONTHLY_MINS));
         assert_eq!(state.status, "depleted");
+        assert_eq!(state.email.as_deref(), Some("dev@example.com"));
     }
 
     #[test]
@@ -328,7 +346,7 @@ mod tests {
     fn parses_console_and_key_credentials() {
         let console = row(
             "opencode",
-            r#"{"type":"oauth","access":"st_a","expires":2000,"metadata":{"orgID":"org_1"}}"#,
+            r#"{"type":"oauth","access":"st_a","expires":2000,"metadata":{"orgID":"org_1","email":" dev@example.com "}}"#,
         );
         assert_eq!(
             parse_credential(&console, 1000).unwrap(),
@@ -336,6 +354,7 @@ mod tests {
                 base: CONSOLE_BASE,
                 token: "st_a".to_owned(),
                 org_id: Some("org_1".to_owned()),
+                email: Some("dev@example.com".to_owned()),
             }
         );
         let expired = parse_credential(&console, 2000).unwrap_err().to_string();
@@ -344,8 +363,12 @@ mod tests {
         let key = row("opencode-go", r#"{"type":"api","key":" sk-go "}"#);
         let credential = parse_credential(&key, 0).unwrap();
         assert_eq!(
-            (credential.base, credential.token.as_str()),
-            (KEY_BASE, "sk-go")
+            (
+                credential.base,
+                credential.token.as_str(),
+                credential.email.as_deref()
+            ),
+            (KEY_BASE, "sk-go", None)
         );
 
         let none = parse_credential(b"", 0).unwrap_err().to_string();
