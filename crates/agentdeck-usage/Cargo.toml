@@ -1,6 +1,6 @@
 [package]
 name = "agentdeck-usage"
-version = "0.1.38"
+version = "0.1.39"
 edition = "2024"
 description = "T3 subscription quotas, API-key balances, state model and history for agentdeck"
 license = "GPL-3.0-or-later"
