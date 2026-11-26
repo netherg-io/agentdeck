@@ -138,10 +138,31 @@ fn coordinator_page_shows_checklist_and_backlog() {
         ui.find("1/3").expect("progress pill");
         ui.find("Public server split and archive")
             .expect("checklist item");
+        ui.find("Reports").expect("reports card");
+        assert!(
+            ui.find("Backlog blockfield · 2 open").is_err(),
+            "backlog belongs on its own tab"
+        );
+    }
+    let _ = app::update(&mut state, Message::SelectPage(Page::Backlog));
+    {
+        let mut ui = iced_test::simulator(app::view(&state));
         ui.find("Backlog blockfield · 2 open")
             .expect("backlog heading");
-        ui.find("Reports").expect("reports card");
+        ui.find("Flaky RC on cold VMs").expect("backlog item");
+        assert!(
+            ui.find("Public server split and archive").is_err(),
+            "progress checklist belongs on the Progress tab"
+        );
     }
+    agentdeck_gui::i18n::set_language("ru");
+    {
+        let mut ui = iced_test::simulator(app::view(&state));
+        ui.find("Бэклог blockfield · открыто 2")
+            .expect("RU backlog heading");
+    }
+    agentdeck_gui::i18n::set_language("en");
+    let _ = app::update(&mut state, Message::SelectPage(Page::Coordinator));
     std::fs::create_dir_all(SNAPSHOTS).unwrap();
     for lang in ["en", "ru"] {
         agentdeck_gui::i18n::set_language(lang);

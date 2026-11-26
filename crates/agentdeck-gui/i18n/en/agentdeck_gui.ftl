@@ -319,7 +319,9 @@ drift-instr-confirm-local = Replace shared file
 
 nav-group-coordinator = Coordinator
 nav-coordinator = Progress
-coord-empty = No coordinator has saved a goal or a backlog yet.
+nav-backlog = Backlog
+coord-empty = No coordinator has saved a goal yet.
+coord-backlog-empty = No open backlog items.
 coord-no-checklist = No checklist yet.
 coord-backlog = Backlog { $project } · { $count } open
 coord-status-todo = To do

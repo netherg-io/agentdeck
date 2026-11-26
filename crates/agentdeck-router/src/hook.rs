@@ -13,7 +13,6 @@ use crate::reasoning::{read_catalog, read_live_catalog, repair_reasoning, valida
 
 const ROUTE_TIMEOUT_SECS: u64 = 55;
 const ROUTE_MAX_BYTES: usize = 2 * 1024 * 1024;
-const USER_CHOICE: &str = "[route:user-choice]";
 const USER_CHOICE_HINT: &str = " If the user explicitly asked for a specific model, call delegate_task with that exact target and start the task with [route:user-choice]; routing then only warns.";
 
 const NOISE: &[&str] = &[
@@ -545,29 +544,54 @@ fn in_t3(harness: &str, chain: &[Vec<String>], input: &Value) -> bool {
     }
 }
 
-fn route_args(source: &str, validate: Option<(&str, &str)>) -> Vec<String> {
+fn route_args(
+    source: &str,
+    validate: Option<(&str, &str)>,
+    exclude: &[String],
+    review: bool,
+) -> Vec<String> {
     let mut args = vec!["route".into(), "--source".into(), source.into()];
     if let Some((provider, model)) = validate {
         args.extend(["--validate-target".into(), provider.into(), model.into()]);
+    }
+    for x in exclude {
+        args.extend(["--exclude".into(), x.clone()]);
+    }
+    if review {
+        args.push("--review".into());
     }
     args.push("-".into());
     args
 }
 
-fn preflight_hint(source: &str, provider: &str, model: &str) -> String {
-    let args = route_args(source, Some((provider, model)));
-    let command = args
-        .iter()
-        .enumerate()
-        .map(|(i, arg)| {
-            if matches!(i, 0 | 1 | 3 | 6) {
-                arg.clone()
-            } else {
-                format!("'{}'", arg.replace('\'', "'\"'\"'"))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
+fn quote_shell_arg(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\"'\"'"))
+}
+
+fn preflight_hint(
+    source: &str,
+    provider: &str,
+    model: &str,
+    exclude: &[String],
+    review: bool,
+) -> String {
+    let mut parts = vec![
+        "route".to_string(),
+        "--source".to_string(),
+        quote_shell_arg(source),
+        "--validate-target".to_string(),
+        quote_shell_arg(provider),
+        quote_shell_arg(model),
+    ];
+    for x in exclude {
+        parts.push("--exclude".to_string());
+        parts.push(quote_shell_arg(x));
+    }
+    if review {
+        parts.push("--review".to_string());
+    }
+    parts.push("-".to_string());
+    let command = parts.join(" ");
     format!(
         " To obtain this routing verdict before dispatch, save the exact delegate_task.task text in task.txt and run `agentdeck {command} < task.txt`. Use the full task, not a shortened goal; quota and load are rechecked at dispatch."
     )
@@ -577,11 +601,13 @@ fn preflight_hint(source: &str, provider: &str, model: &str) -> String {
 fn run_route(
     source: &str,
     validate: Option<(&str, &str)>,
+    exclude: &[String],
+    review: bool,
     task_text: &str,
 ) -> anyhow::Result<Value> {
     let exe = agentdeck_core::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(route_args(source, validate));
+    cmd.args(route_args(source, validate, exclude, review));
     let output = crate::run_piped_with_timeout(
         &mut cmd,
         task_text.as_bytes(),
@@ -943,6 +969,8 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
             serde_json::to_string(&args)?
         )
     };
+    let markers = crate::policy::parse_route_markers(&brief);
+    let is_review_role = delegate && args.get("role").and_then(Value::as_str) == Some("review");
     let route = run_route(
         instance.as_deref().unwrap_or_default(),
         delegate.then(|| {
@@ -957,6 +985,8 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
                     .unwrap_or_default(),
             )
         }),
+        &markers.exclude,
+        is_review_role,
         &brief,
     )?;
     let confidence = route
@@ -976,21 +1006,17 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
         String::new()
     };
     if delegate {
-        let allowed = route
-            .get("validation")
-            .and_then(|v| v.get("allowed"))
+        let mut validation = route.get("validation").cloned().unwrap_or(Value::Null);
+        let mut allowed = validation
+            .get("allowed")
             .and_then(Value::as_bool)
             .ok_or_else(|| anyhow::anyhow!("invalid validation"))?;
-        let mut validation = route.get("validation").cloned().unwrap_or(Value::Null);
-        if args.get("role").and_then(Value::as_str) == Some("review")
-            && route.get("requestedNoReview").and_then(Value::as_bool) == Some(true)
-        {
-            validation = serde_json::json!({"allowed": false, "reason": "never for audits or reviews (user rule 2026-10-17)"});
+        if is_review_role && route.get("requestedNoReview").and_then(Value::as_bool) == Some(true) {
+            allowed = false;
+            validation =
+                serde_json::json!({"allowed": false, "reason": crate::policy::NO_REVIEW_BAN});
         }
-        let user_choice = !allowed
-            && str_field(&args, "task")
-                .unwrap_or_default()
-                .starts_with(USER_CHOICE);
+        let user_choice = !allowed && markers.user_choice;
         let mut choice_warning = String::new();
         if user_choice {
             match user_named_model(
@@ -1138,13 +1164,12 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
             .get("reason")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        // Reviews keep the deny: the no-review rule overrides validation, and the
-        // router target is not checked against it.
+        // `--review` and `--exclude` are already applied to `route.target`, so
+        // reviews can safely rewrite to the non-excluded, non-banned winner.
         if !allowed_now
             && !user_choice
             && !workflow_retry
             && can_rewrite(&ctx.harness)
-            && args.get("role").and_then(Value::as_str) != Some("review")
             && let Some(t) = route
                 .get("target")
                 .filter(|t| !t.is_null() && !same_target(t, target))
@@ -1227,6 +1252,8 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
                             .and_then(|t| t.get("model"))
                             .and_then(Value::as_str)
                             .unwrap_or_default(),
+                        &markers.exclude,
+                        is_review_role,
                     )
                 )
             } else {

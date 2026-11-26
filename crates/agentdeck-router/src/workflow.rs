@@ -518,16 +518,28 @@ fn route_diagnostics(r: &Value) -> Value {
 /// Production router: this binary's `route --source <s> -` (like the .mjs
 /// exec of `route.mjs`), 55s timeout, 16MB cap.
 pub fn run_router(task: &str, source: &str) -> anyhow::Result<Value> {
-    run_router_excluding(task, source, &[])
+    run_router_opts(task, source, &[], false)
 }
 
 /// `run_router` with `--exclude` for instances whose account hit a usage limit.
 pub fn run_router_excluding(task: &str, source: &str, exclude: &[String]) -> anyhow::Result<Value> {
+    run_router_opts(task, source, exclude, false)
+}
+
+fn run_router_opts(
+    task: &str,
+    source: &str,
+    exclude: &[String],
+    review: bool,
+) -> anyhow::Result<Value> {
     let exe = agentdeck_core::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["route", "--source", source]);
     for x in exclude {
         cmd.args(["--exclude", x]);
+    }
+    if review {
+        cmd.arg("--review");
     }
     cmd.arg("-");
     let out = crate::run_piped_with_timeout(
@@ -1219,7 +1231,10 @@ async fn run_inner(argv: &[String]) -> Result<Value, WfError> {
         "prepare" => {
             let step = step.ok_or_else(|| WfError::usage(USAGE))?;
             let source = cli.source.clone().unwrap_or_default();
-            let out = prepare(&mut state, &step, &source, run_router)?;
+            let review = step_of(&state, &step).is_ok_and(|s| s.role == "review");
+            let out = prepare(&mut state, &step, &source, |t, s| {
+                run_router_opts(t, s, &[], review)
+            })?;
             if out.get("state") == Some(&Value::from("prepared")) && out.get("reused").is_none() {
                 write_state(&path, &state, false)?;
             }

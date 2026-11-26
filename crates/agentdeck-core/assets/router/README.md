@@ -15,7 +15,8 @@ same way: `claudeAgent`, `claude_second`, `claude_third` and `claude_fourth` mat
 - `agentdeck route --source codex --validate-target PROVIDER MODEL -`: read the complete task from stdin and validate an already selected target. Output includes `validation.allowed` and its reason. A denied target exits 0; malformed input or router failure exits nonzero.
 - `agentdeck route --effort medium|high|xhigh`: replaces the estimated difficulty when choosing the reasoning level of the returned target. The model choice is unchanged.
 - OpenCode worker agent: `agentdeck plugin enable router` writes `~/.config/opencode/agent/agentdeck-worker.md` (short invariants-first prompt, temperature 0.1, force-push denied; project rules stay in the project's own AGENTS.md). Once OpenCode loads it, T3 lists it as the `agent` option and `route` adds `options.agent` to OpenCode targets. Restart the OpenCode server and refresh the catalog after enabling.
-- `agentdeck route --exclude INSTANCE`: ban every favorite on that instance's account for this call (repeatable).
+- `agentdeck route --exclude INSTANCE`: ban every favorite on that instance's account for this call (repeatable). A leading `[route:exclude=id1,id2]` marker in the task text (repeatable, combinable with `[route:user-choice]`) applies the same exclusion in both CLI and launch hooks, and is stripped before Jev so `--exclude` preflights share the cache.
+- `agentdeck route --review`: treat the task as a review/audit regardless of Jev's `review` score (passed automatically by launch hooks and workflows when `role` is `review`).
 - `agentdeck route --check`: quota, per-size cost and allowed sizes per favorite; favorites without a family
   profile are flagged `UNPROFILED` (report-only, exit 0: they route on their Jev judgment with
   conservative max-burn quota, no manual roster edit required).
@@ -45,7 +46,7 @@ Selection policy:
   In `roster.json`, `routing.sharedQuotaPenalty` defaults to **0.05**: shared-account use costs 0.05 score points (one Jev level is 0.33).
   `routing.cheapModelBonus` is **0.15** × `max(0, 1 - burn)` (Haiku burn 0.1: +0.135, Sonnet 0.6: +0.06, unknown or
   burn >= 1: 0): a cheap model wins a small quality gap, never a whole Jev level (0.33).
-  For hard tasks (difficulty 2..3), all penalties and the bonus are halved. Low remaining quota is never penalized
+  For hard tasks (difficulty 2..3), all penalties and the bonus are halved. For review/audit tasks (`--review`, `role: "review"`, Jev `review >= 2`, or keyword fallback), `cheapModelBonus` is **0**. Low remaining quota is never penalized
   (user rule 2026-10-17): quota only decides `allowed`, i.e. whether the task fits. One model on several accounts
   (e.g. `codex` and `codex_second`) gets the mean of its per-account `quality`, `fit` and `confidence`: the copies
   differ only by Jev noise. Exact score ties prefer the account with fewer active agents, then the cheaper task,

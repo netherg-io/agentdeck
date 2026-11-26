@@ -8,8 +8,8 @@ use crate::policy::{
     Candidate, MIN_FIT, ModelCost, NO_REVIEW_BAN, QuotaProvenance, QuotaWindow,
     QuotaWindowEstimate, Ranked, RouterConfig, UsageAccount, UsageSnapshot, budget_allowed,
     budget_cost_full, enabled_favorites, family_of, hint_of_on, is_review_task, load_router_json,
-    max_burn, owns_usage, quota_windows, rank_candidates, reserve_active_quota, router_config,
-    routing_weights, valid_answer, validate_target,
+    max_burn, owns_usage, parse_route_markers, quota_windows, rank_candidates,
+    reserve_active_quota, router_config, routing_weights, valid_answer, validate_target,
 };
 use crate::reasoning::{read_live_catalog, reasoning_target, save_catalog};
 use crate::{home_dir, js_num, parse_time_ms, round2, round3, runtime_dir, state_home};
@@ -39,7 +39,7 @@ const CAPABILITY: [&str; 4] = [
     "Specific relevant strengths should produce a substantially better result on THIS task. A merely stronger model with no practical advantage does not qualify.",
 ];
 
-const USAGE: &str = "usage: agentdeck route [--source <provider instance>] [--validate-target <provider instance> <model>] [--exclude <provider instance>]... [--effort medium|high|xhigh] \"<task brief>\" | - (brief on stdin) | --check | --catalog (orchestrator_capabilities structuredContent on stdin) | hook --harness <name> | claude-shell [args...] | t3-mcp-call TOOL FILE | workflow CMD ... | outcomes record|list|evaluate ...";
+const USAGE: &str = "usage: agentdeck route [--source <provider instance>] [--validate-target <provider instance> <model>] [--exclude <provider instance>]... [--review] [--effort medium|high|xhigh] \"<task brief>\" | - (brief on stdin) | --check | --catalog (orchestrator_capabilities structuredContent on stdin) | hook --harness <name> | claude-shell [args...] | t3-mcp-call TOOL FILE | workflow CMD ... | outcomes record|list|evaluate ...";
 
 pub struct Env {
     pub home: std::path::PathBuf,
@@ -1446,6 +1446,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     let mut source: Option<String> = None;
     let mut requested: Option<ValidatedTarget> = None;
     let mut exclude: Vec<String> = Vec::new();
+    let mut force_review = false;
     let mut effort: Option<i64> = None;
     while args.first().is_some_and(|a| a.starts_with("--")) && args[0] != "--check" {
         let flag = args[0].clone();
@@ -1465,6 +1466,8 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         } else if flag == "--exclude" && !args.is_empty() {
             exclude.push(args[0].clone());
             args = &args[1..];
+        } else if flag == "--review" {
+            force_review = true;
         } else if flag == "--effort"
             && let Some(level) = args
                 .first()
@@ -1716,6 +1719,13 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     {
         task = task[..task.len() - h.len()].trim().to_string();
     }
+    let markers = parse_route_markers(&task);
+    for x in &markers.exclude {
+        if !exclude.iter().any(|e| e == x) {
+            exclude.push(x.clone());
+        }
+    }
+    task = markers.cleaned_task().trim().to_string();
     if task.is_empty() {
         eprintln!("{USAGE}");
         return Ok(2);
@@ -1935,17 +1945,19 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         .unwrap_or(0.0)
         .round() as i64)
         .clamp(0, 3);
-    // Jev's judgment of the task; keywords only when it gave no valid answer.
-    let is_review = match answers.get("review").filter(|a| valid_answer(a, false)) {
-        Some(a) => {
-            a.get("score")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0)
-                .round()
-                >= 2.0
-        }
-        None => is_review_task(&task),
-    };
+    // Explicit --review (e.g. delegate_task role=review), else Jev's review
+    // judgment, with keyword fallback only when Jev gave no valid answer.
+    let is_review = force_review
+        || match answers.get("review").filter(|a| valid_answer(a, false)) {
+            Some(a) => {
+                a.get("score")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    .round()
+                    >= 2.0
+            }
+            None => is_review_task(&task),
+        };
     let failures = read_instance_failures(&env.home.join(".t3/userdata/statev2.sqlite"), now);
     let mut candidates: Vec<Candidate> = vec![];
     for (provider, model, profile) in &favorites {
@@ -1989,7 +2001,8 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                 })
                 .or(policy_ban);
         }
-        // An excluded instance just hit a usage limit; its whole account is out.
+        // Exclude every candidate on an excluded instance's account (author
+        // instance on review or a limit-hit account on workflow retry).
         let account_of = |i: &str| {
             current_cfg
                 .account
@@ -2001,7 +2014,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
             .iter()
             .any(|x| account_of(x) == account_of(provider))
         {
-            policy_ban = Some("excluded: account hit a usage limit".to_string());
+            policy_ban = Some("excluded for this route".to_string());
         }
         let q = quota(&cfg, &measured, &usage, &load, provider, model, now);
         let failure = failures.get(provider);
@@ -2075,7 +2088,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         candidates,
         difficulty,
         source.as_deref(),
-        (shared_w, paid_w, cheap_w),
+        (shared_w, paid_w, if is_review { 0.0 } else { cheap_w }),
     );
     let best = ranking.iter().find(|r| r.eligible);
     let blocked: Vec<String> = ranking

@@ -373,7 +373,7 @@ pub fn plan_remove_router_files(paths: &Paths) -> Vec<Change> {
 /// the always-loaded text stays minimal.
 pub fn router_block() -> String {
     "## Delegation routing (agentdeck router)\n\n\
-    - The agentdeck launch hook routes every `Agent`/`delegate_task` launch on its full task text; when it denies one, relaunch exactly as its message says. A user-chosen model: start the task with `[route:user-choice]`. Never set `runtimeMode` unless asked.\n"
+    - The agentdeck launch hook routes every `Agent`/`delegate_task` launch on its full task text; when it denies one, relaunch exactly as its message says. A user-chosen model: start the task with `[route:user-choice]`. Exclude instances (e.g. a PR author on review): start with `[route:exclude=id1,id2]`. Never set `runtimeMode` unless asked.\n"
         .to_string()
 }
 

@@ -30,6 +30,7 @@ pub enum Page {
     Modules,
     Processes,
     Coordinator,
+    Backlog,
     Pool,
     Shared,
     Harnesses,
@@ -52,6 +53,7 @@ impl Page {
             Self::Modules => fl!(loader(), "nav-modules"),
             Self::Processes => fl!(loader(), "nav-processes"),
             Self::Coordinator => fl!(loader(), "nav-coordinator"),
+            Self::Backlog => fl!(loader(), "nav-backlog"),
             Self::ApproverSettings => fl!(loader(), "nav-approver-settings"),
             Self::CoordinatorSettings => fl!(loader(), "nav-coord-settings"),
             Self::Pool => fl!(loader(), "nav-pool"),
@@ -1058,6 +1060,7 @@ fn modal(state: &State) -> Option<Modal<'_, Message>> {
         | Page::RouterSettings
         | Page::ImagegenSettings
         | Page::Coordinator
+        | Page::Backlog
         | Page::ApproverSettings
         | Page::CoordinatorSettings
         | Page::Modules => None,
@@ -1161,6 +1164,7 @@ fn sidebar(state: &State) -> Element<'_, Message> {
             agentdeck_core::plugins::PLUGIN_COORDINATOR,
             &[
                 (Page::Coordinator, st::Icon::CircleCheck),
+                (Page::Backlog, st::Icon::List),
                 (Page::CoordinatorSettings, st::Icon::Wrench),
             ],
         ),
@@ -1263,7 +1267,8 @@ fn header(state: &State) -> Element<'_, Message> {
         ),
         Page::Shared => (t("shared-title"), None),
         Page::Harnesses => (t("harness-title"), None),
-        Page::Coordinator => (t("nav-group-coordinator"), None),
+        Page::Coordinator => (t("nav-coordinator"), None),
+        Page::Backlog => (t("nav-backlog"), None),
         Page::ApproverSettings => (t("approver-settings-title"), None),
         Page::CoordinatorSettings => (t("coord-settings-title"), None),
         Page::Processes => (
@@ -1289,6 +1294,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
         Page::Modules => pages::plugins::view(&state.data, &state.plugin_open),
         Page::Processes => pages::processes::view(&state.data, &state.proc_ui),
         Page::Coordinator => pages::coordinator::view(&state.data),
+        Page::Backlog => pages::coordinator::backlog_view(&state.data),
         Page::ApproverSettings => settings::approver_view(&state.settings).map(Message::Settings),
         Page::CoordinatorSettings => settings::coord_view(&state.settings).map(Message::Settings),
         Page::Pool => pool::view(&state.pool).map(Message::Pool),

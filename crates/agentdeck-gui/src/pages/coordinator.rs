@@ -364,7 +364,7 @@ fn backlog_card<'a>(project: &'a str, items: &'a [Entry]) -> Element<'a, Message
 
 pub fn view(data: &Data) -> Element<'_, Message> {
     let look = st::look();
-    if data.coordinators.is_empty() && data.backlogs.is_empty() && data.reports.is_empty() {
+    if data.coordinators.is_empty() && data.reports.is_empty() {
         return st::card(st::muted(fl!(loader(), "coord-empty")));
     }
     let mut col = column![].spacing(look.gap.max(st::SPACE_S));
@@ -374,6 +374,15 @@ pub fn view(data: &Data) -> Element<'_, Message> {
     if !data.reports.is_empty() {
         col = col.push(reports_card(&data.reports));
     }
+    col.into()
+}
+
+pub fn backlog_view(data: &Data) -> Element<'_, Message> {
+    let look = st::look();
+    if data.backlogs.is_empty() {
+        return st::card(st::muted(fl!(loader(), "coord-backlog-empty")));
+    }
+    let mut col = column![].spacing(look.gap.max(st::SPACE_S));
     for (project, items) in &data.backlogs {
         col = col.push(backlog_card(project, items));
     }

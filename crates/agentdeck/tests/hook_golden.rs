@@ -1159,3 +1159,108 @@ fn hook_drains_route_output_larger_than_pipe_buffer() {
         "unexpected verdict: {verdict}"
     );
 }
+
+#[test]
+fn exclude_marker_routes_reviews_away_from_author_instance() {
+    let hint = shared_hint();
+    let sol = serde_json::json!({"providerInstanceId": "codex", "model": "gpt-6.1-sol",
+        "options": {"reasoningEffort": "high"}});
+    let opus = serde_json::json!({"providerInstanceId": "claudeAgent", "model": "claude-opus-5-5",
+        "options": {"effort": "high"}});
+    let task = format!("[route:exclude=codex] Review PR #185\n\n{hint}");
+
+    // Shell harness: excluded author instance is denied and rerouted to the other instance.
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        let mut input = delegate_input("delegate_task", &task, sol.clone(), serde_json::json!({}));
+        input["tool_input"]["role"] = "review".into();
+        input["source"] = "claudeAgent".into();
+        let (code, out, err) = run_rust(&fx, "shell", &input.to_string());
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        let verdict: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(verdict["decision"], "deny", "{verdict}");
+        let reason = verdict["reason"].as_str().unwrap();
+        assert!(reason.contains("excluded for this route"), "{reason}");
+        assert!(reason.contains("claude-opus-5-5"), "{reason}");
+        assert!(reason.contains("--exclude 'codex' --review"), "{reason}");
+        assert_eq!(last_record(&fx)["decision"], "deny:delegate");
+    }
+
+    // Shell harness: non-excluded target is allowed.
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        let mut input = delegate_input("delegate_task", &task, opus.clone(), serde_json::json!({}));
+        input["tool_input"]["role"] = "review".into();
+        input["source"] = "claudeAgent".into();
+        let (code, out, err) = run_rust(&fx, "shell", &input.to_string());
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        let verdict: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(verdict["decision"], "allow", "{verdict}");
+        assert_eq!(last_record(&fx)["decision"], "allow:delegate");
+    }
+
+    // Claude harness: rewrites directly to the non-excluded target even with role=review.
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        let mut input = delegate_input(
+            "mcp__t3-code__delegate_task",
+            &task,
+            sol,
+            serde_json::json!({}),
+        );
+        input["tool_input"]["role"] = "review".into();
+        let (code, out, err) = run_rust(&fx, "claude", &input.to_string());
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        let verdict: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            verdict["hookSpecificOutput"]["permissionDecision"], "allow",
+            "{verdict}"
+        );
+        assert_eq!(
+            verdict["hookSpecificOutput"]["updatedInput"]["target"]["providerInstanceId"],
+            "claudeAgent",
+            "{verdict}"
+        );
+        assert_eq!(last_record(&fx)["decision"], "rewrite:delegate");
+    }
+}
+
+#[test]
+fn review_role_disables_cheap_model_bonus_in_hook() {
+    const HAIKU: (&str, &str) = ("claudeAgent", "claude-haiku-5-5");
+    let hint = shared_hint();
+    let mut jev = answers_for(
+        &[
+            ("claudeagent_claude_opus_5_5", level(2.5, 0.95)),
+            ("claudeagent_claude_haiku_5_5", level(2.4, 0.95)),
+        ],
+        1.0,
+        1.0,
+    );
+    // Jev thinks it is not a review, but delegate_task carries role=review.
+    jev["answers"]["review"] = serde_json::json!({"score": 0.0, "confidence": 0.9});
+    let haiku = serde_json::json!({"providerInstanceId": "claudeAgent", "model": "claude-haiku-5-5",
+        "options": {"effort": "high"}});
+    let fx = Fixture::new(&[OPUS, HAIKU], &jev, None);
+    let mut input = delegate_input(
+        "delegate_task",
+        &format!("Inspect parser.rs for edge cases\n\n{hint}"),
+        haiku,
+        serde_json::json!({}),
+    );
+    input["tool_input"]["role"] = "review".into();
+    input["source"] = "claudeAgent".into();
+    let (code, out, err) = run_rust(&fx, "shell", &input.to_string());
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    let verdict: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(verdict["decision"], "deny", "{verdict}");
+    let rec = last_record(&fx);
+    assert_eq!(rec["target"]["model"], OPUS.1, "{rec}");
+    let haiku_row = rec["ranking"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["model"] == HAIKU.1)
+        .unwrap();
+    assert_eq!(haiku_row["cheapModelBonus"].as_f64(), Some(0.0), "{rec}");
+}

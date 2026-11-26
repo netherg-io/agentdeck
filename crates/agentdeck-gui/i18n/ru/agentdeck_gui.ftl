@@ -326,7 +326,9 @@ drift-instr-confirm-local = Заменить общий
 
 nav-group-coordinator = Координатор
 nav-coordinator = Прогресс
-coord-empty = Координаторы ещё не сохранили ни цели, ни бэклога.
+nav-backlog = Бэклог
+coord-empty = Координаторы ещё не сохранили целей.
+coord-backlog-empty = Открытых задач в бэклоге нет.
 coord-no-checklist = Чеклиста пока нет.
 coord-backlog = Бэклог { $project } · открыто { $count }
 coord-status-todo = Ждёт
