@@ -30,7 +30,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-on-failure: true
+          key: ${{ hashFiles('Cargo.toml') }}
 
       - name: Install iced system dependencies
         run: |
@@ -71,7 +71,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-on-failure: true
+          key: ${{ hashFiles('Cargo.toml') }}
 
       - name: Check
         run: cargo check --all-targets --locked
@@ -91,7 +91,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-on-failure: true
+          key: ${{ hashFiles('Cargo.toml') }}
 
       - name: Install libcosmic system dependencies
         run: |
@@ -123,7 +123,7 @@ jobs:
       - id: rust-cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "release-${{ matrix.package }}"
+          shared-key: "release-${{ matrix.package }}-${{ hashFiles('Cargo.toml') }}"
 
       - name: Install system dependencies
         if: steps.rust-cache.outputs.cache-hit != 'true'

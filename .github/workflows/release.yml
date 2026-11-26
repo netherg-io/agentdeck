@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -30,6 +31,10 @@ jobs:
         id: version
         shell: bash
         run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            echo "version=dry-run" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           VERSION="${GITHUB_REF_NAME#v}"
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
             echo "Invalid version: $VERSION" >&2
@@ -44,7 +49,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "release-${{ matrix.package }}"
+          shared-key: "release-${{ matrix.package }}-${{ hashFiles('Cargo.toml') }}"
           # Tag-scoped caches are unreadable by subsequent tags; main's release-cache saves them.
           save-if: false
 
@@ -83,6 +88,7 @@ jobs:
           retention-days: 1
 
   publish:
+    if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-latest
     steps:
