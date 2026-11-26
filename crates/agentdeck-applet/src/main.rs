@@ -678,12 +678,29 @@ fn provider_icon(provider: &str) -> widget::icon::Handle {
     widget::icon::from_svg_bytes(bytes).symbolic(true)
 }
 
+fn is_disabled(account: &AccountState) -> bool {
+    account.status == "disabled"
+        || (account.status == "error"
+            && account
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("is disabled in T3 settings.json")))
+}
+
 fn visible_groups<'a>(
     accounts: &'a [AccountState],
     prefs: &Prefs,
 ) -> Vec<(&'a str, Vec<&'a AccountState>)> {
-    let mut groups = prefs.group_by_provider(accounts, |a| a.id.as_str(), |a| a.provider.as_str());
-    groups.retain(|(provider, _)| !prefs.hidden.contains(*provider));
+    let mut groups = prefs.group_by_provider(
+        accounts,
+        |a| a.id.as_str(),
+        |a| a.name.as_str(),
+        |a| a.provider.as_str(),
+    );
+    for (_, list) in &mut groups {
+        list.retain(|a| !is_disabled(a));
+    }
+    groups.retain(|(provider, list)| !prefs.hidden.contains(*provider) && !list.is_empty());
     groups
 }
 
@@ -1175,20 +1192,52 @@ mod tests {
             ids(visible_accounts(&accounts, &prefs)),
             ["b", "d", "a", "c"]
         );
-        // Legacy account-id order still groups new instances with their provider.
+        // Legacy account-id order still ranks provider groups, while items inside
+        // each group keep natural label order (so a restored first instance stays first).
         let legacy = Prefs {
             order: vec!["c".into()],
             ..Prefs::default()
         };
         assert_eq!(
             ids(visible_accounts(&accounts, &legacy)),
-            ["c", "a", "b", "d"]
+            ["a", "c", "b", "d"]
         );
         prefs.hidden.insert("codex".to_owned());
         let visible = visible_accounts(&accounts, &prefs);
         assert_eq!(ids(visible), ["b", "d"]);
         prefs.hidden.insert("claude".to_owned());
         assert!(visible_accounts(&accounts, &prefs).is_empty());
+    }
+
+    #[test]
+    fn disabled_t3_instances_are_hidden_and_restored_first_sorts_first() {
+        let mut c2 = quota_account("claude-second", "claude", 50.0, false);
+        c2.name = "Claude 2".into();
+        let mut c4 = test_account("claude-fourth", "claude");
+        c4.name = "Claude 4".into();
+        c4.status = "disabled".into();
+        let mut c5 = AccountState::error(
+            "claude-fifth",
+            "Claude 5",
+            "claude",
+            r#"T3 instance "claude_fifth" is disabled in T3 settings.json; enable it in T3 Code"#,
+        );
+        c5.windows.clear();
+        let mut c1 = quota_account("claudeAgent", "claude", 80.0, false);
+        c1.name = "Claude 1".into();
+        let mut sole_disabled = test_account("codex-main", "codex");
+        sole_disabled.status = "disabled".into();
+
+        let accounts = vec![c2, c4, c5, c1, sole_disabled];
+        let legacy = Prefs {
+            order: vec!["claude-second".into(), "claude-fourth".into()],
+            ..Prefs::default()
+        };
+        let groups = visible_groups(&accounts, &legacy);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "claude");
+        let names: Vec<&str> = groups[0].1.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["Claude 1", "Claude 2"]);
     }
 
     fn quota_account(id: &str, provider: &str, remaining_pct: f64, stale: bool) -> AccountState {

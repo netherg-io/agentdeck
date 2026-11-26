@@ -2,8 +2,49 @@
 //! accounts' display order. Written by the agentdeck GUI, read by the applet;
 //! polling and routing ignore it.
 
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+/// Case-insensitive natural comparison where ASCII digit runs compare numerically
+/// (`"Claude 1" < "Claude 2" < "Claude 10"`, `"Antigravity" < "Antigravity 2"`).
+pub fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let (mut ai, mut bi) = (a.as_bytes(), b.as_bytes());
+    while !ai.is_empty() && !bi.is_empty() {
+        if ai[0].is_ascii_digit() && bi[0].is_ascii_digit() {
+            let an = ai.iter().take_while(|c| c.is_ascii_digit()).count();
+            let bn = bi.iter().take_while(|c| c.is_ascii_digit()).count();
+            let aslice = &ai[..an];
+            let bslice = &bi[..bn];
+            let a_trim = aslice
+                .iter()
+                .position(|&c| c != b'0')
+                .map_or(&[][..], |i| &aslice[i..]);
+            let b_trim = bslice
+                .iter()
+                .position(|&c| c != b'0')
+                .map_or(&[][..], |i| &bslice[i..]);
+            let ord = a_trim
+                .len()
+                .cmp(&b_trim.len())
+                .then_with(|| a_trim.cmp(b_trim))
+                .then_with(|| an.cmp(&bn));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            ai = &ai[an..];
+            bi = &bi[bn..];
+        } else {
+            let ord = ai[0].to_ascii_lowercase().cmp(&bi[0].to_ascii_lowercase());
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            ai = &ai[1..];
+            bi = &bi[1..];
+        }
+    }
+    ai.len().cmp(&bi.len())
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Prefs {
@@ -45,12 +86,14 @@ impl Prefs {
             .unwrap_or(usize::MAX)
     }
 
-    /// Group items by provider in panel order so new instances immediately land
-    /// next to their provider group and moving a group moves all its instances.
+    /// Group items by provider in panel order so new or restored instances
+    /// land in natural label order inside their provider group and moving a
+    /// group moves all its instances.
     pub fn group_by_provider<'a, T>(
         &self,
         items: &'a [T],
         id: impl Fn(&T) -> &str,
+        label: impl Fn(&T) -> &str,
         provider: impl Fn(&'a T) -> &'a str,
     ) -> Vec<(&'a str, Vec<&'a T>)> {
         let mut groups: Vec<(&'a str, Vec<&'a T>)> = Vec::new();
@@ -63,7 +106,9 @@ impl Prefs {
             }
         }
         for (_, list) in &mut groups {
-            list.sort_by_key(|item| self.rank(id(item)));
+            list.sort_by(|a, b| {
+                natural_cmp(label(a), label(b)).then_with(|| natural_cmp(id(a), id(b)))
+            });
         }
         groups.sort_by_key(|(p, _)| self.provider_rank(p, items, &id, &provider));
         groups
@@ -129,18 +174,19 @@ mod tests {
     #[test]
     fn groups_new_instances_with_their_provider_and_honors_legacy_id_order() {
         let items = [
-            ("codex-1", "codex"),
-            ("claude-1", "claude"),
-            ("agy-1", "antigravity"),
-            ("claude-2", "claude"),
-            ("agy-2", "antigravity"),
+            ("codex-1", "Codex 1", "codex"),
+            ("claude-2", "Claude 2", "claude"),
+            ("agy-2", "Antigravity 2", "antigravity"),
+            ("agy-10", "Antigravity 10", "antigravity"),
+            ("agy-1", "Antigravity", "antigravity"),
+            ("claudeAgent", "Claude 1", "claude"),
         ];
-        // Provider-keyed order moves whole groups and keeps newly added instances in their group.
+        // Provider-keyed order moves whole groups; within each group items sort naturally by label.
         let prefs = Prefs {
             order: vec!["antigravity".into(), "claude".into()],
             ..Prefs::default()
         };
-        let grouped = prefs.group_by_provider(&items, |x| x.0, |x| x.1);
+        let grouped = prefs.group_by_provider(&items, |x| x.0, |x| x.1, |x| x.2);
         let summary: Vec<(&str, Vec<&str>)> = grouped
             .iter()
             .map(|(p, list)| (*p, list.iter().map(|x| x.0).collect()))
@@ -148,19 +194,19 @@ mod tests {
         assert_eq!(
             summary,
             vec![
-                ("antigravity", vec!["agy-1", "agy-2"]),
-                ("claude", vec!["claude-1", "claude-2"]),
+                ("antigravity", vec!["agy-1", "agy-2", "agy-10"]),
+                ("claude", vec!["claudeAgent", "claude-2"]),
                 ("codex", vec!["codex-1"]),
             ]
         );
 
-        // Legacy account-id order still ranks groups by their earliest member and pulls new
-        // unlisted instances of that provider right into the group.
+        // Legacy account-id order still ranks provider groups by their earliest member,
+        // while a restored first instance (`claudeAgent` / "Claude 1") still lands first in its group.
         let legacy = Prefs {
-            order: vec!["agy-2".into(), "claude-1".into(), "codex-1".into()],
+            order: vec!["agy-2".into(), "claude-2".into(), "codex-1".into()],
             ..Prefs::default()
         };
-        let grouped = legacy.group_by_provider(&items, |x| x.0, |x| x.1);
+        let grouped = legacy.group_by_provider(&items, |x| x.0, |x| x.1, |x| x.2);
         let summary: Vec<(&str, Vec<&str>)> = grouped
             .iter()
             .map(|(p, list)| (*p, list.iter().map(|x| x.0).collect()))
@@ -168,8 +214,8 @@ mod tests {
         assert_eq!(
             summary,
             vec![
-                ("antigravity", vec!["agy-2", "agy-1"]),
-                ("claude", vec!["claude-1", "claude-2"]),
+                ("antigravity", vec!["agy-1", "agy-2", "agy-10"]),
+                ("claude", vec!["claudeAgent", "claude-2"]),
                 ("codex", vec!["codex-1"]),
             ]
         );

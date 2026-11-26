@@ -978,14 +978,14 @@ mod tests {
             explicit_plan: None,
         };
 
-        // 1. Instance disabled in T3 -> not transient
+        // 1. Instance disabled in T3 -> disabled and not transient
         let disabled = providers::t3::fetch_from_root(
             &dir,
             src("claude-dis", Some("claude-dis")),
             900,
             1_794_570_000,
         );
-        assert_eq!(disabled.status, "error");
+        assert_eq!(disabled.status, "disabled");
         assert!(!has_transient_error(&wrap(disabled)));
 
         // 2. Source without T3 instance -> not transient

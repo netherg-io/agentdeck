@@ -136,13 +136,15 @@ pub fn fetch_from_root(
             return AccountState::error(source.id, source.name, source.provider, msg);
         }
         Ok(Some(false)) => {
-            return AccountState::error(
-                source.id,
-                source.name,
-                source.provider,
-                format!(
+            return make_state(
+                "disabled",
+                source.explicit_plan.map(str::to_owned),
+                None,
+                Vec::new(),
+                Some(format!(
                     "T3 instance {instance_id:?} is disabled in T3 settings.json; enable it in T3 Code"
-                ),
+                )),
+                now,
             );
         }
         Ok(Some(true)) => {}
@@ -1079,7 +1081,7 @@ mod tests {
         );
 
         let st = fetch_from_root(&t3, src("c1", "claude", Some("disabled-inst")), 900, NOW);
-        assert_eq!(st.status, "error");
+        assert_eq!(st.status, "disabled");
         assert!(st.windows.is_empty());
         assert!(st.error.as_deref().unwrap().contains("disabled"));
     }
