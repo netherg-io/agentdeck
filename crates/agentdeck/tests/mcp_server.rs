@@ -2,7 +2,7 @@
 //! install that reaches every harness dir, an instructions edit, and refusal
 //! once the plugin is disabled.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -35,17 +35,22 @@ fn session_env(dir: &Path, env: &[(&str, &str)], requests: &[Value]) -> Vec<Valu
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut replies = Vec::new();
     for r in requests {
         writeln!(stdin, "{r}").unwrap();
+        stdin.flush().unwrap();
+        if r.get("id").is_some() {
+            let mut line = String::new();
+            let n = stdout.read_line(&mut line).unwrap();
+            assert!(n > 0, "unexpected EOF waiting for reply to {r}");
+            replies.push(serde_json::from_str(&line).unwrap());
+        }
     }
     drop(stdin);
-    let out = child.wait_with_output().unwrap();
-    assert!(out.status.success());
-    String::from_utf8(out.stdout)
-        .unwrap()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect()
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    replies
 }
 
 fn call(id: u64, name: &str, args: Value) -> Value {
@@ -1101,7 +1106,7 @@ fn route_batch_lists_schema_handles_invalid_and_warms_hook_cache() {
 
     // 3b. Routing the identical launch through the actual hook (`agentdeck route hook --harness claude`)
     // also succeeds with zero judge calls (cache hit!).
-    let hint = results[0]["briefHint"].as_str().unwrap_or_default();
+    let hint = agentdeck_router::policy::hint_of_on("codex", "gpt-6.1-sol").unwrap_or_default();
     let hook_payload = json!({
         "tool_name": "mcp__t3-code__delegate_task",
         "tool_input": {
@@ -1354,7 +1359,7 @@ fn route_batch_resolves_secondary_account_via_t3_thread_and_hits_hook_cache() {
 
     // Run actual hook for secondary Codex account with ONLY CODEX_HOME (no T3CODE_THREAD_ID),
     // verifying cross-mechanism source parity and cache hit with zero judge calls.
-    let hint = results[0]["briefHint"].as_str().unwrap_or_default();
+    let hint = agentdeck_router::policy::hint_of_on("codex", "gpt-6.1-sol").unwrap_or_default();
     let hook_payload = json!({
         "tool_name": "mcp__t3-code__delegate_task",
         "tool_input": {
@@ -1395,5 +1400,339 @@ fn route_batch_resolves_secondary_account_via_t3_thread_and_hits_hook_cache() {
             && decision_log.contains("\"decision\":\"allow:delegate\""),
         "hook for secondary account must hit route_batch cache with zero judge calls; log={decision_log}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn setup_route_batch_fixture(
+    dir: &Path,
+    mock_jev_body: Value,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let _ = std::fs::remove_dir_all(dir);
+    let home = dir.join("home");
+    let runtime = dir.join("runtime");
+    let xdg_state = dir.join("xdg-state");
+    for p in [
+        dir.join("config"),
+        home.join(".t3/userdata"),
+        home.join(".local/state/ai-usage"),
+        xdg_state.join("model-route"),
+        runtime.clone(),
+    ] {
+        std::fs::create_dir_all(p).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::fs::write(
+        dir.join("config/instances.toml"),
+        "version = 1\n\n[plugins]\nmcp-server = true\nrouter = true\n",
+    )
+    .unwrap();
+    std::fs::write(home.join(".t3/userdata/settings.json"), "{}").unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/catalog.fixture.json"),
+        xdg_state.join("model-route/catalog.json"),
+    )
+    .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64() as i64;
+    let usage = json!({"accounts": [
+        {"provider": "claude", "id": "claude-main", "plan": "Max 5x", "status": "ok", "updated_at": now, "balances": [],
+         "windows": [
+            {"key": "weekly_all", "label": "Week", "remaining_percent": 70, "duration_mins": 10080, "resets_at": now + 5 * 86400},
+            {"key": "session", "label": "5h", "remaining_percent": 70, "duration_mins": 300, "resets_at": now + 3 * 3600}
+         ]},
+        {"provider": "codex", "id": "codex-main", "plan": "Pro 5x", "status": "ok", "updated_at": now, "balances": [],
+         "windows": [
+            {"key": "weekly", "label": "Week", "remaining_percent": 90, "duration_mins": 10080, "resets_at": now + 5 * 86400},
+            {"key": "5h", "label": "5h", "remaining_percent": 90, "duration_mins": 300, "resets_at": now + 3 * 3600}
+         ]}
+    ]});
+    std::fs::write(
+        home.join(".local/state/ai-usage/state.json"),
+        usage.to_string(),
+    )
+    .unwrap();
+    let router_json = dir.join("router.json");
+    let router_cfg = json!({
+        "version": 1,
+        "decisionProvider": "openrouter",
+        "decisionModel": "~typesafe/jev-latest",
+        "pool": [
+            {"providerInstanceId": "codex", "model": "gpt-6.1-sol", "enabled": true},
+            {"providerInstanceId": "claudeAgent", "model": "claude-opus-5-5", "enabled": true}
+        ],
+        "accounts": {
+            "codex": {"instances": ["codex"], "usageProvider": "codex", "usageId": "codex-main"},
+            "claude": {"instances": ["claudeAgent"], "usageProvider": "claude", "usageId": "claude-main"}
+        }
+    });
+    std::fs::write(&router_json, router_cfg.to_string()).unwrap();
+    let mock_jev = dir.join("jev.json");
+    std::fs::write(&mock_jev, mock_jev_body.to_string()).unwrap();
+    (runtime, router_json, mock_jev)
+}
+
+#[test]
+fn slow_route_batch_does_not_block_ping_on_same_stdio_session() {
+    let dir = std::env::temp_dir().join(format!(
+        "agentdeck-mcp-concurrent-ping-{}",
+        std::process::id()
+    ));
+    let (runtime, router_json, mock_jev) = setup_route_batch_fixture(
+        &dir,
+        json!({
+            "answers": {
+                "size": {"score": 1, "confidence": 0.9},
+                "difficulty": {"score": 1, "confidence": 0.9},
+                "review": {"score": 0, "confidence": 0.95},
+                "codex_gpt_6_1_sol": {"score": 2.8, "confidence": 0.9, "probabilities": {"0": 0.0, "1": 0.05, "2": 0.15, "3": 0.8}},
+                "claudeagent_claude_opus_5_5": {"score": 2.2, "confidence": 0.85, "probabilities": {"0": 0.0, "1": 0.1, "2": 0.7, "3": 0.2}}
+            },
+            "usage": {"cost": 0.003}
+        }),
+    );
+
+    // Hold route_batch for ~2 s via the judge 429 block store while ping runs concurrently.
+    let blocks = agentdeck_core::judge::BlockStore::for_runtime_dir(&runtime);
+    blocks
+        .record_rate_limit(
+            &agentdeck_core::judge::JudgeEndpoint::new("openrouter", "~typesafe/jev-latest"),
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentdeck"))
+        .arg("mcp-server")
+        .env_remove("T3CODE_THREAD_ID")
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("JEV_OPENROUTER_API_KEY")
+        .env_remove("AI_GATEWAY_API_KEY")
+        .env("AGENTDECK_T3_DIR", dir.join("no-t3"))
+        .env("HOME", dir.join("home"))
+        .env("AGENTDECK_CONFIG_DIR", dir.join("config"))
+        .env("AGENTDECK_STATE_DIR", dir.join("state"))
+        .env("XDG_STATE_HOME", dir.join("xdg-state"))
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("MODEL_ROUTE_ROUTER_JSON", &router_json)
+        .env("AGENTDECK_ROUTE_MOCK_JEV", &mock_jev)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // Handshake first.
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let mut init_line = String::new();
+    stdout.read_line(&mut init_line).unwrap();
+    let init_reply: Value = serde_json::from_str(&init_line).unwrap();
+    assert_eq!(init_reply["id"], 1);
+
+    // Send slow route_batch (id 10) followed immediately by ping (id 11) on the same stdio session.
+    let slow = call(
+        10,
+        "route_batch",
+        json!({
+            "harness": "claude",
+            "launches": [{
+                "tool": "mcp__t3-code__delegate_task",
+                "input": {"task": "Add concurrency tests for stdio MCP server"}
+            }]
+        }),
+    );
+    let ping = json!({"jsonrpc": "2.0", "id": 11, "method": "ping"});
+    writeln!(stdin, "{slow}").unwrap();
+    writeln!(stdin, "{ping}").unwrap();
+    stdin.flush().unwrap();
+
+    let mut first_line = String::new();
+    stdout.read_line(&mut first_line).unwrap();
+    let first: Value = serde_json::from_str(&first_line).unwrap();
+    let mut second_line = String::new();
+    stdout.read_line(&mut second_line).unwrap();
+    let second: Value = serde_json::from_str(&second_line).unwrap();
+
+    drop(stdin);
+    let status = child.wait().unwrap();
+    assert!(status.success());
+
+    assert_eq!(
+        first["id"], 11,
+        "ping must answer before the slow route_batch call; got first={first}, second={second}"
+    );
+    assert_eq!(first["result"], json!({}));
+    assert_eq!(second["id"], 10);
+    assert!(
+        second["result"].get("isError").is_none(),
+        "{}",
+        text(&second)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn route_batch_default_compact_under_4000_chars_and_verbose_returns_full() {
+    let dir = std::env::temp_dir().join(format!(
+        "agentdeck-mcp-route-batch-compact-{}",
+        std::process::id()
+    ));
+    let (runtime, router_json, mock_jev) = setup_route_batch_fixture(
+        &dir,
+        json!({
+            "answers": {
+                "size": {"score": 1, "confidence": 0.9},
+                "difficulty": {"score": 1, "confidence": 0.9},
+                "review": {"score": 0, "confidence": 0.95},
+                "codex_gpt_6_1_sol": {"score": 2.8, "confidence": 0.9, "probabilities": {"0": 0.0, "1": 0.05, "2": 0.15, "3": 0.8}},
+                "claudeagent_claude_opus_5_5": {"score": 2.2, "confidence": 0.85, "probabilities": {"0": 0.0, "1": 0.1, "2": 0.7, "3": 0.2}}
+            },
+            "usage": {"cost": 0.003}
+        }),
+    );
+
+    let runtime_s = runtime.to_string_lossy().into_owned();
+    let router_s = router_json.to_string_lossy().into_owned();
+    let mock_s = mock_jev.to_string_lossy().into_owned();
+    let env = [
+        ("XDG_RUNTIME_DIR", runtime_s.as_str()),
+        ("MODEL_ROUTE_ROUTER_JSON", router_s.as_str()),
+        ("AGENTDECK_ROUTE_MOCK_JEV", mock_s.as_str()),
+    ];
+
+    let launches = json!([
+        {"tool": "mcp__t3-code__delegate_task", "input": {"task": "Implement feature A with tests"}},
+        {"tool": "mcp__t3-code__delegate_task", "input": {"task": "Refactor module B helper"}},
+        {"tool": "mcp__t3-code__delegate_task", "input": {"task": "Fix edge case C in parser"}}
+    ]);
+
+    let replies = session_env(
+        &dir,
+        &env,
+        &[
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            call(
+                2,
+                "route_batch",
+                json!({ "harness": "claude", "launches": launches }),
+            ),
+            call(
+                3,
+                "route_batch",
+                json!({ "harness": "claude", "launches": launches, "verbose": true }),
+            ),
+        ],
+    );
+
+    let route_tool = replies[0]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "route_batch")
+        .unwrap();
+    assert_eq!(
+        route_tool["inputSchema"]["properties"]["verbose"]["type"], "boolean",
+        "route_batch schema must expose optional verbose flag: {route_tool}"
+    );
+
+    let compact_raw = text(&replies[1]);
+    assert!(
+        compact_raw.len() < 4000,
+        "3-launch default route_batch output must stay under 4000 chars, got {} chars",
+        compact_raw.len()
+    );
+    let compact: Value = serde_json::from_str(&compact_raw).unwrap();
+    let results = compact["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+    for r in results {
+        assert!(r["target"]["providerInstanceId"].is_string(), "{r}");
+        assert!(r["target"]["model"].is_string(), "{r}");
+        assert_eq!(r["jevChannel"], "primary", "{r}");
+        assert_eq!(r["jevCache"], "miss", "{r}");
+        assert!(r["confidence"].is_object(), "{r}");
+        assert!(r.get("ranking").is_none(), "compact must omit ranking: {r}");
+        assert!(
+            r.get("briefHint").is_none(),
+            "compact must omit briefHint: {r}"
+        );
+        assert!(
+            r.get("coefficients").is_none(),
+            "compact must omit coefficients: {r}"
+        );
+    }
+
+    let verbose_raw = text(&replies[2]);
+    let verbose: Value = serde_json::from_str(&verbose_raw).unwrap();
+    let v_results = verbose["results"].as_array().unwrap();
+    assert_eq!(v_results.len(), 3);
+    assert!(v_results[0]["ranking"].is_array(), "{}", v_results[0]);
+    assert!(v_results[0]["briefHint"].is_string(), "{}", v_results[0]);
+
+    // Low confidence + unknown source carry warning messages without candidate tables.
+    std::fs::write(
+        &mock_jev,
+        json!({
+            "answers": {
+                "size": {"score": 1, "confidence": 0.2},
+                "difficulty": {"score": 1, "confidence": 0.2},
+                "review": {"score": 0, "confidence": 0.95},
+                "codex_gpt_6_1_sol": {"score": 2.8, "confidence": 0.2, "probabilities": {"0": 0.25, "1": 0.25, "2": 0.25, "3": 0.25}},
+                "claudeagent_claude_opus_5_5": {"score": 2.2, "confidence": 0.2, "probabilities": {"0": 0.25, "1": 0.25, "2": 0.25, "3": 0.25}}
+            },
+            "usage": {"cost": 0.003}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let warn_replies = session_env(
+        &dir,
+        &env,
+        &[call(
+            4,
+            "route_batch",
+            json!({
+                "source": "unknown-inst",
+                "launches": [{
+                    "tool": "mcp__t3-code__delegate_task",
+                    "input": {"task": "Low confidence warning check"}
+                }]
+            }),
+        )],
+    );
+    let warn_batch: Value = serde_json::from_str(&text(&warn_replies[0])).unwrap();
+    let wr = &warn_batch["results"][0];
+    assert!(
+        wr["sourceWarning"]
+            .as_str()
+            .is_some_and(|s| s.contains("unknown-inst")),
+        "{wr}"
+    );
+    assert!(
+        wr["confidenceWarning"]
+            .as_str()
+            .is_some_and(|s| s.contains("below 0.4")),
+        "compact confidenceWarning should carry message string only: {wr}"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

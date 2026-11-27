@@ -4,8 +4,11 @@
 //! state that survives provider switches. Newline-delimited JSON-RPC 2.0.
 
 use std::collections::HashSet;
-use std::io::{BufRead, Write};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use agentdeck_coordinator::checkpoint::{
     CheckpointInput, CheckpointJudge, CheckpointVerdict, HeuristicCheckpointJudge,
@@ -240,7 +243,7 @@ fn tools() -> Value {
         },
         {
             "name": "route_batch",
-            "description": "Pre-route a wave of 2 or more delegate launches in batched judge requests and warm the 10-minute routing cache. Call before launching 2+ delegates in one turn with the exact tool names and input payloads you will launch, then launch with the same payloads (a changed payload misses the cache). Returns per-launch routing JSON or {error} in input order.",
+            "description": "Pre-route a wave of 2 or more delegate launches in batched judge requests and warm the 10-minute routing cache. Call before launching 2+ delegates in one turn with the exact tool names and input payloads you will launch, then launch with the same payloads (a changed payload misses the cache). Returns compact per-launch results (target, source, jevChannel, jevCache, confidence, warnings/confidenceWarning messages, validation, or error) in input order; pass `verbose: true` for the full `agentdeck route` JSON.",
             "inputSchema": {
                 "type": "object",
                 "required": ["launches"],
@@ -275,6 +278,10 @@ fn tools() -> Value {
                     "source": {
                         "type": "string",
                         "description": "Optional caller T3 provider instance id (overrides harness/process detection)"
+                    },
+                    "verbose": {
+                        "type": "boolean",
+                        "description": "Return the full `agentdeck route` JSON per launch (rankings, candidate tables, brief hints). Defaults to false (compact output)."
                     }
                 }
             }
@@ -501,6 +508,10 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
                 .get("launches")
                 .and_then(Value::as_array)
                 .ok_or_else(|| anyhow::anyhow!("launches must be an array"))?;
+            let verbose = args
+                .get("verbose")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let env = agentdeck_router::route::Env::from_env()?;
             let opts = agentdeck_router::route::BatchOptions {
                 harness: str_arg(args, "harness").map(str::to_string),
@@ -508,6 +519,11 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
                 budget: agentdeck_router::route::BATCH_BUDGET,
             };
             let results = agentdeck_router::route::route_batch(&env, launches, opts).await?;
+            let results = if verbose {
+                results
+            } else {
+                results.into_iter().map(compact_route_result).collect()
+            };
             Ok(json!({ "results": results }))
         }
         "state_read" => {
@@ -1041,25 +1057,244 @@ async fn handle(paths: &Paths, msg: &Value) -> Option<Value> {
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
-pub async fn run(paths: &Paths) -> anyhow::Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
+fn compact_route_result(v: Value) -> Value {
+    if let Some(err) = v.get("error") {
+        return json!({ "error": err });
+    }
+    let mut out = serde_json::Map::new();
+    for key in [
+        "target",
+        "source",
+        "jevChannel",
+        "jevCache",
+        "confidence",
+        "validation",
+        "sourceWarning",
+        "warnings",
+    ] {
+        if let Some(val) = v.get(key)
+            && (key == "target" || !val.is_null())
+        {
+            out.insert(key.into(), val.clone());
+        }
+    }
+    if v.get("target").is_some_and(Value::is_null)
+        && let Some(reason) = v.get("reason")
+    {
+        out.insert("reason".into(), reason.clone());
+    }
+    if let Some(cw) = v.get("confidenceWarning") {
+        let msg = cw
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| cw.as_str());
+        if let Some(msg) = msg {
+            out.insert("confidenceWarning".into(), Value::from(msg));
+        }
+    }
+    Value::Object(out)
+}
+
+async fn write_reply<W: AsyncWrite + Unpin>(
+    writer: &tokio::sync::Mutex<W>,
+    reply: &Value,
+) -> std::io::Result<()> {
+    let mut line = serde_json::to_vec(reply)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    line.push(b'\n');
+    let mut out = writer.lock().await;
+    out.write_all(&line).await?;
+    out.flush().await
+}
+
+async fn serve_with<R, W, F, Fut>(reader: R, writer: W, handler: F) -> anyhow::Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+    F: Fn(Value) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Option<Value>> + Send + 'static,
+{
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    let handler = Arc::new(handler);
+    let mut lines = reader.lines();
+    let mut tasks: tokio::task::JoinSet<std::io::Result<()>> = tokio::task::JoinSet::new();
+    loop {
+        let line = tokio::select! {
+            biased;
+            Some(res) = tasks.join_next(), if !tasks.is_empty() => {
+                res??;
+                continue;
+            }
+            line = lines.next_line() => match line? {
+                Some(line) => line,
+                None => break,
+            },
+        };
         if line.trim().is_empty() {
             continue;
         }
-        let reply = match serde_json::from_str::<Value>(&line) {
-            Ok(msg) => handle(paths, &msg).await,
-            Err(e) => Some(json!({
-                "jsonrpc": "2.0", "id": null,
-                "error": { "code": -32700, "message": format!("parse error: {e}") }
-            })),
+        let msg = match serde_json::from_str::<Value>(&line) {
+            Ok(msg) => msg,
+            Err(e) => {
+                let err = json!({
+                    "jsonrpc": "2.0", "id": null,
+                    "error": { "code": -32700, "message": format!("parse error: {e}") }
+                });
+                write_reply(&writer, &err).await?;
+                continue;
+            }
         };
-        if let Some(reply) = reply {
-            writeln!(stdout, "{reply}")?;
-            stdout.flush()?;
+        // Notifications carry no id and get no reply; keep them ordered inline.
+        if msg.get("id").is_none() {
+            continue;
         }
+        // Complete `initialize` before reading later lines so the handshake stays ordered.
+        if msg.get("method").and_then(Value::as_str) == Some("initialize") {
+            if let Some(reply) = handler(msg).await {
+                write_reply(&writer, &reply).await?;
+            }
+            continue;
+        }
+        let writer = Arc::clone(&writer);
+        let handler = Arc::clone(&handler);
+        tasks.spawn(async move {
+            if let Some(reply) = handler(msg).await {
+                write_reply(&writer, &reply).await?;
+            }
+            Ok(())
+        });
+    }
+    while let Some(res) = tasks.join_next().await {
+        res??;
     }
     Ok(())
+}
+
+pub async fn run(paths: &Paths) -> anyhow::Result<()> {
+    let paths = paths.clone();
+    serve_with(
+        tokio::io::BufReader::new(tokio::io::stdin()),
+        tokio::io::stdout(),
+        move |msg| {
+            let paths = paths.clone();
+            async move { handle(&paths, &msg).await }
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::{Mutex, oneshot};
+
+    #[tokio::test]
+    async fn serve_with_dispatches_concurrently_preserves_init_and_serializes_stdout() {
+        let (mut client_in, server_in) = tokio::io::duplex(64 * 1024);
+        let (server_out, client_out) = tokio::io::duplex(256 * 1024);
+
+        let (entered_tx, entered_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let entered = Arc::new(Mutex::new(Some(entered_tx)));
+        let release = Arc::new(Mutex::new(Some(release_rx)));
+
+        let server = tokio::spawn(serve_with(
+            tokio::io::BufReader::new(server_in),
+            server_out,
+            move |msg| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                async move {
+                    let id = msg.get("id")?.clone();
+                    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                    match method {
+                        "initialize" => {
+                            Some(json!({"jsonrpc": "2.0", "id": id, "result": {"ok": "init"}}))
+                        }
+                        "ping" => Some(json!({"jsonrpc": "2.0", "id": id, "result": {}})),
+                        "tools/call" => {
+                            let name = msg
+                                .pointer("/params/name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            if name == "slow" {
+                                if let Some(tx) = entered.lock().await.take() {
+                                    let _ = tx.send(());
+                                }
+                                if let Some(rx) = release.lock().await.take() {
+                                    let _ = rx.await;
+                                }
+                                Some(
+                                    json!({"jsonrpc": "2.0", "id": id, "result": {"done": "slow"}}),
+                                )
+                            } else {
+                                let payload = "x".repeat(4096);
+                                Some(
+                                    json!({"jsonrpc": "2.0", "id": id, "result": {"pad": payload}}),
+                                )
+                            }
+                        }
+                        _ => Some(
+                            json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "not found"}}),
+                        ),
+                    }
+                }
+            },
+        ));
+
+        let mut reader = tokio::io::BufReader::new(client_out).lines();
+
+        // Send initialize + notification + slow call + ping together.
+        let batch = format!(
+            "{}\n{}\n{}\n{}\n",
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "slow"}}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}),
+        );
+        client_in.write_all(batch.as_bytes()).await.unwrap();
+        client_in.flush().await.unwrap();
+
+        let r1: Value = serde_json::from_str(&reader.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(r1["id"], 1);
+        assert_eq!(r1["result"]["ok"], "init");
+
+        // Wait until slow handler is in flight, then verify ping answers while slow is still blocked.
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let r2: Value = serde_json::from_str(
+            &tokio::time::timeout(std::time::Duration::from_secs(2), reader.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(r2["id"], 3, "ping must answer before slow call: {r2}");
+        assert_eq!(r2["result"], json!({}));
+
+        // Burst 8 large concurrent replies while releasing the slow call to check serialized writes.
+        let mut burst = String::new();
+        for id in 10..18 {
+            burst.push_str(&format!(
+                "{}\n",
+                json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "bulk"}})
+            ));
+        }
+        client_in.write_all(burst.as_bytes()).await.unwrap();
+        client_in.flush().await.unwrap();
+        let _ = release_tx.send(());
+        drop(client_in);
+
+        let mut seen = HashSet::new();
+        while let Some(line) = reader.next_line().await.unwrap() {
+            let v: Value = serde_json::from_str(&line).expect("each reply must be whole JSON");
+            seen.insert(v["id"].as_u64().unwrap());
+        }
+        server.await.unwrap().unwrap();
+        let expected: HashSet<u64> = std::iter::once(2).chain(10..18).collect();
+        assert_eq!(seen, expected);
+    }
 }

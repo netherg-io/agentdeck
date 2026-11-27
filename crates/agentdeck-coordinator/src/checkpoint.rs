@@ -207,6 +207,15 @@ struct CheckpointTarget {
     id: JudgeEndpoint,
 }
 
+#[derive(Clone)]
+struct CheckpointFallback {
+    endpoint: String,
+    /// `None` resolves dynamically on each judge call so keys installed after
+    /// daemon startup are picked up without a restart.
+    api_key: Option<String>,
+    id: JudgeEndpoint,
+}
+
 fn default_endpoint_for(provider: &str) -> anyhow::Result<&'static str> {
     match provider {
         PROVIDER_OPENROUTER => Ok("https://openrouter.ai/api/alpha/decisions"),
@@ -242,7 +251,7 @@ pub struct HttpCheckpointJudge {
     pub api_key: String,
     pub model: String,
     provider: String,
-    fallback: Option<CheckpointTarget>,
+    fallback: Option<CheckpointFallback>,
     timeout: Duration,
     deadline: Duration,
     blocks: BlockStore,
@@ -270,16 +279,15 @@ impl HttpCheckpointJudge {
         })?;
         let fallback = cfg.judge_fallback.endpoint().and_then(|ep| {
             let fb_endpoint = default_endpoint_for(&ep.provider).ok()?;
-            let Some(fb_key) = resolve_api_key(&ep.provider) else {
+            if resolve_api_key(&ep.provider).is_none() {
                 eprintln!(
-                    "checkpoint judge: no API key for fallback provider {}; fallback disabled",
+                    "checkpoint judge: no API key for fallback provider {}; fallback waiting for key",
                     ep.provider
                 );
-                return None;
-            };
-            Some(CheckpointTarget {
+            }
+            Some(CheckpointFallback {
                 endpoint: fb_endpoint.to_string(),
-                api_key: fb_key,
+                api_key: None,
                 id: ep,
             })
         });
@@ -317,9 +325,9 @@ impl HttpCheckpointJudge {
             Some(u) => u,
             None => default_endpoint_for(provider)?.to_string(),
         };
-        self.fallback = Some(CheckpointTarget {
+        self.fallback = Some(CheckpointFallback {
             endpoint: ep,
-            api_key,
+            api_key: Some(api_key),
             id: JudgeEndpoint::new(provider, model),
         });
         Ok(self)
@@ -561,7 +569,18 @@ impl CheckpointJudge for HttpCheckpointJudge {
             api_key: self.api_key.clone(),
             id: JudgeEndpoint::new(&self.provider, &self.model),
         };
-        let fallback_id = self.fallback.as_ref().map(|fb| &fb.id);
+        let fallback = self.fallback.as_ref().and_then(|fb| {
+            let api_key = match &fb.api_key {
+                Some(k) => k.clone(),
+                None => resolve_api_key(&fb.id.provider)?,
+            };
+            Some(CheckpointTarget {
+                endpoint: fb.endpoint.clone(),
+                api_key,
+                id: fb.id.clone(),
+            })
+        });
+        let fallback_id = fallback.as_ref().map(|fb| &fb.id);
         let (verdict, _channel) = dispatch_with_deadline(
             &self.blocks,
             &primary.id,
@@ -574,7 +593,7 @@ impl CheckpointJudge for HttpCheckpointJudge {
                 let target = if ep == &primary.id {
                     &primary
                 } else {
-                    self.fallback.as_ref().unwrap_or(&primary)
+                    fallback.as_ref().unwrap_or(&primary)
                 };
                 self.judge_target(target, input, attempt_deadline)
             },
@@ -1341,5 +1360,173 @@ mod tests {
         server.join().unwrap();
         assert!(verdict.should_checkpoint);
         assert_eq!(verdict.confidence, 0.92);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checkpoint_fallback_key_installed_between_ticks_is_picked_up() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "AGENTDECK_CHECKPOINT_LATE_KEY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = std::env::temp_dir().join(format!(
+                "agentdeck-checkpoint-late-key-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let home = root.join("home");
+            let xdg = root.join("xdg");
+            let key_dir = home.join(".config/model-route");
+            std::fs::create_dir_all(&key_dir).unwrap();
+            std::fs::create_dir_all(&xdg).unwrap();
+            std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(key_dir.join("openrouter.key"), "primary-or-key\n").unwrap();
+
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "checkpoint::tests::checkpoint_fallback_key_installed_between_ticks_is_picked_up",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HOME", &home)
+                .env("XDG_RUNTIME_DIR", &xdg)
+                .env_remove("OPENROUTER_API_KEY")
+                .env_remove("JEV_OPENROUTER_API_KEY")
+                .env_remove("AI_GATEWAY_API_KEY")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let _ = std::fs::remove_dir_all(&root);
+            assert!(
+                output.status.success(),
+                "child failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            return;
+        }
+
+        let cfg = CoordinatorConfig {
+            judge_provider: Some(PROVIDER_OPENROUTER.to_string()),
+            judge_model: Some("~typesafe/jev-latest".to_string()),
+            judge_fallback: agentdeck_core::settings::JudgeFallbackSettings {
+                provider: Some(PROVIDER_VERCEL.to_string()),
+                model: Some("openai/gpt-4o-mini".to_string()),
+            },
+            ..Default::default()
+        };
+
+        let primary_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+        let primary_srv = std::thread::spawn(move || {
+            let mut hits = 0usize;
+            for _ in 0..2 {
+                let (mut stream, _) = primary_listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut req_line = String::new();
+                reader.read_line(&mut req_line).unwrap();
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        len = v.trim().parse().unwrap();
+                    }
+                }
+                let mut buf = vec![0; len];
+                reader.read_exact(&mut buf).unwrap();
+                let body = "{}";
+                write!(
+                    stream,
+                    "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                hits += 1;
+            }
+            hits
+        });
+
+        let fb_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fb_addr = fb_listener.local_addr().unwrap();
+        let fb_srv = std::thread::spawn(move || {
+            let (mut stream, _) = fb_listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            let mut len = 0usize;
+            let mut auth = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((n, v)) = line.split_once(':') {
+                    if n.eq_ignore_ascii_case("content-length") {
+                        len = v.trim().parse().unwrap();
+                    } else if n.eq_ignore_ascii_case("authorization") {
+                        auth = v.trim().to_string();
+                    }
+                }
+            }
+            let mut buf = vec![0; len];
+            reader.read_exact(&mut buf).unwrap();
+            let body = json!({
+                "answers": [{"name": "checkpoint_safe", "type": "score", "score": 3, "confidence": 0.91}]
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            auth
+        });
+
+        // Built once on tick 1 while fallback key is absent (as cached by the daemon).
+        let mut judge = HttpCheckpointJudge::from_env(&cfg).expect("primary key present");
+        judge.endpoint = format!("http://{primary_addr}/api/alpha/decisions");
+        judge.client = reqwest::Client::builder().no_proxy().build().unwrap();
+        if let Some(fb) = judge.fallback.as_mut() {
+            fb.endpoint = format!("http://{fb_addr}/v1/decisions");
+        }
+
+        // Tick 1: fallback key absent -> primary 500 fails without hitting fallback.
+        let tick1 =
+            tokio::time::timeout(Duration::from_secs(3), judge.judge(&sample_input(), &cfg))
+                .await
+                .unwrap();
+        assert!(
+            tick1.is_err(),
+            "tick 1 without fallback key must fail: {tick1:?}"
+        );
+
+        // Install fallback key between tick 1 and tick 2.
+        let key_path =
+            PathBuf::from(std::env::var_os("HOME").unwrap()).join(".config/model-route/vercel.key");
+        std::fs::write(&key_path, "late-vercel-key\n").unwrap();
+
+        // Tick 2: same cached judge instance picks up the fallback key and succeeds via fallback.
+        let tick2 =
+            tokio::time::timeout(Duration::from_secs(3), judge.judge(&sample_input(), &cfg))
+                .await
+                .unwrap()
+                .expect("tick 2 must use fallback once its key is installed");
+        assert!(tick2.should_checkpoint);
+        assert_eq!(tick2.confidence, 0.91);
+        assert_eq!(primary_srv.join().unwrap(), 2);
+        assert_eq!(fb_srv.join().unwrap(), "Bearer late-vercel-key");
     }
 }
