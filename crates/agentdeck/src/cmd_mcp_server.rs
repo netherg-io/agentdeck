@@ -1059,7 +1059,9 @@ async fn handle(paths: &Paths, msg: &Value) -> Option<Value> {
 const COMPACT_TEXT_LIMIT: usize = 240;
 
 fn truncate_compact_text(s: &str, max_chars: usize) -> String {
-    let mut chars = s.chars();
+    // Control characters serialize as six-character escapes; replace them so
+    // the character limit also bounds the serialized size.
+    let mut chars = s.chars().map(|c| if c.is_control() { '?' } else { c });
     let prefix: String = chars.by_ref().take(max_chars).collect();
     if chars.next().is_some() {
         format!("{prefix}…")
@@ -1080,9 +1082,11 @@ fn compact_route_result(v: Value, brief_hints: &mut Vec<String>) -> Value {
         return json!({ "error": truncate_compact_value(err) });
     }
     let mut out = serde_json::Map::new();
+    if let Some(src) = v.get("source").filter(|val| !val.is_null()) {
+        out.insert("source".into(), truncate_compact_value(src));
+    }
     for key in [
         "target",
-        "source",
         "jevChannel",
         "jevCache",
         "confidence",
@@ -1312,6 +1316,25 @@ pub async fn run(paths: &Paths) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use tokio::sync::{Mutex, oneshot};
+
+    #[test]
+    fn compact_output_stays_bounded_for_control_character_source() {
+        let source = "\u{1}".repeat(2000);
+        let full = json!({
+            "target": {"providerInstanceId": "codex", "model": "m"},
+            "source": source,
+            "sourceWarning": format!("unknown source instance \"{source}\": no shared-quota protection"),
+        });
+        let mut hints = Vec::new();
+        let rows: Vec<Value> = (0..3)
+            .map(|_| compact_route_result(full.clone(), &mut hints))
+            .collect();
+        let len = Value::from(rows).to_string().len();
+        assert!(
+            len < 4000,
+            "compact output must stay under 4000 chars, got {len}"
+        );
+    }
 
     #[tokio::test]
     async fn serve_with_dispatches_concurrently_preserves_init_and_serializes_stdout() {
