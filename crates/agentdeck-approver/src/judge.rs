@@ -388,7 +388,7 @@ impl HttpPolicyJudge {
 
         // OpenRouter: decision models (`~...` like `~typesafe/jev-latest`) use
         // `/api/alpha/decisions`; standard chat models use `/api/v1/chat/completions`.
-        if target.endpoint.model.starts_with('~') {
+        if agentdeck_core::judge::is_openrouter_decision_model(&target.endpoint.model) {
             let url = format!("{base}/api/alpha/decisions");
             let body = openrouter_decisions_body(&target.endpoint.model, system, input);
             let v = self

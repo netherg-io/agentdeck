@@ -270,7 +270,13 @@ impl HttpCheckpointJudge {
         })?;
         let fallback = cfg.judge_fallback.endpoint().and_then(|ep| {
             let fb_endpoint = default_endpoint_for(&ep.provider).ok()?;
-            let fb_key = resolve_api_key(&ep.provider)?;
+            let Some(fb_key) = resolve_api_key(&ep.provider) else {
+                eprintln!(
+                    "checkpoint judge: no API key for fallback provider {}; fallback disabled",
+                    ep.provider
+                );
+                return None;
+            };
             Some(CheckpointTarget {
                 endpoint: fb_endpoint.to_string(),
                 api_key: fb_key,
@@ -484,7 +490,9 @@ impl HttpCheckpointJudge {
         deadline: Instant,
     ) -> anyhow::Result<CheckpointVerdict> {
         // OpenRouter chat models (no `~` decision-model prefix) only answer on chat completions.
-        if target.id.provider == PROVIDER_OPENROUTER && !target.id.model.starts_with('~') {
+        if target.id.provider == PROVIDER_OPENROUTER
+            && !agentdeck_core::judge::is_openrouter_decision_model(&target.id.model)
+        {
             let body = Self::request_body_for(PROVIDER_VERCEL, &target.id.model, input);
             return self
                 .judge_with_chat_for(target, &body["input"], &body["questions"][0], deadline)

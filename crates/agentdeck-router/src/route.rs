@@ -1428,8 +1428,8 @@ async fn jev_fetch_endpoint(
         Some(k) => k.to_string(),
         None => decision_key("JEV_OPENROUTER_API_KEY", "openrouter.key")?,
     };
-    // OpenRouter chat models (no `~` decision-model prefix) only answer on chat completions.
-    if !endpoint.model.starts_with('~') {
+    // OpenRouter chat models only answer on chat completions.
+    if !agentdeck_core::judge::is_openrouter_decision_model(&endpoint.model) {
         let url = format!(
             "{}/api/v1/chat/completions",
             bases.openrouter.trim_end_matches('/')
@@ -1442,6 +1442,7 @@ async fn jev_fetch_endpoint(
             false,
         )
         .await?;
+        // shortcut: the chat completion's cost is not read, so Jev cost reports as unknown; read `usage.cost` when OpenRouter chat cost matters.
         return Ok((gateway_answers(&v)?, None));
     }
     let eff_body = match eff_request {

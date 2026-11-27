@@ -86,6 +86,12 @@ pub enum FallbackTrigger {
     None,
 }
 
+/// OpenRouter decision models: `~` aliases (e.g. `~typesafe/jev-latest`) and the
+/// unprefixed `typesafe/` ids. Everything else is a chat model.
+pub fn is_openrouter_decision_model(model: &str) -> bool {
+    model.starts_with('~') || model.starts_with("typesafe/")
+}
+
 /// Parse an HTTP `Retry-After` header value (integer seconds); defaults to 30s.
 pub fn parse_retry_after(header_value: Option<&str>) -> Duration {
     header_value
@@ -1053,6 +1059,16 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::Mutex;
+
+    #[test]
+    fn openrouter_decision_models_include_unprefixed_typesafe_ids() {
+        assert!(is_openrouter_decision_model("~typesafe/jev-latest"));
+        assert!(is_openrouter_decision_model("typesafe/jev-1.14"));
+        assert!(!is_openrouter_decision_model("openai/gpt-4o-mini"));
+        assert!(!is_openrouter_decision_model(
+            "perplexity/pplx-decider-v1.2"
+        ));
+    }
 
     fn temp_blocks(tag: &str) -> (PathBuf, BlockStore) {
         static SEQ: AtomicU64 = AtomicU64::new(0);
