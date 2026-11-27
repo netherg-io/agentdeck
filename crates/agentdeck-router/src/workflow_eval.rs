@@ -656,6 +656,14 @@ impl Claim {
     }
 }
 
+impl Drop for Claim {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // Release the lock even if a forked child still holds the descriptor.
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 fn set_marker(state: &mut State, id: &str, m: EvalStatus) {
     if let Some(p) = state.progress.iter_mut().find(|p| p.id == id) {
         p.eval = Some(m);
@@ -1368,6 +1376,8 @@ mod tests {
         let mut claim = Claim::open(&dir.0, "corrupt-task").unwrap().unwrap();
         use std::io::Write;
         claim.file.write_all(b"{torn").unwrap();
+        // Model a sibling subprocess retaining the descriptor until exec.
+        let _inherited = claim.file.try_clone().unwrap();
         drop(claim);
         let mut s = settled("corrupt-task");
         assert!(
