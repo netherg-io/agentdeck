@@ -19,19 +19,14 @@ use sha2::{Digest, Sha256};
 
 /// Default `Retry-After` when a 429 response omits the header or sends a non-integer.
 pub const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(30);
-/// Default TTL for remembering that a `(provider, model)` pair is a language
-/// model (not a decision model) so later Vercel calls skip `/v1/decisions`.
-pub const LANGUAGE_MODEL_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Base directory name under the trusted per-user runtime dir storing per-pair 429 blocks.
 pub const JUDGE_BLOCKS_DIR_NAME: &str = "agentdeck-judge-blocks";
-/// Base directory name under the trusted per-user runtime dir storing language-model hints.
-pub const JUDGE_LANGUAGE_MODELS_DIR_NAME: &str = "agentdeck-judge-language-models";
 /// Upper bound on rate-limit wait loops within one deadline so a broken server
 /// replying `Retry-After: 0` cannot spin forever.
 const MAX_RATE_LIMIT_RETRIES: usize = 8;
 /// Maximum byte length enforced symmetrically on both reads and writes of
-/// private runtime JSON files (429 blocks, language-model hints, Jev cache,
-/// and queue `.req`/`.done` entries).
+/// private runtime JSON files (429 blocks, Jev cache, and queue `.req`/`.done`
+/// entries).
 ///
 /// The router itself accepts unbounded briefs, while T3/workflow enforces a
 /// 120 000-character task limit (`MAX_TASK`). Because queue `.req` files store
@@ -298,9 +293,9 @@ pub fn runtime_base_from(
 }
 
 /// Trusted per-user runtime base directory shared across all consumers (Jev cache,
-/// queue spool, 429 block store, and language-model hints): `$XDG_RUNTIME_DIR`
-/// when it is an existing, absolute, user-owned `0700`-private directory,
-/// otherwise `$HOME/.cache/agentdeck/runtime` created `0700` and verified.
+/// queue spool, and 429 block store): `$XDG_RUNTIME_DIR` when it is an existing,
+/// absolute, user-owned `0700`-private directory, otherwise
+/// `$HOME/.cache/agentdeck/runtime` created `0700` and verified.
 pub fn default_runtime_base() -> std::io::Result<PathBuf> {
     runtime_base_from(
         std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
@@ -323,23 +318,6 @@ pub fn blocks_dir_name() -> String {
 /// Resolve the per-user judge block directory inside a runtime base directory.
 pub fn blocks_dir_for_runtime(runtime_base: &Path) -> PathBuf {
     runtime_base.join(blocks_dir_name())
-}
-
-/// Per-user subdirectory name for cross-process language-model hints.
-pub fn language_models_dir_name() -> String {
-    #[cfg(unix)]
-    {
-        format!("{JUDGE_LANGUAGE_MODELS_DIR_NAME}-{}", current_euid())
-    }
-    #[cfg(not(unix))]
-    {
-        JUDGE_LANGUAGE_MODELS_DIR_NAME.to_string()
-    }
-}
-
-/// Resolve the per-user judge language-model cache directory inside a runtime base directory.
-pub fn language_models_dir_for_runtime(runtime_base: &Path) -> PathBuf {
-    runtime_base.join(language_models_dir_name())
 }
 
 #[cfg(unix)]
@@ -583,100 +561,6 @@ fn endpoint_stem(endpoint: &JudgeEndpoint) -> String {
     h.update([0u8]);
     h.update(endpoint.model.as_bytes());
     format!("{:x}", h.finalize())
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LanguageModelRecord {
-    provider: String,
-    model: String,
-    expires_at_ms: u64,
-}
-
-/// Cross-process cache remembering `(provider, model)` pairs known to be
-/// language models (not decision models) so Vercel calls go straight to
-/// `/v1/chat/completions` without wasting budget on `/v1/decisions` first.
-#[derive(Debug, Clone)]
-pub struct LanguageModelCache {
-    dir: PathBuf,
-}
-
-impl LanguageModelCache {
-    pub fn default_runtime() -> std::io::Result<Self> {
-        Ok(Self::for_runtime_dir(&default_runtime_base()?))
-    }
-
-    pub fn for_runtime_dir(runtime_dir: &Path) -> Self {
-        Self {
-            dir: language_models_dir_for_runtime(runtime_dir),
-        }
-    }
-
-    pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
-    }
-
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    pub fn entry_path(&self, endpoint: &JudgeEndpoint) -> PathBuf {
-        self.dir.join(format!("{}.json", endpoint_stem(endpoint)))
-    }
-
-    pub fn is_language_model_at(&self, endpoint: &JudgeEndpoint, now: SystemTime) -> bool {
-        let path = self.entry_path(endpoint);
-        let text = match read_private_entry(&self.dir, &path) {
-            Ok(Some(t)) => t,
-            Ok(None) => return false,
-            Err(e) => {
-                eprintln!(
-                    "agentdeck: refusing untrusted judge language-model entry {}: {e}",
-                    path.display()
-                );
-                return false;
-            }
-        };
-        let Ok(rec) = serde_json::from_str::<LanguageModelRecord>(&text) else {
-            return false;
-        };
-        rec.provider == endpoint.provider
-            && rec.model == endpoint.model
-            && rec.expires_at_ms > system_time_ms(now)
-    }
-
-    pub fn is_language_model(&self, endpoint: &JudgeEndpoint) -> bool {
-        self.is_language_model_at(endpoint, SystemTime::now())
-    }
-
-    pub fn record_language_model_at(
-        &self,
-        endpoint: &JudgeEndpoint,
-        ttl: Duration,
-        now: SystemTime,
-    ) -> std::io::Result<()> {
-        create_private_dir(&self.dir)?;
-        let add_ms = ttl.as_millis().min(u64::MAX as u128) as u64;
-        let rec = LanguageModelRecord {
-            provider: endpoint.provider.clone(),
-            model: endpoint.model.clone(),
-            expires_at_ms: system_time_ms(now).saturating_add(add_ms),
-        };
-        let text = serde_json::to_string(&rec).map_err(std::io::Error::other)?;
-        write_atomic(&self.entry_path(endpoint), &text)
-    }
-
-    pub fn record_language_model(&self, endpoint: &JudgeEndpoint) -> std::io::Result<()> {
-        self.record_language_model_at(endpoint, LANGUAGE_MODEL_TTL, SystemTime::now())
-    }
-
-    pub fn record_language_model_logged(&self, endpoint: &JudgeEndpoint) {
-        if let Err(err) = self.record_language_model(endpoint) {
-            eprintln!(
-                "agentdeck: failed to persist language-model hint for {}/{}: {err}",
-                endpoint.provider, endpoint.model
-            );
-        }
-    }
 }
 
 /// Cross-process 429 block store backed by private JSON files per `(provider, model)`.
@@ -2043,47 +1927,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn language_model_cache_honours_ttl_provider_isolation_and_private_perms() {
-        let dir =
-            std::env::temp_dir().join(format!("agentdeck-lm-cache-unit-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let cache = LanguageModelCache::new(dir.clone());
-        let vercel_ep = JudgeEndpoint::new("vercel", "openai/gpt-4o-mini");
-        let or_ep = JudgeEndpoint::new("openrouter", "openai/gpt-4o-mini");
-        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-
-        assert!(!cache.is_language_model_at(&vercel_ep, t0));
-        cache
-            .record_language_model_at(&vercel_ep, LANGUAGE_MODEL_TTL, t0)
-            .unwrap();
-        assert!(cache.is_language_model_at(&vercel_ep, t0 + Duration::from_secs(3600)));
-        assert!(
-            !cache.is_language_model_at(&or_ep, t0 + Duration::from_secs(3600)),
-            "provider+model key must isolate distinct providers"
-        );
-        assert!(
-            !cache.is_language_model_at(&vercel_ep, t0 + LANGUAGE_MODEL_TTL),
-            "entry must expire at TTL"
-        );
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let p = cache.entry_path(&vercel_ep);
-            assert_eq!(
-                std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
-            assert!(
-                !cache.is_language_model_at(&vercel_ep, t0 + Duration::from_secs(1)),
-                "loose permissions on language-model entry must be refused"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

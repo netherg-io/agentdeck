@@ -7,7 +7,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentdeck_core::judge::{
@@ -20,25 +21,132 @@ use sha2::{Digest, Sha256};
 /// How a terminal dispatch error should be handled across requests in a batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchErrorKind {
-    /// Server or channel-wide error (401/403/404, missing API key, channel-level
-    /// 400, 5xx, network failure): fail the whole remaining batch at once.
+    /// Unambiguous status/channel error (401/403/404/405, missing API key, 5xx,
+    /// network failure, 429): fail the whole remaining batch at once.
     ChannelWide,
     /// Leader-side timeout: keep local to the leader's own requests so longer
     /// waiters in the same group survive untouched.
     LeaderTimeout,
-    /// Ambiguous or request-specific error (ambiguous 400, malformed JSON):
-    /// if batched, fall back to one-by-one capped at `batch_size + 1` sends.
+    /// Any 400 or response parse error: if batched, fall back one-by-one capped
+    /// at `batch_size + 1` actual HTTP sends.
     RequestSpecific,
 }
 
-fn system_time_ms(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH)
+/// System-wide monotonic timestamp in milliseconds (`CLOCK_MONOTONIC` on Unix),
+/// comparable across processes on the same host and immune to wall-clock jumps.
+pub(crate) fn monotonic_now_ms() -> u64 {
+    #[cfg(unix)]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid out-pointer for `clock_gettime(CLOCK_MONOTONIC)`.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
+            let secs = u64::try_from(ts.tv_sec).unwrap_or(0);
+            let nsec = u64::try_from(ts.tv_nsec).unwrap_or(0);
+            return secs.saturating_mul(1_000).saturating_add(nsec / 1_000_000);
+        }
+    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
         .unwrap_or(0)
 }
 
 fn duration_ms(d: Duration) -> u64 {
-    d.as_millis().min(u64::MAX as u128) as u64
+    (d.as_millis().min(u64::MAX as u128) as u64).max(u64::from(!d.is_zero()))
+}
+
+/// Fixed error reported to remaining tasks when a batch round hits its
+/// `batch_size + 1` actual-HTTP-send cap.
+pub const BATCH_SEND_CAP_ERROR: &str = "Jev queue: batch send cap reached";
+
+#[derive(Debug)]
+struct NoLiveParticipants;
+
+impl std::fmt::Display for NoLiveParticipants {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Jev queue: no live participants left")
+    }
+}
+
+impl std::error::Error for NoLiveParticipants {}
+
+/// Returned when a batch round exhausts its `batch_size + 1` cap of actual
+/// HTTP sends (primary, fallback, and Vercel chat follow-up).
+#[derive(Debug)]
+pub struct SendCapReached;
+
+impl std::fmt::Display for SendCapReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(BATCH_SEND_CAP_ERROR)
+    }
+}
+
+impl std::error::Error for SendCapReached {}
+
+struct BatchSendState {
+    active: Vec<Pending>,
+    sends: Arc<AtomicUsize>,
+    max_sends: Option<usize>,
+}
+
+/// Per-attempt guard shared with `fetch` so every actual HTTP send (primary,
+/// fallback, one-by-one retry, and Vercel chat follow-up) re-checks each
+/// participant's `.req` file and monotonic deadline, rebuilds the payload from
+/// surviving participants only, and counts against the batch's `batch_size + 1`
+/// send cap.
+#[derive(Clone)]
+pub struct BatchSendGuard {
+    inner: Arc<Mutex<BatchSendState>>,
+}
+
+impl BatchSendGuard {
+    fn new(active: Vec<Pending>, sends: Arc<AtomicUsize>, max_sends: Option<usize>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(BatchSendState {
+                active,
+                sends,
+                max_sends,
+            })),
+        }
+    }
+
+    /// Re-check `.req` existence and monotonic deadlines, reserve one HTTP send
+    /// against the batch cap, and build `(request, body)` from surviving tasks.
+    pub fn prepare_send(&self, now_mono_ms: u64) -> anyhow::Result<(Value, String)> {
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .active
+            .retain(|p| !p.is_expired(now_mono_ms) && p.path.exists());
+        if state.active.is_empty() {
+            return Err(NoLiveParticipants.into());
+        }
+        if let Some(limit) = state.max_sends {
+            let prev = state.sends.fetch_add(1, Ordering::Relaxed);
+            if prev >= limit {
+                state.sends.fetch_sub(1, Ordering::Relaxed);
+                return Err(SendCapReached.into());
+            }
+        }
+        Ok(build_payload(&state.active))
+    }
+
+    fn into_active(self) -> Vec<Pending> {
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut state.active)
+    }
+}
+
+fn build_payload(sub: &[Pending]) -> (Value, String) {
+    if sub.len() == 1 {
+        (sub[0].request.clone(), sub[0].body.clone())
+    } else {
+        let r = combine(sub);
+        let b = crate::route::stringify_like_node(&r);
+        (r, b)
+    }
 }
 
 /// Total wait for one answer on the hook path, queue and 429 back-off included:
@@ -117,7 +225,7 @@ pub async fn ask<F, Fut, C, Cb>(
     classify_batch: Cb,
 ) -> anyhow::Result<QueueAnswer>
 where
-    F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
+    F: FnMut(JudgeEndpoint, Value, String, Instant, BatchSendGuard) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
     Cb: Fn(&anyhow::Error) -> BatchErrorKind,
@@ -153,7 +261,7 @@ pub async fn ask_with_deadline<F, Fut, C, Cb>(
     classify_batch: Cb,
 ) -> anyhow::Result<QueueAnswer>
 where
-    F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
+    F: FnMut(JudgeEndpoint, Value, String, Instant, BatchSendGuard) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
     Cb: Fn(&anyhow::Error) -> BatchErrorKind,
@@ -167,6 +275,7 @@ where
         primary,
         fallback,
         Instant::now,
+        monotonic_now_ms,
         SystemTime::now,
         tokio::time::sleep,
         true,
@@ -193,7 +302,7 @@ pub async fn ask_many_with_deadline<F, Fut, C, Cb>(
     classify_batch: Cb,
 ) -> Vec<anyhow::Result<QueueAnswer>>
 where
-    F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
+    F: FnMut(JudgeEndpoint, Value, String, Instant, BatchSendGuard) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
     Cb: Fn(&anyhow::Error) -> BatchErrorKind,
@@ -206,6 +315,7 @@ where
         primary,
         fallback,
         Instant::now,
+        monotonic_now_ms,
         SystemTime::now,
         tokio::time::sleep,
         true,
@@ -217,7 +327,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn ask_inner<MonoNow, WallNow, Sleep, SleepFut, F, Fut, C, Cb>(
+async fn ask_inner<MonoNow, MonoMs, WallNow, Sleep, SleepFut, F, Fut, C, Cb>(
     spool: &Path,
     request: &Value,
     body: &str,
@@ -226,6 +336,7 @@ async fn ask_inner<MonoNow, WallNow, Sleep, SleepFut, F, Fut, C, Cb>(
     primary: &JudgeEndpoint,
     fallback: Option<&JudgeEndpoint>,
     mono_now: MonoNow,
+    mono_now_ms: MonoMs,
     wall_now: WallNow,
     sleep: Sleep,
     add_jitter: bool,
@@ -235,10 +346,11 @@ async fn ask_inner<MonoNow, WallNow, Sleep, SleepFut, F, Fut, C, Cb>(
 ) -> anyhow::Result<QueueAnswer>
 where
     MonoNow: FnMut() -> Instant,
+    MonoMs: FnMut() -> u64,
     WallNow: FnMut() -> SystemTime,
     Sleep: FnMut(Duration) -> SleepFut,
     SleepFut: Future<Output = ()>,
-    F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
+    F: FnMut(JudgeEndpoint, Value, String, Instant, BatchSendGuard) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
     Cb: Fn(&anyhow::Error) -> BatchErrorKind,
@@ -251,6 +363,7 @@ where
         primary,
         fallback,
         mono_now,
+        mono_now_ms,
         wall_now,
         sleep,
         add_jitter,
@@ -265,7 +378,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn ask_many_inner<MonoNow, WallNow, Sleep, SleepFut, F, Fut, C, Cb>(
+async fn ask_many_inner<MonoNow, MonoMs, WallNow, Sleep, SleepFut, F, Fut, C, Cb>(
     spool: &Path,
     items: &[(Value, String)],
     budget: Duration,
@@ -273,6 +386,7 @@ async fn ask_many_inner<MonoNow, WallNow, Sleep, SleepFut, F, Fut, C, Cb>(
     primary: &JudgeEndpoint,
     fallback: Option<&JudgeEndpoint>,
     mut mono_now: MonoNow,
+    mut mono_now_ms: MonoMs,
     mut wall_now: WallNow,
     mut sleep: Sleep,
     add_jitter: bool,
@@ -282,10 +396,11 @@ async fn ask_many_inner<MonoNow, WallNow, Sleep, SleepFut, F, Fut, C, Cb>(
 ) -> Vec<anyhow::Result<QueueAnswer>>
 where
     MonoNow: FnMut() -> Instant,
+    MonoMs: FnMut() -> u64,
     WallNow: FnMut() -> SystemTime,
     Sleep: FnMut(Duration) -> SleepFut,
     SleepFut: Future<Output = ()>,
-    F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
+    F: FnMut(JudgeEndpoint, Value, String, Instant, BatchSendGuard) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
     Cb: Fn(&anyhow::Error) -> BatchErrorKind,
@@ -294,7 +409,7 @@ where
         return Vec::new();
     }
     let deadline = mono_now() + budget;
-    let wall_deadline_ms = system_time_ms(wall_now()).saturating_add(duration_ms(budget));
+    let deadline_mono_ms = mono_now_ms().saturating_add(duration_ms(budget));
     if let Err(e) = create_private_dir(spool) {
         let msg = e.to_string();
         return (0..items.len())
@@ -318,7 +433,7 @@ where
             "group": group,
             "request": request,
             "body": body,
-            "deadline_ms": wall_deadline_ms,
+            "deadline_mono_ms": deadline_mono_ms,
         });
         if let Err(e) = write_atomic(&req_path, &entry.to_string()) {
             results[i] = Some(Err(e.into()));
@@ -406,6 +521,7 @@ where
                     primary,
                     fallback,
                     &mut mono_now,
+                    &mut mono_now_ms,
                     &mut wall_now,
                     &mut fetch,
                     &classify,
@@ -526,12 +642,12 @@ struct Pending {
     id: String,
     request: Value,
     body: String,
-    deadline_ms: Option<u64>,
+    deadline_mono_ms: Option<u64>,
 }
 
 impl Pending {
-    fn is_expired(&self, now_ms: u64) -> bool {
-        self.deadline_ms.is_some_and(|dl| now_ms >= dl)
+    fn is_expired(&self, now_mono_ms: u64) -> bool {
+        self.deadline_mono_ms.is_some_and(|dl| now_mono_ms >= dl)
     }
 }
 
@@ -565,11 +681,12 @@ fn expected_keys_present(p: &Pending, split_answers: &Value) -> bool {
 
 /// Sends this process's request together with every compatible pending one
 /// through the shared block/fallback dispatcher without sleeping under the lock.
-/// Drops expired peer requests before every send and before writing answers;
-/// keeps leader timeouts local to the leader; and on ambiguous request errors
-/// falls back one-by-one with a hard cap of `batch_size + 1` sends per batch.
+/// Re-checks every participant's `.req` and monotonic deadline before every
+/// actual HTTP send (including fallback and one-by-one retries), maps answers
+/// by the composition actually sent, keeps leader timeouts local, and caps
+/// total actual HTTP sends per batch round at `batch_size + 1`.
 #[allow(clippy::too_many_arguments)]
-async fn lead_once<MonoNow, WallNow, F, Fut, C, Cb>(
+async fn lead_once<MonoNow, MonoMs, WallNow, F, Fut, C, Cb>(
     spool: &Path,
     own: &str,
     own_ids: &HashSet<&str>,
@@ -578,6 +695,7 @@ async fn lead_once<MonoNow, WallNow, F, Fut, C, Cb>(
     primary: &JudgeEndpoint,
     fallback: Option<&JudgeEndpoint>,
     mono_now: &mut MonoNow,
+    mono_now_ms: &mut MonoMs,
     wall_now: &mut WallNow,
     fetch: &mut F,
     classify: &C,
@@ -585,58 +703,33 @@ async fn lead_once<MonoNow, WallNow, F, Fut, C, Cb>(
 ) -> LeadOutcome
 where
     MonoNow: FnMut() -> Instant,
+    MonoMs: FnMut() -> u64,
     WallNow: FnMut() -> SystemTime,
-    F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
+    F: FnMut(JudgeEndpoint, Value, String, Instant, BatchSendGuard) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
     Cb: Fn(&anyhow::Error) -> BatchErrorKind,
 {
-    let batch = match collect(spool, own, system_time_ms(wall_now())) {
+    let batch = match collect(spool, own, mono_now_ms(), wall_now()) {
         Ok(b) => b,
         Err(msg) => return LeadOutcome::OwnError(msg),
     };
     if batch.is_empty() || batch[0].id != own {
         return LeadOutcome::Done;
     }
-    let max_sends = batch.len() + 1;
-    let mut sends = 0usize;
-    let mut last_err: Option<String> = None;
+    let max_sends = (batch.len() > 1).then_some(batch.len() + 1);
+    let sends = Arc::new(AtomicUsize::new(0));
     let mut work: VecDeque<Vec<Pending>> = VecDeque::from([batch]);
     while let Some(mut sub) = work.pop_front() {
         if mono_now() >= deadline {
             return LeadOutcome::Done;
         }
-        let now_ms = system_time_ms(wall_now());
-        sub.retain(|p| {
-            own_ids.contains(p.id.as_str()) || (!p.is_expired(now_ms) && p.path.exists())
-        });
+        let now_mono = mono_now_ms();
+        sub.retain(|p| !p.is_expired(now_mono) && p.path.exists());
         if sub.is_empty() {
             continue;
         }
-        if sends >= max_sends {
-            let err_payload = serde_json::json!({
-                "error": last_err
-                    .as_deref()
-                    .unwrap_or("Jev queue: batch send cap reached"),
-            });
-            for p in &sub {
-                finish_if_live(spool, p, own_ids, &err_payload, now_ms);
-            }
-            for rest in &work {
-                for p in rest {
-                    finish_if_live(spool, p, own_ids, &err_payload, now_ms);
-                }
-            }
-            return LeadOutcome::Done;
-        }
-        sends += 1;
-        let (request, body) = if sub.len() == 1 {
-            (sub[0].request.clone(), sub[0].body.clone())
-        } else {
-            let r = combine(&sub);
-            let b = crate::route::stringify_like_node(&r);
-            (r, b)
-        };
+        let guard = BatchSendGuard::new(sub, sends.clone(), max_sends);
         let step = dispatch_once(
             blocks,
             primary,
@@ -647,34 +740,55 @@ where
             &mut *mono_now,
             &mut *wall_now,
             |ep, attempt_deadline| {
-                fetch(ep.clone(), request.clone(), body.clone(), attempt_deadline)
+                let prepared = guard.prepare_send(mono_now_ms());
+                let fut = prepared.map(|(request, body)| {
+                    fetch(ep.clone(), request, body, attempt_deadline, guard.clone())
+                });
+                async move {
+                    match fut {
+                        Ok(f) => f.await,
+                        Err(e) => Err(e),
+                    }
+                }
             },
-            classify,
+            |e| {
+                if e.downcast_ref::<NoLiveParticipants>().is_some()
+                    || e.downcast_ref::<SendCapReached>().is_some()
+                {
+                    FallbackTrigger::None
+                } else {
+                    classify(e)
+                }
+            },
             |ep, ra, rem| ChannelWideRateLimit(format_rate_limit_exceeded(ep, ra, rem)).into(),
         )
         .await;
+        let sent = guard.into_active();
         match step {
             DispatchStep::Done((answers, cost), channel) => {
-                let write_now_ms = system_time_ms(wall_now());
-                let n = sub.len();
+                let write_now = mono_now_ms();
+                let n = sent.len();
+                if n == 0 {
+                    continue;
+                }
                 if n == 1 {
                     finish_if_live(
                         spool,
-                        &sub[0],
+                        &sent[0],
                         own_ids,
                         &serde_json::json!({
                             "answers": answers,
                             "cost": cost,
                             "channel": channel.as_str(),
                         }),
-                        write_now_ms,
+                        write_now,
                     );
                     continue;
                 }
                 let mut good = Vec::new();
                 let mut bad = Vec::new();
                 if answers.is_object() {
-                    for (i, p) in sub.into_iter().enumerate() {
+                    for (i, p) in sent.into_iter().enumerate() {
                         let a = split(&answers, i);
                         if expected_keys_present(&p, &a) {
                             good.push((p, a));
@@ -683,7 +797,7 @@ where
                         }
                     }
                 } else {
-                    bad = sub;
+                    bad = sent;
                 }
                 for (p, a) in good {
                     let per_cost = cost.map(|c| c / n as f64);
@@ -696,7 +810,7 @@ where
                             "cost": per_cost,
                             "channel": channel.as_str(),
                         }),
-                        write_now_ms,
+                        write_now,
                     );
                 }
                 for p in bad.into_iter().rev() {
@@ -709,6 +823,22 @@ where
                 return LeadOutcome::Wait(wait);
             }
             DispatchStep::Fail(e) => {
+                if e.downcast_ref::<NoLiveParticipants>().is_some() {
+                    continue;
+                }
+                if e.downcast_ref::<SendCapReached>().is_some() {
+                    let write_now = mono_now_ms();
+                    let err_payload = serde_json::json!({"error": BATCH_SEND_CAP_ERROR});
+                    for p in &sent {
+                        finish_if_live(spool, p, own_ids, &err_payload, write_now);
+                    }
+                    for rest in &work {
+                        for p in rest {
+                            finish_if_live(spool, p, own_ids, &err_payload, write_now);
+                        }
+                    }
+                    return LeadOutcome::Done;
+                }
                 if e.downcast_ref::<ChannelWideRateLimit>().is_some() {
                     // Caller-deadline rate-limit failure: only fail this caller's items
                     // so longer-deadline waiters in the same group survive.
@@ -722,30 +852,28 @@ where
                 }
                 let channel_wide = batch_kind == BatchErrorKind::ChannelWide
                     || !matches!(classify(&e), FallbackTrigger::None);
-                let write_now_ms = system_time_ms(wall_now());
+                let write_now = mono_now_ms();
                 let err_msg = e.to_string();
                 let err_payload = serde_json::json!({"error": &err_msg});
                 if channel_wide {
-                    // Server/channel-wide failure (401/403, missing key, channel-level 400, 5xx):
-                    // fail the whole remaining batch at once instead of N failing calls.
-                    for p in &sub {
-                        finish_if_live(spool, p, own_ids, &err_payload, write_now_ms);
+                    // Unambiguous channel-wide failure (401/403/404/405, missing key,
+                    // 5xx/network after fallback, 429): fail the remaining batch at once.
+                    for p in &sent {
+                        finish_if_live(spool, p, own_ids, &err_payload, write_now);
                     }
                     for rest in &work {
                         for p in rest {
-                            finish_if_live(spool, p, own_ids, &err_payload, write_now_ms);
+                            finish_if_live(spool, p, own_ids, &err_payload, write_now);
                         }
                     }
                     return LeadOutcome::Done;
                 }
-                // Ambiguous / request-specific failure (ambiguous 400 / invalid JSON parse error):
-                // if solo, attribute the error to this task; if batched, fall back one-by-one
-                // (capped at batch_size + 1 total sends for the batch).
-                if sub.len() == 1 {
-                    finish_if_live(spool, &sub[0], own_ids, &err_payload, write_now_ms);
+                // Any 400 or response parse error: solo fails directly; batch > 1
+                // falls back one-by-one under the batch_size + 1 actual-HTTP-send cap.
+                if sent.len() == 1 {
+                    finish_if_live(spool, &sent[0], own_ids, &err_payload, write_now);
                 } else {
-                    last_err = Some(err_msg);
-                    for p in sub.into_iter().rev() {
+                    for p in sent.into_iter().rev() {
                         work.push_front(vec![p]);
                     }
                 }
@@ -756,10 +884,15 @@ where
 }
 
 /// Own request first, then the oldest compatible unexpired ones. Requests of
-/// exited processes and stale answers are deleted; expired live peers are
-/// skipped without touching their files; an unreadable own request returns
-/// an explicit error instead of being silently skipped.
-fn collect(spool: &Path, own: &str, now_ms: u64) -> Result<Vec<Pending>, String> {
+/// exited processes and stale `.done`/`.tmp` files are deleted; expired live
+/// peers are skipped without touching their files; an unreadable own request
+/// returns an explicit error instead of being silently skipped.
+fn collect(
+    spool: &Path,
+    own: &str,
+    now_mono_ms: u64,
+    wall_now: SystemTime,
+) -> Result<Vec<Pending>, String> {
     let mut all: Vec<(SystemTime, Pending, String)> = Vec::new();
     for f in std::fs::read_dir(spool).into_iter().flatten().flatten() {
         let path = f.path();
@@ -792,8 +925,8 @@ fn collect(spool: &Path, own: &str, now_ms: u64) -> Result<Vec<Pending>, String>
                 }
                 Err(_) => continue,
             };
-            let deadline_ms = v.get("deadline_ms").and_then(Value::as_u64);
-            if id != own && deadline_ms.is_some_and(|dl| now_ms >= dl) {
+            let deadline_mono_ms = v.get("deadline_mono_ms").and_then(Value::as_u64);
+            if id != own && deadline_mono_ms.is_some_and(|dl| now_mono_ms >= dl) {
                 continue;
             }
             let group = v["group"].as_str().unwrap_or_default().to_string();
@@ -802,11 +935,11 @@ fn collect(spool: &Path, own: &str, now_ms: u64) -> Result<Vec<Pending>, String>
                 id: id.to_string(),
                 request: v["request"].clone(),
                 body: v["body"].as_str().unwrap_or_default().to_string(),
-                deadline_ms,
+                deadline_mono_ms,
             };
             all.push((modified, p, group));
         } else if (name.ends_with(".done") || name.ends_with(".tmp"))
-            && SystemTime::now()
+            && wall_now
                 .duration_since(modified)
                 .is_ok_and(|age| age > STALE)
         {
@@ -884,8 +1017,14 @@ fn finish(spool: &Path, p: &Pending, result: &Value) {
     let _ = std::fs::remove_file(&p.path);
 }
 
-fn finish_if_live(spool: &Path, p: &Pending, own_ids: &HashSet<&str>, result: &Value, now_ms: u64) {
-    if !own_ids.contains(p.id.as_str()) && (p.is_expired(now_ms) || !p.path.exists()) {
+fn finish_if_live(
+    spool: &Path,
+    p: &Pending,
+    own_ids: &HashSet<&str>,
+    result: &Value,
+    now_mono_ms: u64,
+) {
+    if !own_ids.contains(p.id.as_str()) && (p.is_expired(now_mono_ms) || !p.path.exists()) {
         return;
     }
     finish(spool, p, result);
@@ -916,7 +1055,6 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
-    use std::sync::{Arc, Mutex};
 
     fn request(task: &str) -> Value {
         serde_json::json!({
@@ -978,7 +1116,7 @@ mod tests {
                 id: i.to_string(),
                 request: request(t),
                 body: String::new(),
-                deadline_ms: None,
+                deadline_mono_ms: None,
             })
             .collect();
         let c = combine(&batch);
@@ -1014,9 +1152,12 @@ mod tests {
         let m0 = Instant::now();
         let wall = Rc::new(Cell::new(t0));
         let mono = Rc::new(Cell::new(m0));
+        let mono_ms = Rc::new(Cell::new(10_000u64));
         let m_now = mono.clone();
+        let ms_now = mono_ms.clone();
         let w_now = wall.clone();
         let m_sleep = mono.clone();
+        let ms_sleep = mono_ms.clone();
         let w_sleep = wall.clone();
         let log = sent.clone();
         let answer = ask_inner(
@@ -1028,14 +1169,16 @@ mod tests {
             &primary,
             None,
             move || m_now.get(),
+            move || ms_now.get(),
             move || w_now.get(),
             move |d| {
                 m_sleep.set(m_sleep.get() + d);
+                ms_sleep.set(ms_sleep.get() + duration_ms(d));
                 w_sleep.set(w_sleep.get() + d);
                 async {}
             },
             false,
-            move |_ep, r, _, _| {
+            move |_ep, r, _, _, _| {
                 let log = log.clone();
                 async move {
                     let mut log = log.lock().unwrap();
@@ -1084,9 +1227,11 @@ mod tests {
         let m0 = Instant::now();
         let wall = Rc::new(Cell::new(t0));
         let mono = Rc::new(Cell::new(m0));
+        let mono_ms = Rc::new(Cell::new(10_000u64));
 
         // Without fallback, 60s > 50s BUDGET fails fast with clear error and no sleep.
         let m1 = mono.clone();
+        let ms1 = mono_ms.clone();
         let w1 = wall.clone();
         let slept = Rc::new(Cell::new(false));
         let s1 = slept.clone();
@@ -1099,13 +1244,14 @@ mod tests {
             &primary,
             None,
             move || m1.get(),
+            move || ms1.get(),
             move || w1.get(),
             move |_| {
                 s1.set(true);
                 async {}
             },
             false,
-            |_ep, _r, _, _| async {
+            |_ep, _r, _, _, _| async {
                 Err::<(Value, Option<f64>), anyhow::Error>(
                     RateLimited {
                         retry_after: Duration::from_secs(60),
@@ -1125,6 +1271,7 @@ mod tests {
 
         // With fallback configured, subsequent request skips blocked primary immediately.
         let m2 = mono.clone();
+        let ms2 = mono_ms.clone();
         let w2 = wall.clone();
         let providers: Arc<Mutex<Vec<String>>> = Arc::default();
         let p2 = providers.clone();
@@ -1137,10 +1284,11 @@ mod tests {
             &primary,
             Some(&fallback),
             move || m2.get(),
+            move || ms2.get(),
             move || w2.get(),
             |_| async {},
             false,
-            move |ep, _r, _, _| {
+            move |ep, _r, _, _, _| {
                 let p2 = p2.clone();
                 async move {
                     p2.lock().unwrap().push(ep.provider);
@@ -1170,7 +1318,7 @@ mod tests {
             &blocks,
             &primary,
             None,
-            move |_ep, req, body, _| {
+            move |_ep, req, body, _, _| {
                 let expected = expected.clone();
                 async move {
                     assert_eq!(req, expected);
@@ -1195,7 +1343,11 @@ mod tests {
         let calls: Arc<Mutex<Vec<usize>>> = Arc::default();
 
         let make_fetch = |log: Arc<Mutex<Vec<usize>>>| {
-            move |_ep: JudgeEndpoint, req: Value, _body: String, _deadline: Instant| {
+            move |_ep: JudgeEndpoint,
+                  req: Value,
+                  _body: String,
+                  _deadline: Instant,
+                  _guard: BatchSendGuard| {
                 let log = log.clone();
                 async move {
                     let count = req
@@ -1314,10 +1466,11 @@ mod tests {
             &primary,
             Some(&fallback),
             Instant::now,
+            monotonic_now_ms,
             SystemTime::now,
             |_| async {},
             false,
-            move |_ep, req, _, _| {
+            move |_ep, req, _, _, _| {
                 let s = s.clone();
                 async move {
                     s.lock().unwrap().push(req);
@@ -1366,7 +1519,7 @@ mod tests {
             &blocks,
             &primary,
             None,
-            move |_ep, _req, _body, _deadline| {
+            move |_ep, _req, _body, _deadline, _guard| {
                 let c = c.clone();
                 async move {
                     *c.lock().unwrap() += 1;
@@ -1405,7 +1558,7 @@ mod tests {
             &blocks,
             &primary,
             None,
-            move |_ep, req, _body, _deadline| {
+            move |_ep, req, _body, _deadline, _guard| {
                 let rc = rc.clone();
                 async move {
                     *rc.lock().unwrap() += 1;
@@ -1461,7 +1614,7 @@ mod tests {
                 &blocks_a,
                 &ep_a,
                 None,
-                move |_ep, _req, _body, _deadline| {
+                move |_ep, _req, _body, _deadline, _guard| {
                     let notify = notify_a.clone();
                     let calls = calls_a.clone();
                     async move {
@@ -1500,7 +1653,7 @@ mod tests {
             &blocks,
             &group_b,
             None,
-            |_ep, _req, _body, _deadline| async {
+            |_ep, _req, _body, _deadline, _guard| async {
                 Ok((serde_json::json!({"size": {"score": 2}}), Some(0.01)))
             },
             classify_rl,
@@ -1526,7 +1679,7 @@ mod tests {
             &blocks,
             &group_a,
             None,
-            |_ep, _req, _body, _deadline| async {
+            |_ep, _req, _body, _deadline, _guard| async {
                 Ok((serde_json::json!({"size": {"score": 9}}), Some(0.01)))
             },
             classify_rl,
@@ -1575,7 +1728,7 @@ mod tests {
             &blocks,
             &primary,
             None,
-            |_ep, req, _body, _deadline| async move {
+            |_ep, req, _body, _deadline, _guard| async move {
                 let contains_bad = req
                     .pointer("/state/task")
                     .and_then(Value::as_str)
@@ -1627,7 +1780,7 @@ mod tests {
             &blocks,
             &primary,
             None,
-            |_ep, req, _body, _deadline| async move {
+            |_ep, req, _body, _deadline, _guard| async move {
                 if req.pointer("/state/tasks").is_some() {
                     // Malformed combined answer (missing tN__ prefixes).
                     return Ok((serde_json::json!({"size": {"score": 1}}), Some(0.01)));
@@ -1679,7 +1832,7 @@ mod tests {
             &blocks,
             &primary,
             None,
-            move |_ep, _req, _body, _deadline| {
+            move |_ep, _req, _body, _deadline, _guard| {
                 let c = c.clone();
                 async move {
                     *c.lock().unwrap() += 1;
@@ -1716,7 +1869,7 @@ mod tests {
             &blocks,
             &primary,
             None,
-            |_ep, _req, _body, _deadline| async {
+            |_ep, _req, _body, _deadline, _guard| async {
                 Ok((serde_json::json!({"size": {"score": 1}}), None))
             },
             classify_rl,
@@ -1748,7 +1901,7 @@ mod tests {
         let corrupt_id = format!("{}-corrupt-own", std::process::id());
         write_atomic(&dir.join(format!("{corrupt_id}.req")), "{not-json").unwrap();
         let collect_err =
-            collect(&dir, &corrupt_id, system_time_ms(SystemTime::now())).unwrap_err();
+            collect(&dir, &corrupt_id, monotonic_now_ms(), SystemTime::now()).unwrap_err();
         assert!(
             collect_err.contains("own request"),
             "expected explicit own-request error, got: {collect_err}"
@@ -1782,7 +1935,7 @@ mod tests {
                 &blocks_w,
                 &ep_w,
                 None,
-                |_ep, _req, _body, attempt_deadline| async move {
+                |_ep, _req, _body, attempt_deadline, _guard| async move {
                     let needed = Duration::from_millis(400);
                     let rem = attempt_deadline.saturating_duration_since(Instant::now());
                     if rem < needed {
@@ -1832,7 +1985,7 @@ mod tests {
             &blocks,
             &primary,
             None,
-            move |_ep, req, _body, attempt_deadline| {
+            move |_ep, req, _body, attempt_deadline, _guard| {
                 let sb = sb.clone();
                 async move {
                     if req
@@ -1881,10 +2034,10 @@ mod tests {
         let (dir, blocks) = temp_dirs("expired-peer");
         let primary = JudgeEndpoint::new("vercel", "judge");
         let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let t0_ms = t0.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         let m0 = Instant::now();
+        let mono0_ms = 50_000u64;
 
-        // 1. Combined request fails with ambiguous 400 after peer's deadline passes:
+        // 1. Combined request fails with ambiguous 400 after peer's monotonic deadline passes:
         // peer must NOT be re-sent and must NOT get an orphaned .done file.
         let peer_id = format!("{}-expired-split", std::process::id());
         let peer_req = request("peer-short");
@@ -1892,15 +2045,18 @@ mod tests {
             "group": group_of(&peer_req, &primary, None),
             "request": peer_req,
             "body": "peer",
-            "deadline_ms": t0_ms + 500,
+            "deadline_mono_ms": mono0_ms + 500,
         });
         write_atomic(&dir.join(format!("{peer_id}.req")), &peer_entry.to_string()).unwrap();
 
         let wall = Rc::new(Cell::new(t0));
         let mono = Rc::new(Cell::new(m0));
+        let mono_ms = Rc::new(Cell::new(mono0_ms));
         let m_now = mono.clone();
+        let ms_now = mono_ms.clone();
         let w_now = wall.clone();
         let m_call = mono.clone();
+        let ms_call = mono_ms.clone();
         let w_call = wall.clone();
         let sent = Arc::new(Mutex::new(Vec::<Value>::new()));
         let sent_cb = sent.clone();
@@ -1914,18 +2070,20 @@ mod tests {
             &primary,
             None,
             move || m_now.get(),
+            move || ms_now.get(),
             move || w_now.get(),
             |_| async {},
             false,
-            move |_ep, req, _body, _deadline| {
+            move |_ep, req, _body, _deadline, _guard| {
                 let sent_cb = sent_cb.clone();
                 let mut log = sent_cb.lock().unwrap();
                 log.push(req.clone());
                 let call_no = log.len();
                 drop(log);
                 if call_no == 1 {
-                    // Advance past peer's 500ms deadline during the combined call.
+                    // Advance past peer's 500ms monotonic deadline during the combined call.
                     m_call.set(m_call.get() + Duration::from_millis(700));
+                    ms_call.set(ms_call.get() + 700);
                     w_call.set(w_call.get() + Duration::from_millis(700));
                 }
                 async move {
@@ -1956,17 +2114,18 @@ mod tests {
         );
         let _ = std::fs::remove_file(dir.join(format!("{peer_id}.req")));
 
-        // 2. Combined request succeeds AFTER peer's deadline passes:
+        // 2. Combined request succeeds AFTER peer's monotonic deadline passes:
         // leader still gets its answer, but expired peer must NOT get an orphaned .done file.
         wall.set(t0);
         mono.set(m0);
+        mono_ms.set(mono0_ms);
         let peer2_id = format!("{}-expired-done", std::process::id());
         let peer2_req = request("peer-late");
         let peer2_entry = serde_json::json!({
             "group": group_of(&peer2_req, &primary, None),
             "request": peer2_req,
             "body": "peer2",
-            "deadline_ms": t0_ms + 500,
+            "deadline_mono_ms": mono0_ms + 500,
         });
         write_atomic(
             &dir.join(format!("{peer2_id}.req")),
@@ -1975,8 +2134,10 @@ mod tests {
         .unwrap();
 
         let m_now2 = mono.clone();
+        let ms_now2 = mono_ms.clone();
         let w_now2 = wall.clone();
         let m_call2 = mono.clone();
+        let ms_call2 = mono_ms.clone();
         let w_call2 = wall.clone();
         let ans2 = ask_inner(
             &dir,
@@ -1987,11 +2148,13 @@ mod tests {
             &primary,
             None,
             move || m_now2.get(),
+            move || ms_now2.get(),
             move || w_now2.get(),
             |_| async {},
             false,
-            move |_ep, req, _body, _deadline| {
+            move |_ep, req, _body, _deadline, _guard| {
                 m_call2.set(m_call2.get() + Duration::from_millis(700));
+                ms_call2.set(ms_call2.get() + 700);
                 w_call2.set(w_call2.get() + Duration::from_millis(700));
                 async move {
                     let mut a = Map::new();
@@ -2034,7 +2197,7 @@ mod tests {
             &blocks,
             &primary,
             None,
-            move |_ep, _req, _body, _deadline| {
+            move |_ep, _req, _body, _deadline, _guard| {
                 let s = s.clone();
                 async move {
                     *s.lock().unwrap() += 1;
@@ -2053,6 +2216,431 @@ mod tests {
             *sends.lock().unwrap(),
             9,
             "ambiguous 400 on 8 tasks must fall back one-by-one capped at batch_size + 1 (9), not 15 via bisect"
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn primary_503_plus_fallback_400_and_chat_followup_respect_batch_plus_one_http_cap() {
+        let (dir, blocks) = temp_dirs("http-cap-503-400");
+        let primary = JudgeEndpoint::new("vercel", "judge");
+        let fallback = JudgeEndpoint::new("openrouter", "fb-judge");
+        let items: Vec<(Value, String)> = (0..8)
+            .map(|i| {
+                let r = request(&format!("task-{i}"));
+                let b = r.to_string();
+                (r, b)
+            })
+            .collect();
+
+        // 1. Primary 503 + fallback 400 across 8 tasks -> total actual HTTP calls <= 9.
+        let http_calls = Arc::new(AtomicUsize::new(0));
+        let hc = http_calls.clone();
+        let outcomes = ask_many_with_deadline(
+            &dir,
+            &items,
+            Duration::from_secs(30),
+            &blocks,
+            &primary,
+            Some(&fallback),
+            move |ep, _req, _body, _deadline, _guard| {
+                let hc = hc.clone();
+                async move {
+                    hc.fetch_add(1, Ordering::SeqCst);
+                    if ep.provider == "vercel" {
+                        Err(anyhow::anyhow!("jev_http_status_503"))
+                    } else {
+                        Err(anyhow::anyhow!("jev_http_status_400"))
+                    }
+                }
+            },
+            |e| {
+                if e.to_string().contains("503") {
+                    FallbackTrigger::Transient
+                } else {
+                    classify_rl(e)
+                }
+            },
+            classify_batch_test,
+        )
+        .await;
+        assert_eq!(outcomes.len(), 8);
+        assert!(outcomes.iter().all(Result::is_err));
+        assert!(
+            http_calls.load(Ordering::SeqCst) <= 9,
+            "primary 503 + fallback 400 for 8 tasks must make <= 9 actual HTTP calls, got {}",
+            http_calls.load(Ordering::SeqCst)
+        );
+        assert_eq!(http_calls.load(Ordering::SeqCst), 9);
+        assert!(
+            outcomes
+                .iter()
+                .filter_map(|r| r.as_ref().err())
+                .any(|e| e.to_string() == BATCH_SEND_CAP_ERROR),
+            "remaining tasks must fail with fixed cap error: {outcomes:?}"
+        );
+
+        // 2. Multi-HTTP chat follow-up inside fetch also counts against the same cap.
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let cc = chat_calls.clone();
+        let outcomes2 = ask_many_with_deadline(
+            &dir,
+            &items,
+            Duration::from_secs(30),
+            &blocks,
+            &primary,
+            None,
+            move |_ep, _req, _body, _deadline, guard| {
+                let cc = cc.clone();
+                async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    // Simulate Vercel /v1/decisions -> /v1/chat/completions second HTTP send.
+                    let _ = guard.prepare_send(monotonic_now_ms())?;
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Err::<(Value, Option<f64>), anyhow::Error>(anyhow::anyhow!(
+                        "jev_http_status_400"
+                    ))
+                }
+            },
+            classify_rl,
+            classify_batch_test,
+        )
+        .await;
+        assert_eq!(outcomes2.len(), 8);
+        assert!(outcomes2.iter().all(Result::is_err));
+        assert_eq!(chat_calls.load(Ordering::SeqCst), 9);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_waiter_removed_during_primary_503_is_excluded_from_fallback_and_answers_remap()
+    {
+        let (dir, blocks) = temp_dirs("fallback-recheck");
+        let primary = JudgeEndpoint::new("vercel", "judge");
+        let fallback = JudgeEndpoint::new("openrouter", "fb-judge");
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let m0 = Instant::now();
+        let mono0_ms = 80_000u64;
+
+        // Seed two peers alongside leader: waiter_gone (500ms budget) and waiter_live (10s budget).
+        let gone_id = format!("{}-waiter-gone", std::process::id());
+        let live_id = format!("{}-waiter-live", std::process::id());
+        let gone_req_path = dir.join(format!("{gone_id}.req"));
+        let live_req_path = dir.join(format!("{live_id}.req"));
+        let gone_req = request("task-gone");
+        let live_req = request("task-live");
+        let group = group_of(&gone_req, &primary, Some(&fallback));
+        write_atomic(
+            &gone_req_path,
+            &serde_json::json!({
+                "group": group,
+                "request": gone_req,
+                "body": "gone",
+                "deadline_mono_ms": mono0_ms + 500,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        write_atomic(
+            &live_req_path,
+            &serde_json::json!({
+                "group": group,
+                "request": live_req,
+                "body": "live",
+                "deadline_mono_ms": mono0_ms + 10_000,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let wall = Rc::new(Cell::new(t0));
+        let mono = Rc::new(Cell::new(m0));
+        let mono_ms = Rc::new(Cell::new(mono0_ms));
+        let m_now = mono.clone();
+        let ms_now = mono_ms.clone();
+        let w_now = wall.clone();
+        let m_call = mono.clone();
+        let ms_call = mono_ms.clone();
+        let sent_reqs = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let sent_cb = sent_reqs.clone();
+        let gone_path_cb = gone_req_path.clone();
+
+        let leader_ans = ask_inner(
+            &dir,
+            &request("task-leader"),
+            "leader",
+            Duration::from_secs(10),
+            &blocks,
+            &primary,
+            Some(&fallback),
+            move || m_now.get(),
+            move || ms_now.get(),
+            move || w_now.get(),
+            |_| async {},
+            false,
+            move |ep, req, _body, _deadline, _guard| {
+                sent_cb
+                    .lock()
+                    .unwrap()
+                    .push((ep.provider.clone(), req.clone()));
+                if ep.provider == "vercel" {
+                    // While primary is in flight, waiter_gone expires and removes its .req.
+                    m_call.set(m_call.get() + Duration::from_millis(700));
+                    ms_call.set(ms_call.get() + 700);
+                    let _ = std::fs::remove_file(&gone_path_cb);
+                }
+                async move {
+                    if ep.provider == "vercel" {
+                        return Err(anyhow::anyhow!("jev_http_status_503"));
+                    }
+                    // Score each task by name so wrong index remapping is caught immediately.
+                    let mut a = Map::new();
+                    for k in req["questions"].as_object().unwrap().keys() {
+                        let task = k
+                            .split_once("__")
+                            .and_then(|(t, _)| req["state"]["tasks"][t].as_str())
+                            .or_else(|| req["state"]["task"].as_str())
+                            .unwrap_or_default();
+                        let score = match task {
+                            "task-leader" => 1,
+                            "task-live" => 3,
+                            _ => 9,
+                        };
+                        a.insert(k.clone(), serde_json::json!({"score": score}));
+                    }
+                    Ok((Value::Object(a), Some(0.02)))
+                }
+            },
+            |e| {
+                if e.to_string().contains("503") {
+                    FallbackTrigger::Transient
+                } else {
+                    classify_rl(e)
+                }
+            },
+            classify_batch_test,
+        )
+        .await
+        .unwrap();
+
+        let sent = sent_reqs.lock().unwrap();
+        assert_eq!(sent.len(), 2, "primary 503 then fallback 200");
+        assert_eq!(sent[0].0, "vercel");
+        assert_eq!(sent[0].1["state"]["tasks"].as_object().unwrap().len(), 3);
+        assert_eq!(sent[1].0, "openrouter");
+        let fb_tasks = sent[1].1["state"]["tasks"].as_object().unwrap();
+        assert_eq!(
+            fb_tasks.len(),
+            2,
+            "fallback must drop expired waiter: {fb_tasks:?}"
+        );
+        assert!(
+            fb_tasks.values().all(|v| v.as_str() != Some("task-gone")),
+            "fallback must not contain expired waiter task: {fb_tasks:?}"
+        );
+        assert_eq!(leader_ans.answers["size"]["score"], 1);
+        let live_done = take_done(&dir, &dir.join(format!("{live_id}.done")))
+            .expect("live peer must receive remapped answer")
+            .unwrap();
+        assert_eq!(live_done.answers["size"]["score"], 3);
+        assert!(
+            !dir.join(format!("{gone_id}.done")).exists(),
+            "expired waiter must not receive an orphaned .done"
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn monotonic_deadline_ignores_wall_clock_jumps() {
+        let (dir, blocks) = temp_dirs("mono-wall-jump");
+        let primary = JudgeEndpoint::new("vercel", "judge");
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let m0 = Instant::now();
+        let mono0_ms = 100_000u64;
+
+        // 1. Wall clock jumps forward +1h while monotonic advances only 100ms (< 500ms budget):
+        // live peer must NOT be dropped and must receive its answer.
+        let live_id = format!("{}-wall-fwd", std::process::id());
+        let live_req = request("peer-wall-fwd");
+        write_atomic(
+            &dir.join(format!("{live_id}.req")),
+            &serde_json::json!({
+                "group": group_of(&live_req, &primary, None),
+                "request": live_req,
+                "body": "p",
+                "deadline_mono_ms": mono0_ms + 500,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let wall = Rc::new(Cell::new(t0));
+        let mono = Rc::new(Cell::new(m0));
+        let mono_ms = Rc::new(Cell::new(mono0_ms));
+        let m1 = mono.clone();
+        let ms1 = mono_ms.clone();
+        let w1 = wall.clone();
+        let m_call1 = mono.clone();
+        let ms_call1 = mono_ms.clone();
+        let w_call1 = wall.clone();
+        let ans1 = ask_inner(
+            &dir,
+            &request("leader-wall-fwd"),
+            "l",
+            Duration::from_secs(10),
+            &blocks,
+            &primary,
+            None,
+            move || m1.get(),
+            move || ms1.get(),
+            move || w1.get(),
+            |_| async {},
+            false,
+            move |_ep, req, _body, _deadline, _guard| {
+                w_call1.set(w_call1.get() + Duration::from_secs(3600));
+                m_call1.set(m_call1.get() + Duration::from_millis(100));
+                ms_call1.set(ms_call1.get() + 100);
+                async move {
+                    let mut a = Map::new();
+                    for k in req["questions"].as_object().unwrap().keys() {
+                        a.insert(k.clone(), serde_json::json!({"score": 2}));
+                    }
+                    Ok((Value::Object(a), Some(0.01)))
+                }
+            },
+            classify_rl,
+            classify_batch_test,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ans1.answers["size"]["score"], 2);
+        let live_done = take_done(&dir, &dir.join(format!("{live_id}.done")))
+            .expect("forward wall-clock jump must not drop live peer")
+            .unwrap();
+        assert_eq!(live_done.answers["size"]["score"], 2);
+
+        // 2. Wall clock jumps backward -1h while monotonic advances 700ms (> 500ms budget):
+        // expired peer MUST be dropped and receive no .done.
+        wall.set(t0);
+        mono.set(m0);
+        mono_ms.set(mono0_ms);
+        let exp_id = format!("{}-wall-back", std::process::id());
+        let exp_req = request("peer-wall-back");
+        write_atomic(
+            &dir.join(format!("{exp_id}.req")),
+            &serde_json::json!({
+                "group": group_of(&exp_req, &primary, None),
+                "request": exp_req,
+                "body": "p2",
+                "deadline_mono_ms": mono0_ms + 500,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let m2 = mono.clone();
+        let ms2 = mono_ms.clone();
+        let w2 = wall.clone();
+        let m_call2 = mono.clone();
+        let ms_call2 = mono_ms.clone();
+        let w_call2 = wall.clone();
+        let _ = ask_inner(
+            &dir,
+            &request("leader-wall-back"),
+            "l2",
+            Duration::from_secs(10),
+            &blocks,
+            &primary,
+            None,
+            move || m2.get(),
+            move || ms2.get(),
+            move || w2.get(),
+            |_| async {},
+            false,
+            move |_ep, req, _body, _deadline, _guard| {
+                w_call2.set(w_call2.get() - Duration::from_secs(3600));
+                m_call2.set(m_call2.get() + Duration::from_millis(700));
+                ms_call2.set(ms_call2.get() + 700);
+                async move {
+                    let mut a = Map::new();
+                    for k in req["questions"].as_object().unwrap().keys() {
+                        a.insert(k.clone(), serde_json::json!({"score": 2}));
+                    }
+                    Ok((Value::Object(a), Some(0.01)))
+                }
+            },
+            classify_rl,
+            classify_batch_test,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !dir.join(format!("{exp_id}.done")).exists(),
+            "backward wall-clock jump must not keep monotonically expired peer"
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_gc_removes_orphaned_done_files() {
+        let (dir, blocks) = temp_dirs("orphan-done-gc");
+        let primary = JudgeEndpoint::new("vercel", "judge");
+        create_private_dir(&dir).unwrap();
+
+        // Simulate an orphaned .done left behind when a waiter deleted its .req
+        // between the leader's liveness check and publish.
+        let orphan = dir.join(format!("{}-orphan.done", std::process::id()));
+        write_atomic(&orphan, r#"{"answers":{"size":{"score":1}}}"#).unwrap();
+
+        let ok_fetch = |_ep: JudgeEndpoint,
+                        _req: Value,
+                        _body: String,
+                        _deadline: Instant,
+                        _guard: BatchSendGuard| async {
+            Ok((serde_json::json!({"size": {"score": 1}}), Some(0.01)))
+        };
+
+        // While fresh (age <= STALE), stale GC keeps it untouched.
+        ask_with_deadline(
+            &dir,
+            &request("gc-check-fresh"),
+            "b1",
+            Duration::from_secs(5),
+            &blocks,
+            &primary,
+            None,
+            ok_fetch,
+            classify_rl,
+            classify_batch_test,
+        )
+        .await
+        .unwrap();
+        assert!(orphan.exists(), "fresh .done must not be removed early");
+
+        // Once older than STALE, the next leader sweep removes the orphaned .done.
+        std::fs::File::options()
+            .write(true)
+            .open(&orphan)
+            .unwrap()
+            .set_modified(SystemTime::now() - STALE - Duration::from_secs(10))
+            .unwrap();
+        ask_with_deadline(
+            &dir,
+            &request("gc-check-stale"),
+            "b2",
+            Duration::from_secs(5),
+            &blocks,
+            &primary,
+            None,
+            ok_fetch,
+            classify_rl,
+            classify_batch_test,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !orphan.exists(),
+            "stale GC must collect orphaned .done files older than STALE"
         );
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
