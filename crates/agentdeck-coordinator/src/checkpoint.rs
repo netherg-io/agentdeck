@@ -292,10 +292,18 @@ impl HttpCheckpointJudge {
             timeout: CHECKPOINT_JUDGE_TIMEOUT,
             deadline: CHECKPOINT_JUDGE_DEADLINE,
             blocks: BlockStore::default_runtime_or_disabled(),
-            client: reqwest::Client::builder()
-                .timeout(CHECKPOINT_JUDGE_TIMEOUT)
-                .build()?,
+            client: Self::build_client(CHECKPOINT_JUDGE_TIMEOUT, false)?,
         })
+    }
+
+    fn build_client(timeout: Duration, no_proxy: bool) -> reqwest::Result<reqwest::Client> {
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(timeout);
+        if no_proxy {
+            builder = builder.no_proxy();
+        }
+        builder.build()
     }
 
     pub fn with_fallback(
@@ -410,12 +418,18 @@ impl HttpCheckpointJudge {
                 }
                 .into());
             }
-            let is_language_model = check_language_model
-                && (400..500).contains(&status)
-                && res
-                    .text()
+            let is_language_model = if check_language_model && (400..500).contains(&status) {
+                res.text()
                     .await
-                    .is_ok_and(|text| text.contains("is a language model"));
+                    .map_err(|e| CheckpointHttpError {
+                        trigger: FallbackTrigger::Transient,
+                        is_language_model: false,
+                        message: format!("checkpoint judge response read failed: {e}"),
+                    })?
+                    .contains("is a language model")
+            } else {
+                false
+            };
             return Err(CheckpointHttpError {
                 trigger: classify_http_status(status, None),
                 is_language_model,
@@ -676,7 +690,7 @@ mod tests {
             timeout: CHECKPOINT_JUDGE_TIMEOUT,
             deadline: CHECKPOINT_JUDGE_DEADLINE,
             blocks: BlockStore::new(base.join("blocks")),
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            client: HttpCheckpointJudge::build_client(CHECKPOINT_JUDGE_TIMEOUT, true).unwrap(),
         }
     }
 
@@ -1052,8 +1066,9 @@ mod tests {
         let primary_addr = primary_listener.local_addr().unwrap();
         let primary_paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let pp = primary_paths.clone();
+        let redirect_target = format!("http://{primary_addr}/redirected");
         let primary_srv = std::thread::spawn(move || {
-            for idx in 0..2 {
+            for idx in 0..4 {
                 let (mut stream, _) = primary_listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
@@ -1082,6 +1097,17 @@ mod tests {
                     let _ = stream.write_all(
                         b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 500\r\nconnection: close\r\n\r\n{\"answers\":",
                     );
+                } else if idx == 1 {
+                    // Truncated Vercel 400 body -> body-read error -> transient -> fallback.
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 500\r\nconnection: close\r\n\r\n{\"error\":",
+                    );
+                } else if idx == 2 {
+                    // 307 redirect must fail without following or falling back.
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {redirect_target}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    );
                 } else {
                     // 429 whose body says "is a language model": must NOT call /v1/chat/completions.
                     let body = r#"{"error":"test-model is a language model"}"#;
@@ -1099,7 +1125,7 @@ mod tests {
         let ok_or =
             json!({"answers": {"checkpoint_safe": {"score": 3, "confidence": 0.91}}}).to_string();
         let fb_srv = std::thread::spawn(move || {
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let (mut stream, _) = fb_listener.accept().unwrap();
                 let mut reader = BufReader::new(&mut stream);
                 let mut first = String::new();
@@ -1139,25 +1165,44 @@ mod tests {
             .with_blocks_dir(blocks_dir.clone());
         judge.endpoint = format!("http://{primary_addr}/v1/decisions");
 
+        // 1. Truncated 200 -> fallback.
         let v1 = judge
             .judge(&sample_input(), &CoordinatorConfig::default())
             .await
             .unwrap();
         assert!(v1.should_checkpoint);
 
-        let v2 = judge
+        // 2. Truncated Vercel 400 -> fallback.
+        let v2_400 = judge
             .judge(&sample_input(), &CoordinatorConfig::default())
             .await
             .unwrap();
-        assert!(v2.should_checkpoint);
+        assert!(v2_400.should_checkpoint);
+
+        // 3. 307 redirect -> error, no redirect follow, no fallback.
+        let err_307 = judge
+            .judge(&sample_input(), &CoordinatorConfig::default())
+            .await
+            .unwrap_err();
+        assert!(
+            err_307.to_string().contains("307"),
+            "307 redirect must fail without fallback: {err_307}"
+        );
+
+        // 4. 429 with "is a language model" -> fallback without /v1/chat/completions.
+        let v3 = judge
+            .judge(&sample_input(), &CoordinatorConfig::default())
+            .await
+            .unwrap();
+        assert!(v3.should_checkpoint);
 
         primary_srv.join().unwrap();
         fb_srv.join().unwrap();
         let seen = primary_paths.lock().unwrap();
         assert_eq!(
             seen.len(),
-            2,
-            "429 with 'is a language model' must not trigger /v1/chat/completions: {seen:?}"
+            4,
+            "307 must not follow redirect and 429 with 'is a language model' must not trigger /v1/chat/completions: {seen:?}"
         );
         assert!(seen.iter().all(|p| p.contains("/v1/decisions")));
         let _ = std::fs::remove_dir_all(&blocks_dir);
