@@ -237,6 +237,47 @@ fn tools() -> Value {
                 "path": {"type": "string"},
                 "choice": {"type": "string", "enum": ["shared", "local"]}
             }}
+        },
+        {
+            "name": "route_batch",
+            "description": "Pre-route a wave of 2 or more delegate launches in batched judge requests and warm the 10-minute routing cache. Call before launching 2+ delegates in one turn with the exact tool names and input payloads you will launch, then launch with the same payloads (a changed payload misses the cache). Returns per-launch routing JSON or {error} in input order.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["launches"],
+                "properties": {
+                    "launches": {
+                        "type": "array",
+                        "description": "Planned delegation tool calls in launch order",
+                        "items": {
+                            "type": "object",
+                            "required": ["tool", "input"],
+                            "properties": {
+                                "tool": {
+                                    "type": "string",
+                                    "description": "Launch tool name as the hook sees it (e.g. mcp__t3-code__delegate_task, delegate_task, Agent)"
+                                },
+                                "input": {
+                                    "type": "object",
+                                    "description": "Exact tool input payload to launch"
+                                },
+                                "effort": {
+                                    "type": "string",
+                                    "enum": ["medium", "high", "xhigh"],
+                                    "description": "Optional reasoning effort override"
+                                }
+                            }
+                        }
+                    },
+                    "harness": {
+                        "type": "string",
+                        "description": "Optional caller harness (claude, codex, agy, opencode, shell) used to resolve source when source is omitted"
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Optional caller T3 provider instance id (overrides harness/process detection)"
+                    }
+                }
+            }
         }
     ])
 }
@@ -454,6 +495,20 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
             )?;
             agentdeck_core::shared::apply_instruction_resolution(&home, &plan)?;
             Ok(json!({ "diff": plan.diff, "changes": describe(&plan.changes) }))
+        }
+        "route_batch" => {
+            let launches = args
+                .get("launches")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("launches must be an array"))?;
+            let env = agentdeck_router::route::Env::from_env()?;
+            let opts = agentdeck_router::route::BatchOptions {
+                harness: str_arg(args, "harness").map(str::to_string),
+                source: str_arg(args, "source").map(str::to_string),
+                budget: agentdeck_router::route::BATCH_BUDGET,
+            };
+            let results = agentdeck_router::route::route_batch(&env, launches, opts).await?;
+            Ok(json!({ "results": results }))
         }
         "state_read" => {
             let id = thread_arg(args)?;

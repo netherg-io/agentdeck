@@ -6,6 +6,7 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentdeck_core::judge::{
@@ -19,10 +20,23 @@ use sha2::{Digest, Sha256};
 /// the hook kills `route` after 55 s.
 pub const BUDGET: Duration = Duration::from_secs(50);
 /// Tasks per batched decision; 7 real briefs measured about 11k input tokens.
-const MAX_TASKS: usize = 8;
+pub const MAX_TASKS: usize = 8;
 const POLL: Duration = Duration::from_millis(150);
 const STALE: Duration = Duration::from_secs(600);
 const MAX_WAIT_RETRIES: usize = 8;
+
+fn next_request_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{}-{nanos}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 /// HTTP 429 from the decision endpoint, with the server's `Retry-After`.
 #[derive(Debug)]
@@ -106,6 +120,41 @@ where
     .await
 }
 
+/// Asks Jev for several requests through the shared spool at once, so the
+/// leader batches up to [`MAX_TASKS`] compatible requests per judge call within
+/// the shared `budget` deadline. Returns one result per input item in order.
+#[allow(clippy::too_many_arguments)]
+pub async fn ask_many_with_deadline<F, Fut, C>(
+    spool: &Path,
+    items: &[(Value, String)],
+    budget: Duration,
+    blocks: &BlockStore,
+    primary: &JudgeEndpoint,
+    fallback: Option<&JudgeEndpoint>,
+    fetch: F,
+    classify: C,
+) -> Vec<anyhow::Result<QueueAnswer>>
+where
+    F: FnMut(JudgeEndpoint, Value, String, Duration) -> Fut,
+    Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
+    C: Fn(&anyhow::Error) -> FallbackTrigger,
+{
+    ask_many_inner(
+        spool,
+        items,
+        budget,
+        blocks,
+        primary,
+        fallback,
+        SystemTime::now,
+        tokio::time::sleep,
+        true,
+        fetch,
+        classify,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn ask_inner<Now, Sleep, SleepFut, F, Fut, C>(
     spool: &Path,
@@ -115,10 +164,10 @@ async fn ask_inner<Now, Sleep, SleepFut, F, Fut, C>(
     blocks: &BlockStore,
     primary: &JudgeEndpoint,
     fallback: Option<&JudgeEndpoint>,
-    mut now: Now,
-    mut sleep: Sleep,
+    now: Now,
+    sleep: Sleep,
     add_jitter: bool,
-    mut fetch: F,
+    fetch: F,
     classify: C,
 ) -> anyhow::Result<QueueAnswer>
 where
@@ -129,55 +178,170 @@ where
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
 {
+    ask_many_inner(
+        spool,
+        &[(request.clone(), body.to_string())],
+        budget,
+        blocks,
+        primary,
+        fallback,
+        now,
+        sleep,
+        add_jitter,
+        fetch,
+        classify,
+    )
+    .await
+    .into_iter()
+    .next()
+    .unwrap_or_else(|| Err(anyhow::anyhow!("Jev queue: empty request")))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ask_many_inner<Now, Sleep, SleepFut, F, Fut, C>(
+    spool: &Path,
+    items: &[(Value, String)],
+    budget: Duration,
+    blocks: &BlockStore,
+    primary: &JudgeEndpoint,
+    fallback: Option<&JudgeEndpoint>,
+    mut now: Now,
+    mut sleep: Sleep,
+    add_jitter: bool,
+    mut fetch: F,
+    classify: C,
+) -> Vec<anyhow::Result<QueueAnswer>>
+where
+    Now: FnMut() -> SystemTime,
+    Sleep: FnMut(Duration) -> SleepFut,
+    SleepFut: Future<Output = ()>,
+    F: FnMut(JudgeEndpoint, Value, String, Duration) -> Fut,
+    Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
+    C: Fn(&anyhow::Error) -> FallbackTrigger,
+{
+    if items.is_empty() {
+        return Vec::new();
+    }
     let started = now();
-    create_private_dir(spool)?;
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let id = format!("{}-{nanos}", std::process::id());
-    let req_path = spool.join(format!("{id}.req"));
-    let done_path = spool.join(format!("{id}.done"));
-    let entry = serde_json::json!({"group": group_of(request), "request": request, "body": body});
-    write_atomic(&req_path, &entry.to_string())?;
-    let lock = std::fs::File::options()
+    if let Err(e) = create_private_dir(spool) {
+        let msg = e.to_string();
+        return (0..items.len())
+            .map(|_| Err(anyhow::anyhow!("{msg}")))
+            .collect();
+    }
+    // Enqueue every request before acquiring the lock so the first leader turn
+    // sees the whole wave and packs up to MAX_TASKS into one judge request.
+    let mut ids = Vec::with_capacity(items.len());
+    let mut req_paths = Vec::with_capacity(items.len());
+    let mut done_paths = Vec::with_capacity(items.len());
+    let mut results: Vec<Option<anyhow::Result<QueueAnswer>>> =
+        (0..items.len()).map(|_| None).collect();
+    for (i, (request, body)) in items.iter().enumerate() {
+        let id = next_request_id();
+        let req_path = spool.join(format!("{id}.req"));
+        let done_path = spool.join(format!("{id}.done"));
+        let entry =
+            serde_json::json!({"group": group_of(request), "request": request, "body": body});
+        if let Err(e) = write_atomic(&req_path, &entry.to_string()) {
+            results[i] = Some(Err(e.into()));
+        }
+        ids.push(id);
+        req_paths.push(req_path);
+        done_paths.push(done_path);
+    }
+    let lock = match std::fs::File::options()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(spool.join("lock"))?;
-    loop {
-        if let Some(r) = take_done(&done_path) {
-            return r;
+        .open(spool.join("lock"))
+    {
+        Ok(f) => f,
+        Err(e) => {
+            let msg = e.to_string();
+            for (i, slot) in results.iter_mut().enumerate() {
+                if slot.is_none() {
+                    let _ = std::fs::remove_file(&req_paths[i]);
+                    *slot = Some(Err(anyhow::anyhow!("{msg}")));
+                }
+            }
+            return results.into_iter().map(Option::unwrap).collect();
         }
+    };
+    loop {
+        for (i, slot) in results.iter_mut().enumerate() {
+            if slot.is_none()
+                && let Some(r) = take_done(&done_paths[i])
+            {
+                *slot = Some(r);
+            }
+        }
+        let Some(first) = results.iter().position(Option::is_none) else {
+            break;
+        };
         let elapsed = now().duration_since(started).unwrap_or(Duration::ZERO);
         if elapsed >= budget {
-            let _ = std::fs::remove_file(&req_path);
-            return take_done(&done_path).unwrap_or_else(|| {
-                Err(anyhow::anyhow!(
-                    "Jev queue: no answer within {}s (decision rate limit)",
-                    budget.as_secs()
-                ))
-            });
+            for (i, slot) in results.iter_mut().enumerate() {
+                if slot.is_none() {
+                    let _ = std::fs::remove_file(&req_paths[i]);
+                    *slot = Some(take_done(&done_paths[i]).unwrap_or_else(|| {
+                        Err(anyhow::anyhow!(
+                            "Jev queue: no answer within {}s (decision rate limit)",
+                            budget.as_secs()
+                        ))
+                    }));
+                }
+            }
+            break;
         }
         match lock.try_lock() {
             Ok(()) => {
                 let led = lead(
-                    spool, &id, started, budget, blocks, primary, fallback, &mut now, &mut sleep,
-                    add_jitter, &mut fetch, &classify,
+                    spool,
+                    &ids[first],
+                    started,
+                    budget,
+                    blocks,
+                    primary,
+                    fallback,
+                    &mut now,
+                    &mut sleep,
+                    add_jitter,
+                    &mut fetch,
+                    &classify,
                 )
                 .await;
                 let _ = lock.unlock();
-                led?;
-                if let Some(r) = take_done(&done_path) {
-                    return r;
+                if let Err(e) = led {
+                    let _ = std::fs::remove_file(&req_paths[first]);
+                    results[first] = Some(Err(e));
+                    continue;
                 }
-                // Not answered (own request unreadable): don't spin on the lock.
-                sleep(POLL).await;
+                for (i, slot) in results.iter_mut().enumerate() {
+                    if slot.is_none()
+                        && let Some(r) = take_done(&done_paths[i])
+                    {
+                        *slot = Some(r);
+                    }
+                }
+                if results[first].is_none() {
+                    // Not answered (own request unreadable): don't spin on the lock.
+                    sleep(POLL).await;
+                }
             }
             Err(std::fs::TryLockError::WouldBlock) => sleep(POLL).await,
-            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+            Err(std::fs::TryLockError::Error(e)) => {
+                let msg = e.to_string();
+                for (i, slot) in results.iter_mut().enumerate() {
+                    if slot.is_none() {
+                        let _ = std::fs::remove_file(&req_paths[i]);
+                        *slot = Some(Err(anyhow::anyhow!("{msg}")));
+                    }
+                }
+                break;
+            }
         }
     }
+    results.into_iter().map(Option::unwrap).collect()
 }
 
 struct Pending {
@@ -670,6 +834,100 @@ mod tests {
         .unwrap();
         assert_eq!(got.answers, serde_json::json!({"size": 1}));
         assert_eq!(got.channel, JudgeChannel::Primary);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ask_many_batches_up_to_max_tasks_per_call() {
+        let (dir, blocks) = temp_dirs("ask-many");
+        let primary = JudgeEndpoint::new("vercel", "judge");
+        let calls: Arc<Mutex<Vec<usize>>> = Arc::default();
+
+        let make_fetch = |log: Arc<Mutex<Vec<usize>>>| {
+            move |_ep: JudgeEndpoint, req: Value, _body: String, _rem: Duration| {
+                let log = log.clone();
+                async move {
+                    let count = req
+                        .pointer("/state/tasks")
+                        .and_then(Value::as_object)
+                        .map(|m| m.len())
+                        .unwrap_or(1);
+                    log.lock().unwrap().push(count);
+                    let mut answers = Map::new();
+                    for (k, _) in req["questions"].as_object().unwrap() {
+                        let task_idx = k
+                            .strip_prefix('t')
+                            .and_then(|s| s.split_once("__"))
+                            .and_then(|(n, _)| n.parse::<usize>().ok());
+                        let task_text = match task_idx {
+                            Some(i) => req["state"]["tasks"][format!("t{i}")]
+                                .as_str()
+                                .unwrap_or_default(),
+                            None => req["state"]["task"].as_str().unwrap_or_default(),
+                        };
+                        let score = task_text
+                            .strip_prefix("task-")
+                            .and_then(|n| n.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        answers.insert(k.clone(), serde_json::json!({"score": score}));
+                    }
+                    Ok((Value::Object(answers), Some(0.08)))
+                }
+            }
+        };
+
+        // 3 items -> 1 judge call, results in exact input order.
+        let three: Vec<(Value, String)> = (0..3)
+            .map(|i| {
+                let r = request(&format!("task-{i}"));
+                let b = r.to_string();
+                (r, b)
+            })
+            .collect();
+        let res3 = ask_many_with_deadline(
+            &dir,
+            &three,
+            Duration::from_secs(120),
+            &blocks,
+            &primary,
+            None,
+            make_fetch(calls.clone()),
+            classify_rl,
+        )
+        .await;
+        assert_eq!(*calls.lock().unwrap(), vec![3]);
+        assert_eq!(res3.len(), 3);
+        for (i, r) in res3.iter().enumerate() {
+            assert_eq!(r.as_ref().unwrap().answers["size"]["score"], i as i64);
+        }
+
+        // 10 items -> 2 judge calls (8 + 2), results in exact input order.
+        calls.lock().unwrap().clear();
+        let ten: Vec<(Value, String)> = (0..10)
+            .map(|i| {
+                let r = request(&format!("task-{i}"));
+                let b = r.to_string();
+                (r, b)
+            })
+            .collect();
+        let res10 = ask_many_with_deadline(
+            &dir,
+            &ten,
+            Duration::from_secs(120),
+            &blocks,
+            &primary,
+            None,
+            make_fetch(calls.clone()),
+            classify_rl,
+        )
+        .await;
+        let counts = calls.lock().unwrap().clone();
+        assert_eq!(counts, vec![MAX_TASKS, 2], "10 items must batch as 8 + 2");
+        assert_eq!(res10.len(), 10);
+        for (i, r) in res10.iter().enumerate() {
+            assert_eq!(r.as_ref().unwrap().answers["size"]["score"], i as i64);
+        }
+
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }

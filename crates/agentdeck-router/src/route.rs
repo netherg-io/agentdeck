@@ -1345,11 +1345,34 @@ async fn jev_fetch_endpoint(
     timeout: std::time::Duration,
     bases: &JevBases,
 ) -> anyhow::Result<(Value, Option<f64>)> {
-    if let Ok(mock) = std::env::var("AGENTDECK_ROUTE_MOCK_JEV") {
+    if bases.openrouter == OPENROUTER_BASE
+        && bases.vercel == VERCEL_BASE
+        && let Ok(mock) = std::env::var("AGENTDECK_ROUTE_MOCK_JEV")
+    {
         let text = std::fs::read_to_string(mock)?;
         let v: Value = serde_json::from_str(&text)?;
+        let raw_answers = v.get("answers").cloned().unwrap_or(Value::Null);
+        let answers = if let (Some(req_qs), Some(ans_map)) = (
+            request.get("questions").and_then(Value::as_object),
+            raw_answers.as_object(),
+        ) && request.pointer("/state/tasks").is_some()
+        {
+            let mut out = serde_json::Map::new();
+            for qk in req_qs.keys() {
+                if let Some(val) = ans_map.get(qk) {
+                    out.insert(qk.clone(), val.clone());
+                } else if let Some((_, base)) = qk.split_once("__")
+                    && let Some(val) = ans_map.get(base)
+                {
+                    out.insert(qk.clone(), val.clone());
+                }
+            }
+            Value::Object(out)
+        } else {
+            raw_answers
+        };
         return Ok((
-            v.get("answers").cloned().unwrap_or(Value::Null),
+            answers,
             v.get("usage")
                 .and_then(|u| u.get("cost"))
                 .and_then(Value::as_f64),
@@ -1555,126 +1578,49 @@ pub async fn probe_decision(
 
 // --- CLI ---------------------------------------------------------------------
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatedTarget {
     pub provider: String,
     pub model: String,
 }
 
-pub async fn run(argv: Vec<String>) -> i32 {
-    match run_inner(argv).await {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("{e}");
-            1
+/// Total deadline for one `route_batch` call (fits a 60s 429 block when no
+/// fallback is configured, or falls back immediately when configured).
+pub const BATCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+#[derive(Clone, Debug)]
+pub struct BatchOptions {
+    pub harness: Option<String>,
+    pub source: Option<String>,
+    pub budget: std::time::Duration,
+}
+
+impl Default for BatchOptions {
+    fn default() -> Self {
+        Self {
+            harness: None,
+            source: None,
+            budget: BATCH_BUDGET,
         }
     }
 }
 
-async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
-    match argv.first().map(String::as_str) {
-        Some("hook") => return Ok(crate::hook::run(&argv[1..])),
-        Some("claude-shell") => return Ok(crate::shell::run(&argv[1..])),
-        Some("t3-mcp-call") => return Ok(crate::mcp_call::run(&argv[1..]).await),
-        Some("workflow") => return Ok(crate::workflow::run(&argv[1..]).await),
-        Some("outcomes") => return Ok(crate::outcomes::run(&argv[1..]).await),
-        _ => {}
-    }
-    let env = Env::from_env()?;
-    if argv.len() == 1 && argv[0] == "--catalog" {
-        let mut stdin = String::new();
-        use std::io::Read;
-        std::io::stdin().read_to_string(&mut stdin)?;
-        let data: Value = serde_json::from_str(&stdin).map_err(|_| {
-            anyhow::anyhow!(
-                "expected orchestrator_capabilities structuredContent with model option descriptors"
-            )
-        })?;
-        match save_catalog(&env.state_home, data) {
-            Ok(()) => {
-                println!("model option catalog updated");
-                return Ok(0);
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                return Ok(1);
-            }
-        }
-    }
-    let mut args = argv.as_slice();
-    let mut source: Option<String> = None;
-    let mut requested: Option<ValidatedTarget> = None;
-    let mut exclude: Vec<String> = Vec::new();
-    let mut force_review = false;
-    let mut effort: Option<i64> = None;
-    while args.first().is_some_and(|a| a.starts_with("--")) && args[0] != "--check" {
-        let flag = args[0].clone();
-        args = &args[1..];
-        if flag == "--" {
-            break;
-        }
-        if flag == "--source" && !args.is_empty() {
-            source = Some(args[0].clone());
-            args = &args[1..];
-        } else if flag == "--validate-target" && args.len() >= 2 {
-            requested = Some(ValidatedTarget {
-                provider: args[0].clone(),
-                model: args[1].clone(),
-            });
-            args = &args[2..];
-        } else if flag == "--exclude" && !args.is_empty() {
-            exclude.push(args[0].clone());
-            args = &args[1..];
-        } else if flag == "--review" {
-            force_review = true;
-        } else if flag == "--effort"
-            && let Some(level) = args
-                .first()
-                .and_then(|l| ["medium", "high", "xhigh"].iter().position(|x| x == l))
-        {
-            // Same scale as `reasoning_target`: difficulty 0 medium, 1 high, 2 xhigh.
-            effort = Some(level as i64);
-            args = &args[1..];
-        } else {
-            eprintln!("{USAGE}");
-            return Ok(2);
-        }
-    }
-    let settings =
-        read_settings(&env.home).map_err(|e| anyhow::anyhow!("cannot read T3 settings: {e}"))?;
-    if source.is_none() {
-        source = detect_source(&settings);
-    }
-    let cfg = match load_router_config(&env) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{e}");
-            return Ok(1);
-        }
-    };
-    let source_warning = match &source {
-        Some(s) if !cfg.account.contains_key(s) => Some(format!(
-            "unknown source instance \"{s}\": no shared-quota protection"
-        )),
-        _ => None,
-    };
-    let usage_path = cfg
-        .usage_state_path
+fn usage_state_path(env: &Env, cfg: &RouterConfig) -> std::path::PathBuf {
+    cfg.usage_state_path
         .clone()
         .map(|p| {
             p.strip_prefix("~/")
                 .map(|rest| env.home.join(rest))
                 .unwrap_or_else(|| std::path::PathBuf::from(p))
         })
-        .unwrap_or_else(|| env.home.join(".local/state/ai-usage/state.json"));
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    let mut usage = parse_usage_state(&usage_path)
-        .map_err(|e| anyhow::anyhow!("cannot read usage state {}: {e}", usage_path.display()))?;
-    let mut load = read_active_agents(&env.home.join(".t3/userdata/statev2.sqlite"));
-    let measured = codex_costs(&env);
+        .unwrap_or_else(|| env.home.join(".local/state/ai-usage/state.json"))
+}
 
+fn resolve_favorites(
+    cfg: &RouterConfig,
+    settings: &Value,
+    state_home: &std::path::Path,
+) -> anyhow::Result<(Vec<(String, String, Option<String>)>, Vec<String>)> {
     let configured: Vec<Value> = enabled_favorites(
         cfg.pool
             .iter()
@@ -1695,13 +1641,13 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                 Value::Object(m)
             })
             .collect(),
-        &settings,
+        settings,
     );
     let opencode_models: Vec<String> = if configured
         .iter()
         .any(|f| f.get("provider").and_then(Value::as_str) == Some("opencode"))
     {
-        let catalog = read_live_catalog(&env.state_home)?;
+        let catalog = read_live_catalog(state_home)?;
         catalog
             .get("providers")
             .and_then(Value::as_array)
@@ -1753,124 +1699,52 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         .filter(|(_, _, p)| p.is_none())
         .map(|(pr, m, _)| format!("{pr}/{m}"))
         .collect();
+    Ok((favorites, unprofiled))
+}
 
-    if args.first().is_some_and(|a| a == "--check") {
-        println!(
-            "source: {}",
-            source
-                .as_deref()
-                .unwrap_or("unknown (use --source to preserve orchestrator quota)")
-        );
-        // Source is visible so the GUI/operator can tell a default ban from
-        // an explicit user override.
-        println!(
-            "user rules (source: {}): no-review: {}; denied: {}",
-            cfg.user_rules.source.as_str(),
-            if cfg.user_rules.no_review_models.is_empty() {
-                "(none)".to_string()
-            } else {
-                cfg.user_rules.no_review_models.join(", ")
-            },
-            if cfg.user_rules.deny_models.is_empty() {
-                "(none)".to_string()
-            } else {
-                cfg.user_rules.deny_models.join(", ")
-            }
-        );
-        if !load.known {
-            println!("live T3 agent metadata unavailable");
-        }
-        for (provider, model, profile) in &favorites {
-            let q = quota(&cfg, &measured, &usage, &load, provider, model, now);
-            print!(
-                "{}{}  {provider}/{model}\n    left: {}",
-                if profile.is_some() {
-                    "ok"
-                } else {
-                    "UNPROFILED"
-                },
-                if cfg.user_rules.is_denied(model) {
-                    " DENIED by user rule"
-                } else {
-                    ""
-                },
-                q.note
-            );
-            if let (Some(w), Some(b)) = (q.weekly, q.basis) {
-                print!(
-                    "\n    weekly % per size 0..3: {} ({b})",
-                    w.iter()
-                        .map(|c| format_js(round2(*c)))
-                        .collect::<Vec<_>>()
-                        .join(" / ")
-                );
-            }
-            let allowed: Vec<String> = [0, 1, 2, 3]
-                .iter()
-                .filter(|s| q.allowed[**s])
-                .map(|s| s.to_string())
-                .collect();
-            println!(
-                "\n    allowed sizes: {}",
-                if allowed.is_empty() {
-                    "none".to_string()
-                } else {
-                    allowed.join(",")
-                }
-            );
-        }
-        // UNPROFILED is an informational flag (conservative max-burn quota,
-        // profiled:false in JSON): unknown-profile favorites route on their
-        // Jev judgment like any other, so --check reports and exits 0.
-        return Ok(0);
-    }
-
-    let mut task = if args.len() == 1 && args[0] == "-" {
-        let mut s = String::new();
-        use std::io::Read;
-        std::io::stdin().read_to_string(&mut s)?;
-        s
-    } else {
-        args.join(" ")
-    }
-    .trim()
-    .to_string();
+fn known_brief_hints() -> Vec<String> {
     let brief_hint = crate::policy::roster_brief_hint();
-    let known_hints: Vec<String> = {
-        let mut v: Vec<String> = crate::policy::roster()["families"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|f| {
-                let fh = f
-                    .get("briefHint")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let parts: Vec<&str> = [brief_hint.as_str(), fh]
-                    .into_iter()
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if parts.is_empty() {
-                    None
-                } else {
-                    Some(parts.join("\n\n"))
-                }
-            })
-            .collect();
-        v.push(brief_hint.clone());
-        if let Some(a) = crate::policy::roster()["antigravityBriefHint"].as_str() {
-            v.push(format!("{brief_hint}\n\n{a}"));
-        }
-        // Dedupe (first wins), drop empties, longest first.
-        let mut seen = std::collections::HashSet::new();
-        let mut out: Vec<String> = v
-            .into_iter()
-            .filter(|s| !s.is_empty() && seen.insert(s.clone()))
-            .collect();
-        out.sort_by_key(|s| std::cmp::Reverse(s.len()));
-        out
-    };
+    let mut v: Vec<String> = crate::policy::roster()["families"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|f| {
+            let fh = f
+                .get("briefHint")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let parts: Vec<&str> = [brief_hint.as_str(), fh]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n\n"))
+            }
+        })
+        .collect();
+    v.push(brief_hint.clone());
+    if let Some(a) = crate::policy::roster()["antigravityBriefHint"].as_str() {
+        v.push(format!("{brief_hint}\n\n{a}"));
+    }
+    // Dedupe (first wins), drop empties, longest first.
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = v
+        .into_iter()
+        .filter(|s| !s.is_empty() && seen.insert(s.clone()))
+        .collect();
+    out.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    out
+}
+
+fn normalize_task(
+    raw: &str,
+    known_hints: &[String],
+    exclude: &mut Vec<String>,
+) -> (String, crate::policy::RouteMarkers) {
+    let mut task = raw.trim().to_string();
     if let Some(h) = known_hints
         .iter()
         .find(|h| task.ends_with(h.as_str()) && task.len() > h.len())
@@ -1884,12 +1758,11 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         }
     }
     task = markers.cleaned_task().trim().to_string();
-    if task.is_empty() {
-        eprintln!("{USAGE}");
-        return Ok(2);
-    }
+    (task, markers)
+}
 
-    let criteria: Vec<(String, String)> = favorites
+fn build_criteria(favorites: &[(String, String, Option<String>)]) -> Vec<(String, String)> {
+    favorites
         .iter()
         .map(|(p, m, prof)| {
             (
@@ -1900,13 +1773,20 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                 ),
             )
         })
-        .collect();
-    // Build the Jev request with Node's exact key order.
+        .collect()
+}
+
+/// Build the Jev request with Node's exact key order.
+fn build_jev_request(
+    primary_model: &str,
+    task: &str,
+    criteria: &[(String, String)],
+) -> (Value, String) {
     let mut questions = serde_json::Map::new();
     questions.insert("size".into(), serde_json::json!({"type": "score", "instructions": "How much work will the actual delegated task take? Scope is not difficulty. Do not assume a large task from a long prompt, repository name or safeguards.", "criteria": SIZES}));
     questions.insert("difficulty".into(), serde_json::json!({"type": "score", "instructions": "How difficult is the actual task, independently of its volume? Many files, a large repository, long inputs or a request to use Sonnet/Opus do not by themselves make work difficult.", "criteria": DIFFICULTY}));
     questions.insert("review".into(), serde_json::json!({"type": "score", "instructions": "Is the delegated task itself a review or audit of existing work? Mentioning a review, or fixing what a review found, does not make the task a review.", "criteria": REVIEW}));
-    for (k, _) in &criteria {
+    for (k, _) in criteria {
         questions.insert(
             k.clone(),
             serde_json::json!({"type": "score",
@@ -1915,63 +1795,59 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         );
     }
     let mut state = serde_json::Map::new();
-    state.insert("task".into(), Value::from(task.clone()));
+    state.insert("task".into(), Value::from(task));
     let mut models = serde_json::Map::new();
-    for (k, c) in &criteria {
+    for (k, c) in criteria {
         models.insert(k.clone(), Value::from(c.clone()));
     }
     state.insert("models".into(), Value::Object(models));
-    let primary = primary_endpoint(&cfg)?;
-    let fallback = cfg.judge_fallback.endpoint();
     let mut request = serde_json::Map::new();
-    request.insert("model".into(), Value::from(primary.model.as_str()));
+    request.insert("model".into(), Value::from(primary_model));
     request.insert("state".into(), Value::Object(state));
     request.insert("questions".into(), Value::Object(questions));
     let request_value = Value::Object(request);
     let body_json = stringify_like_node(&request_value);
-    let hash_input = stringify_like_node(&serde_json::json!([
-        source.as_deref(),
-        cfg.version,
-        request_value
-    ]));
+    (request_value, body_json)
+}
 
-    let complete = |a: &Value| {
-        let size_ok = a.get("size").is_some_and(|s| valid_answer(s, false));
-        let diff_ok = a.get("difficulty").is_some_and(|d| valid_answer(d, false));
-        size_ok
-            && diff_ok
-            && criteria
-                .iter()
-                .all(|(k, _)| a.get(k).is_some_and(|x| valid_answer(x, true)))
-    };
-    let blocks = agentdeck_core::judge::BlockStore::new(
-        env.runtime
-            .join(agentdeck_core::judge::JUDGE_BLOCKS_DIR_NAME),
-    );
-    let (answers, cost, jev_hit, jev_channel) = fetch_jev_cached(
-        &env.runtime,
-        &hash_input,
-        &request_value,
-        &body_json,
-        &primary,
-        fallback.as_ref(),
-        crate::jev_queue::BUDGET,
-        &blocks,
-        &JevBases::default(),
-        None,
-        &complete,
-    )
-    .await?;
-    let jev_cache = if jev_hit { "hit" } else { "miss" };
-    // Re-read quota/load snapshots after Jev before ranking.
+fn jev_cache_key(source: Option<&str>, cfg_version: &Value, request_value: &Value) -> String {
+    stringify_like_node(&serde_json::json!([source, cfg_version, request_value]))
+}
+
+fn answers_complete(a: &Value, criteria: &[(String, String)]) -> bool {
+    let size_ok = a.get("size").is_some_and(|s| valid_answer(s, false));
+    let diff_ok = a.get("difficulty").is_some_and(|d| valid_answer(d, false));
+    size_ok
+        && diff_ok
+        && criteria
+            .iter()
+            .all(|(k, _)| a.get(k).is_some_and(|x| valid_answer(x, true)))
+}
+
+struct RoutingSnapshot {
+    now: f64,
+    usage: Vec<UsageAccountFull>,
+    load: AgentLoad,
+    current_cfg: RouterConfig,
+    pending: std::collections::HashMap<String, usize>,
+    capacity_error: Option<String>,
+    catalog: Value,
+    failures: std::collections::HashMap<String, crate::load::InstanceFailures>,
+}
+
+fn read_routing_snapshot(
+    env: &Env,
+    usage_path: &std::path::Path,
+    fallback_now: f64,
+) -> anyhow::Result<RoutingSnapshot> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
-        .unwrap_or(now);
-    usage = parse_usage_state(&usage_path)
+        .unwrap_or(fallback_now);
+    let usage = parse_usage_state(usage_path)
         .map_err(|e| anyhow::anyhow!("cannot read usage state {}: {e}", usage_path.display()))?;
-    load = read_active_agents(&env.home.join(".t3/userdata/statev2.sqlite"));
-    let current_cfg = load_router_config(&env)?;
+    let mut load = read_active_agents(&env.home.join(".t3/userdata/statev2.sqlite"));
+    let current_cfg = load_router_config(env)?;
     let mut pending = std::collections::HashMap::new();
     let mut capacity_error = None;
     if !current_cfg.instance_limits.is_empty() {
@@ -1984,6 +1860,43 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         }
     }
     let catalog = read_live_catalog(&env.state_home)?;
+    let failures = read_instance_failures(&env.home.join(".t3/userdata/statev2.sqlite"), now);
+    Ok(RoutingSnapshot {
+        now,
+        usage,
+        load,
+        current_cfg,
+        pending,
+        capacity_error,
+        catalog,
+        failures,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_route_output(
+    cfg: &RouterConfig,
+    measured: &Measured,
+    snapshot: &RoutingSnapshot,
+    favorites: &[(String, String, Option<String>)],
+    unprofiled: &[String],
+    source: Option<&str>,
+    source_warning: Option<&str>,
+    task: &str,
+    requested: Option<&ValidatedTarget>,
+    exclude: &[String],
+    force_review: bool,
+    effort: Option<i64>,
+    answers: &Value,
+    cost: Option<f64>,
+    jev_hit: bool,
+    jev_channel: agentdeck_core::judge::JudgeChannel,
+) -> Value {
+    let jev_cache = if jev_hit { "hit" } else { "miss" };
+    let now = snapshot.now;
+    let current_cfg = &snapshot.current_cfg;
+    let load = &snapshot.load;
+    let pending = &snapshot.pending;
 
     let size = (answers
         .get("size")
@@ -2010,26 +1923,29 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                     .round()
                     >= 2.0
             }
-            None => is_review_task(&task),
+            None => is_review_task(task),
         };
-    let failures = read_instance_failures(&env.home.join(".t3/userdata/statev2.sqlite"), now);
     let mut candidates: Vec<Candidate> = vec![];
-    for (provider, model, profile) in &favorites {
+    for (provider, model, profile) in favorites {
         let a = answers
             .get(key_of(provider, model).as_str())
             .cloned()
             .unwrap_or(Value::Null);
-        let (target, reasoning_error) =
-            match reasoning_target(&catalog, provider, model, effort.unwrap_or(difficulty)) {
-                Ok(mut t) => {
-                    crate::reasoning::with_worker_agent(&catalog, &mut t);
-                    (t, None)
-                }
-                Err(e) => (
-                    serde_json::json!({"providerInstanceId": provider, "model": model}),
-                    Some(e.to_string()),
-                ),
-            };
+        let (target, reasoning_error) = match reasoning_target(
+            &snapshot.catalog,
+            provider,
+            model,
+            effort.unwrap_or(difficulty),
+        ) {
+            Ok(mut t) => {
+                crate::reasoning::with_worker_agent(&snapshot.catalog, &mut t);
+                (t, None)
+            }
+            Err(e) => (
+                serde_json::json!({"providerInstanceId": provider, "model": model}),
+                Some(e.to_string()),
+            ),
+        };
         let fam = family_of(model);
         // User rules (defaults preserve the embedded Argon ban): deny wins,
         // then the audit/review ban, then the instance capacity ban.
@@ -2043,11 +1959,12 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
             None
         };
         if let Some(limit) = current_cfg.instance_limits.get(provider) {
-            policy_ban = capacity_error
+            policy_ban = snapshot
+                .capacity_error
                 .clone()
                 .or_else(|| {
                     crate::admission::reason(
-                        &load,
+                        load,
                         pending.get(provider).copied().unwrap_or_default(),
                         provider,
                         *limit,
@@ -2070,8 +1987,8 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         {
             policy_ban = Some("excluded for this route".to_string());
         }
-        let q = quota(&cfg, &measured, &usage, &load, provider, model, now);
-        let failure = failures.get(provider);
+        let q = quota(cfg, measured, &snapshot.usage, load, provider, model, now);
+        let failure = snapshot.failures.get(provider);
         if let Some(block) = failure.and_then(|f| f.quota_block_for(model))
             && !q.refilled_since(block, now)
         {
@@ -2138,10 +2055,10 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     }
     let (shared_w, paid_w, cheap_w, _) = routing_weights();
     let ranking = rank_candidates(
-        &cfg,
+        cfg,
         candidates,
         difficulty,
-        source.as_deref(),
+        source,
         (shared_w, paid_w, if is_review { 0.0 } else { cheap_w }),
     );
     let best = ranking.iter().find(|r| r.eligible);
@@ -2255,12 +2172,11 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     }
     out.insert(
         "source".into(),
-        source.clone().map(Value::String).unwrap_or(Value::Null),
+        source.map(Value::from).unwrap_or(Value::Null),
     );
     out.insert(
         "sourceAccount".into(),
         source
-            .as_deref()
             .and_then(|s| cfg.account.get(s))
             .cloned()
             .map(Value::String)
@@ -2305,7 +2221,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
             }),
         );
     }
-    if let Some(req) = &requested {
+    if let Some(req) = requested {
         if let Some(h) = hint_of_on(&req.provider, &req.model) {
             out.insert("requestedBriefHint".into(), Value::from(h));
         }
@@ -2363,8 +2279,8 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                 .collect::<Vec<_>>(),
         ),
     );
-    if let Some(n) = load.note {
-        load_json.insert("note".into(), Value::from(n));
+    if let Some(n) = &load.note {
+        load_json.insert("note".into(), Value::from(n.clone()));
     }
     out.insert("activeLoad".into(), Value::Object(load_json));
     if let Some(c) = cost {
@@ -2372,8 +2288,746 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     }
     out.insert("jevCache".into(), Value::from(jev_cache));
     out.insert("jevChannel".into(), Value::from(jev_channel.as_str()));
-    println!("{}", serde_json::to_string_pretty(&Value::Object(out))?);
+    Value::Object(out)
+}
+
+fn build_user_choice_output(
+    cfg: &RouterConfig,
+    current_cfg: &RouterConfig,
+    source: Option<&str>,
+    source_warning: Option<&str>,
+    requested: &ValidatedTarget,
+    raw_target: Option<&Value>,
+) -> Value {
+    let target = raw_target.cloned().unwrap_or_else(
+        || serde_json::json!({"providerInstanceId": requested.provider, "model": requested.model}),
+    );
+    let mut out = serde_json::Map::new();
+    out.insert("target".into(), target.clone());
+    if let Some(h) = hint_of_on(&requested.provider, &requested.model) {
+        out.insert("briefHint".into(), Value::from(h.clone()));
+        out.insert("requestedBriefHint".into(), Value::from(h));
+    }
+    out.insert(
+        "source".into(),
+        source.map(Value::from).unwrap_or(Value::Null),
+    );
+    out.insert(
+        "sourceAccount".into(),
+        source
+            .and_then(|s| cfg.account.get(s))
+            .cloned()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    if let Some(w) = source_warning {
+        out.insert("sourceWarning".into(), Value::from(w));
+    }
+    out.insert("reason".into(), Value::from("user-requested target"));
+    out.insert("userChoice".into(), Value::from(true));
+    out.insert("requestedTarget".into(), target);
+    out.insert(
+        "requestedNoReview".into(),
+        Value::from(current_cfg.user_rules.is_no_review(&requested.model)),
+    );
+    out.insert(
+        "validation".into(),
+        serde_json::json!({"allowed": true, "reason": "user-requested target"}),
+    );
+    out.insert("userRules".into(), current_cfg.user_rules.to_json());
+    out.insert("jevCache".into(), Value::from("skipped"));
+    out.insert("jevChannel".into(), Value::from("skipped"));
+    Value::Object(out)
+}
+
+/// Pre-route a wave of planned launches in as few Jev calls as possible (up to
+/// `jev_queue::MAX_TASKS` per call), warming the Jev cache so later hook
+/// invocations hit the cache. Returns one JSON object per input launch in order:
+/// either the exact `agentdeck route` JSON or `{"error": "..."}`.
+pub async fn route_batch(
+    env: &Env,
+    launches: &[Value],
+    opts: BatchOptions,
+) -> anyhow::Result<Vec<Value>> {
+    route_batch_with_bases(env, launches, opts, &JevBases::default(), None).await
+}
+
+async fn route_batch_with_bases(
+    env: &Env,
+    launches: &[Value],
+    opts: BatchOptions,
+    bases: &JevBases,
+    key_override: Option<&str>,
+) -> anyhow::Result<Vec<Value>> {
+    if launches.is_empty() {
+        return Ok(Vec::new());
+    }
+    let settings =
+        read_settings(&env.home).map_err(|e| anyhow::anyhow!("cannot read T3 settings: {e}"))?;
+    let harness = opts.harness.as_deref().unwrap_or_default();
+    let source = if let Some(s) = opts.source.as_deref().filter(|s| !s.is_empty()) {
+        Some(s.to_string())
+    } else if !harness.is_empty() {
+        let chain = crate::hook::process_ancestors();
+        crate::hook::resolve_instance(harness, &env.home, &chain, None)?
+    } else {
+        detect_source(&settings)
+    };
+    let cfg = load_router_config(env)?;
+    let source_warning = match &source {
+        Some(s) if !cfg.account.contains_key(s) => Some(format!(
+            "unknown source instance \"{s}\": no shared-quota protection"
+        )),
+        _ => None,
+    };
+    let usage_path = usage_state_path(env, &cfg);
+    let now_before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let (favorites, unprofiled) = resolve_favorites(&cfg, &settings, &env.state_home)?;
+    let criteria = build_criteria(&favorites);
+    let primary = primary_endpoint(&cfg)?;
+    let fallback = cfg.judge_fallback.endpoint();
+    let known_hints = known_brief_hints();
+    let complete = |a: &Value| answers_complete(a, &criteria);
+
+    enum BatchSlot {
+        Error(String),
+        UserChoice {
+            target: ValidatedTarget,
+            raw_target: Option<Value>,
+        },
+        Cached {
+            task: String,
+            requested: Option<ValidatedTarget>,
+            exclude: Vec<String>,
+            is_review: bool,
+            effort: Option<i64>,
+            answers: Value,
+            channel: agentdeck_core::judge::JudgeChannel,
+        },
+        Pending {
+            task: String,
+            requested: Option<ValidatedTarget>,
+            exclude: Vec<String>,
+            is_review: bool,
+            effort: Option<i64>,
+            fetch_idx: usize,
+            duplicate: bool,
+        },
+    }
+
+    let mut slots: Vec<BatchSlot> = Vec::with_capacity(launches.len());
+    let mut to_fetch: Vec<(String, Value, String)> = Vec::new();
+    let mut hash_to_fetch: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+
+    for item in launches {
+        let Some(obj) = item.as_object() else {
+            slots.push(BatchSlot::Error(
+                "each launch must be an object with tool and input".into(),
+            ));
+            continue;
+        };
+        let Some(tool) = obj
+            .get("tool")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            slots.push(BatchSlot::Error("launch requires non-empty tool".into()));
+            continue;
+        };
+        let Some(input) = obj.get("input").filter(|v| v.is_object()) else {
+            slots.push(BatchSlot::Error("launch input must be an object".into()));
+            continue;
+        };
+        let effort = match obj.get("effort") {
+            None | Some(Value::Null) => None,
+            Some(v) => {
+                match v
+                    .as_str()
+                    .and_then(|l| ["medium", "high", "xhigh"].iter().position(|x| *x == l))
+                {
+                    Some(level) => Some(level as i64),
+                    None => {
+                        slots.push(BatchSlot::Error(
+                            "effort must be medium, high, or xhigh".into(),
+                        ));
+                        continue;
+                    }
+                }
+            }
+        };
+        let parsed = match crate::hook::parse_launch(tool, input, harness) {
+            Ok(p) => p,
+            Err(e) => {
+                slots.push(BatchSlot::Error(format!("{e}")));
+                continue;
+            }
+        };
+        match parsed.kind {
+            crate::hook::LaunchKind::Other => {
+                slots.push(BatchSlot::Error(format!(
+                    "unsupported launch tool {:?}",
+                    parsed.tool_name
+                )));
+                continue;
+            }
+            crate::hook::LaunchKind::Workflow => {
+                slots.push(BatchSlot::Error(
+                    "Workflow cannot be pre-routed; route each child launch separately".into(),
+                ));
+                continue;
+            }
+            crate::hook::LaunchKind::Delegate => {
+                if parsed.brief.trim().is_empty() {
+                    slots.push(BatchSlot::Error(
+                        "delegate_task requires a non-empty task".into(),
+                    ));
+                    continue;
+                }
+                if parsed.target_malformed {
+                    slots.push(BatchSlot::Error(
+                        "delegate_task target requires non-empty providerInstanceId and model"
+                            .into(),
+                    ));
+                    continue;
+                }
+            }
+            crate::hook::LaunchKind::Native => {}
+        }
+
+        let mut exclude = parsed.markers.exclude.clone();
+        let (task, markers) = normalize_task(&parsed.brief, &known_hints, &mut exclude);
+        if task.is_empty() {
+            slots.push(BatchSlot::Error("empty task brief".into()));
+            continue;
+        }
+        // User-chosen explicit targets skip the judge and do not consume batch slots.
+        if (parsed.markers.user_choice || markers.user_choice)
+            && let Some(target) = parsed.target
+        {
+            slots.push(BatchSlot::UserChoice {
+                target,
+                raw_target: parsed.raw_target,
+            });
+            continue;
+        }
+
+        let (request_value, body_json) = build_jev_request(&primary.model, &task, &criteria);
+        let hash_input = jev_cache_key(source.as_deref(), &cfg.version, &request_value);
+        if let Some((answers, channel)) = read_jev_cache(&env.runtime, &hash_input, &complete) {
+            slots.push(BatchSlot::Cached {
+                task,
+                requested: parsed.target,
+                exclude,
+                is_review: parsed.is_review,
+                effort,
+                answers,
+                channel,
+            });
+            continue;
+        }
+        let (fetch_idx, duplicate) = match hash_to_fetch.get(&hash_input).copied() {
+            Some(idx) => (idx, true),
+            None => {
+                let idx = to_fetch.len();
+                to_fetch.push((hash_input.clone(), request_value, body_json));
+                hash_to_fetch.insert(hash_input, idx);
+                (idx, false)
+            }
+        };
+        slots.push(BatchSlot::Pending {
+            task,
+            requested: parsed.target,
+            exclude,
+            is_review: parsed.is_review,
+            effort,
+            fetch_idx,
+            duplicate,
+        });
+    }
+
+    let mut fetched: Vec<anyhow::Result<crate::jev_queue::QueueAnswer>> = Vec::new();
+    if !to_fetch.is_empty() {
+        let blocks = agentdeck_core::judge::BlockStore::new(
+            env.runtime
+                .join(agentdeck_core::judge::JUDGE_BLOCKS_DIR_NAME),
+        );
+        let queue_items: Vec<(Value, String)> = to_fetch
+            .iter()
+            .map(|(_, req, body)| (req.clone(), body.clone()))
+            .collect();
+        let bases_owned = bases.clone();
+        let key_owned = key_override.map(str::to_string);
+        let raw_outcomes = crate::jev_queue::ask_many_with_deadline(
+            &env.runtime.join("model-route-jev-queue"),
+            &queue_items,
+            opts.budget,
+            &blocks,
+            &primary,
+            fallback.as_ref(),
+            move |endpoint, request, body, remaining| {
+                let bases = bases_owned.clone();
+                let key_owned = key_owned.clone();
+                async move {
+                    jev_fetch_endpoint(
+                        &endpoint,
+                        &request,
+                        &body,
+                        key_owned.as_deref(),
+                        remaining,
+                        &bases,
+                    )
+                    .await
+                }
+            },
+            classify_jev_error,
+        )
+        .await;
+        for (idx, outcome) in raw_outcomes.into_iter().enumerate() {
+            match outcome {
+                Ok(queued) if complete(&queued.answers) => {
+                    write_jev_cache(
+                        &env.runtime,
+                        &to_fetch[idx].0,
+                        &queued.answers,
+                        queued.channel,
+                    );
+                    fetched.push(Ok(queued));
+                }
+                Ok(_) => fetched.push(Err(anyhow::anyhow!(
+                    "Jev returned incomplete or out-of-range routing answers"
+                ))),
+                Err(e) => fetched.push(Err(e)),
+            }
+        }
+    }
+
+    let needs_snapshot = slots.iter().any(|s| {
+        matches!(
+            s,
+            BatchSlot::Cached { .. } | BatchSlot::Pending { .. } | BatchSlot::UserChoice { .. }
+        )
+    });
+    if !needs_snapshot {
+        return Ok(slots
+            .into_iter()
+            .map(|s| match s {
+                BatchSlot::Error(msg) => serde_json::json!({"error": msg}),
+                _ => unreachable!(),
+            })
+            .collect());
+    }
+    let snapshot = read_routing_snapshot(env, &usage_path, now_before)?;
+    let measured = codex_costs(env);
+
+    let mut out = Vec::with_capacity(slots.len());
+    for slot in slots {
+        match slot {
+            BatchSlot::Error(msg) => out.push(serde_json::json!({"error": msg})),
+            BatchSlot::UserChoice { target, raw_target } => {
+                out.push(build_user_choice_output(
+                    &cfg,
+                    &snapshot.current_cfg,
+                    source.as_deref(),
+                    source_warning.as_deref(),
+                    &target,
+                    raw_target.as_ref(),
+                ));
+            }
+            BatchSlot::Cached {
+                task,
+                requested,
+                exclude,
+                is_review,
+                effort,
+                answers,
+                channel,
+            } => {
+                out.push(build_route_output(
+                    &cfg,
+                    &measured,
+                    &snapshot,
+                    &favorites,
+                    &unprofiled,
+                    source.as_deref(),
+                    source_warning.as_deref(),
+                    &task,
+                    requested.as_ref(),
+                    &exclude,
+                    is_review,
+                    effort,
+                    &answers,
+                    Some(0.0),
+                    true,
+                    channel,
+                ));
+            }
+            BatchSlot::Pending {
+                task,
+                requested,
+                exclude,
+                is_review,
+                effort,
+                fetch_idx,
+                duplicate,
+            } => match &fetched[fetch_idx] {
+                Ok(queued) => {
+                    let (hit, cost) = if duplicate {
+                        (true, Some(0.0))
+                    } else {
+                        (false, queued.cost)
+                    };
+                    out.push(build_route_output(
+                        &cfg,
+                        &measured,
+                        &snapshot,
+                        &favorites,
+                        &unprofiled,
+                        source.as_deref(),
+                        source_warning.as_deref(),
+                        &task,
+                        requested.as_ref(),
+                        &exclude,
+                        is_review,
+                        effort,
+                        &queued.answers,
+                        cost,
+                        hit,
+                        queued.channel,
+                    ));
+                }
+                Err(e) => out.push(serde_json::json!({"error": format!("{e:#}")})),
+            },
+        }
+    }
+    Ok(out)
+}
+
+pub async fn run(argv: Vec<String>) -> i32 {
+    match run_inner(argv).await {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
+async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
+    match argv.first().map(String::as_str) {
+        Some("hook") => return Ok(crate::hook::run(&argv[1..])),
+        Some("claude-shell") => return Ok(crate::shell::run(&argv[1..])),
+        Some("t3-mcp-call") => return Ok(crate::mcp_call::run(&argv[1..]).await),
+        Some("workflow") => return Ok(crate::workflow::run(&argv[1..]).await),
+        Some("outcomes") => return Ok(crate::outcomes::run(&argv[1..]).await),
+        _ => {}
+    }
+    let env = Env::from_env()?;
+    if argv.len() == 1 && argv[0] == "--catalog" {
+        let mut stdin = String::new();
+        use std::io::Read;
+        std::io::stdin().read_to_string(&mut stdin)?;
+        let data: Value = serde_json::from_str(&stdin).map_err(|_| {
+            anyhow::anyhow!(
+                "expected orchestrator_capabilities structuredContent with model option descriptors"
+            )
+        })?;
+        match save_catalog(&env.state_home, data) {
+            Ok(()) => {
+                println!("model option catalog updated");
+                return Ok(0);
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return Ok(1);
+            }
+        }
+    }
+    let mut args = argv.as_slice();
+    let mut source: Option<String> = None;
+    let mut requested: Option<ValidatedTarget> = None;
+    let mut exclude: Vec<String> = Vec::new();
+    let mut force_review = false;
+    let mut effort: Option<i64> = None;
+    while args.first().is_some_and(|a| a.starts_with("--")) && args[0] != "--check" {
+        let flag = args[0].clone();
+        args = &args[1..];
+        if flag == "--" {
+            break;
+        }
+        if flag == "--source" && !args.is_empty() {
+            source = Some(args[0].clone());
+            args = &args[1..];
+        } else if flag == "--validate-target" && args.len() >= 2 {
+            requested = Some(ValidatedTarget {
+                provider: args[0].clone(),
+                model: args[1].clone(),
+            });
+            args = &args[2..];
+        } else if flag == "--exclude" && !args.is_empty() {
+            exclude.push(args[0].clone());
+            args = &args[1..];
+        } else if flag == "--review" {
+            force_review = true;
+        } else if flag == "--effort"
+            && let Some(level) = args
+                .first()
+                .and_then(|l| ["medium", "high", "xhigh"].iter().position(|x| x == l))
+        {
+            // Same scale as `reasoning_target`: difficulty 0 medium, 1 high, 2 xhigh.
+            effort = Some(level as i64);
+            args = &args[1..];
+        } else {
+            eprintln!("{USAGE}");
+            return Ok(2);
+        }
+    }
+    let settings =
+        read_settings(&env.home).map_err(|e| anyhow::anyhow!("cannot read T3 settings: {e}"))?;
+    if source.is_none() {
+        source = detect_source(&settings);
+    }
+    let cfg = match load_router_config(&env) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return Ok(1);
+        }
+    };
+    let source_warning = match &source {
+        Some(s) if !cfg.account.contains_key(s) => Some(format!(
+            "unknown source instance \"{s}\": no shared-quota protection"
+        )),
+        _ => None,
+    };
+    let usage_path = usage_state_path(&env, &cfg);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let usage = parse_usage_state(&usage_path)
+        .map_err(|e| anyhow::anyhow!("cannot read usage state {}: {e}", usage_path.display()))?;
+    let load = read_active_agents(&env.home.join(".t3/userdata/statev2.sqlite"));
+    let measured = codex_costs(&env);
+
+    let (favorites, unprofiled) = resolve_favorites(&cfg, &settings, &env.state_home)?;
+
+    if args.first().is_some_and(|a| a == "--check") {
+        println!(
+            "source: {}",
+            source
+                .as_deref()
+                .unwrap_or("unknown (use --source to preserve orchestrator quota)")
+        );
+        // Source is visible so the GUI/operator can tell a default ban from
+        // an explicit user override.
+        println!(
+            "user rules (source: {}): no-review: {}; denied: {}",
+            cfg.user_rules.source.as_str(),
+            if cfg.user_rules.no_review_models.is_empty() {
+                "(none)".to_string()
+            } else {
+                cfg.user_rules.no_review_models.join(", ")
+            },
+            if cfg.user_rules.deny_models.is_empty() {
+                "(none)".to_string()
+            } else {
+                cfg.user_rules.deny_models.join(", ")
+            }
+        );
+        if !load.known {
+            println!("live T3 agent metadata unavailable");
+        }
+        for (provider, model, profile) in &favorites {
+            let q = quota(&cfg, &measured, &usage, &load, provider, model, now);
+            print!(
+                "{}{}  {provider}/{model}\n    left: {}",
+                if profile.is_some() {
+                    "ok"
+                } else {
+                    "UNPROFILED"
+                },
+                if cfg.user_rules.is_denied(model) {
+                    " DENIED by user rule"
+                } else {
+                    ""
+                },
+                q.note
+            );
+            if let (Some(w), Some(b)) = (q.weekly, q.basis) {
+                print!(
+                    "\n    weekly % per size 0..3: {} ({b})",
+                    w.iter()
+                        .map(|c| format_js(round2(*c)))
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                );
+            }
+            let allowed: Vec<String> = [0, 1, 2, 3]
+                .iter()
+                .filter(|s| q.allowed[**s])
+                .map(|s| s.to_string())
+                .collect();
+            println!(
+                "\n    allowed sizes: {}",
+                if allowed.is_empty() {
+                    "none".to_string()
+                } else {
+                    allowed.join(",")
+                }
+            );
+        }
+        // UNPROFILED is an informational flag (conservative max-burn quota,
+        // profiled:false in JSON): unknown-profile favorites route on their
+        // Jev judgment like any other, so --check reports and exits 0.
+        return Ok(0);
+    }
+
+    let raw_task = if args.len() == 1 && args[0] == "-" {
+        let mut s = String::new();
+        use std::io::Read;
+        std::io::stdin().read_to_string(&mut s)?;
+        s
+    } else {
+        args.join(" ")
+    };
+    let known_hints = known_brief_hints();
+    let (task, _) = normalize_task(&raw_task, &known_hints, &mut exclude);
+    if task.is_empty() {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    }
+
+    let criteria = build_criteria(&favorites);
+    let primary = primary_endpoint(&cfg)?;
+    let fallback = cfg.judge_fallback.endpoint();
+    let (request_value, body_json) = build_jev_request(&primary.model, &task, &criteria);
+    let hash_input = jev_cache_key(source.as_deref(), &cfg.version, &request_value);
+    let complete = |a: &Value| answers_complete(a, &criteria);
+    let blocks = agentdeck_core::judge::BlockStore::new(
+        env.runtime
+            .join(agentdeck_core::judge::JUDGE_BLOCKS_DIR_NAME),
+    );
+    let (answers, cost, jev_hit, jev_channel) = fetch_jev_cached(
+        &env.runtime,
+        &hash_input,
+        &request_value,
+        &body_json,
+        &primary,
+        fallback.as_ref(),
+        crate::jev_queue::BUDGET,
+        &blocks,
+        &JevBases::default(),
+        None,
+        &complete,
+    )
+    .await?;
+    // Re-read quota/load snapshots after Jev before ranking.
+    let snapshot = read_routing_snapshot(&env, &usage_path, now)?;
+    let out = build_route_output(
+        &cfg,
+        &measured,
+        &snapshot,
+        &favorites,
+        &unprofiled,
+        source.as_deref(),
+        source_warning.as_deref(),
+        &task,
+        requested.as_ref(),
+        &exclude,
+        force_review,
+        effort,
+        &answers,
+        cost,
+        jev_hit,
+        jev_channel,
+    );
+    println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(0)
+}
+
+fn jev_cache_path(runtime_dir: &std::path::Path, hash_input: &str) -> std::path::PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(hash_input.as_bytes());
+    runtime_dir
+        .join("model-route-jev-cache")
+        .join(format!("{:x}.json", hasher.finalize()))
+}
+
+fn read_jev_cache(
+    runtime_dir: &std::path::Path,
+    hash_input: &str,
+    complete: &dyn Fn(&Value) -> bool,
+) -> Option<(Value, agentdeck_core::judge::JudgeChannel)> {
+    let cache_file = jev_cache_path(runtime_dir, hash_input);
+    let fresh = |t: f64| {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0);
+        now_ms - t >= 0.0 && now_ms - t < 10.0 * 60e3
+    };
+    let text = std::fs::read_to_string(&cache_file).ok()?;
+    let entry: Value = serde_json::from_str(&text).ok()?;
+    if !entry.get("t").and_then(Value::as_f64).is_some_and(fresh) {
+        return None;
+    }
+    let answers = entry.get("answers").filter(|a| complete(a)).cloned()?;
+    let channel = match entry.get("channel").and_then(Value::as_str) {
+        Some("fallback") => agentdeck_core::judge::JudgeChannel::Fallback,
+        _ => agentdeck_core::judge::JudgeChannel::Primary,
+    };
+    Some((answers, channel))
+}
+
+fn write_jev_cache(
+    runtime_dir: &std::path::Path,
+    hash_input: &str,
+    answers: &Value,
+    channel: agentdeck_core::judge::JudgeChannel,
+) {
+    let cache_dir = runtime_dir.join("model-route-jev-cache");
+    let cache_file = jev_cache_path(runtime_dir, hash_input);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0);
+    let _ = (|| {
+        agentdeck_core::judge::create_private_dir(&cache_dir)?;
+        for f in std::fs::read_dir(&cache_dir)? {
+            let f = f?;
+            let name = f.file_name().to_string_lossy().into_owned();
+            if name.len() == 69
+                && name.ends_with(".json")
+                && name[..64]
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+            {
+                let stale = std::fs::metadata(f.path())
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map(|t| {
+                        std::time::SystemTime::now()
+                            .duration_since(t)
+                            .map(|d| d.as_millis() as f64)
+                            .unwrap_or(f64::NAN)
+                    });
+                if stale.is_some_and(|age| !(0.0..10.0 * 60e3).contains(&age)) {
+                    let _ = std::fs::remove_file(f.path());
+                }
+            }
+        }
+        let payload = serde_json::to_string(&serde_json::json!({
+            "t": now_ms,
+            "answers": answers,
+            "channel": channel.as_str(),
+        }))?;
+        agentdeck_core::judge::write_atomic(&cache_file, &payload)?;
+        Ok::<(), anyhow::Error>(())
+    })();
 }
 
 /// Lookup or fetch a Jev routing judgment through the shared queue, storing
@@ -2397,26 +3051,7 @@ async fn fetch_jev_cached(
     bool,
     agentdeck_core::judge::JudgeChannel,
 )> {
-    let cache_dir = runtime_dir.join("model-route-jev-cache");
-    let mut hasher = Sha256::new();
-    hasher.update(hash_input.as_bytes());
-    let cache_file = cache_dir.join(format!("{:x}.json", hasher.finalize()));
-    let fresh = |t: f64| {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as f64)
-            .unwrap_or(0.0);
-        now_ms - t >= 0.0 && now_ms - t < 10.0 * 60e3
-    };
-    if let Ok(text) = std::fs::read_to_string(&cache_file)
-        && let Ok(entry) = serde_json::from_str::<Value>(&text)
-        && entry.get("t").and_then(Value::as_f64).is_some_and(fresh)
-        && let Some(answers) = entry.get("answers").filter(|a| complete(a)).cloned()
-    {
-        let channel = match entry.get("channel").and_then(Value::as_str) {
-            Some("fallback") => agentdeck_core::judge::JudgeChannel::Fallback,
-            _ => agentdeck_core::judge::JudgeChannel::Primary,
-        };
+    if let Some((answers, channel)) = read_jev_cache(runtime_dir, hash_input, complete) {
         // A hit reuses the cached judgment; like the Node router it reports zero
         // additional Jev cost for the reused answer.
         return Ok((answers, Some(0.0), true, channel));
@@ -2457,43 +3092,7 @@ async fn fetch_jev_cached(
             "Jev returned incomplete or out-of-range routing answers"
         ));
     }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as f64)
-        .unwrap_or(0.0);
-    let _ = (|| {
-        agentdeck_core::judge::create_private_dir(&cache_dir)?;
-        for f in std::fs::read_dir(&cache_dir)? {
-            let f = f?;
-            let name = f.file_name().to_string_lossy().into_owned();
-            if name.len() == 69
-                && name.ends_with(".json")
-                && name[..64]
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
-            {
-                let stale = std::fs::metadata(f.path())
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .map(|t| {
-                        std::time::SystemTime::now()
-                            .duration_since(t)
-                            .map(|d| d.as_millis() as f64)
-                            .unwrap_or(f64::NAN)
-                    });
-                if stale.is_some_and(|age| !(0.0..10.0 * 60e3).contains(&age)) {
-                    let _ = std::fs::remove_file(f.path());
-                }
-            }
-        }
-        let payload = serde_json::to_string(&serde_json::json!({
-            "t": now_ms,
-            "answers": queued.answers,
-            "channel": queued.channel.as_str(),
-        }))?;
-        agentdeck_core::judge::write_atomic(&cache_file, &payload)?;
-        Ok::<(), anyhow::Error>(())
-    })();
+    write_jev_cache(runtime_dir, hash_input, &queued.answers, queued.channel);
     Ok((queued.answers, queued.cost, false, queued.channel))
 }
 
@@ -2805,6 +3404,343 @@ mod gateway_tests {
         assert_eq!(or_seen.len(), 3);
         assert_eq!(or_seen[0].1["model"], "~typesafe/jev-latest");
         let _ = std::fs::remove_dir_all(&rt);
+    }
+
+    fn setup_batch_env(tag: &str) -> (std::path::PathBuf, Env) {
+        let dir = std::env::temp_dir().join(format!(
+            "agentdeck-route-batch-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        let runtime = dir.join("rt");
+        let state_home = home.join(".local/state");
+        for p in [
+            home.join(".t3/userdata"),
+            state_home.join("ai-usage"),
+            state_home.join("model-route"),
+            runtime.clone(),
+        ] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::fs::write(home.join(".t3/userdata/settings.json"), "{}").unwrap();
+        let catalog = serde_json::json!({
+            "providers": [
+                {
+                    "providerInstanceId": "codex",
+                    "models": [
+                        {
+                            "id": "gpt-6.1-sol",
+                            "options": [
+                                {"id": "reasoningEffort", "type": "select", "values": ["medium", "high", "xhigh"]}
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "providerInstanceId": "claudeAgent",
+                    "models": [
+                        {
+                            "id": "claude-opus-5-5",
+                            "options": [
+                                {"id": "effort", "type": "select", "values": ["medium", "high", "xhigh"]}
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+        std::fs::write(
+            state_home.join("model-route/catalog.json"),
+            catalog.to_string(),
+        )
+        .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64() as i64;
+        let usage = serde_json::json!({"accounts": [
+            {"provider": "codex", "id": "codex-main", "plan": "Pro 5x", "status": "ok", "updated_at": now, "balances": [],
+             "windows": [
+                {"key": "weekly", "label": "Week", "remaining_percent": 90, "duration_mins": 10080, "resets_at": now + 5 * 86400},
+                {"key": "5h", "label": "5h", "remaining_percent": 90, "duration_mins": 300, "resets_at": now + 3 * 3600}
+             ]},
+            {"provider": "claude", "id": "claude-main", "plan": "Max 5x", "status": "ok", "updated_at": now, "balances": [],
+             "windows": [
+                {"key": "weekly_all", "label": "Week", "remaining_percent": 80, "duration_mins": 10080, "resets_at": now + 5 * 86400},
+                {"key": "session", "label": "5h", "remaining_percent": 80, "duration_mins": 300, "resets_at": now + 3 * 3600}
+             ]}
+        ]});
+        std::fs::write(state_home.join("ai-usage/state.json"), usage.to_string()).unwrap();
+        let router_json = dir.join("router.json");
+        let cfg = serde_json::json!({
+            "version": 1,
+            "decisionProvider": "openrouter",
+            "decisionModel": "~typesafe/jev-latest",
+            "pool": [
+                {"providerInstanceId": "codex", "model": "gpt-6.1-sol", "enabled": true},
+                {"providerInstanceId": "claudeAgent", "model": "claude-opus-5-5", "enabled": true}
+            ],
+            "accounts": {
+                "codex": {"instances": ["codex"], "usageProvider": "codex", "usageId": "codex-main"},
+                "claude": {"instances": ["claudeAgent"], "usageProvider": "claude", "usageId": "claude-main"}
+            }
+        });
+        std::fs::write(&router_json, cfg.to_string()).unwrap();
+        let env = Env {
+            home,
+            runtime,
+            state_home,
+            router_json: Some(router_json.to_string_lossy().into_owned()),
+        };
+        (dir, env)
+    }
+
+    async fn dynamic_openrouter_server(
+        expected_calls: usize,
+    ) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::task::spawn_blocking(move || {
+            let mut seen = Vec::new();
+            for _ in 0..expected_calls {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        size = value.trim().parse().unwrap();
+                    }
+                }
+                let mut req_body = vec![0; size];
+                reader.read_exact(&mut req_body).unwrap();
+                let parsed: Value = serde_json::from_slice(&req_body).unwrap();
+                // Encode task index (0..3) into `size.score` so tests can verify
+                // per-launch ordering matches the input launches.
+                let mut answers = serde_json::Map::new();
+                for qk in parsed["questions"].as_object().unwrap().keys() {
+                    let (task_text, base_q) = if let Some((prefix, rest)) = qk.split_once("__") {
+                        (
+                            parsed["state"]["tasks"][prefix]
+                                .as_str()
+                                .unwrap_or_default(),
+                            rest,
+                        )
+                    } else {
+                        (
+                            parsed["state"]["task"].as_str().unwrap_or_default(),
+                            qk.as_str(),
+                        )
+                    };
+                    let idx_mod = task_text
+                        .split('#')
+                        .nth(1)
+                        .and_then(|s| s.split_whitespace().next())
+                        .and_then(|n| n.parse::<i64>().ok())
+                        .unwrap_or(1)
+                        % 4;
+                    let entry = match base_q {
+                        "size" => serde_json::json!({"score": idx_mod, "confidence": 0.9}),
+                        "difficulty" => serde_json::json!({"score": 1, "confidence": 0.9}),
+                        "review" => serde_json::json!({"score": 0, "confidence": 0.95}),
+                        "codex_gpt_6_1_sol" => serde_json::json!({
+                            "score": 2.8, "confidence": 0.9,
+                            "probabilities": {"0": 0.0, "1": 0.05, "2": 0.15, "3": 0.8}
+                        }),
+                        _ => serde_json::json!({
+                            "score": 2.2, "confidence": 0.85,
+                            "probabilities": {"0": 0.0, "1": 0.1, "2": 0.7, "3": 0.2}
+                        }),
+                    };
+                    answers.insert(qk.clone(), entry);
+                }
+                let body =
+                    serde_json::json!({"answers": answers, "usage": {"cost": 0.01}}).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                seen.push(parsed);
+            }
+            seen
+        });
+        (base, handle)
+    }
+
+    #[tokio::test]
+    async fn route_batch_3_launches_uses_1_request_and_preserves_order_and_warms_cache() {
+        let (dir, env) = setup_batch_env("three");
+        let (or_base, srv) = dynamic_openrouter_server(1).await;
+        let bases = JevBases {
+            openrouter: or_base,
+            vercel: VERCEL_BASE.into(),
+        };
+        let launches = vec![
+            serde_json::json!({
+                "tool": "mcp__t3-code__delegate_task",
+                "input": {"task": "Implement unit #0 parser"}
+            }),
+            serde_json::json!({
+                "tool": "Agent",
+                "input": {"prompt": "Implement unit #1 formatter"}
+            }),
+            serde_json::json!({
+                "tool": "mcp__t3-code__delegate_task",
+                "input": {
+                    "task": "Implement unit #2 tests",
+                    "target": {"providerInstanceId": "codex", "model": "gpt-6.1-sol"}
+                }
+            }),
+        ];
+        let results = route_batch_with_bases(
+            &env,
+            &launches,
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: None,
+                budget: BATCH_BUDGET,
+            },
+            &bases,
+            Some("test-key"),
+        )
+        .await
+        .unwrap();
+        let seen = srv.await.unwrap();
+        assert_eq!(
+            seen.len(),
+            1,
+            "3 launches must send exactly 1 judge request"
+        );
+        assert_eq!(seen[0]["state"]["tasks"].as_object().unwrap().len(), 3);
+        assert_eq!(results.len(), 3);
+        for (i, r) in results.iter().enumerate() {
+            assert!(r.get("error").is_none(), "unexpected error at {i}: {r}");
+            assert!(
+                r["size"].as_str().unwrap().starts_with(&format!("{i}:")),
+                "order mismatch at {i}: {}",
+                r["size"]
+            );
+            assert_eq!(r["source"], "claudeAgent");
+            assert_eq!(r["jevCache"], "miss");
+            assert_eq!(r["jevChannel"], "primary");
+            assert_eq!(r["target"]["providerInstanceId"], "codex");
+        }
+        assert!(results[2].get("validation").is_some());
+
+        // Re-running the same launches must hit the cache with 0 judge requests.
+        let dead_bases = JevBases {
+            openrouter: "http://127.0.0.1:1".into(),
+            vercel: "http://127.0.0.1:1".into(),
+        };
+        let cached = route_batch_with_bases(
+            &env,
+            &launches,
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: None,
+                budget: BATCH_BUDGET,
+            },
+            &dead_bases,
+            Some("test-key"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cached.len(), 3);
+        for r in &cached {
+            assert_eq!(r["jevCache"], "hit");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn route_batch_10_launches_uses_2_requests_and_skips_invalid_and_user_choice() {
+        let (dir, env) = setup_batch_env("ten");
+        let (or_base, srv) = dynamic_openrouter_server(2).await;
+        let bases = JevBases {
+            openrouter: or_base,
+            vercel: VERCEL_BASE.into(),
+        };
+        // 10 real launches + 1 invalid + 1 [route:user-choice] = 12 entries,
+        // only 10 need judge calls -> 2 judge requests (8 + 2).
+        let mut launches: Vec<Value> = (0..10)
+            .map(|i| {
+                serde_json::json!({
+                    "tool": "mcp__t3-code__delegate_task",
+                    "input": {"task": format!("Task #{i} for wave")}
+                })
+            })
+            .collect();
+        launches.insert(
+            4,
+            serde_json::json!({
+                "tool": "Bash",
+                "input": {"command": "ls"}
+            }),
+        );
+        launches.insert(
+            7,
+            serde_json::json!({
+                "tool": "mcp__t3-code__delegate_task",
+                "input": {
+                    "task": "[route:user-choice] Audit auth with chosen model",
+                    "target": {"providerInstanceId": "claudeAgent", "model": "claude-opus-5-5"}
+                }
+            }),
+        );
+
+        let results = route_batch_with_bases(
+            &env,
+            &launches,
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: None,
+                budget: BATCH_BUDGET,
+            },
+            &bases,
+            Some("test-key"),
+        )
+        .await
+        .unwrap();
+        let seen = srv.await.unwrap();
+        assert_eq!(seen.len(), 2, "10 judged launches must use 2 requests");
+        assert_eq!(seen[0]["state"]["tasks"].as_object().unwrap().len(), 8);
+        assert_eq!(seen[1]["state"]["tasks"].as_object().unwrap().len(), 2);
+        assert_eq!(results.len(), 12);
+        assert!(
+            results[4].get("error").is_some(),
+            "invalid launch must yield {{error}}: {}",
+            results[4]
+        );
+        assert_eq!(results[7]["userChoice"], true);
+        assert_eq!(results[7]["jevCache"], "skipped");
+        assert_eq!(results[7]["target"]["model"], "claude-opus-5-5");
+        for (idx, r) in results.iter().enumerate() {
+            if idx != 4 && idx != 7 {
+                assert!(r.get("error").is_none(), "unexpected error at {idx}: {r}");
+                assert_eq!(r["jevCache"], "miss");
+                assert_eq!(r["target"]["providerInstanceId"], "codex");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -157,6 +157,129 @@ fn is_native_tool(name: &str) -> bool {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchKind {
+    Delegate,
+    Native,
+    Workflow,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedLaunch {
+    pub kind: LaunchKind,
+    pub tool_name: String,
+    pub brief: String,
+    pub target: Option<crate::route::ValidatedTarget>,
+    pub target_malformed: bool,
+    pub raw_target: Option<Value>,
+    pub markers: crate::policy::RouteMarkers,
+    pub is_review: bool,
+}
+
+/// Shared launch parser used by both the pre-tool hook and `route_batch`:
+/// unwraps Antigravity `call_mcp_tool` envelopes, classifies the tool, extracts
+/// the task brief, `[route:...]` markers, review flag and optional target.
+pub fn parse_launch(tool_name: &str, args: &Value, harness: &str) -> anyhow::Result<ParsedLaunch> {
+    let (effective_name, effective_args) = if tool_name == "call_mcp_tool"
+        && args
+            .get("ServerName")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s == "t3-code" || s == "t3_code")
+    {
+        (
+            str_field(args, "ToolName").unwrap_or_default(),
+            args.get("Arguments").unwrap_or(args),
+        )
+    } else {
+        (tool_name, args)
+    };
+    let kind = if is_delegate_tool(effective_name) {
+        LaunchKind::Delegate
+    } else if is_native_tool(effective_name) {
+        LaunchKind::Native
+    } else if effective_name == "Workflow" {
+        LaunchKind::Workflow
+    } else {
+        LaunchKind::Other
+    };
+    let raw_target = effective_args
+        .get("target")
+        .filter(|t| !t.is_null())
+        .cloned();
+    let (target, target_malformed) = if kind == LaunchKind::Delegate {
+        match raw_target.as_ref() {
+            None => (None, false),
+            Some(t) => {
+                let provider = t
+                    .get("providerInstanceId")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty());
+                let model = t
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty());
+                match (provider, model) {
+                    (Some(provider), Some(model)) => (
+                        Some(crate::route::ValidatedTarget {
+                            provider: provider.to_string(),
+                            model: model.to_string(),
+                        }),
+                        false,
+                    ),
+                    _ => (None, true),
+                }
+            }
+        }
+    } else {
+        (None, false)
+    };
+    let get_str = |key: &str| {
+        effective_args
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    };
+    let prompt = if !get_str("message").is_empty() {
+        get_str("message")
+    } else if !get_str("prompt").is_empty() {
+        get_str("prompt")
+    } else if !get_str("instructions").is_empty() {
+        get_str("instructions")
+    } else {
+        get_str("task")
+    };
+    let brief = match kind {
+        LaunchKind::Delegate => str_field(effective_args, "task")
+            .unwrap_or_default()
+            .to_string(),
+        LaunchKind::Native => {
+            if !prompt.trim().is_empty() {
+                prompt.to_string()
+            } else {
+                format!(
+                    "Subagent call from {harness}: {}",
+                    serde_json::to_string(effective_args)?
+                )
+            }
+        }
+        LaunchKind::Workflow | LaunchKind::Other => String::new(),
+    };
+    let markers = crate::policy::parse_route_markers(&brief);
+    let is_review = kind == LaunchKind::Delegate
+        && effective_args.get("role").and_then(Value::as_str) == Some("review");
+    Ok(ParsedLaunch {
+        kind,
+        tool_name: effective_name.to_string(),
+        brief,
+        target,
+        target_malformed,
+        raw_target,
+        markers,
+        is_review,
+    })
+}
+
 /// Append a verdict line to `decisions.jsonl`; never fails the hook.
 const SHOWN_ERROR: &str = "model-route: routing failed or timed out; delegation was blocked. The cause is in the latest deny:router-error entry of model-route/decisions.jsonl. Retry the router or do the work yourself.";
 
@@ -489,7 +612,7 @@ fn proc_ppid(pid: u32) -> anyhow::Result<u32> {
         .map_err(|_| anyhow::anyhow!("bad stat"))
 }
 
-fn ancestors() -> Vec<Vec<String>> {
+pub(crate) fn process_ancestors() -> Vec<Vec<String>> {
     let mut out = Vec::new();
     let mut pid = std::os::unix::process::parent_id();
     for _ in 0..12 {
@@ -507,6 +630,56 @@ fn ancestors() -> Vec<Vec<String>> {
         };
     }
     out
+}
+
+/// Resolve the caller's T3 provider instance id from harness, environment and
+/// process ancestry — shared between the launch hook and `route_batch`.
+pub fn resolve_instance(
+    harness: &str,
+    home: &std::path::Path,
+    chain: &[Vec<String>],
+    explicit_source: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let mut instance: Option<String> = default_instance(harness).map(str::to_string);
+    if harness == "claude"
+        && let Some(dir) =
+            std::env::var_os("CLAUDE_CONFIG_DIR").map(|d| d.to_string_lossy().into_owned())
+        && !dir.is_empty()
+    {
+        let text = std::fs::read_to_string(home.join(".t3/userdata/settings.json"))?;
+        let settings: Value = serde_json::from_str(&text)?;
+        if let Some(id) = settings_instance(&settings, "claudeAgent", "homePath", &dir) {
+            instance = Some(id);
+        }
+    }
+    if harness == "agy" {
+        // Missing or unreadable settings keep the `antigravity` default.
+        let settings = std::fs::read_to_string(home.join(".t3/userdata/settings.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+        let environ: Vec<String> = std::env::vars_os()
+            .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
+            .collect();
+        if let Some(id) = settings
+            .and_then(|s| crate::policy::antigravity_instance(&s, &environ, &chain.concat()))
+        {
+            instance = Some(id);
+        }
+    }
+    if harness == "shell" {
+        instance = Some(explicit_source.unwrap_or_default().to_string());
+    }
+    if harness == "codex"
+        && let Some(dir) = std::env::var_os("CODEX_HOME").map(|d| d.to_string_lossy().into_owned())
+        && !dir.is_empty()
+    {
+        let text = std::fs::read_to_string(home.join(".t3/userdata/settings.json"))?;
+        let settings: Value = serde_json::from_str(&text)?;
+        if let Some(id) = settings_instance(&settings, "codex", "shadowHomePath", &dir) {
+            instance = Some(id);
+        }
+    }
+    Ok(instance)
 }
 
 /// Older T3 ran a Node server; current T3 is a native `t3 serve` binary.
@@ -799,14 +972,15 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
     } else {
         Value::Object(Map::new())
     };
-    let native = is_native_tool(&tool_name);
-    let delegate = is_delegate_tool(&tool_name);
-    let workflow = tool_name == "Workflow";
-    if !native && !delegate && !workflow {
+    let parsed = parse_launch(&tool_name, &args_obj, &harness)?;
+    let tool_name = parsed.tool_name.clone();
+    let delegate = parsed.kind == LaunchKind::Delegate;
+    let workflow = parsed.kind == LaunchKind::Workflow;
+    if parsed.kind == LaunchKind::Other {
         ctx.emit(true, "");
         return Ok(());
     }
-    let chain = ancestors();
+    let chain = process_ancestors();
     // delegate_task exists only in T3, so it is always routed: a missed T3
     // detection must not skip routing.
     if !delegate && !in_t3(&harness, &chain, &input) {
@@ -832,35 +1006,9 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    let mut instance: Option<String> = default_instance(&harness).map(str::to_string);
-    if harness == "claude"
-        && let Some(dir) =
-            std::env::var_os("CLAUDE_CONFIG_DIR").map(|d| d.to_string_lossy().into_owned())
-        && !dir.is_empty()
-    {
-        let text = std::fs::read_to_string(home.join(".t3/userdata/settings.json"))?;
-        let settings: Value = serde_json::from_str(&text)?;
-        if let Some(id) = settings_instance(&settings, "claudeAgent", "homePath", &dir) {
-            instance = Some(id);
-        }
-    }
-    if harness == "agy" {
-        // Missing or unreadable settings keep the `antigravity` default.
-        let settings = std::fs::read_to_string(home.join(".t3/userdata/settings.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str::<Value>(&t).ok());
-        let environ: Vec<String> = std::env::vars_os()
-            .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
-            .collect();
-        if let Some(id) = settings
-            .and_then(|s| crate::policy::antigravity_instance(&s, &environ, &chain.concat()))
-        {
-            instance = Some(id);
-        }
-    }
+    let instance = resolve_instance(&harness, &home, &chain, str_field(&input, "source"))?;
     if harness == "shell" {
-        let source = str_field(&input, "source").unwrap_or_default();
-        instance = Some(source.to_string());
+        let source = instance.as_deref().unwrap_or_default();
         let catalog = read_catalog(&state_dir()?)?;
         let known = catalog
             .get("providers")
@@ -882,16 +1030,6 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
                 reason,
             );
             return Ok(());
-        }
-    }
-    if harness == "codex"
-        && let Some(dir) = std::env::var_os("CODEX_HOME").map(|d| d.to_string_lossy().into_owned())
-        && !dir.is_empty()
-    {
-        let text = std::fs::read_to_string(home.join(".t3/userdata/settings.json"))?;
-        let settings: Value = serde_json::from_str(&text)?;
-        if let Some(id) = settings_instance(&settings, "codex", "shadowHomePath", &dir) {
-            instance = Some(id);
         }
     }
     if std::env::var_os("MODEL_ROUTE_HOOK_DEBUG").is_some()
@@ -922,72 +1060,30 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    let get_str = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
-    let prompt = if !get_str("message").is_empty() {
-        get_str("message")
-    } else if !get_str("prompt").is_empty() {
-        get_str("prompt")
-    } else if !get_str("instructions").is_empty() {
-        get_str("instructions")
-    } else {
-        get_str("task")
-    }
-    .to_string();
-    if delegate {
-        let task = str_field(&args, "task").unwrap_or_default();
-        let target = args.get("target");
-        let valid = !task.trim().is_empty()
-            && target
-                .and_then(|t| t.get("providerInstanceId"))
-                .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty())
-            && target
-                .and_then(|t| t.get("model"))
-                .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty());
-        if !valid {
-            let reason = "model-route: delegate_task requires a task and an explicit exact providerInstanceId/model target.";
-            ctx.deny(
-                instance.as_deref(),
-                Some(&tool_name),
-                &args_obj,
-                None,
-                "deny:invalid-delegate",
-                reason,
-            );
-            return Ok(());
-        }
+    if delegate && (parsed.brief.trim().is_empty() || parsed.target.is_none()) {
+        let reason = "model-route: delegate_task requires a task and an explicit exact providerInstanceId/model target.";
+        ctx.deny(
+            instance.as_deref(),
+            Some(&tool_name),
+            &args_obj,
+            None,
+            "deny:invalid-delegate",
+            reason,
+        );
+        return Ok(());
     }
     let target = args.get("target");
-    let brief = if delegate {
-        str_field(&args, "task").unwrap_or_default().to_string()
-    } else if !prompt.trim().is_empty() {
-        prompt.clone()
-    } else {
-        format!(
-            "Subagent call from {harness}: {}",
-            serde_json::to_string(&args)?
-        )
-    };
-    let markers = crate::policy::parse_route_markers(&brief);
-    let is_review_role = delegate && args.get("role").and_then(Value::as_str) == Some("review");
+    let markers = &parsed.markers;
+    let is_review_role = parsed.is_review;
     let route = run_route(
         instance.as_deref().unwrap_or_default(),
-        delegate.then(|| {
-            (
-                target
-                    .and_then(|t| t.get("providerInstanceId"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                target
-                    .and_then(|t| t.get("model"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            )
-        }),
+        parsed
+            .target
+            .as_ref()
+            .map(|t| (t.provider.as_str(), t.model.as_str())),
         &markers.exclude,
         is_review_role,
-        &brief,
+        &parsed.brief,
     )?;
     let confidence = route
         .get("jevConfidence")

@@ -895,3 +895,247 @@ fn coordinator_mcp_prefers_observed_model_tracks_checkpoint_deltas_and_worktrees
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn route_batch_lists_schema_handles_invalid_and_warms_hook_cache() {
+    let dir =
+        std::env::temp_dir().join(format!("agentdeck-mcp-route-batch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let home = dir.join("home");
+    let runtime = dir.join("runtime");
+    let xdg_state = dir.join("xdg-state");
+    for p in [
+        dir.join("config"),
+        home.join(".t3/userdata"),
+        home.join(".local/state/ai-usage"),
+        xdg_state.join("model-route"),
+        runtime.clone(),
+    ] {
+        std::fs::create_dir_all(p).unwrap();
+    }
+    std::fs::write(
+        dir.join("config/instances.toml"),
+        "version = 1\n\n[plugins]\nmcp-server = true\nrouter = true\n",
+    )
+    .unwrap();
+    std::fs::write(home.join(".t3/userdata/settings.json"), "{}").unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/catalog.fixture.json"),
+        xdg_state.join("model-route/catalog.json"),
+    )
+    .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64() as i64;
+    let usage = json!({"accounts": [
+        {"provider": "claude", "id": "claude-main", "plan": "Max 5x", "status": "ok", "updated_at": now, "balances": [],
+         "windows": [
+            {"key": "weekly_all", "label": "Week", "remaining_percent": 70, "duration_mins": 10080, "resets_at": now + 5 * 86400},
+            {"key": "session", "label": "5h", "remaining_percent": 70, "duration_mins": 300, "resets_at": now + 3 * 3600}
+         ]},
+        {"provider": "codex", "id": "codex-main", "plan": "Pro 5x", "status": "ok", "updated_at": now, "balances": [],
+         "windows": [
+            {"key": "weekly", "label": "Week", "remaining_percent": 90, "duration_mins": 10080, "resets_at": now + 5 * 86400},
+            {"key": "5h", "label": "5h", "remaining_percent": 90, "duration_mins": 300, "resets_at": now + 3 * 3600}
+         ]}
+    ]});
+    std::fs::write(
+        home.join(".local/state/ai-usage/state.json"),
+        usage.to_string(),
+    )
+    .unwrap();
+    let router_json = dir.join("router.json");
+    let router_cfg = json!({
+        "version": 1,
+        "decisionProvider": "openrouter",
+        "decisionModel": "~typesafe/jev-latest",
+        "pool": [
+            {"providerInstanceId": "codex", "model": "gpt-6.1-sol", "enabled": true},
+            {"providerInstanceId": "claudeAgent", "model": "claude-opus-5-5", "enabled": true}
+        ],
+        "accounts": {
+            "codex": {"instances": ["codex"], "usageProvider": "codex", "usageId": "codex-main"},
+            "claude": {"instances": ["claudeAgent"], "usageProvider": "claude", "usageId": "claude-main"}
+        }
+    });
+    std::fs::write(&router_json, router_cfg.to_string()).unwrap();
+    let mock_jev = dir.join("jev.json");
+    std::fs::write(
+        &mock_jev,
+        json!({
+            "answers": {
+                "size": {"score": 1, "confidence": 0.9},
+                "difficulty": {"score": 1, "confidence": 0.9},
+                "review": {"score": 0, "confidence": 0.95},
+                "codex_gpt_6_1_sol": {"score": 2.8, "confidence": 0.9, "probabilities": {"0": 0.0, "1": 0.05, "2": 0.15, "3": 0.8}},
+                "claudeagent_claude_opus_5_5": {"score": 2.2, "confidence": 0.85, "probabilities": {"0": 0.0, "1": 0.1, "2": 0.7, "3": 0.2}}
+            },
+            "usage": {"cost": 0.003}
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let runtime_s = runtime.to_string_lossy().into_owned();
+    let router_s = router_json.to_string_lossy().into_owned();
+    let mock_s = mock_jev.to_string_lossy().into_owned();
+    let env = [
+        ("XDG_RUNTIME_DIR", runtime_s.as_str()),
+        ("MODEL_ROUTE_ROUTER_JSON", router_s.as_str()),
+        ("AGENTDECK_ROUTE_MOCK_JEV", mock_s.as_str()),
+    ];
+
+    let launch0 = json!({
+        "tool": "mcp__t3-code__delegate_task",
+        "input": {
+            "task": "Add unit tests for parser",
+            "target": {"providerInstanceId": "codex", "model": "gpt-6.1-sol", "options": {"reasoningEffort": "high"}}
+        }
+    });
+    let launch1_invalid = json!({
+        "tool": "mcp__t3-code__delegate_task",
+        "input": {"task": ""}
+    });
+    let launch2 = json!({
+        "tool": "mcp__t3-code__delegate_task",
+        "input": {"task": "[route:exclude=claudeAgent] Refactor cache key helper"}
+    });
+
+    let replies = session_env(
+        &dir,
+        &env,
+        &[
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            call(
+                2,
+                "route_batch",
+                json!({
+                    "harness": "claude",
+                    "launches": [launch0, launch1_invalid, launch2]
+                }),
+            ),
+        ],
+    );
+    // 1. tools/list includes route_batch with a valid inputSchema.
+    let route_tool = replies[0]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "route_batch")
+        .expect("route_batch must appear in tools/list");
+    assert_eq!(route_tool["inputSchema"]["type"], "object");
+    assert_eq!(route_tool["inputSchema"]["required"], json!(["launches"]));
+    assert_eq!(
+        route_tool["inputSchema"]["properties"]["launches"]["type"],
+        "array"
+    );
+    assert!(
+        route_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("10-minute")
+    );
+
+    // 2. route_batch returns per-launch results in order; invalid launch gets {error} while others succeed.
+    assert!(
+        replies[1]["result"].get("isError").is_none(),
+        "{}",
+        text(&replies[1])
+    );
+    let batch: Value = serde_json::from_str(&text(&replies[1])).unwrap();
+    let results = batch["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3, "{batch}");
+    assert_eq!(results[0]["target"]["providerInstanceId"], "codex");
+    assert_eq!(results[0]["jevCache"], "miss");
+    assert_eq!(results[0]["jevChannel"], "primary");
+    assert!(results[1].get("error").is_some(), "{}", results[1]);
+    assert_eq!(results[2]["target"]["providerInstanceId"], "codex");
+    assert_eq!(results[2]["jevCache"], "miss");
+
+    // 3. Remove the mock Jev file and unset all API keys: any judge call will now fail.
+    std::fs::remove_file(&mock_jev).unwrap();
+
+    // 3a. Direct `agentdeck route` with the exact same source + task hits the warmed cache.
+    let mut route_cmd = Command::new(env!("CARGO_BIN_EXE_agentdeck"))
+        .args([
+            "route",
+            "--source",
+            "claudeAgent",
+            "--validate-target",
+            "codex",
+            "gpt-6.1-sol",
+            "-",
+        ])
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("MODEL_ROUTE_ROUTER_JSON", &router_json)
+        .env_remove("AGENTDECK_ROUTE_MOCK_JEV")
+        .env_remove("JEV_OPENROUTER_API_KEY")
+        .env_remove("AI_GATEWAY_API_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    route_cmd
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"Add unit tests for parser")
+        .unwrap();
+    let route_out = route_cmd.wait_with_output().unwrap();
+    assert!(
+        route_out.status.success(),
+        "route must hit cache without judge call: {}",
+        String::from_utf8_lossy(&route_out.stderr)
+    );
+    let routed: Value = serde_json::from_slice(&route_out.stdout).unwrap();
+    assert_eq!(routed["jevCache"], "hit", "{routed}");
+
+    // 3b. Routing the identical launch through the actual hook (`agentdeck route hook --harness claude`)
+    // also succeeds with zero judge calls (cache hit!).
+    let hint = results[0]["briefHint"].as_str().unwrap_or_default();
+    let hook_payload = json!({
+        "tool_name": "mcp__t3-code__delegate_task",
+        "tool_input": {
+            "task": format!("Add unit tests for parser\n\n{hint}"),
+            "target": results[0]["target"]
+        }
+    });
+    let mut hook_cmd = Command::new(env!("CARGO_BIN_EXE_agentdeck"))
+        .args(["route", "hook", "--harness", "claude"])
+        .env("HOME", &home)
+        .env("AGENTDECK_CONFIG_DIR", dir.join("config"))
+        .env("AGENTDECK_STATE_DIR", dir.join("state"))
+        .env("XDG_STATE_HOME", &xdg_state)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("MODEL_ROUTE_ROUTER_JSON", &router_json)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("AGENTDECK_ROUTE_MOCK_JEV")
+        .env_remove("JEV_OPENROUTER_API_KEY")
+        .env_remove("AI_GATEWAY_API_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    hook_cmd
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(hook_payload.to_string().as_bytes())
+        .unwrap();
+    let hook_out = hook_cmd.wait_with_output().unwrap();
+    assert!(hook_out.status.success());
+    let hook_stdout = String::from_utf8_lossy(&hook_out.stdout);
+    let decision_log =
+        std::fs::read_to_string(xdg_state.join("model-route/decisions.jsonl")).unwrap();
+    assert!(
+        decision_log.contains("\"decision\":\"allow:delegate\""),
+        "hook must allow from warm cache without calling judge; stdout={hook_stdout}; log={decision_log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
