@@ -924,19 +924,30 @@ where
                     record_block_logged(blocks, primary, retry_after, received_w, lock_wait);
                     let after_persist_w = wall_now();
                     let after_persist_m = mono_now();
-                    let remaining_after = deadline.saturating_duration_since(after_persist_m);
-                    // Keep receipt time as block start; recompute remaining waits against fresh
-                    // post-persistence time (monotonic for local expiry so wall-clock jumps cannot
-                    // zero out Retry-After), honouring any longer stored block and preserving the
+                    // Keep receipt time as block start; recompute waits
+                    // against fresh post-persistence time (monotonic for this
+                    // response's expiry so wall-clock jumps in either
+                    // direction cannot distort Retry-After), honouring a
+                    // later shared expiry from another writer and preserving
                     // local expiry if persistence failed.
                     let elapsed = after_persist_m.saturating_duration_since(received_m);
                     let local_rem = retry_after.saturating_sub(elapsed);
+                    let own_until_ms = system_time_ms(received_w)
+                        .saturating_add(retry_after.as_millis().min(u64::MAX as u128) as u64);
                     let stored_rem = blocks
-                        .remaining_at(primary, after_persist_w)
+                        .read_until_ms(primary)
+                        .filter(|&until_ms| until_ms > own_until_ms)
+                        .map(|until_ms| {
+                            Duration::from_millis(
+                                until_ms.saturating_sub(system_time_ms(after_persist_w)),
+                            )
+                        })
                         .unwrap_or(Duration::ZERO);
                     let primary_rem = local_rem.max(stored_rem);
+                    let fb_rem = fb.and_then(|f| blocks.remaining_at(f, after_persist_w));
+                    let remaining_after = deadline.saturating_duration_since(mono_now());
                     if let Some(fb) = fb {
-                        if let Some(fb_rem) = blocks.remaining_at(fb, after_persist_w) {
+                        if let Some(fb_rem) = fb_rem {
                             let wait = primary_rem.min(fb_rem);
                             return if can_wait(wait, remaining_after) {
                                 DispatchStep::Wait(wait)
@@ -2199,34 +2210,68 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir1b);
 
-        // 2. Concurrent writer holds lock and writes a longer 40s block ONLY after the primary
-        // call has already started (so step 1 sees primary unblocked): caller received
-        // retry_after=5s, must honour the longer stored 40s block.
+        // 1c. Wall clock jumps backward by 60s during persistence while monotonic advances 100ms:
+        // own 5s Retry-After record must stay ~4.9s instead of inflating to 65s and failing.
+        let (dir1c, blocks1c) = temp_blocks("wall-jump-backward");
+        let mono_calls = AtomicUsize::new(0);
+        let wall_calls = AtomicUsize::new(0);
+        let step1c = run_block(dispatch_once(
+            &blocks1c,
+            &ep,
+            None,
+            base_m + Duration::from_secs(10),
+            Duration::ZERO,
+            None,
+            || {
+                if mono_calls.fetch_add(1, Ordering::SeqCst) >= 2 {
+                    base_m + Duration::from_millis(100)
+                } else {
+                    base_m
+                }
+            },
+            || {
+                if wall_calls.fetch_add(1, Ordering::SeqCst) >= 2 {
+                    base_w - Duration::from_secs(60)
+                } else {
+                    base_w
+                }
+            },
+            |_ep, _| async {
+                Err::<&str, TestErr>(TestErr {
+                    trigger: FallbackTrigger::RateLimited {
+                        retry_after: Duration::from_secs(5),
+                    },
+                    msg: "429".into(),
+                })
+            },
+            |e| e.trigger,
+            |ep, ra, rem| TestErr {
+                trigger: FallbackTrigger::None,
+                msg: format_rate_limit_exceeded(ep, ra, rem),
+            },
+        ));
+        match step1c {
+            DispatchStep::Wait(wait) => {
+                assert_eq!(
+                    wait,
+                    Duration::from_millis(4900),
+                    "backward wall-clock jump must not inflate own Retry-After"
+                );
+            }
+            other => panic!("expected Wait(4900ms), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir1c);
+
+        // 2. Concurrent writer publishes a longer 40s block AFTER the primary call has already
+        // started (so step 1 sees primary unblocked): caller received retry_after=5s, must honour
+        // the longer stored 40s block.
         let (dir2, blocks2) = temp_blocks("longer-stored");
         let seed_t = base_w - Duration::from_secs(60);
         blocks2
             .record_rate_limit_at(&ep, Duration::from_secs(1), seed_t)
             .unwrap();
-        let lock_file2 = std::fs::File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(blocks2.lock_path(&ep).unwrap())
-            .unwrap();
-        lock_file2.lock().unwrap();
         let bp2 = blocks2.block_path(&ep).unwrap();
         let ep2 = ep.clone();
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let holder2 = std::thread::spawn(move || {
-            rx.recv().unwrap();
-            let rec = BlockRecord {
-                provider: ep2.provider,
-                model: ep2.model,
-                blocked_until_ms: system_time_ms(base_w) + 40_000,
-            };
-            write_atomic(&bp2, &serde_json::to_string(&rec).unwrap()).unwrap();
-            drop(lock_file2);
-        });
         let step2 = run_block(dispatch_once(
             &blocks2,
             &ep,
@@ -2237,7 +2282,12 @@ mod tests {
             || base_m,
             || base_w,
             |_ep, _| {
-                let _ = tx.send(());
+                let rec = BlockRecord {
+                    provider: ep2.provider.clone(),
+                    model: ep2.model.clone(),
+                    blocked_until_ms: system_time_ms(base_w) + 40_000,
+                };
+                write_atomic(&bp2, &serde_json::to_string(&rec).unwrap()).unwrap();
                 async {
                     Err::<&str, TestErr>(TestErr {
                         trigger: FallbackTrigger::RateLimited {
@@ -2253,7 +2303,6 @@ mod tests {
                 msg: format_rate_limit_exceeded(ep, ra, rem),
             },
         ));
-        holder2.join().unwrap();
         match step2 {
             DispatchStep::Wait(wait) => {
                 assert_eq!(
