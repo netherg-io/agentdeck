@@ -4,7 +4,7 @@
 //! primary/fallback block dispatcher, then writes each answer back. A request
 //! alone in the queue is sent unchanged.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +16,30 @@ use agentdeck_core::judge::{
 };
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+
+/// How a terminal dispatch error should be handled across requests in a batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchErrorKind {
+    /// Server or channel-wide error (401/403/404, missing API key, channel-level
+    /// 400, 5xx, network failure): fail the whole remaining batch at once.
+    ChannelWide,
+    /// Leader-side timeout: keep local to the leader's own requests so longer
+    /// waiters in the same group survive untouched.
+    LeaderTimeout,
+    /// Ambiguous or request-specific error (ambiguous 400, malformed JSON):
+    /// if batched, fall back to one-by-one capped at `batch_size + 1` sends.
+    RequestSpecific,
+}
+
+fn system_time_ms(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+fn duration_ms(d: Duration) -> u64 {
+    d.as_millis().min(u64::MAX as u128) as u64
+}
 
 /// Total wait for one answer on the hook path, queue and 429 back-off included:
 /// the hook kills `route` after 55 s.
@@ -81,7 +105,7 @@ pub struct QueueAnswer {
 
 /// Asks Jev through the shared queue with the default hook-path budget ([`BUDGET`]).
 #[allow(clippy::too_many_arguments)]
-pub async fn ask<F, Fut, C, Cw>(
+pub async fn ask<F, Fut, C, Cb>(
     spool: &Path,
     request: &Value,
     body: &str,
@@ -90,13 +114,13 @@ pub async fn ask<F, Fut, C, Cw>(
     fallback: Option<&JudgeEndpoint>,
     fetch: F,
     classify: C,
-    is_channel_wide: Cw,
+    classify_batch: Cb,
 ) -> anyhow::Result<QueueAnswer>
 where
     F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
-    Cw: Fn(&anyhow::Error) -> bool,
+    Cb: Fn(&anyhow::Error) -> BatchErrorKind,
 {
     ask_with_deadline(
         spool,
@@ -108,7 +132,7 @@ where
         fallback,
         fetch,
         classify,
-        is_channel_wide,
+        classify_batch,
     )
     .await
 }
@@ -116,7 +140,7 @@ where
 /// Asks Jev through the shared queue with an explicit `budget` deadline (so
 /// callers such as `route_batch` can pass e.g. 120 s).
 #[allow(clippy::too_many_arguments)]
-pub async fn ask_with_deadline<F, Fut, C, Cw>(
+pub async fn ask_with_deadline<F, Fut, C, Cb>(
     spool: &Path,
     request: &Value,
     body: &str,
@@ -126,13 +150,13 @@ pub async fn ask_with_deadline<F, Fut, C, Cw>(
     fallback: Option<&JudgeEndpoint>,
     fetch: F,
     classify: C,
-    is_channel_wide: Cw,
+    classify_batch: Cb,
 ) -> anyhow::Result<QueueAnswer>
 where
     F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
-    Cw: Fn(&anyhow::Error) -> bool,
+    Cb: Fn(&anyhow::Error) -> BatchErrorKind,
 {
     ask_inner(
         spool,
@@ -148,7 +172,7 @@ where
         true,
         fetch,
         classify,
-        is_channel_wide,
+        classify_batch,
     )
     .await
 }
@@ -157,7 +181,7 @@ where
 /// leader batches up to [`MAX_TASKS`] compatible requests per judge call within
 /// the shared `budget` deadline. Returns one result per input item in order.
 #[allow(clippy::too_many_arguments)]
-pub async fn ask_many_with_deadline<F, Fut, C, Cw>(
+pub async fn ask_many_with_deadline<F, Fut, C, Cb>(
     spool: &Path,
     items: &[(Value, String)],
     budget: Duration,
@@ -166,13 +190,13 @@ pub async fn ask_many_with_deadline<F, Fut, C, Cw>(
     fallback: Option<&JudgeEndpoint>,
     fetch: F,
     classify: C,
-    is_channel_wide: Cw,
+    classify_batch: Cb,
 ) -> Vec<anyhow::Result<QueueAnswer>>
 where
     F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
-    Cw: Fn(&anyhow::Error) -> bool,
+    Cb: Fn(&anyhow::Error) -> BatchErrorKind,
 {
     ask_many_inner(
         spool,
@@ -187,13 +211,13 @@ where
         true,
         fetch,
         classify,
-        is_channel_wide,
+        classify_batch,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn ask_inner<MonoNow, WallNow, Sleep, SleepFut, F, Fut, C, Cw>(
+async fn ask_inner<MonoNow, WallNow, Sleep, SleepFut, F, Fut, C, Cb>(
     spool: &Path,
     request: &Value,
     body: &str,
@@ -207,7 +231,7 @@ async fn ask_inner<MonoNow, WallNow, Sleep, SleepFut, F, Fut, C, Cw>(
     add_jitter: bool,
     fetch: F,
     classify: C,
-    is_channel_wide: Cw,
+    classify_batch: Cb,
 ) -> anyhow::Result<QueueAnswer>
 where
     MonoNow: FnMut() -> Instant,
@@ -217,7 +241,7 @@ where
     F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
-    Cw: Fn(&anyhow::Error) -> bool,
+    Cb: Fn(&anyhow::Error) -> BatchErrorKind,
 {
     ask_many_inner(
         spool,
@@ -232,7 +256,7 @@ where
         add_jitter,
         fetch,
         classify,
-        is_channel_wide,
+        classify_batch,
     )
     .await
     .into_iter()
@@ -241,7 +265,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn ask_many_inner<MonoNow, WallNow, Sleep, SleepFut, F, Fut, C, Cw>(
+async fn ask_many_inner<MonoNow, WallNow, Sleep, SleepFut, F, Fut, C, Cb>(
     spool: &Path,
     items: &[(Value, String)],
     budget: Duration,
@@ -254,7 +278,7 @@ async fn ask_many_inner<MonoNow, WallNow, Sleep, SleepFut, F, Fut, C, Cw>(
     add_jitter: bool,
     mut fetch: F,
     classify: C,
-    is_channel_wide: Cw,
+    classify_batch: Cb,
 ) -> Vec<anyhow::Result<QueueAnswer>>
 where
     MonoNow: FnMut() -> Instant,
@@ -264,12 +288,13 @@ where
     F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
-    Cw: Fn(&anyhow::Error) -> bool,
+    Cb: Fn(&anyhow::Error) -> BatchErrorKind,
 {
     if items.is_empty() {
         return Vec::new();
     }
     let deadline = mono_now() + budget;
+    let wall_deadline_ms = system_time_ms(wall_now()).saturating_add(duration_ms(budget));
     if let Err(e) = create_private_dir(spool) {
         let msg = e.to_string();
         return (0..items.len())
@@ -293,6 +318,7 @@ where
             "group": group,
             "request": request,
             "body": body,
+            "deadline_ms": wall_deadline_ms,
         });
         if let Err(e) = write_atomic(&req_path, &entry.to_string()) {
             results[i] = Some(Err(e.into()));
@@ -302,6 +328,7 @@ where
         req_paths.push(req_path);
         done_paths.push(done_path);
     }
+    let own_ids: HashSet<&str> = ids.iter().map(String::as_str).collect();
     let mut locks: HashMap<String, std::fs::File> = HashMap::new();
     let mut wait_retries: HashMap<String, usize> = HashMap::new();
     let fail_group = |target_group: &str,
@@ -373,6 +400,7 @@ where
                 let outcome = lead_once(
                     spool,
                     &ids[first],
+                    &own_ids,
                     deadline,
                     blocks,
                     primary,
@@ -381,7 +409,7 @@ where
                     &mut wall_now,
                     &mut fetch,
                     &classify,
-                    &is_channel_wide,
+                    &classify_batch,
                 )
                 .await;
                 // Release the per-group lock immediately so we NEVER hold it while sleeping
@@ -423,7 +451,7 @@ where
                             sleep(dur).await;
                         }
                     }
-                    LeadOutcome::RateLimitExceeded(msg) => {
+                    LeadOutcome::LocalError(msg) => {
                         fail_group(
                             &group,
                             &msg,
@@ -433,6 +461,15 @@ where
                             &done_paths,
                             &mut results,
                         );
+                    }
+                    LeadOutcome::OwnError(msg) => {
+                        let _ = std::fs::remove_file(&req_paths[first]);
+                        if results[first].is_none() {
+                            results[first] = Some(
+                                take_done(spool, &done_paths[first])
+                                    .unwrap_or_else(|| Err(anyhow::anyhow!("{msg}"))),
+                            );
+                        }
                     }
                 }
             }
@@ -476,14 +513,26 @@ fn open_group_lock(spool: &Path, group: &str) -> std::io::Result<std::fs::File> 
 enum LeadOutcome {
     Done,
     Wait(Duration),
-    RateLimitExceeded(String),
+    /// Caller-local failure (caller-deadline 429 or leader timeout): fail only
+    /// this process's items in the group; other processes' `.req` files stay.
+    LocalError(String),
+    /// This caller's own `.req` file could not be read or parsed.
+    OwnError(String),
 }
 
+#[derive(Debug)]
 struct Pending {
     path: PathBuf,
     id: String,
     request: Value,
     body: String,
+    deadline_ms: Option<u64>,
+}
+
+impl Pending {
+    fn is_expired(&self, now_ms: u64) -> bool {
+        self.deadline_ms.is_some_and(|dl| now_ms >= dl)
+    }
 }
 
 fn with_bounded_jitter(wait: Duration, remaining: Duration, add_jitter: bool) -> Duration {
@@ -516,13 +565,14 @@ fn expected_keys_present(p: &Pending, split_answers: &Value) -> bool {
 
 /// Sends this process's request together with every compatible pending one
 /// through the shared block/fallback dispatcher without sleeping under the lock.
-/// On request-specific errors (HTTP 400 or combined-answer parse/split errors),
-/// bisects the batch and retries parts within the original `deadline` so healthy
-/// tasks are never lost to a single bad task.
+/// Drops expired peer requests before every send and before writing answers;
+/// keeps leader timeouts local to the leader; and on ambiguous request errors
+/// falls back one-by-one with a hard cap of `batch_size + 1` sends per batch.
 #[allow(clippy::too_many_arguments)]
-async fn lead_once<MonoNow, WallNow, F, Fut, C, Cw>(
+async fn lead_once<MonoNow, WallNow, F, Fut, C, Cb>(
     spool: &Path,
     own: &str,
+    own_ids: &HashSet<&str>,
     deadline: Instant,
     blocks: &BlockStore,
     primary: &JudgeEndpoint,
@@ -531,7 +581,7 @@ async fn lead_once<MonoNow, WallNow, F, Fut, C, Cw>(
     wall_now: &mut WallNow,
     fetch: &mut F,
     classify: &C,
-    is_channel_wide: &Cw,
+    classify_batch: &Cb,
 ) -> LeadOutcome
 where
     MonoNow: FnMut() -> Instant,
@@ -539,20 +589,47 @@ where
     F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
-    Cw: Fn(&anyhow::Error) -> bool,
+    Cb: Fn(&anyhow::Error) -> BatchErrorKind,
 {
-    let batch = collect(spool, own);
+    let batch = match collect(spool, own, system_time_ms(wall_now())) {
+        Ok(b) => b,
+        Err(msg) => return LeadOutcome::OwnError(msg),
+    };
     if batch.is_empty() || batch[0].id != own {
         return LeadOutcome::Done;
     }
+    let max_sends = batch.len() + 1;
+    let mut sends = 0usize;
+    let mut last_err: Option<String> = None;
     let mut work: VecDeque<Vec<Pending>> = VecDeque::from([batch]);
-    while let Some(sub) = work.pop_front() {
-        if sub.is_empty() {
-            continue;
-        }
+    while let Some(mut sub) = work.pop_front() {
         if mono_now() >= deadline {
             return LeadOutcome::Done;
         }
+        let now_ms = system_time_ms(wall_now());
+        sub.retain(|p| {
+            own_ids.contains(p.id.as_str()) || (!p.is_expired(now_ms) && p.path.exists())
+        });
+        if sub.is_empty() {
+            continue;
+        }
+        if sends >= max_sends {
+            let err_payload = serde_json::json!({
+                "error": last_err
+                    .as_deref()
+                    .unwrap_or("Jev queue: batch send cap reached"),
+            });
+            for p in &sub {
+                finish_if_live(spool, p, own_ids, &err_payload, now_ms);
+            }
+            for rest in &work {
+                for p in rest {
+                    finish_if_live(spool, p, own_ids, &err_payload, now_ms);
+                }
+            }
+            return LeadOutcome::Done;
+        }
+        sends += 1;
         let (request, body) = if sub.len() == 1 {
             (sub[0].request.clone(), sub[0].body.clone())
         } else {
@@ -578,16 +655,19 @@ where
         .await;
         match step {
             DispatchStep::Done((answers, cost), channel) => {
+                let write_now_ms = system_time_ms(wall_now());
                 let n = sub.len();
                 if n == 1 {
-                    finish(
+                    finish_if_live(
                         spool,
                         &sub[0],
+                        own_ids,
                         &serde_json::json!({
                             "answers": answers,
                             "cost": cost,
                             "channel": channel.as_str(),
                         }),
+                        write_now_ms,
                     );
                     continue;
                 }
@@ -607,25 +687,20 @@ where
                 }
                 for (p, a) in good {
                     let per_cost = cost.map(|c| c / n as f64);
-                    finish(
+                    finish_if_live(
                         spool,
                         &p,
+                        own_ids,
                         &serde_json::json!({
                             "answers": a,
                             "cost": per_cost,
                             "channel": channel.as_str(),
                         }),
+                        write_now_ms,
                     );
                 }
-                if !bad.is_empty() {
-                    if bad.len() == 1 {
-                        work.push_front(bad);
-                    } else {
-                        let mid = bad.len() / 2;
-                        let right = bad.split_off(mid);
-                        work.push_front(right);
-                        work.push_front(bad);
-                    }
+                for p in bad.into_iter().rev() {
+                    work.push_front(vec![p]);
                 }
             }
             DispatchStep::Wait(wait) => {
@@ -637,35 +712,42 @@ where
                 if e.downcast_ref::<ChannelWideRateLimit>().is_some() {
                     // Caller-deadline rate-limit failure: only fail this caller's items
                     // so longer-deadline waiters in the same group survive.
-                    return LeadOutcome::RateLimitExceeded(e.to_string());
+                    return LeadOutcome::LocalError(e.to_string());
                 }
-                let channel_wide =
-                    !matches!(classify(&e), FallbackTrigger::None) || is_channel_wide(&e);
-                let err_payload = serde_json::json!({"error": e.to_string()});
+                let batch_kind = classify_batch(&e);
+                if batch_kind == BatchErrorKind::LeaderTimeout || mono_now() >= deadline {
+                    // Leader's own timeout or exhausted deadline stays local to the leader
+                    // so longer-deadline waiters in the same group survive untouched.
+                    return LeadOutcome::LocalError(e.to_string());
+                }
+                let channel_wide = batch_kind == BatchErrorKind::ChannelWide
+                    || !matches!(classify(&e), FallbackTrigger::None);
+                let write_now_ms = system_time_ms(wall_now());
+                let err_msg = e.to_string();
+                let err_payload = serde_json::json!({"error": &err_msg});
                 if channel_wide {
-                    // Server/channel-wide failure (401/403, missing key, fallback exhausted):
+                    // Server/channel-wide failure (401/403, missing key, channel-level 400, 5xx):
                     // fail the whole remaining batch at once instead of N failing calls.
                     for p in &sub {
-                        finish(spool, p, &err_payload);
+                        finish_if_live(spool, p, own_ids, &err_payload, write_now_ms);
                     }
                     for rest in &work {
                         for p in rest {
-                            finish(spool, p, &err_payload);
+                            finish_if_live(spool, p, own_ids, &err_payload, write_now_ms);
                         }
                     }
                     return LeadOutcome::Done;
                 }
-                // Request-specific failure (400 / invalid JSON parse error):
-                // if solo, attribute the error to this task; if batched, bisect and retry
-                // both halves within the original deadline.
+                // Ambiguous / request-specific failure (ambiguous 400 / invalid JSON parse error):
+                // if solo, attribute the error to this task; if batched, fall back one-by-one
+                // (capped at batch_size + 1 total sends for the batch).
                 if sub.len() == 1 {
-                    finish(spool, &sub[0], &err_payload);
+                    finish_if_live(spool, &sub[0], own_ids, &err_payload, write_now_ms);
                 } else {
-                    let mut left = sub;
-                    let mid = left.len() / 2;
-                    let right = left.split_off(mid);
-                    work.push_front(right);
-                    work.push_front(left);
+                    last_err = Some(err_msg);
+                    for p in sub.into_iter().rev() {
+                        work.push_front(vec![p]);
+                    }
                 }
             }
         }
@@ -673,9 +755,11 @@ where
     LeadOutcome::Done
 }
 
-/// Own request first, then the oldest compatible ones. Requests of exited
-/// processes and stale answers are deleted.
-fn collect(spool: &Path, own: &str) -> Vec<Pending> {
+/// Own request first, then the oldest compatible unexpired ones. Requests of
+/// exited processes and stale answers are deleted; expired live peers are
+/// skipped without touching their files; an unreadable own request returns
+/// an explicit error instead of being silently skipped.
+fn collect(spool: &Path, own: &str, now_ms: u64) -> Result<Vec<Pending>, String> {
     let mut all: Vec<(SystemTime, Pending, String)> = Vec::new();
     for f in std::fs::read_dir(spool).into_iter().flatten().flatten() {
         let path = f.path();
@@ -693,19 +777,32 @@ fn collect(spool: &Path, own: &str) -> Vec<Pending> {
                 let _ = std::fs::remove_file(&path);
                 continue;
             }
-            let Some(v) = read_private_entry(spool, &path)
-                .ok()
-                .flatten()
-                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-            else {
-                continue;
+            let text = match read_private_entry(spool, &path) {
+                Ok(Some(t)) => t,
+                Ok(None) => continue,
+                Err(e) if id == own => {
+                    return Err(format!("Jev queue: own request unreadable: {e}"));
+                }
+                Err(_) => continue,
             };
+            let v = match serde_json::from_str::<Value>(&text) {
+                Ok(v) => v,
+                Err(e) if id == own => {
+                    return Err(format!("Jev queue: own request corrupt: {e}"));
+                }
+                Err(_) => continue,
+            };
+            let deadline_ms = v.get("deadline_ms").and_then(Value::as_u64);
+            if id != own && deadline_ms.is_some_and(|dl| now_ms >= dl) {
+                continue;
+            }
             let group = v["group"].as_str().unwrap_or_default().to_string();
             let p = Pending {
                 path,
                 id: id.to_string(),
                 request: v["request"].clone(),
                 body: v["body"].as_str().unwrap_or_default().to_string(),
+                deadline_ms,
             };
             all.push((modified, p, group));
         } else if (name.ends_with(".done") || name.ends_with(".tmp"))
@@ -721,11 +818,11 @@ fn collect(spool: &Path, own: &str) -> Vec<Pending> {
         .find(|(_, p, _)| p.id == own)
         .map(|(_, _, g)| g.clone())
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     all.retain(|(_, _, g)| *g == group);
     all.sort_by_key(|(t, p, _)| (p.id != own, *t));
-    all.into_iter().take(MAX_TASKS).map(|(_, p, _)| p).collect()
+    Ok(all.into_iter().take(MAX_TASKS).map(|(_, p, _)| p).collect())
 }
 
 /// Requests can share a decision only when primary provider/model, fallback
@@ -785,6 +882,13 @@ fn split(answers: &Value, i: usize) -> Value {
 fn finish(spool: &Path, p: &Pending, result: &Value) {
     let _ = write_atomic(&spool.join(format!("{}.done", p.id)), &result.to_string());
     let _ = std::fs::remove_file(&p.path);
+}
+
+fn finish_if_live(spool: &Path, p: &Pending, own_ids: &HashSet<&str>, result: &Value, now_ms: u64) {
+    if !own_ids.contains(p.id.as_str()) && (p.is_expired(now_ms) || !p.path.exists()) {
+        return;
+    }
+    finish(spool, p, result);
 }
 
 fn take_done(spool: &Path, path: &Path) -> Option<anyhow::Result<QueueAnswer>> {
@@ -850,9 +954,18 @@ mod tests {
         }
     }
 
-    fn is_channel_wide_test(e: &anyhow::Error) -> bool {
+    fn classify_batch_test(e: &anyhow::Error) -> BatchErrorKind {
         let msg = e.to_string();
-        msg.contains("401") || msg.contains("403") || msg.contains("decision key not found")
+        if msg.contains("timeout") {
+            BatchErrorKind::LeaderTimeout
+        } else if msg.contains("401")
+            || msg.contains("403")
+            || msg.contains("decision key not found")
+        {
+            BatchErrorKind::ChannelWide
+        } else {
+            BatchErrorKind::RequestSpecific
+        }
     }
 
     #[test]
@@ -865,6 +978,7 @@ mod tests {
                 id: i.to_string(),
                 request: request(t),
                 body: String::new(),
+                deadline_ms: None,
             })
             .collect();
         let c = combine(&batch);
@@ -941,7 +1055,7 @@ mod tests {
                 }
             },
             classify_rl,
-            is_channel_wide_test,
+            classify_batch_test,
         )
         .await
         .unwrap();
@@ -1001,7 +1115,7 @@ mod tests {
                 )
             },
             classify_rl,
-            is_channel_wide_test,
+            classify_batch_test,
         )
         .await
         .unwrap_err();
@@ -1034,7 +1148,7 @@ mod tests {
                 }
             },
             classify_rl,
-            is_channel_wide_test,
+            classify_batch_test,
         )
         .await
         .unwrap();
@@ -1065,7 +1179,7 @@ mod tests {
                 }
             },
             classify_rl,
-            is_channel_wide_test,
+            classify_batch_test,
         )
         .await
         .unwrap();
@@ -1130,7 +1244,7 @@ mod tests {
             None,
             make_fetch(calls.clone()),
             classify_rl,
-            is_channel_wide_test,
+            classify_batch_test,
         )
         .await;
         assert_eq!(*calls.lock().unwrap(), vec![3]);
@@ -1157,7 +1271,7 @@ mod tests {
             None,
             make_fetch(calls.clone()),
             classify_rl,
-            is_channel_wide_test,
+            classify_batch_test,
         )
         .await;
         let counts = calls.lock().unwrap().clone();
@@ -1211,7 +1325,7 @@ mod tests {
                 }
             },
             classify_rl,
-            is_channel_wide_test,
+            classify_batch_test,
         )
         .await
         .unwrap();
@@ -1262,7 +1376,7 @@ mod tests {
                 }
             },
             classify_rl,
-            is_channel_wide_test,
+            classify_batch_test,
         )
         .await;
         assert_eq!(outcomes.len(), 8);
@@ -1273,8 +1387,8 @@ mod tests {
             "channel-wide 401 must fail the entire wave of 8 in 1 judge call, not 8"
         );
 
-        // Combined-body 400 (e.g. payload rejected only when combined): bisecting splits
-        // into smaller parts and recovers ALL 3 healthy tasks instead of losing task 0.
+        // Combined-body 400 (e.g. payload rejected only when combined): falling back
+        // one-by-one recovers ALL 3 healthy tasks within batch_size + 1 (4) sends.
         let three: Vec<(Value, String)> = (0..3)
             .map(|i| {
                 let r = request(&format!("req-{i}"));
@@ -1310,13 +1424,16 @@ mod tests {
                 }
             },
             classify_rl,
-            is_channel_wide_test,
+            classify_batch_test,
         )
         .await;
-        assert_eq!(*req_calls.lock().unwrap(), 3);
-        assert!(res_req[0].is_ok(), "first request recovered after bisect");
-        assert!(res_req[1].is_ok(), "second request recovered after bisect");
-        assert!(res_req[2].is_ok(), "third request recovered after bisect");
+        assert_eq!(*req_calls.lock().unwrap(), 4);
+        assert!(res_req[0].is_ok(), "first request recovered after fallback");
+        assert!(
+            res_req[1].is_ok(),
+            "second request recovered after fallback"
+        );
+        assert!(res_req[2].is_ok(), "third request recovered after fallback");
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
@@ -1365,7 +1482,7 @@ mod tests {
                     }
                 },
                 classify_rl,
-                is_channel_wide_test,
+                classify_batch_test,
             )
             .await
         });
@@ -1387,7 +1504,7 @@ mod tests {
                 Ok((serde_json::json!({"size": {"score": 2}}), Some(0.01)))
             },
             classify_rl,
-            is_channel_wide_test,
+            classify_batch_test,
         )
         .await
         .expect("group B must succeed immediately");
@@ -1413,7 +1530,7 @@ mod tests {
                 Ok((serde_json::json!({"size": {"score": 9}}), Some(0.01)))
             },
             classify_rl,
-            is_channel_wide_test,
+            classify_batch_test,
         )
         .await
         .unwrap_err();
@@ -1477,7 +1594,7 @@ mod tests {
                 Ok((Value::Object(answers), Some(0.01)))
             },
             classify_rl,
-            is_channel_wide_test,
+            classify_batch_test,
         )
         .await;
         assert_eq!(outcomes.len(), 4);
@@ -1522,7 +1639,7 @@ mod tests {
                 Ok((Value::Object(answers), Some(0.01)))
             },
             classify_rl,
-            is_channel_wide_test,
+            classify_batch_test,
         )
         .await;
         assert_eq!(parsed_outcomes.len(), 3);
@@ -1538,6 +1655,405 @@ mod tests {
             assert_eq!(ans.answers["m"]["score"], 2);
         }
 
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn long_brief_succeeds_and_oversized_req_errors_at_write_time() {
+        let (dir, blocks) = temp_dirs("long-brief");
+        let primary = JudgeEndpoint::new("vercel", "judge");
+
+        // 1. 100 000-char multibyte brief (~405+ KiB serialized .req, below T3's 120k limit):
+        // must NOT hang until deadline; must be read and answered immediately.
+        let long_task = "ж".repeat(100_000);
+        let long_req = request(&long_task);
+        let long_body = crate::route::stringify_like_node(&long_req);
+        let calls = Arc::new(Mutex::new(0usize));
+        let c = calls.clone();
+        let started = Instant::now();
+        let ans = ask_with_deadline(
+            &dir,
+            &long_req,
+            &long_body,
+            Duration::from_secs(2),
+            &blocks,
+            &primary,
+            None,
+            move |_ep, _req, _body, _deadline| {
+                let c = c.clone();
+                async move {
+                    *c.lock().unwrap() += 1;
+                    Ok((
+                        serde_json::json!({"size": {"score": 1}, "m": {"score": 2}}),
+                        Some(0.01),
+                    ))
+                }
+            },
+            classify_rl,
+            classify_batch_test,
+        )
+        .await
+        .expect("100 000-char brief must succeed without hanging in the queue");
+        assert_eq!(ans.answers["size"]["score"], 1);
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "long brief should complete immediately, took {:?}",
+            started.elapsed()
+        );
+
+        // 2. Request far above the private runtime file cap (> 4 MiB) must fail explicitly
+        // at write time without waiting until deadline or leaving a .req file behind.
+        let huge_task = "a".repeat(5 * 1024 * 1024);
+        let huge_req = request(&huge_task);
+        let huge_body = crate::route::stringify_like_node(&huge_req);
+        let started_huge = Instant::now();
+        let err = ask_with_deadline(
+            &dir,
+            &huge_req,
+            &huge_body,
+            Duration::from_secs(3),
+            &blocks,
+            &primary,
+            None,
+            |_ep, _req, _body, _deadline| async {
+                Ok((serde_json::json!({"size": {"score": 1}}), None))
+            },
+            classify_rl,
+            classify_batch_test,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            started_huge.elapsed() < Duration::from_secs(1),
+            "oversized request must fail at write time, not wait for deadline: {err} ({:?})",
+            started_huge.elapsed()
+        );
+        assert!(
+            err.to_string().contains("limit") || err.to_string().contains("exceeds"),
+            "expected explicit size-limit error at write time, got: {err}"
+        );
+        let leftover_reqs: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".req"))
+            .collect();
+        assert!(
+            leftover_reqs.is_empty(),
+            "oversized request must not leave .req files behind: {leftover_reqs:?}"
+        );
+
+        // 3. An unreadable own .req on disk must return an explicit error instead of
+        // silently skipping one's own request.
+        let corrupt_id = format!("{}-corrupt-own", std::process::id());
+        write_atomic(&dir.join(format!("{corrupt_id}.req")), "{not-json").unwrap();
+        let collect_err =
+            collect(&dir, &corrupt_id, system_time_ms(SystemTime::now())).unwrap_err();
+        assert!(
+            collect_err.contains("own request"),
+            "expected explicit own-request error, got: {collect_err}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn short_deadline_leader_timeout_does_not_fail_longer_waiter() {
+        let (dir, blocks) = temp_dirs("leader-timeout-local");
+        let primary = JudgeEndpoint::new("vercel", "judge");
+        let sample = request("long-waiter");
+        let group = group_of(&sample, &primary, None);
+
+        // Hold the group lock briefly so the longer waiter enqueues its .req and enters
+        // its poll sleep, guaranteeing the short-deadline leader grabs the lock first.
+        create_private_dir(&dir).unwrap();
+        let test_lock = open_group_lock(&dir, &group).unwrap();
+        test_lock.lock().unwrap();
+
+        let dir_w = dir.clone();
+        let blocks_w = blocks.clone();
+        let ep_w = primary.clone();
+        let waiter = tokio::spawn(async move {
+            ask_with_deadline(
+                &dir_w,
+                &request("long-waiter"),
+                "body-w",
+                Duration::from_secs(3),
+                &blocks_w,
+                &ep_w,
+                None,
+                |_ep, _req, _body, attempt_deadline| async move {
+                    let needed = Duration::from_millis(400);
+                    let rem = attempt_deadline.saturating_duration_since(Instant::now());
+                    if rem < needed {
+                        tokio::time::sleep(rem).await;
+                        return Err(anyhow::anyhow!("jev_error_timeout"));
+                    }
+                    tokio::time::sleep(needed).await;
+                    Ok((
+                        serde_json::json!({"size": {"score": 2}, "m": {"score": 2}}),
+                        Some(0.01),
+                    ))
+                },
+                |e| {
+                    if e.to_string().contains("timeout") {
+                        FallbackTrigger::Transient
+                    } else {
+                        classify_rl(e)
+                    }
+                },
+                classify_batch_test,
+            )
+            .await
+        });
+
+        // Wait until waiter has enqueued its .req and hit WouldBlock on the lock.
+        for _ in 0..100 {
+            let has_req = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().ends_with(".req"));
+            if has_req {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(test_lock);
+
+        // Short-deadline leader (200ms) grabs lock, batches [leader, waiter], and times out.
+        let saw_batch = Arc::new(Mutex::new(false));
+        let sb = saw_batch.clone();
+        let leader_err = ask_with_deadline(
+            &dir,
+            &request("short-leader"),
+            "body-l",
+            Duration::from_millis(200),
+            &blocks,
+            &primary,
+            None,
+            move |_ep, req, _body, attempt_deadline| {
+                let sb = sb.clone();
+                async move {
+                    if req
+                        .pointer("/state/tasks")
+                        .and_then(Value::as_object)
+                        .is_some_and(|m| m.len() == 2)
+                    {
+                        *sb.lock().unwrap() = true;
+                    }
+                    let rem = attempt_deadline.saturating_duration_since(Instant::now());
+                    tokio::time::sleep(rem).await;
+                    Err::<(Value, Option<f64>), anyhow::Error>(anyhow::anyhow!("jev_error_timeout"))
+                }
+            },
+            |e| {
+                if e.to_string().contains("timeout") {
+                    FallbackTrigger::Transient
+                } else {
+                    classify_rl(e)
+                }
+            },
+            classify_batch_test,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            *saw_batch.lock().unwrap(),
+            "short leader should have batched both requests"
+        );
+        assert!(
+            leader_err.to_string().contains("timeout")
+                || leader_err.to_string().contains("no answer"),
+            "unexpected leader error: {leader_err}"
+        );
+
+        let waiter_ans = waiter
+            .await
+            .unwrap()
+            .expect("longer-deadline waiter must not be failed by short-deadline leader's timeout");
+        assert_eq!(waiter_ans.answers["size"]["score"], 2);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_peer_not_resent_after_split_and_no_orphaned_done() {
+        let (dir, blocks) = temp_dirs("expired-peer");
+        let primary = JudgeEndpoint::new("vercel", "judge");
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let t0_ms = t0.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let m0 = Instant::now();
+
+        // 1. Combined request fails with ambiguous 400 after peer's deadline passes:
+        // peer must NOT be re-sent and must NOT get an orphaned .done file.
+        let peer_id = format!("{}-expired-split", std::process::id());
+        let peer_req = request("peer-short");
+        let peer_entry = serde_json::json!({
+            "group": group_of(&peer_req, &primary, None),
+            "request": peer_req,
+            "body": "peer",
+            "deadline_ms": t0_ms + 500,
+        });
+        write_atomic(&dir.join(format!("{peer_id}.req")), &peer_entry.to_string()).unwrap();
+
+        let wall = Rc::new(Cell::new(t0));
+        let mono = Rc::new(Cell::new(m0));
+        let m_now = mono.clone();
+        let w_now = wall.clone();
+        let m_call = mono.clone();
+        let w_call = wall.clone();
+        let sent = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let sent_cb = sent.clone();
+
+        let ans = ask_inner(
+            &dir,
+            &request("leader-long"),
+            "leader",
+            Duration::from_secs(10),
+            &blocks,
+            &primary,
+            None,
+            move || m_now.get(),
+            move || w_now.get(),
+            |_| async {},
+            false,
+            move |_ep, req, _body, _deadline| {
+                let sent_cb = sent_cb.clone();
+                let mut log = sent_cb.lock().unwrap();
+                log.push(req.clone());
+                let call_no = log.len();
+                drop(log);
+                if call_no == 1 {
+                    // Advance past peer's 500ms deadline during the combined call.
+                    m_call.set(m_call.get() + Duration::from_millis(700));
+                    w_call.set(w_call.get() + Duration::from_millis(700));
+                }
+                async move {
+                    if call_no == 1 {
+                        return Err(anyhow::anyhow!("jev_http_status_400"));
+                    }
+                    let mut a = Map::new();
+                    for k in req["questions"].as_object().unwrap().keys() {
+                        a.insert(k.clone(), serde_json::json!({"score": 1}));
+                    }
+                    Ok((Value::Object(a), Some(0.01)))
+                }
+            },
+            classify_rl,
+            classify_batch_test,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ans.answers["size"]["score"], 1);
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            2,
+            "expired peer must be dropped before retry (expected 2 sends: batch + leader solo)"
+        );
+        assert!(
+            !dir.join(format!("{peer_id}.done")).exists(),
+            "expired peer must not receive an orphaned .done file"
+        );
+        let _ = std::fs::remove_file(dir.join(format!("{peer_id}.req")));
+
+        // 2. Combined request succeeds AFTER peer's deadline passes:
+        // leader still gets its answer, but expired peer must NOT get an orphaned .done file.
+        wall.set(t0);
+        mono.set(m0);
+        let peer2_id = format!("{}-expired-done", std::process::id());
+        let peer2_req = request("peer-late");
+        let peer2_entry = serde_json::json!({
+            "group": group_of(&peer2_req, &primary, None),
+            "request": peer2_req,
+            "body": "peer2",
+            "deadline_ms": t0_ms + 500,
+        });
+        write_atomic(
+            &dir.join(format!("{peer2_id}.req")),
+            &peer2_entry.to_string(),
+        )
+        .unwrap();
+
+        let m_now2 = mono.clone();
+        let w_now2 = wall.clone();
+        let m_call2 = mono.clone();
+        let w_call2 = wall.clone();
+        let ans2 = ask_inner(
+            &dir,
+            &request("leader-long-2"),
+            "leader2",
+            Duration::from_secs(10),
+            &blocks,
+            &primary,
+            None,
+            move || m_now2.get(),
+            move || w_now2.get(),
+            |_| async {},
+            false,
+            move |_ep, req, _body, _deadline| {
+                m_call2.set(m_call2.get() + Duration::from_millis(700));
+                w_call2.set(w_call2.get() + Duration::from_millis(700));
+                async move {
+                    let mut a = Map::new();
+                    for k in req["questions"].as_object().unwrap().keys() {
+                        a.insert(k.clone(), serde_json::json!({"score": 2}));
+                    }
+                    Ok((Value::Object(a), Some(0.02)))
+                }
+            },
+            classify_rl,
+            classify_batch_test,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ans2.answers["size"]["score"], 2);
+        assert!(
+            !dir.join(format!("{peer2_id}.done")).exists(),
+            "late response after peer expiry must not leave an orphaned .done file"
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ambiguous_400_falls_back_one_by_one_with_batch_plus_one_send_cap() {
+        let (dir, blocks) = temp_dirs("ambig-400-cap");
+        let primary = JudgeEndpoint::new("vercel", "judge");
+        let items: Vec<(Value, String)> = (0..8)
+            .map(|i| {
+                let r = request(&format!("task-{i}"));
+                let b = r.to_string();
+                (r, b)
+            })
+            .collect();
+        let sends = Arc::new(Mutex::new(0usize));
+        let s = sends.clone();
+        let outcomes = ask_many_with_deadline(
+            &dir,
+            &items,
+            Duration::from_secs(30),
+            &blocks,
+            &primary,
+            None,
+            move |_ep, _req, _body, _deadline| {
+                let s = s.clone();
+                async move {
+                    *s.lock().unwrap() += 1;
+                    Err::<(Value, Option<f64>), anyhow::Error>(anyhow::anyhow!(
+                        "jev_http_status_400"
+                    ))
+                }
+            },
+            classify_rl,
+            classify_batch_test,
+        )
+        .await;
+        assert_eq!(outcomes.len(), 8);
+        assert!(outcomes.iter().all(Result::is_err));
+        assert_eq!(
+            *sends.lock().unwrap(),
+            9,
+            "ambiguous 400 on 8 tasks must fall back one-by-one capped at batch_size + 1 (9), not 15 via bisect"
+        );
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }

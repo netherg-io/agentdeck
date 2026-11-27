@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use agentdeck_core::judge::{
-    BlockStore, DispatchBudget, FallbackTrigger, JudgeEndpoint, classify_http_status,
-    dispatch_with_deadline, format_rate_limit_exceeded, parse_retry_after, request_timeout,
+    BlockStore, DispatchBudget, FallbackTrigger, JudgeEndpoint, LanguageModelCache,
+    classify_http_status, default_runtime_base, dispatch_with_deadline, format_rate_limit_exceeded,
+    parse_retry_after, request_timeout,
 };
 use agentdeck_core::settings::{DEFAULT_DECISION_MODEL, PROVIDER_OPENROUTER, PROVIDER_VERCEL};
 use serde::{Deserialize, Serialize};
@@ -246,6 +247,7 @@ pub struct HttpCheckpointJudge {
     timeout: Duration,
     deadline: Duration,
     blocks: BlockStore,
+    language_models: LanguageModelCache,
     client: reqwest::Client,
 }
 
@@ -277,6 +279,7 @@ impl HttpCheckpointJudge {
                 id: ep,
             })
         });
+        let runtime_base = default_runtime_base()?;
         Ok(Self {
             endpoint: endpoint.to_string(),
             api_key,
@@ -285,7 +288,8 @@ impl HttpCheckpointJudge {
             fallback,
             timeout: CHECKPOINT_JUDGE_TIMEOUT,
             deadline: CHECKPOINT_JUDGE_DEADLINE,
-            blocks: BlockStore::default_runtime()?,
+            blocks: BlockStore::for_runtime_dir(&runtime_base),
+            language_models: LanguageModelCache::for_runtime_dir(&runtime_base),
             client: reqwest::Client::builder()
                 .timeout(CHECKPOINT_JUDGE_TIMEOUT)
                 .build()?,
@@ -317,6 +321,7 @@ impl HttpCheckpointJudge {
     }
 
     pub fn with_blocks_dir(mut self, dir: PathBuf) -> Self {
+        self.language_models = LanguageModelCache::new(dir.join("language-models"));
         self.blocks = BlockStore::new(dir);
         self
     }
@@ -485,6 +490,11 @@ impl HttpCheckpointJudge {
     ) -> anyhow::Result<CheckpointVerdict> {
         let body = Self::request_body_for(&target.id.provider, &target.id.model, input);
         let check_lm = target.id.provider == PROVIDER_VERCEL;
+        if check_lm && self.language_models.is_language_model(&target.id) {
+            return self
+                .judge_with_chat_for(target, &body["input"], &body["questions"][0], deadline)
+                .await;
+        }
         let resp = match self
             .post_target(&target.endpoint, &target.api_key, &body, deadline, check_lm)
             .await
@@ -495,6 +505,8 @@ impl HttpCheckpointJudge {
                     && e.downcast_ref::<CheckpointHttpError>()
                         .is_some_and(|he| he.is_language_model) =>
             {
+                self.language_models
+                    .record_language_model_logged(&target.id);
                 return self
                     .judge_with_chat_for(target, &body["input"], &body["questions"][0], deadline)
                     .await;
@@ -640,6 +652,12 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
 
     fn judge_for(provider: &str) -> HttpCheckpointJudge {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "agentdeck-coord-test-blocks-{}-{}-{provider}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         HttpCheckpointJudge {
             endpoint: "http://127.0.0.1:1/v1/decisions".to_string(),
             api_key: "test".to_string(),
@@ -648,10 +666,8 @@ mod tests {
             fallback: None,
             timeout: CHECKPOINT_JUDGE_TIMEOUT,
             deadline: CHECKPOINT_JUDGE_DEADLINE,
-            blocks: BlockStore::new(std::env::temp_dir().join(format!(
-                "agentdeck-coord-test-blocks-{}-{provider}",
-                std::process::id()
-            ))),
+            blocks: BlockStore::new(base.join("blocks")),
+            language_models: LanguageModelCache::new(base.join("language-models")),
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
         }
     }
@@ -1104,5 +1120,97 @@ mod tests {
                 >= CHECKPOINT_FALLBACK_RESERVE,
             "checkpoint must reserve {CHECKPOINT_FALLBACK_RESERVE:?} for fallback"
         );
+    }
+
+    #[tokio::test]
+    async fn vercel_language_model_cached_skips_decisions_on_later_calls() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let blocks_dir =
+            std::env::temp_dir().join(format!("agentdeck-coord-lm-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&blocks_dir);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1/decisions", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_bg = stop.clone();
+        let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let paths_bg = paths.clone();
+        let srv = std::thread::spawn(move || {
+            let chat_ok =
+                json!({"choices": [{"message": {"content": r#"{"score": 3, "confidence": 0.9}"#}}]})
+                    .to_string();
+            let lm_400 = r#"{"error":"test-model is a language model"}"#;
+            while !stop_bg.load(Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        len = v.trim().parse().unwrap();
+                    }
+                }
+                let mut buf = vec![0; len];
+                reader.read_exact(&mut buf).unwrap();
+                let (status, body) = if first.contains("/v1/decisions") {
+                    ("400 Bad Request", lm_400)
+                } else {
+                    ("200 OK", chat_ok.as_str())
+                };
+                paths_bg.lock().unwrap().push(first);
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+
+        let mut judge1 = judge_for(PROVIDER_VERCEL).with_blocks_dir(blocks_dir.clone());
+        judge1.endpoint = endpoint.clone();
+        let v1 = judge1
+            .judge(&sample_input(), &CoordinatorConfig::default())
+            .await
+            .unwrap();
+        assert!(v1.should_checkpoint);
+
+        let mut judge2 = judge_for(PROVIDER_VERCEL).with_blocks_dir(blocks_dir.clone());
+        judge2.endpoint = endpoint;
+        let v2 = judge2
+            .judge(&sample_input(), &CoordinatorConfig::default())
+            .await
+            .unwrap();
+        assert!(v2.should_checkpoint);
+
+        stop.store(true, Ordering::SeqCst);
+        srv.join().unwrap();
+        let seen = paths.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            3,
+            "second checkpoint call must go straight to /v1/chat/completions without hitting /v1/decisions: {seen:?}"
+        );
+        assert!(seen[0].contains("/v1/decisions"));
+        assert!(seen[1].contains("/v1/chat/completions"));
+        assert!(seen[2].contains("/v1/chat/completions"));
+        let _ = std::fs::remove_dir_all(&blocks_dir);
     }
 }

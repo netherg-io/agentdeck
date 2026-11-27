@@ -913,6 +913,11 @@ fn route_batch_lists_schema_handles_invalid_and_warms_hook_cache() {
     ] {
         std::fs::create_dir_all(p).unwrap();
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     std::fs::write(
         dir.join("config/instances.toml"),
         "version = 1\n\n[plugins]\nmcp-server = true\nrouter = true\n",
@@ -1160,6 +1165,11 @@ fn route_batch_resolves_secondary_account_via_t3_thread_and_hits_hook_cache() {
         codex_b_home.clone(),
     ] {
         std::fs::create_dir_all(p).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     std::fs::write(
         dir.join("config/instances.toml"),

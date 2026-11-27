@@ -11,8 +11,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use agentdeck_core::judge::{
-    BlockStore, DispatchBudget, FallbackTrigger, JudgeChannel, JudgeEndpoint, classify_http_status,
-    dispatch_with_deadline, parse_retry_after, request_timeout,
+    BlockStore, DispatchBudget, FallbackTrigger, JudgeChannel, JudgeEndpoint, LanguageModelCache,
+    classify_http_status, default_runtime_base, dispatch_with_deadline, parse_retry_after,
+    request_timeout,
 };
 use agentdeck_core::settings::{DEFAULT_DECISION_MODEL, PROVIDER_OPENROUTER, PROVIDER_VERCEL};
 use anyhow::{Context, Result, bail};
@@ -204,6 +205,7 @@ pub struct HttpPolicyJudge {
     deadline: Duration,
     max_rate_limit_wait: Duration,
     blocks: BlockStore,
+    language_models: LanguageModelCache,
 }
 
 impl fmt::Debug for HttpPolicyJudge {
@@ -225,8 +227,10 @@ impl HttpPolicyJudge {
             .timeout(JUDGE_TIMEOUT)
             .build()
             .context("failed to build policy judge HTTP client")?;
-        let blocks =
-            BlockStore::default_runtime().context("failed to resolve policy judge block store")?;
+        let runtime_base =
+            default_runtime_base().context("failed to resolve policy judge runtime base")?;
+        let blocks = BlockStore::for_runtime_dir(&runtime_base);
+        let language_models = LanguageModelCache::for_runtime_dir(&runtime_base);
         Ok(Self {
             client,
             primary,
@@ -235,6 +239,7 @@ impl HttpPolicyJudge {
             deadline: DEFAULT_JUDGE_DEADLINE,
             max_rate_limit_wait: MAX_RATE_LIMIT_WAIT,
             blocks,
+            language_models,
         })
     }
 
@@ -295,6 +300,7 @@ impl HttpPolicyJudge {
     }
 
     pub fn with_blocks_dir(mut self, dir: PathBuf) -> Self {
+        self.language_models = LanguageModelCache::new(dir.join("language-models"));
         self.blocks = BlockStore::new(dir);
         self
     }
@@ -358,24 +364,30 @@ impl HttpPolicyJudge {
         let base = target.effective_base();
 
         if target.endpoint.provider == PROVIDER_VERCEL {
-            let decisions_url = format!("{base}/v1/decisions");
-            let body = vercel_decisions_body(&target.endpoint.model, system, input);
-            match self
-                .post_json(&target.api_key, &decisions_url, &body, deadline, true)
-                .await
-            {
-                Ok(v) => return parse_decisions_verdict(&v),
-                Err(e)
-                    if e.downcast_ref::<JudgeError>().is_some_and(|je| {
-                        matches!(
-                            je,
-                            JudgeError::HttpStatus {
-                                is_language_model: true,
-                                ..
-                            }
-                        )
-                    }) => {}
-                Err(e) => return Err(e),
+            if !self.language_models.is_language_model(&target.endpoint) {
+                let decisions_url = format!("{base}/v1/decisions");
+                let body = vercel_decisions_body(&target.endpoint.model, system, input);
+                match self
+                    .post_json(&target.api_key, &decisions_url, &body, deadline, true)
+                    .await
+                {
+                    Ok(v) => return parse_decisions_verdict(&v),
+                    Err(e)
+                        if e.downcast_ref::<JudgeError>().is_some_and(|je| {
+                            matches!(
+                                je,
+                                JudgeError::HttpStatus {
+                                    is_language_model: true,
+                                    ..
+                                }
+                            )
+                        }) =>
+                    {
+                        self.language_models
+                            .record_language_model_logged(&target.endpoint);
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             let chat_url = format!("{base}/v1/chat/completions");
             let chat_body = chat_completions_body(&target.endpoint.model, system, input);
@@ -833,13 +845,17 @@ mod tests {
         assert_eq!(ok.reason, "judge_approved");
         assert!(!ok.reason.contains("SECRET_TOKEN_12345"));
 
+        let blocks_dir =
+            std::env::temp_dir().join(format!("agentdeck-approver-no-leak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&blocks_dir);
         let vercel_judge = HttpPolicyJudge::new(
             Some(PROVIDER_VERCEL.into()),
             Some("openai/gpt-4o-mini".into()),
             "test-key".into(),
         )
         .unwrap()
-        .with_base_url(base);
+        .with_base_url(base)
+        .with_blocks_dir(blocks_dir.clone());
         let fallback = vercel_judge.evaluate(&req, &mandate).await.unwrap();
         assert!(!fallback.allow);
         assert_eq!(fallback.reason, "judge_denied");
@@ -848,6 +864,7 @@ mod tests {
         let paths = server.await.unwrap();
         assert!(paths[2].contains("/v1/decisions"));
         assert!(paths[3].contains("/v1/chat/completions"));
+        let _ = std::fs::remove_dir_all(&blocks_dir);
     }
 
     async fn mock_judge_server_with_headers(
@@ -1239,6 +1256,128 @@ mod tests {
             "11s 429 block must fail fast instead of waiting past the 10s cap; took {elapsed:?}"
         );
         assert_eq!(primary_srv.await.unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&blocks_dir);
+    }
+
+    #[tokio::test]
+    async fn vercel_language_model_cached_skips_decisions_across_instances() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let blocks_dir = std::env::temp_dir().join(format!(
+            "agentdeck-approver-lm-cache-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&blocks_dir);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = stop.clone();
+        let paths = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let paths_bg = paths.clone();
+        let srv = tokio::spawn(async move {
+            let chat_ok = json!({
+                "choices": [{"message": {"content": r#"{"allow": true, "confidence": 0.92, "reason": "ok"}"#}}]
+            })
+            .to_string();
+            let lm_400 = r#"{"error":"openai/gpt-4o-mini is a language model"}"#;
+            loop {
+                let accept =
+                    tokio::time::timeout(Duration::from_millis(50), listener.accept()).await;
+                let (stream, _) = match accept {
+                    Ok(Ok(pair)) => pair,
+                    Ok(Err(_)) => break,
+                    Err(_) if stop_bg.load(Ordering::SeqCst) => break,
+                    Err(_) => continue,
+                };
+                let mut stream = BufReader::new(stream);
+                let mut first = String::new();
+                stream.read_line(&mut first).await.unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        size = v.trim().parse().unwrap();
+                    }
+                }
+                let mut req_body = vec![0; size];
+                stream.read_exact(&mut req_body).await.unwrap();
+                let (status, body) = if first.contains("/v1/decisions") {
+                    ("400 Bad Request", lm_400)
+                } else {
+                    ("200 OK", chat_ok.as_str())
+                };
+                paths_bg.lock().await.push(first);
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let req: ApprovalRequest = serde_json::from_value(json!({
+            "kind": "confirm",
+            "title": "Redeploy",
+            "text": "staging",
+            "host": "local",
+            "thread_id": "t-1"
+        }))
+        .unwrap();
+        let mandate = MandateContext {
+            active_autonomous_run: true,
+            owner_granted: true,
+            thread_id: Some("t-1".into()),
+            ..Default::default()
+        };
+
+        let judge1 = HttpPolicyJudge::new(
+            Some(PROVIDER_VERCEL.into()),
+            Some("openai/gpt-4o-mini".into()),
+            "test-key".into(),
+        )
+        .unwrap()
+        .with_base_url(base.clone())
+        .with_blocks_dir(blocks_dir.clone());
+        let v1 = judge1.evaluate(&req, &mandate).await.unwrap();
+        assert!(v1.allow);
+
+        // Second independent instance ("next call / process") must skip /v1/decisions.
+        let judge2 = HttpPolicyJudge::new(
+            Some(PROVIDER_VERCEL.into()),
+            Some("openai/gpt-4o-mini".into()),
+            "test-key".into(),
+        )
+        .unwrap()
+        .with_base_url(base)
+        .with_blocks_dir(blocks_dir.clone());
+        let v2 = judge2.evaluate(&req, &mandate).await.unwrap();
+        assert!(v2.allow);
+
+        stop.store(true, Ordering::SeqCst);
+        srv.await.unwrap();
+        let seen = paths.lock().await;
+        assert_eq!(
+            seen.len(),
+            3,
+            "second approver call must go straight to /v1/chat/completions without hitting /v1/decisions: {seen:?}"
+        );
+        assert!(seen[0].contains("/v1/decisions"));
+        assert!(seen[1].contains("/v1/chat/completions"));
+        assert!(seen[2].contains("/v1/chat/completions"));
         let _ = std::fs::remove_dir_all(&blocks_dir);
     }
 }

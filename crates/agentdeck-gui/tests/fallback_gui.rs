@@ -334,7 +334,7 @@ fn fallback_check_honours_active_429_block_and_displays_error() {
     let (paths, guard) = fixture_paths("probe-blocked");
     Registry::update(&paths, |_| Ok(())).unwrap();
     let rt = guard.0.join("rt");
-    std::fs::create_dir_all(&rt).unwrap();
+    agentdeck_core::judge::create_private_dir(&rt).unwrap();
 
     let prev_rt = std::env::var_os("XDG_RUNTIME_DIR");
     // SAFETY: serialized by `lock()` across tests in this test binary.

@@ -19,14 +19,26 @@ use sha2::{Digest, Sha256};
 
 /// Default `Retry-After` when a 429 response omits the header or sends a non-integer.
 pub const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Default TTL for remembering that a `(provider, model)` pair is a language
+/// model (not a decision model) so later Vercel calls skip `/v1/decisions`.
+pub const LANGUAGE_MODEL_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Base directory name under the trusted per-user runtime dir storing per-pair 429 blocks.
 pub const JUDGE_BLOCKS_DIR_NAME: &str = "agentdeck-judge-blocks";
+/// Base directory name under the trusted per-user runtime dir storing language-model hints.
+pub const JUDGE_LANGUAGE_MODELS_DIR_NAME: &str = "agentdeck-judge-language-models";
 /// Upper bound on rate-limit wait loops within one deadline so a broken server
 /// replying `Retry-After: 0` cannot spin forever.
 const MAX_RATE_LIMIT_RETRIES: usize = 8;
-/// Maximum byte length accepted when reading a private runtime JSON file
-/// (429 block record or cached Jev routing entry).
-const MAX_PRIVATE_FILE_BYTES: u64 = 256 * 1024;
+/// Maximum byte length enforced symmetrically on both reads and writes of
+/// private runtime JSON files (429 blocks, language-model hints, Jev cache,
+/// and queue `.req`/`.done` entries).
+///
+/// The router itself accepts unbounded briefs, while T3/workflow enforces a
+/// 120 000-character task limit (`MAX_TASK`). Because queue `.req` files store
+/// both `request` and JSON-escaped `body`, a 120 000-char brief with multibyte
+/// UTF-8 or heavy escaping reaches ~1–1.6 MiB; 4 MiB gives >2.5x headroom above
+/// T3's maximum while still bounding memory against corrupt files.
+pub const MAX_PRIVATE_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// Upper bound on waiting for a per-pair block lock file for direct sync callers.
 pub const DEFAULT_BLOCK_LOCK_WAIT: Duration = Duration::from_secs(1);
 /// Tighter lock-wait ceiling inside [`dispatch_once`] so a suspended lock holder
@@ -250,10 +262,10 @@ fn current_euid() -> u32 {
 }
 
 /// Resolve the trusted per-user runtime base directory from explicit env inputs:
-/// 1. `xdg_runtime_dir` when set and non-empty (verified not a symlink, owned by
-///    current user, and not world-writable when it already exists).
-/// 2. `<home>/.cache/agentdeck/runtime` created `0700` and verified owner/type/mode
-///    before use.
+/// 1. `xdg_runtime_dir` when set to an existing, absolute, non-symlink directory
+///    owned by the current user with no group or other permissions (`mode & 0o077 == 0`).
+/// 2. Otherwise fall back to `<home>/.cache/agentdeck/runtime` created `0700`
+///    and verified owner/type/mode before use.
 ///
 /// Never falls back to a predictable shared `/tmp` path.
 pub fn runtime_base_from(
@@ -262,45 +274,22 @@ pub fn runtime_base_from(
 ) -> std::io::Result<PathBuf> {
     if let Some(xdg) = xdg_runtime_dir.filter(|v| !v.is_empty()) {
         let dir = PathBuf::from(xdg);
-        #[cfg(unix)]
+        if dir.is_absolute()
+            && let Ok(meta) = std::fs::symlink_metadata(&dir)
         {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            match std::fs::symlink_metadata(&dir) {
-                Ok(meta) => {
-                    if !meta.file_type().is_dir() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            "XDG_RUNTIME_DIR is not a real directory",
-                        ));
-                    }
-                    let euid = current_euid();
-                    if meta.uid() != euid {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            format!(
-                                "XDG_RUNTIME_DIR owned by uid {}, expected {euid}",
-                                meta.uid()
-                            ),
-                        ));
-                    }
-                    let mode = meta.permissions().mode() & 0o777;
-                    if mode & 0o002 != 0 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            format!("XDG_RUNTIME_DIR permissions {mode:o} are world-writable"),
-                        ));
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
+            #[cfg(unix)]
+            let trusted = verify_owner_and_private_mode(&meta, current_euid(), true).is_ok();
+            #[cfg(not(unix))]
+            let trusted = !meta.file_type().is_symlink() && meta.file_type().is_dir();
+            if trusted {
+                return Ok(dir);
             }
         }
-        return Ok(dir);
     }
     let home = home.filter(|v| !v.is_empty()).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "cannot resolve runtime dir: neither XDG_RUNTIME_DIR nor HOME is set",
+            "cannot resolve runtime dir: XDG_RUNTIME_DIR is unusable and HOME is not set",
         )
     })?;
     let dir = PathBuf::from(home).join(".cache/agentdeck/runtime");
@@ -309,7 +298,8 @@ pub fn runtime_base_from(
 }
 
 /// Trusted per-user runtime base directory shared across all consumers (Jev cache,
-/// queue spool, and 429 block store): `$XDG_RUNTIME_DIR` when set and non-empty,
+/// queue spool, 429 block store, and language-model hints): `$XDG_RUNTIME_DIR`
+/// when it is an existing, absolute, user-owned `0700`-private directory,
 /// otherwise `$HOME/.cache/agentdeck/runtime` created `0700` and verified.
 pub fn default_runtime_base() -> std::io::Result<PathBuf> {
     runtime_base_from(
@@ -318,8 +308,7 @@ pub fn default_runtime_base() -> std::io::Result<PathBuf> {
     )
 }
 
-/// Per-user subdirectory name for cross-process 429 block files so falling back
-/// to `/tmp` never collides with another local user.
+/// Per-user subdirectory name for cross-process 429 block files.
 pub fn blocks_dir_name() -> String {
     #[cfg(unix)]
     {
@@ -334,6 +323,23 @@ pub fn blocks_dir_name() -> String {
 /// Resolve the per-user judge block directory inside a runtime base directory.
 pub fn blocks_dir_for_runtime(runtime_base: &Path) -> PathBuf {
     runtime_base.join(blocks_dir_name())
+}
+
+/// Per-user subdirectory name for cross-process language-model hints.
+pub fn language_models_dir_name() -> String {
+    #[cfg(unix)]
+    {
+        format!("{JUDGE_LANGUAGE_MODELS_DIR_NAME}-{}", current_euid())
+    }
+    #[cfg(not(unix))]
+    {
+        JUDGE_LANGUAGE_MODELS_DIR_NAME.to_string()
+    }
+}
+
+/// Resolve the per-user judge language-model cache directory inside a runtime base directory.
+pub fn language_models_dir_for_runtime(runtime_base: &Path) -> PathBuf {
+    runtime_base.join(language_models_dir_name())
 }
 
 #[cfg(unix)]
@@ -510,7 +516,18 @@ pub fn read_private_entry(dir: &Path, path: &Path) -> std::io::Result<Option<Str
 
 /// Atomically write `text` to `path` with private `0600` permissions via a
 /// unique sibling `.tmp` file so concurrent processes cannot clobber each other.
+/// Enforces [`MAX_PRIVATE_FILE_BYTES`] at write time so entries written here
+/// can never exceed [`read_private_entry`]'s read limit.
 pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    if text.len() as u64 > MAX_PRIVATE_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "private runtime entry ({} bytes) exceeds {MAX_PRIVATE_FILE_BYTES}-byte limit",
+                text.len()
+            ),
+        ));
+    }
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let tmp = PathBuf::from(format!(
         "{}.{}.{}.tmp",
@@ -560,6 +577,108 @@ fn system_time_ms(t: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
+fn endpoint_stem(endpoint: &JudgeEndpoint) -> String {
+    let mut h = Sha256::new();
+    h.update(endpoint.provider.as_bytes());
+    h.update([0u8]);
+    h.update(endpoint.model.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LanguageModelRecord {
+    provider: String,
+    model: String,
+    expires_at_ms: u64,
+}
+
+/// Cross-process cache remembering `(provider, model)` pairs known to be
+/// language models (not decision models) so Vercel calls go straight to
+/// `/v1/chat/completions` without wasting budget on `/v1/decisions` first.
+#[derive(Debug, Clone)]
+pub struct LanguageModelCache {
+    dir: PathBuf,
+}
+
+impl LanguageModelCache {
+    pub fn default_runtime() -> std::io::Result<Self> {
+        Ok(Self::for_runtime_dir(&default_runtime_base()?))
+    }
+
+    pub fn for_runtime_dir(runtime_dir: &Path) -> Self {
+        Self {
+            dir: language_models_dir_for_runtime(runtime_dir),
+        }
+    }
+
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn entry_path(&self, endpoint: &JudgeEndpoint) -> PathBuf {
+        self.dir.join(format!("{}.json", endpoint_stem(endpoint)))
+    }
+
+    pub fn is_language_model_at(&self, endpoint: &JudgeEndpoint, now: SystemTime) -> bool {
+        let path = self.entry_path(endpoint);
+        let text = match read_private_entry(&self.dir, &path) {
+            Ok(Some(t)) => t,
+            Ok(None) => return false,
+            Err(e) => {
+                eprintln!(
+                    "agentdeck: refusing untrusted judge language-model entry {}: {e}",
+                    path.display()
+                );
+                return false;
+            }
+        };
+        let Ok(rec) = serde_json::from_str::<LanguageModelRecord>(&text) else {
+            return false;
+        };
+        rec.provider == endpoint.provider
+            && rec.model == endpoint.model
+            && rec.expires_at_ms > system_time_ms(now)
+    }
+
+    pub fn is_language_model(&self, endpoint: &JudgeEndpoint) -> bool {
+        self.is_language_model_at(endpoint, SystemTime::now())
+    }
+
+    pub fn record_language_model_at(
+        &self,
+        endpoint: &JudgeEndpoint,
+        ttl: Duration,
+        now: SystemTime,
+    ) -> std::io::Result<()> {
+        create_private_dir(&self.dir)?;
+        let add_ms = ttl.as_millis().min(u64::MAX as u128) as u64;
+        let rec = LanguageModelRecord {
+            provider: endpoint.provider.clone(),
+            model: endpoint.model.clone(),
+            expires_at_ms: system_time_ms(now).saturating_add(add_ms),
+        };
+        let text = serde_json::to_string(&rec).map_err(std::io::Error::other)?;
+        write_atomic(&self.entry_path(endpoint), &text)
+    }
+
+    pub fn record_language_model(&self, endpoint: &JudgeEndpoint) -> std::io::Result<()> {
+        self.record_language_model_at(endpoint, LANGUAGE_MODEL_TTL, SystemTime::now())
+    }
+
+    pub fn record_language_model_logged(&self, endpoint: &JudgeEndpoint) {
+        if let Err(err) = self.record_language_model(endpoint) {
+            eprintln!(
+                "agentdeck: failed to persist language-model hint for {}/{}: {err}",
+                endpoint.provider, endpoint.model
+            );
+        }
+    }
+}
+
 /// Cross-process 429 block store backed by private JSON files per `(provider, model)`.
 #[derive(Debug, Clone)]
 pub struct BlockStore {
@@ -587,22 +706,12 @@ impl BlockStore {
         &self.dir
     }
 
-    fn endpoint_stem(endpoint: &JudgeEndpoint) -> String {
-        let mut h = Sha256::new();
-        h.update(endpoint.provider.as_bytes());
-        h.update([0u8]);
-        h.update(endpoint.model.as_bytes());
-        format!("{:x}", h.finalize())
-    }
-
     pub fn block_path(&self, endpoint: &JudgeEndpoint) -> PathBuf {
-        self.dir
-            .join(format!("{}.json", Self::endpoint_stem(endpoint)))
+        self.dir.join(format!("{}.json", endpoint_stem(endpoint)))
     }
 
     fn lock_path(&self, endpoint: &JudgeEndpoint) -> PathBuf {
-        self.dir
-            .join(format!("{}.lock", Self::endpoint_stem(endpoint)))
+        self.dir.join(format!("{}.lock", endpoint_stem(endpoint)))
     }
 
     fn read_until_ms(&self, endpoint: &JudgeEndpoint) -> Option<u64> {
@@ -1859,6 +1968,147 @@ mod tests {
             "symlinked fallback runtime base must be refused"
         );
         let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_base_requires_existing_absolute_private_xdg_or_falls_back_to_home() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root =
+            std::env::temp_dir().join(format!("agentdeck-xdg-strict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let fake_home = root.join("home");
+        let expected_fallback = fake_home.join(".cache/agentdeck/runtime");
+        std::fs::create_dir_all(&fake_home).unwrap();
+
+        // 1. Valid existing absolute 0700 XDG_RUNTIME_DIR keeps its exact path.
+        let good_xdg = root.join("xdg-0700");
+        std::fs::create_dir_all(&good_xdg).unwrap();
+        std::fs::set_permissions(&good_xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            runtime_base_from(Some(good_xdg.as_os_str()), Some(fake_home.as_os_str())).unwrap(),
+            good_xdg
+        );
+
+        // 2. Group/other accessible modes (0770, 0750, 0755) fall back to $HOME/.cache/agentdeck/runtime.
+        for mode in [0o770u32, 0o750, 0o755] {
+            let loose_xdg = root.join(format!("xdg-{mode:o}"));
+            std::fs::create_dir_all(&loose_xdg).unwrap();
+            std::fs::set_permissions(&loose_xdg, std::fs::Permissions::from_mode(mode)).unwrap();
+            let resolved =
+                runtime_base_from(Some(loose_xdg.as_os_str()), Some(fake_home.as_os_str()))
+                    .unwrap();
+            assert_eq!(
+                resolved, expected_fallback,
+                "XDG_RUNTIME_DIR with mode {mode:o} must fall back to HOME runtime base"
+            );
+        }
+
+        // 3. Non-existent XDG_RUNTIME_DIR falls back.
+        let missing_xdg = root.join("does-not-exist");
+        assert_eq!(
+            runtime_base_from(Some(missing_xdg.as_os_str()), Some(fake_home.as_os_str())).unwrap(),
+            expected_fallback,
+            "missing XDG_RUNTIME_DIR must fall back to HOME runtime base"
+        );
+
+        // 4. Relative XDG_RUNTIME_DIR falls back.
+        assert_eq!(
+            runtime_base_from(
+                Some(OsStr::new("relative/xdg")),
+                Some(fake_home.as_os_str())
+            )
+            .unwrap(),
+            expected_fallback,
+            "relative XDG_RUNTIME_DIR must fall back to HOME runtime base"
+        );
+
+        // 5. Symlink XDG_RUNTIME_DIR falls back.
+        let link_xdg = root.join("xdg-symlink");
+        symlink(&good_xdg, &link_xdg).unwrap();
+        assert_eq!(
+            runtime_base_from(Some(link_xdg.as_os_str()), Some(fake_home.as_os_str())).unwrap(),
+            expected_fallback,
+            "symlink XDG_RUNTIME_DIR must fall back to HOME runtime base"
+        );
+
+        // 6. Regular file XDG_RUNTIME_DIR falls back.
+        let file_xdg = root.join("xdg-file");
+        std::fs::write(&file_xdg, "not a dir").unwrap();
+        std::fs::set_permissions(&file_xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            runtime_base_from(Some(file_xdg.as_os_str()), Some(fake_home.as_os_str())).unwrap(),
+            expected_fallback,
+            "non-directory XDG_RUNTIME_DIR must fall back to HOME runtime base"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn language_model_cache_honours_ttl_provider_isolation_and_private_perms() {
+        let dir =
+            std::env::temp_dir().join(format!("agentdeck-lm-cache-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = LanguageModelCache::new(dir.clone());
+        let vercel_ep = JudgeEndpoint::new("vercel", "openai/gpt-4o-mini");
+        let or_ep = JudgeEndpoint::new("openrouter", "openai/gpt-4o-mini");
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        assert!(!cache.is_language_model_at(&vercel_ep, t0));
+        cache
+            .record_language_model_at(&vercel_ep, LANGUAGE_MODEL_TTL, t0)
+            .unwrap();
+        assert!(cache.is_language_model_at(&vercel_ep, t0 + Duration::from_secs(3600)));
+        assert!(
+            !cache.is_language_model_at(&or_ep, t0 + Duration::from_secs(3600)),
+            "provider+model key must isolate distinct providers"
+        );
+        assert!(
+            !cache.is_language_model_at(&vercel_ep, t0 + LANGUAGE_MODEL_TTL),
+            "entry must expire at TTL"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = cache.entry_path(&vercel_ep);
+            assert_eq!(
+                std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(
+                !cache.is_language_model_at(&vercel_ep, t0 + Duration::from_secs(1)),
+                "loose permissions on language-model entry must be refused"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_and_read_private_entry_share_size_limit() {
+        let dir =
+            std::env::temp_dir().join(format!("agentdeck-private-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        create_private_dir(&dir).unwrap();
+        let path = dir.join("entry.json");
+
+        // Exact cap succeeds on both write and read.
+        let at_cap = "x".repeat(MAX_PRIVATE_FILE_BYTES as usize);
+        write_atomic(&path, &at_cap).unwrap();
+        assert_eq!(
+            read_private_entry(&dir, &path).unwrap().unwrap().len(),
+            MAX_PRIVATE_FILE_BYTES as usize
+        );
+
+        // One byte over cap fails explicitly at write time.
+        let over_cap = "x".repeat(MAX_PRIVATE_FILE_BYTES as usize + 1);
+        let err = write_atomic(&dir.join("over.json"), &over_cap).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!dir.join("over.json").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

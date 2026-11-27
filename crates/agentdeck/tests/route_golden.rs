@@ -91,6 +91,12 @@ impl Fixture {
         ] {
             std::fs::create_dir_all(dir.join(rel)).unwrap();
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join("rt-rust"), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
         std::fs::copy(
             workspace_root().join("crates/agentdeck/tests/fixtures/catalog.fixture.json"),
             dir.join(".local/state/model-route/catalog.json"),
