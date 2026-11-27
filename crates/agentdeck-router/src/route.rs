@@ -1365,6 +1365,19 @@ async fn jev_fetch_endpoint(
             None => decision_key("AI_GATEWAY_API_KEY", "vercel.key")?,
         };
         let decisions_url = format!("{}/v1/decisions", bases.vercel.trim_end_matches('/'));
+        let chat_url = format!("{}/v1/chat/completions", bases.vercel.trim_end_matches('/'));
+        // One-by-one retries after a batch already learned this is a chat model go straight to chat.
+        if send_guard.is_some_and(|g| g.is_language_model(&endpoint.model)) {
+            let v = post_json(
+                &chat_url,
+                &key,
+                gateway_body(&eff_request).to_string(),
+                deadline,
+                false,
+            )
+            .await?;
+            return Ok((gateway_answers(&v)?, None));
+        }
         match post_json(
             &decisions_url,
             &key,
@@ -1384,6 +1397,9 @@ async fn jev_fetch_endpoint(
                 if e.downcast_ref::<JevHttpError>()
                     .is_some_and(|he| he.is_language_model) =>
             {
+                if let Some(guard) = send_guard {
+                    guard.mark_language_model(&endpoint.model);
+                }
                 let next_request = match send_guard {
                     Some(guard) => {
                         let (rebuilt, _) =
@@ -1394,8 +1410,6 @@ async fn jev_fetch_endpoint(
                 };
                 let chat_eff =
                     with_endpoint_model(next_request.as_ref().unwrap_or(request), &endpoint.model);
-                let chat_url =
-                    format!("{}/v1/chat/completions", bases.vercel.trim_end_matches('/'));
                 let v = post_json(
                     &chat_url,
                     &key,
@@ -4803,6 +4817,88 @@ mod gateway_tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir3);
+
+        // 4. Vercel chat model, no fallback: the batch chat answer omits t1, so t1 is retried
+        // alone and must go straight to chat (decisions already said "language model"):
+        // decisions + batch chat + single chat = 3 = cap for 2 tasks.
+        let (dir4, env4) = setup_batch_env("vc-lm-partial");
+        let router_json4 = std::path::PathBuf::from(env4.router_json.as_ref().unwrap());
+        let mut cfg4: Value =
+            serde_json::from_str(&std::fs::read_to_string(&router_json4).unwrap()).unwrap();
+        cfg4["decisionProvider"] = serde_json::json!("vercel");
+        cfg4["decisionModel"] = serde_json::json!("openai/gpt-4o-mini");
+        std::fs::write(&router_json4, cfg4.to_string()).unwrap();
+        let decisions4 = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let decisions4_bg = decisions4.clone();
+        let (vc_base4, stop_vc4, hits_vc4, srv_vc4) = spawn_http_server(move |first, req| {
+            if first.contains("/v1/decisions") {
+                *decisions4_bg.lock().unwrap() += 1;
+                return (
+                    "400 Bad Request",
+                    r#"{"error":"openai/gpt-4o-mini is a language model"}"#.into(),
+                );
+            }
+            let user: Value = req
+                .pointer("/messages/1/content")
+                .and_then(Value::as_str)
+                .and_then(|c| serde_json::from_str(c).ok())
+                .unwrap_or(Value::Null);
+            let combined = user.pointer("/state/tasks").is_some();
+            let mut answers = serde_json::Map::new();
+            for key in user["questions"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(k, _)| k)
+            {
+                if combined && !key.starts_with("t0__") {
+                    continue;
+                }
+                let score = if key.ends_with("review") { 0 } else { 1 };
+                answers.insert(
+                    key.clone(),
+                    serde_json::json!({"score": score, "confidence": 0.9,
+                        "probabilities": {"0": 0.1, "1": 0.7, "2": 0.1, "3": 0.1}}),
+                );
+            }
+            let content = Value::Object(answers).to_string();
+            let body = serde_json::json!({"choices": [{"message": {"content": content}}]});
+            ("200 OK", body.to_string())
+        });
+        let launches4: Vec<Value> = make_launches("vc-lm-partial").into_iter().take(2).collect();
+        let res4 = route_batch_with_bases(
+            &env4,
+            &launches4,
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: Some("claudeAgent".into()),
+                budget: std::time::Duration::from_secs(10),
+            },
+            &JevBases {
+                openrouter: "http://127.0.0.1:1".into(),
+                vercel: vc_base4,
+            },
+            Some("test-key"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        stop_vc4.store(true, Ordering::SeqCst);
+        srv_vc4.join().unwrap();
+        for (i, r) in res4.iter().enumerate() {
+            assert!(
+                r.get("error").is_none(),
+                "task {i} must be answered via chat: {r}"
+            );
+        }
+        assert_eq!(
+            *decisions4.lock().unwrap(),
+            1,
+            "one-by-one retry must skip /v1/decisions"
+        );
+        assert_eq!(*hits_vc4.lock().unwrap(), 3);
+        let _ = std::fs::remove_dir_all(&dir4);
     }
 }
 

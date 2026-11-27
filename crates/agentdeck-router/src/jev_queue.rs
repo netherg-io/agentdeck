@@ -90,6 +90,8 @@ struct BatchSendState {
     active: Vec<Pending>,
     sends: Arc<AtomicUsize>,
     max_sends: Option<usize>,
+    /// Vercel models that answered `is a language model` in this lead round.
+    language_models: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Per-attempt guard shared with `fetch` so every actual HTTP send (primary,
@@ -103,23 +105,46 @@ pub struct BatchSendGuard {
 }
 
 impl BatchSendGuard {
-    fn new(active: Vec<Pending>, sends: Arc<AtomicUsize>, max_sends: Option<usize>) -> Self {
+    fn new(
+        active: Vec<Pending>,
+        sends: Arc<AtomicUsize>,
+        max_sends: Option<usize>,
+        language_models: Arc<Mutex<HashSet<String>>>,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(BatchSendState {
                 active,
                 sends,
                 max_sends,
+                language_models,
             })),
         }
+    }
+
+    /// True once this lead round saw `model` answer `is a language model`.
+    pub fn is_language_model(&self, model: &str) -> bool {
+        let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let set = state
+            .language_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set.contains(model)
+    }
+
+    pub fn mark_language_model(&self, model: &str) {
+        let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut set = state
+            .language_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set.insert(model.to_string());
     }
 
     /// Re-check `.req` existence and monotonic deadlines, reserve one HTTP send
     /// against the batch cap, and build `(request, body)` from surviving tasks.
     pub fn prepare_send(&self, now_mono_ms: u64) -> anyhow::Result<(Value, String)> {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        state
-            .active
-            .retain(|p| !p.is_expired(now_mono_ms) && p.path.exists());
+        state.active.retain(|p| p.is_live(now_mono_ms));
         if state.active.is_empty() {
             return Err(NoLiveParticipants.into());
         }
@@ -649,6 +674,18 @@ impl Pending {
     fn is_expired(&self, now_mono_ms: u64) -> bool {
         self.deadline_mono_ms.is_some_and(|dl| now_mono_ms >= dl)
     }
+
+    /// Not expired, `.req` still present and its owning process still running.
+    fn is_live(&self, now_mono_ms: u64) -> bool {
+        !self.is_expired(now_mono_ms) && self.path.exists() && pid_alive(&self.id)
+    }
+}
+
+/// Request ids start with the owning process's pid.
+fn pid_alive(id: &str) -> bool {
+    id.split('-')
+        .next()
+        .is_some_and(|pid| Path::new("/proc").join(pid).exists())
 }
 
 fn with_bounded_jitter(wait: Duration, remaining: Duration, add_jitter: bool) -> Duration {
@@ -719,17 +756,18 @@ where
     }
     let max_sends = (batch.len() > 1).then_some(batch.len() + 1);
     let sends = Arc::new(AtomicUsize::new(0));
+    let language_models = Arc::new(Mutex::new(HashSet::new()));
     let mut work: VecDeque<Vec<Pending>> = VecDeque::from([batch]);
     while let Some(mut sub) = work.pop_front() {
         if mono_now() >= deadline {
             return LeadOutcome::Done;
         }
         let now_mono = mono_now_ms();
-        sub.retain(|p| !p.is_expired(now_mono) && p.path.exists());
+        sub.retain(|p| p.is_live(now_mono));
         if sub.is_empty() {
             continue;
         }
-        let guard = BatchSendGuard::new(sub, sends.clone(), max_sends);
+        let guard = BatchSendGuard::new(sub, sends.clone(), max_sends, language_models.clone());
         let step = dispatch_once(
             blocks,
             primary,
@@ -902,11 +940,7 @@ fn collect(
             .and_then(|m| m.modified())
             .unwrap_or(UNIX_EPOCH);
         if let Some(id) = name.strip_suffix(".req") {
-            let alive = id
-                .split('-')
-                .next()
-                .is_some_and(|pid| Path::new("/proc").join(pid).exists());
-            if !alive {
+            if !pid_alive(id) {
                 let _ = std::fs::remove_file(&path);
                 continue;
             }
@@ -2352,6 +2386,25 @@ mod tests {
             .to_string(),
         )
         .unwrap();
+        // A third waiter whose process is killed mid-flight: its .req and deadline stay valid.
+        let mut killed_child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let killed_pid = killed_child.id();
+        let killed_id = format!("{killed_pid}-waiter-killed");
+        let killed_req = request("task-killed");
+        write_atomic(
+            &dir.join(format!("{killed_id}.req")),
+            &serde_json::json!({
+                "group": group,
+                "request": killed_req,
+                "body": "killed",
+                "deadline_mono_ms": mono0_ms + 10_000,
+            })
+            .to_string(),
+        )
+        .unwrap();
 
         let wall = Rc::new(Cell::new(t0));
         let mono = Rc::new(Cell::new(m0));
@@ -2388,6 +2441,11 @@ mod tests {
                     m_call.set(m_call.get() + Duration::from_millis(700));
                     ms_call.set(ms_call.get() + 700);
                     let _ = std::fs::remove_file(&gone_path_cb);
+                    // SAFETY: kill and reap our own child so its /proc entry disappears.
+                    unsafe {
+                        libc::kill(killed_pid as libc::pid_t, libc::SIGKILL);
+                        libc::waitpid(killed_pid as libc::pid_t, std::ptr::null_mut(), 0);
+                    }
                 }
                 async move {
                     if ep.provider == "vercel" {
@@ -2423,10 +2481,11 @@ mod tests {
         .await
         .unwrap();
 
+        let _ = killed_child.wait(); // already reaped above; keeps the Child handle accounted for
         let sent = sent_reqs.lock().unwrap();
         assert_eq!(sent.len(), 2, "primary 503 then fallback 200");
         assert_eq!(sent[0].0, "vercel");
-        assert_eq!(sent[0].1["state"]["tasks"].as_object().unwrap().len(), 3);
+        assert_eq!(sent[0].1["state"]["tasks"].as_object().unwrap().len(), 4);
         assert_eq!(sent[1].0, "openrouter");
         let fb_tasks = sent[1].1["state"]["tasks"].as_object().unwrap();
         assert_eq!(
@@ -2435,7 +2494,9 @@ mod tests {
             "fallback must drop expired waiter: {fb_tasks:?}"
         );
         assert!(
-            fb_tasks.values().all(|v| v.as_str() != Some("task-gone")),
+            fb_tasks
+                .values()
+                .all(|v| v.as_str() != Some("task-gone") && v.as_str() != Some("task-killed")),
             "fallback must not contain expired waiter task: {fb_tasks:?}"
         );
         assert_eq!(leader_ans.answers["size"]["score"], 1);
