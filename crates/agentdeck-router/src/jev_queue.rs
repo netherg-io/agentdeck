@@ -471,6 +471,9 @@ where
     }
     // Enqueue every request before acquiring the per-group lock so the first
     // leader turn sees the whole wave and packs up to MAX_TASKS into one judge request.
+    // Declare `locks` before `req_guard` so on cancellation/drop `req_guard` removes this
+    // caller's `.req` files while any held group locks are still locked.
+    let mut locks: HashMap<String, std::fs::File> = HashMap::new();
     let mut ids = Vec::with_capacity(items.len());
     let mut groups = Vec::with_capacity(items.len());
     let mut req_guard = ReqCleanupGuard {
@@ -499,7 +502,6 @@ where
         done_paths.push(done_path);
     }
     let own_ids: HashSet<&str> = ids.iter().map(String::as_str).collect();
-    let mut locks: HashMap<String, std::fs::File> = HashMap::new();
     let mut wait_retries: HashMap<String, usize> = HashMap::new();
     let fail_group = |target_group: &str,
                       msg: &str,

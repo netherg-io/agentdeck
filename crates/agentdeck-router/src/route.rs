@@ -3275,6 +3275,45 @@ fn accept_until(
 }
 
 #[cfg(test)]
+fn read_mock_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<(String, Vec<u8>)> {
+    use std::io::{BufRead, BufReader, Error, ErrorKind, Read};
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
+    let mut reader = BufReader::new(stream);
+    let mut first = String::new();
+    if reader.read_line(&mut first)? == 0 {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "client closed before request line",
+        ));
+    }
+    let mut size = 0usize;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "client closed before end of headers",
+            ));
+        }
+        if line == "\r\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            size = value
+                .trim()
+                .parse()
+                .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+        }
+    }
+    let mut body = vec![0; size];
+    reader.read_exact(&mut body)?;
+    Ok((first, body))
+}
+
+#[cfg(test)]
 struct MockServerHandle<T> {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<tokio::task::JoinHandle<T>>,
@@ -3305,7 +3344,7 @@ mod gateway_tests {
 
     #[tokio::test]
     async fn openrouter_chat_model_uses_chat_completions() {
-        use std::io::{BufRead, BufReader, Read, Write};
+        use std::io::Write;
         use std::sync::atomic::{AtomicBool, Ordering};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -3315,24 +3354,9 @@ mod gateway_tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let mut seen = Vec::new();
             if let Some(mut stream) = accept_until(&listener, Some(&stop_bg), deadline) {
-                let mut reader = BufReader::new(&mut stream);
-                let mut first = String::new();
-                reader.read_line(&mut first).unwrap();
-                let mut len = 0usize;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((n, v)) = line.split_once(':')
-                        && n.eq_ignore_ascii_case("content-length")
-                    {
-                        len = v.trim().parse().unwrap();
-                    }
-                }
-                let mut body = vec![0; len];
-                reader.read_exact(&mut body).unwrap();
+                let Ok((first, body)) = read_mock_http_request(&mut stream) else {
+                    return seen;
+                };
                 let content = r#"{"size":{"score":1,"confidence":0.9}}"#;
                 let response =
                     serde_json::json!({"choices": [{"message": {"content": content}}]}).to_string();
@@ -3420,7 +3444,7 @@ mod gateway_tests {
         responses: Vec<(&'static str, &'static str, String)>,
         accept_timeout: std::time::Duration,
     ) -> (String, MockServerHandle<Vec<(String, Value)>>) {
-        use std::io::{BufRead, BufReader, Read, Write};
+        use std::io::Write;
         use std::sync::atomic::AtomicBool;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -3433,24 +3457,9 @@ mod gateway_tests {
                 let Some(mut stream) = accept_until(&listener, Some(&stop_bg), deadline) else {
                     break;
                 };
-                let mut reader = BufReader::new(&mut stream);
-                let mut first = String::new();
-                reader.read_line(&mut first).unwrap();
-                let mut size = 0usize;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((name, value)) = line.split_once(':')
-                        && name.eq_ignore_ascii_case("content-length")
-                    {
-                        size = value.trim().parse().unwrap();
-                    }
-                }
-                let mut req_body = vec![0; size];
-                reader.read_exact(&mut req_body).unwrap();
+                let Ok((first, req_body)) = read_mock_http_request(&mut stream) else {
+                    break;
+                };
                 let parsed: Value = serde_json::from_slice(&req_body).unwrap_or(Value::Null);
                 write!(
                     stream,
@@ -3785,7 +3794,7 @@ mod gateway_tests {
     async fn dynamic_openrouter_server(
         expected_calls: usize,
     ) -> (String, MockServerHandle<Vec<Value>>) {
-        use std::io::{BufRead, BufReader, Read, Write};
+        use std::io::Write;
         use std::sync::atomic::AtomicBool;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -3798,27 +3807,9 @@ mod gateway_tests {
                 let Some(mut stream) = accept_until(&listener, Some(&stop_bg), deadline) else {
                     break;
                 };
-                stream
-                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                    .unwrap();
-                let mut reader = BufReader::new(&mut stream);
-                let mut first = String::new();
-                reader.read_line(&mut first).unwrap();
-                let mut size = 0usize;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((name, value)) = line.split_once(':')
-                        && name.eq_ignore_ascii_case("content-length")
-                    {
-                        size = value.trim().parse().unwrap();
-                    }
-                }
-                let mut req_body = vec![0; size];
-                reader.read_exact(&mut req_body).unwrap();
+                let Ok((_, req_body)) = read_mock_http_request(&mut stream) else {
+                    break;
+                };
                 let parsed: Value = serde_json::from_slice(&req_body).unwrap();
                 // Encode task index (0..3) into `size.score` so tests can verify
                 // per-launch ordering matches the input launches.
@@ -4139,7 +4130,7 @@ mod gateway_tests {
 
     #[tokio::test]
     async fn route_body_abort_falls_back_and_429_language_model_does_not_retry_chat() {
-        use std::io::{BufRead, BufReader, Read, Write};
+        use std::io::Write;
         let rt =
             std::env::temp_dir().join(format!("agentdeck-route-body-429-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&rt);
@@ -4158,24 +4149,9 @@ mod gateway_tests {
                 else {
                     break;
                 };
-                let mut reader = BufReader::new(&mut stream);
-                let mut first = String::new();
-                reader.read_line(&mut first).unwrap();
-                let mut size = 0usize;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((n, v)) = line.split_once(':')
-                        && n.eq_ignore_ascii_case("content-length")
-                    {
-                        size = v.trim().parse().unwrap();
-                    }
-                }
-                let mut buf = vec![0; size];
-                reader.read_exact(&mut buf).unwrap();
+                let Ok((first, _)) = read_mock_http_request(&mut stream) else {
+                    break;
+                };
                 vp.lock().unwrap().push(first);
                 if idx == 0 {
                     // Truncated 200 body -> body-read error -> transient -> fallback.
@@ -4214,24 +4190,9 @@ mod gateway_tests {
                 else {
                     break;
                 };
-                let mut reader = BufReader::new(&mut stream);
-                let mut first = String::new();
-                reader.read_line(&mut first).unwrap();
-                let mut size = 0usize;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((n, v)) = line.split_once(':')
-                        && n.eq_ignore_ascii_case("content-length")
-                    {
-                        size = v.trim().parse().unwrap();
-                    }
-                }
-                let mut buf = vec![0; size];
-                reader.read_exact(&mut buf).unwrap();
+                let Ok((_, _)) = read_mock_http_request(&mut stream) else {
+                    break;
+                };
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok_or}",
@@ -4321,7 +4282,7 @@ mod gateway_tests {
 
     #[tokio::test]
     async fn vercel_language_model_retry_and_fallback_share_single_deadline() {
-        use std::io::{BufRead, BufReader, Read, Write};
+        use std::io::Write;
         let rt =
             std::env::temp_dir().join(format!("agentdeck-route-deadline-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&rt);
@@ -4337,9 +4298,7 @@ mod gateway_tests {
             let mut seen = 0usize;
             if let Some(mut stream) = accept_until(&vercel_listener, Some(&vc_stop_bg), deadline) {
                 seen += 1;
-                let mut reader = BufReader::new(&mut stream);
-                let mut line = String::new();
-                let _ = reader.read_line(&mut line);
+                let _ = read_mock_http_request(&mut stream);
                 let sleep_until = std::time::Instant::now() + std::time::Duration::from_secs(2);
                 while !vc_stop_bg.load(std::sync::atomic::Ordering::SeqCst)
                     && std::time::Instant::now() < sleep_until
@@ -4365,24 +4324,9 @@ mod gateway_tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let mut seen = 0usize;
             if let Some(mut stream) = accept_until(&or_listener, Some(&or_stop_bg), deadline) {
-                let mut reader = BufReader::new(&mut stream);
-                let mut first = String::new();
-                reader.read_line(&mut first).unwrap();
-                let mut size = 0usize;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((n, v)) = line.split_once(':')
-                        && n.eq_ignore_ascii_case("content-length")
-                    {
-                        size = v.trim().parse().unwrap();
-                    }
-                }
-                let mut buf = vec![0; size];
-                reader.read_exact(&mut buf).unwrap();
+                let Ok((_, _)) = read_mock_http_request(&mut stream) else {
+                    return seen;
+                };
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok_or}",
@@ -4462,23 +4406,9 @@ mod gateway_tests {
                     break;
                 };
                 seen += 1;
-                let mut reader = BufReader::new(&mut stream);
-                let mut first = String::new();
-                let _ = reader.read_line(&mut first);
-                let mut size = 0usize;
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                        break;
-                    }
-                    if let Some((n, v)) = line.split_once(':')
-                        && n.eq_ignore_ascii_case("content-length")
-                    {
-                        size = v.trim().parse().unwrap_or(0);
-                    }
+                if read_mock_http_request(&mut stream).is_err() {
+                    continue;
                 }
-                let mut buf = vec![0; size];
-                let _ = reader.read_exact(&mut buf);
                 if idx == 0 {
                     std::thread::sleep(std::time::Duration::from_millis(450));
                     let b = r#"{"error":"model is a language model"}"#;
@@ -4685,7 +4615,7 @@ mod gateway_tests {
         std::fs::write(&router_json, cfg.to_string()).unwrap();
 
         let (or_base, or_stop, or_srv) = {
-            use std::io::{BufRead, BufReader, Read, Write};
+            use std::io::Write;
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -4697,24 +4627,9 @@ mod gateway_tests {
                     let Some(mut stream) = accept_until(&listener, Some(&stop_bg), deadline) else {
                         break;
                     };
-                    let mut reader = BufReader::new(&mut stream);
-                    let mut first = String::new();
-                    reader.read_line(&mut first).unwrap();
-                    let mut size = 0usize;
-                    loop {
-                        let mut line = String::new();
-                        reader.read_line(&mut line).unwrap();
-                        if line == "\r\n" {
-                            break;
-                        }
-                        if let Some((n, v)) = line.split_once(':')
-                            && n.eq_ignore_ascii_case("content-length")
-                        {
-                            size = v.trim().parse().unwrap();
-                        }
-                    }
-                    let mut buf = vec![0; size];
-                    reader.read_exact(&mut buf).unwrap();
+                    let Ok((_, _)) = read_mock_http_request(&mut stream) else {
+                        break;
+                    };
                     let body = serde_json::json!({
                         "answers": {
                             "size": {"score": 1, "confidence": 0.9},
@@ -4853,7 +4768,7 @@ mod gateway_tests {
 
     #[tokio::test]
     async fn batch_400_and_primary_503_fallback_400_cap_actual_http_sends() {
-        use std::io::{BufRead, BufReader, Read, Write};
+        use std::io::Write;
         use std::sync::atomic::{AtomicBool, Ordering};
 
         fn spawn_http_server(
@@ -4873,24 +4788,9 @@ mod gateway_tests {
             let handle = std::thread::spawn(move || {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                 while let Some(mut stream) = accept_until(&listener, Some(&stop_bg), deadline) {
-                    let mut reader = BufReader::new(&mut stream);
-                    let mut first = String::new();
-                    reader.read_line(&mut first).unwrap();
-                    let mut size = 0usize;
-                    loop {
-                        let mut line = String::new();
-                        reader.read_line(&mut line).unwrap();
-                        if line == "\r\n" {
-                            break;
-                        }
-                        if let Some((n, v)) = line.split_once(':')
-                            && n.eq_ignore_ascii_case("content-length")
-                        {
-                            size = v.trim().parse().unwrap();
-                        }
-                    }
-                    let mut req_body = vec![0; size];
-                    reader.read_exact(&mut req_body).unwrap();
+                    let Ok((first, req_body)) = read_mock_http_request(&mut stream) else {
+                        break;
+                    };
                     let parsed: Value = serde_json::from_slice(&req_body).unwrap_or(Value::Null);
                     *hits_bg.lock().unwrap() += 1;
                     let (status, body) = responder(&first, &parsed);
@@ -5171,7 +5071,7 @@ mod gateway_tests {
 
     #[tokio::test]
     async fn post_json_disables_redirects_and_fails_without_fallback() {
-        use std::io::{BufRead, BufReader, Read, Write};
+        use std::io::Write;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         let rt = std::env::temp_dir().join(format!(
@@ -5200,25 +5100,9 @@ mod gateway_tests {
                     }
                     Err(_) => break,
                 };
-                stream.set_nonblocking(false).unwrap();
-                let mut reader = BufReader::new(&mut stream);
-                let mut first = String::new();
-                reader.read_line(&mut first).unwrap();
-                let mut size = 0usize;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((n, v)) = line.split_once(':')
-                        && n.eq_ignore_ascii_case("content-length")
-                    {
-                        size = v.trim().parse().unwrap();
-                    }
+                if read_mock_http_request(&mut stream).is_err() {
+                    break;
                 }
-                let mut req_body = vec![0; size];
-                reader.read_exact(&mut req_body).unwrap();
                 let n = hits_bg.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
                     let body = "{}";
@@ -5333,7 +5217,7 @@ mod gateway_tests {
 
     #[tokio::test]
     async fn vercel_400_body_read_abort_triggers_fallback() {
-        use std::io::{BufRead, BufReader, Read, Write};
+        use std::io::Write;
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let rt =
@@ -5357,25 +5241,9 @@ mod gateway_tests {
                     }
                     Err(_) => break,
                 };
-                stream.set_nonblocking(false).unwrap();
-                let mut reader = BufReader::new(&mut stream);
-                let mut first = String::new();
-                reader.read_line(&mut first).unwrap();
-                let mut size = 0usize;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((n, v)) = line.split_once(':')
-                        && n.eq_ignore_ascii_case("content-length")
-                    {
-                        size = v.trim().parse().unwrap();
-                    }
-                }
-                let mut buf = vec![0; size];
-                reader.read_exact(&mut buf).unwrap();
+                let Ok((_, _)) = read_mock_http_request(&mut stream) else {
+                    break;
+                };
                 // Truncated 400 body -> body-read abort must be transient -> fallback.
                 let _ = stream.write_all(
                     b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 500\r\nConnection: close\r\n\r\n{\"error\":\"trunc",
@@ -5408,25 +5276,9 @@ mod gateway_tests {
                     }
                     Err(_) => break,
                 };
-                stream.set_nonblocking(false).unwrap();
-                let mut reader = BufReader::new(&mut stream);
-                let mut first = String::new();
-                reader.read_line(&mut first).unwrap();
-                let mut size = 0usize;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((n, v)) = line.split_once(':')
-                        && n.eq_ignore_ascii_case("content-length")
-                    {
-                        size = v.trim().parse().unwrap();
-                    }
-                }
-                let mut buf = vec![0; size];
-                reader.read_exact(&mut buf).unwrap();
+                let Ok((_, _)) = read_mock_http_request(&mut stream) else {
+                    break;
+                };
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok_or}",
@@ -5490,7 +5342,7 @@ mod gateway_tests {
 
     #[tokio::test]
     async fn route_batch_retries_out_of_range_split_answer_solo_within_send_cap() {
-        use std::io::{BufRead, BufReader, Read, Write};
+        use std::io::Write;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         let (dir, env) = setup_batch_env("split-out-of-range");
@@ -5512,25 +5364,9 @@ mod gateway_tests {
                     }
                     Err(_) => break,
                 };
-                stream.set_nonblocking(false).unwrap();
-                let mut reader = BufReader::new(&mut stream);
-                let mut first = String::new();
-                reader.read_line(&mut first).unwrap();
-                let mut size = 0usize;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((n, v)) = line.split_once(':')
-                        && n.eq_ignore_ascii_case("content-length")
-                    {
-                        size = v.trim().parse().unwrap();
-                    }
-                }
-                let mut req_body = vec![0; size];
-                reader.read_exact(&mut req_body).unwrap();
+                let Ok((_, req_body)) = read_mock_http_request(&mut stream) else {
+                    break;
+                };
                 let parsed: Value = serde_json::from_slice(&req_body).unwrap();
                 hits_bg.fetch_add(1, Ordering::SeqCst);
                 let combined = parsed.pointer("/state/tasks").is_some();
@@ -5709,11 +5545,30 @@ mod gateway_tests {
             .await
             .expect("mock_http_server must exit on deadline instead of hanging in accept()");
         assert_eq!(seen.len(), 0);
+
+        // Client closing mid-headers (EOF before blank line) must not spin forever in read_line.
+        let (base2, srv2) = mock_http_server_with_deadline(
+            vec![("200 OK", "", "{}".into())],
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        let addr = base2.trim_start_matches("http://");
+        {
+            use std::io::Write;
+            let mut client = std::net::TcpStream::connect(addr).unwrap();
+            client
+                .write_all(b"POST /v1/decisions HTTP/1.1\r\nHost: localhost\r\n")
+                .unwrap();
+        }
+        let seen2 = tokio::time::timeout(std::time::Duration::from_millis(600), srv2.wait())
+            .await
+            .expect("mock_http_server must exit cleanly on truncated request headers");
+        assert_eq!(seen2.len(), 0);
     }
 
     #[tokio::test]
     async fn gateway_body_follows_each_questions_criteria_count_on_vercel_and_openrouter() {
-        use std::io::{BufRead, BufReader, Read, Write};
+        use std::io::Write;
         use std::sync::atomic::{AtomicBool, Ordering};
 
         // 1. Uniform 2-criteria request: must use 0-1 and 2 criteria, never 0-3 / four.
@@ -5783,25 +5638,9 @@ mod gateway_tests {
                     }
                     Err(_) => break,
                 };
-                stream.set_nonblocking(false).unwrap();
-                let mut reader = BufReader::new(&mut stream);
-                let mut first = String::new();
-                reader.read_line(&mut first).unwrap();
-                let mut size = 0usize;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((n, v)) = line.split_once(':')
-                        && n.eq_ignore_ascii_case("content-length")
-                    {
-                        size = v.trim().parse().unwrap();
-                    }
-                }
-                let mut req_body = vec![0; size];
-                reader.read_exact(&mut req_body).unwrap();
+                let Ok((first, req_body)) = read_mock_http_request(&mut stream) else {
+                    break;
+                };
                 let parsed: Value = serde_json::from_slice(&req_body).unwrap_or(Value::Null);
                 cap_bg.lock().unwrap().push((first.clone(), parsed));
                 let (status, body) = if first.contains("/v1/decisions") {
@@ -6347,7 +6186,7 @@ mod probe_tests {
 
     #[tokio::test]
     async fn probe_decision_records_429_block_and_honours_active_block() {
-        use std::io::{BufRead, BufReader, Read, Write};
+        use std::io::Write;
         let dir = std::env::temp_dir().join(format!("agentdeck-probe-429-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -6362,24 +6201,9 @@ mod probe_tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             if let Some(mut stream) = super::accept_until(&listener, Some(&stop_bg), deadline) {
                 hits_bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut reader = BufReader::new(&mut stream);
-                let mut first = String::new();
-                reader.read_line(&mut first).unwrap();
-                let mut size = 0usize;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((n, v)) = line.split_once(':')
-                        && n.eq_ignore_ascii_case("content-length")
-                    {
-                        size = v.trim().parse().unwrap();
-                    }
-                }
-                let mut buf = vec![0; size];
-                reader.read_exact(&mut buf).unwrap();
+                let Ok((_, _)) = super::read_mock_http_request(&mut stream) else {
+                    return;
+                };
                 let body = r#"{"error":"rate limited"}"#;
                 write!(
                     stream,

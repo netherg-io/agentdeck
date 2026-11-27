@@ -1089,12 +1089,18 @@ mod tests {
 
         // Primary server:
         //   req 1: sends 200 OK with Content-Length: 500, partial body, then drops connection.
-        //   req 2: stalls for 2s (exceeds reserved budget of 800ms deadline).
+        //   req 2: sends 400 Bad Request with Content-Length: 500, partial body, then drops (transient -> fallback).
+        //   req 3: sends 307 Temporary Redirect (must not follow, must not fallback).
+        //   req 4: stalls for 2s (exceeds reserved budget of 800ms deadline).
         let primary_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let primary_base = format!("http://{}", primary_listener.local_addr().unwrap());
+        let primary_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary_hits_bg = primary_hits.clone();
+        let redirect_target = format!("{primary_base}/redirected");
         let primary_srv = tokio::spawn(async move {
-            for idx in 0..2 {
+            for idx in 0..4 {
                 let (stream, _) = primary_listener.accept().await.unwrap();
+                primary_hits_bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut stream = BufReader::new(stream);
                 let mut first = String::new();
                 stream.read_line(&mut first).await.unwrap();
@@ -1120,6 +1126,19 @@ mod tests {
                             b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\nConnection: close\r\n\r\n{\"answers\":",
                         )
                         .await;
+                } else if idx == 1 {
+                    // Truncated Vercel 400 body -> body-read abort is transient -> fallback.
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 500\r\nConnection: close\r\n\r\n{\"error\":",
+                        )
+                        .await;
+                } else if idx == 2 {
+                    // 307 redirect must fail without following or falling back.
+                    let resp = format!(
+                        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {redirect_target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
                 } else {
                     // Hang longer than the overall 800ms deadline.
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1129,6 +1148,7 @@ mod tests {
 
         let ok_fb = json!({"answers": {"permit": {"score": 1, "confidence": 0.95}}}).to_string();
         let (fb_base, fb_srv) = mock_judge_server_with_headers(vec![
+            ("200 OK", "", ok_fb.clone()),
             ("200 OK", "", ok_fb.clone()),
             ("200 OK", "", ok_fb),
         ])
@@ -1166,7 +1186,23 @@ mod tests {
         let v1 = judge.evaluate(&req, &mandate).await.unwrap();
         assert_eq!(v1.channel, Some(JudgeChannel::Fallback));
 
-        // 2. Hanging primary must time out early enough for fallback to succeed within 800ms.
+        // 2. Truncated Vercel 400 body must trigger fallback (transient body read abort).
+        let v2_400 = judge.evaluate(&req, &mandate).await.unwrap();
+        assert_eq!(v2_400.channel, Some(JudgeChannel::Fallback));
+
+        // 3. 307 redirect must fail without following redirect or calling fallback.
+        let err_307 = judge.evaluate(&req, &mandate).await.unwrap_err();
+        assert!(
+            err_307.to_string().contains("307"),
+            "307 redirect must surface HTTP 307 without fallback: {err_307}"
+        );
+        assert_eq!(
+            primary_hits.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "307 redirect must not issue a second HTTP request"
+        );
+
+        // 4. Hanging primary must time out early enough for fallback to succeed within 800ms.
         let started = std::time::Instant::now();
         let v2 = judge.evaluate(&req, &mandate).await.unwrap();
         let elapsed = started.elapsed();
@@ -1176,7 +1212,7 @@ mod tests {
             "must finish near 800ms deadline, took {elapsed:?}"
         );
 
-        assert_eq!(fb_srv.await.unwrap().len(), 2);
+        assert_eq!(fb_srv.await.unwrap().len(), 3);
         primary_srv.abort();
         let _ = std::fs::remove_dir_all(&blocks_dir);
     }
