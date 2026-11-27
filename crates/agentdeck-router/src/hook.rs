@@ -157,6 +157,133 @@ fn is_native_tool(name: &str) -> bool {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchKind {
+    Delegate,
+    Native,
+    Workflow,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedLaunch {
+    pub kind: LaunchKind,
+    pub tool_name: String,
+    pub brief: String,
+    pub target: Option<crate::route::ValidatedTarget>,
+    pub target_malformed: bool,
+    pub raw_target: Option<Value>,
+    pub markers: crate::policy::RouteMarkers,
+    pub is_review: bool,
+}
+
+fn unwrap_mcp_call<'a>(tool_name: &'a str, args: &'a Value) -> (&'a str, &'a Value) {
+    if tool_name == "call_mcp_tool"
+        && args
+            .get("ServerName")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s == "t3-code" || s == "t3_code")
+    {
+        (
+            str_field(args, "ToolName").unwrap_or_default(),
+            args.get("Arguments").unwrap_or(args),
+        )
+    } else {
+        (tool_name, args)
+    }
+}
+
+/// Shared launch parser used by both the pre-tool hook and `route_batch`:
+/// unwraps Antigravity `call_mcp_tool` envelopes, classifies the tool, extracts
+/// the task brief, `[route:...]` markers, review flag and optional target.
+pub fn parse_launch(tool_name: &str, args: &Value, harness: &str) -> anyhow::Result<ParsedLaunch> {
+    let (effective_name, effective_args) = unwrap_mcp_call(tool_name, args);
+    let kind = if is_delegate_tool(effective_name) {
+        LaunchKind::Delegate
+    } else if is_native_tool(effective_name) {
+        LaunchKind::Native
+    } else if effective_name == "Workflow" {
+        LaunchKind::Workflow
+    } else {
+        LaunchKind::Other
+    };
+    let raw_target = effective_args
+        .get("target")
+        .filter(|t| !t.is_null())
+        .cloned();
+    let (target, target_malformed) = if kind == LaunchKind::Delegate {
+        match raw_target.as_ref() {
+            None => (None, false),
+            Some(t) => {
+                let provider = t
+                    .get("providerInstanceId")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty());
+                let model = t
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty());
+                match (provider, model) {
+                    (Some(provider), Some(model)) => (
+                        Some(crate::route::ValidatedTarget {
+                            provider: provider.to_string(),
+                            model: model.to_string(),
+                        }),
+                        false,
+                    ),
+                    _ => (None, true),
+                }
+            }
+        }
+    } else {
+        (None, false)
+    };
+    let get_str = |key: &str| {
+        effective_args
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    };
+    let prompt = if !get_str("message").is_empty() {
+        get_str("message")
+    } else if !get_str("prompt").is_empty() {
+        get_str("prompt")
+    } else if !get_str("instructions").is_empty() {
+        get_str("instructions")
+    } else {
+        get_str("task")
+    };
+    let brief = match kind {
+        LaunchKind::Delegate => str_field(effective_args, "task")
+            .unwrap_or_default()
+            .to_string(),
+        LaunchKind::Native => {
+            if !prompt.trim().is_empty() {
+                prompt.to_string()
+            } else {
+                format!(
+                    "Subagent call from {harness}: {}",
+                    serde_json::to_string(effective_args)?
+                )
+            }
+        }
+        LaunchKind::Workflow | LaunchKind::Other => String::new(),
+    };
+    let markers = crate::policy::parse_route_markers(&brief);
+    let is_review = kind == LaunchKind::Delegate
+        && effective_args.get("role").and_then(Value::as_str) == Some("review");
+    Ok(ParsedLaunch {
+        kind,
+        tool_name: effective_name.to_string(),
+        brief,
+        target,
+        target_malformed,
+        raw_target,
+        markers,
+        is_review,
+    })
+}
+
 /// Append a verdict line to `decisions.jsonl`; never fails the hook.
 const SHOWN_ERROR: &str = "model-route: routing failed or timed out; delegation was blocked. The cause is in the latest deny:router-error entry of model-route/decisions.jsonl. Retry the router or do the work yourself.";
 
@@ -489,24 +616,306 @@ fn proc_ppid(pid: u32) -> anyhow::Result<u32> {
         .map_err(|_| anyhow::anyhow!("bad stat"))
 }
 
-fn ancestors() -> Vec<Vec<String>> {
+fn proc_environ(pid: u32) -> Vec<String> {
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .unwrap_or_default()
+        .split(|b| *b == 0)
+        .filter(|e| !e.is_empty())
+        .map(|e| String::from_utf8_lossy(e).into_owned())
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProcessAncestor {
+    pub cmdline: Vec<String>,
+    pub environ: Vec<String>,
+}
+
+pub(crate) fn process_ancestors_full() -> Vec<ProcessAncestor> {
     let mut out = Vec::new();
     let mut pid = std::os::unix::process::parent_id();
     for _ in 0..12 {
         if pid <= 1 {
             break;
         }
-        let cmd = match proc_cmdline(pid) {
+        let cmdline = match proc_cmdline(pid) {
             Ok(c) => c,
             Err(_) => break,
         };
-        out.push(cmd);
+        let environ = proc_environ(pid);
+        out.push(ProcessAncestor { cmdline, environ });
         pid = match proc_ppid(pid) {
             Ok(p) => p,
             Err(_) => break,
         };
     }
     out
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SourceQuery<'a> {
+    pub harness: Option<&'a str>,
+    pub explicit_source: Option<&'a str>,
+    pub thread_id: Option<&'a str>,
+    /// True when invoked from the pre-tool hook launched directly by the harness
+    /// (where own env belongs to the harness instance).
+    pub from_hook: bool,
+}
+
+fn ancestor_harness(cmdline: &[String]) -> Option<&'static str> {
+    let names: Vec<&str> = cmdline
+        .iter()
+        .take(2)
+        .filter_map(|c| c.rsplit('/').next())
+        .collect();
+    if names.contains(&"codex") {
+        Some("codex")
+    } else if names.contains(&"claude") {
+        Some("claude")
+    } else if names.contains(&"opencode") {
+        Some("opencode")
+    } else if names.contains(&"agy")
+        || cmdline
+            .first()
+            .is_some_and(|c| c.contains("/.t3/tools/antigravity-acp/"))
+    {
+        Some("agy")
+    } else {
+        None
+    }
+}
+
+pub(crate) fn current_environ() -> Vec<String> {
+    std::env::vars_os()
+        .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
+        .collect()
+}
+
+fn env_lookup(env: &[String], key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    env.iter()
+        .find_map(|e| e.strip_prefix(&prefix).filter(|v| !v.is_empty()))
+        .map(str::to_string)
+}
+
+fn env_var_from(
+    key: &str,
+    own_env: &[String],
+    ancestor: Option<&ProcessAncestor>,
+) -> Option<String> {
+    env_lookup(own_env, key).or_else(|| ancestor.and_then(|a| env_lookup(&a.environ, key)))
+}
+
+fn expand_home_path(raw: &str, home: &std::path::Path) -> std::path::PathBuf {
+    if raw == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        std::path::PathBuf::from(raw)
+    }
+}
+
+/// Match `CODEX_HOME` against T3's `providerInstances`: check `shadowHomePath`
+/// first (secondary profiles), then `homePath` (or default `<home>/.codex` when
+/// empty) on non-shadow profiles so secondary entries sharing the main
+/// `homePath` are never misidentified as the main profile.
+fn codex_settings_instance(settings: &Value, home: &std::path::Path, dir: &str) -> Option<String> {
+    let pi = settings.get("providerInstances")?.as_object()?;
+    let target = expand_home_path(dir, home);
+    if let Some((id, _)) = pi.iter().find(|(_, v)| {
+        v.get("driver").and_then(Value::as_str) == Some("codex")
+            && v.get("config")
+                .and_then(|c| c.get("shadowHomePath"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .is_some_and(|p| expand_home_path(p, home) == target)
+    }) {
+        return Some(id.clone());
+    }
+    let non_shadow = |v: &Value| {
+        v.get("driver").and_then(Value::as_str) == Some("codex")
+            && v.get("config")
+                .and_then(|c| c.get("shadowHomePath"))
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+    };
+    if let Some((id, _)) = pi.iter().find(|(_, v)| {
+        non_shadow(v)
+            && v.get("config")
+                .and_then(|c| c.get("homePath"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .is_some_and(|p| expand_home_path(p, home) == target)
+    }) {
+        return Some(id.clone());
+    }
+    if target == home.join(".codex")
+        && let Some((id, _)) = pi.iter().find(|(_, v)| {
+            non_shadow(v)
+                && v.get("config")
+                    .and_then(|c| c.get("homePath"))
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+        })
+    {
+        return Some(id.clone());
+    }
+    None
+}
+
+fn has_secondary_driver_instance(settings: &Value, driver: &str, default_id: &str) -> bool {
+    settings
+        .get("providerInstances")
+        .and_then(Value::as_object)
+        .is_some_and(|m| {
+            m.iter().any(|(id, v)| {
+                v.get("driver").and_then(Value::as_str) == Some(driver) && id != default_id
+            })
+        })
+}
+
+fn read_settings_required(home: &std::path::Path) -> anyhow::Result<Value> {
+    let text = std::fs::read_to_string(home.join(".t3/userdata/settings.json"))?;
+    Ok(serde_json::from_str(&text)?)
+}
+
+fn read_settings_optional(home: &std::path::Path) -> Option<Value> {
+    read_settings_required(home).ok()
+}
+
+/// Shared caller source-instance resolver used by the launch hook, `route_batch`,
+/// and `agentdeck route` CLI.
+///
+/// Precedence:
+/// 1. Explicit `source` (and `shell` harness always requires explicit source).
+/// 2. Authoritative T3 thread binding (`thread_id` / `T3CODE_THREAD_ID` in `statev2.sqlite`).
+/// 3. Harness + explicit `own_env`/ancestor environment (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`,
+///    Antigravity profile) matched against `~/.t3/userdata/settings.json`.
+///
+/// Both `own_env` and `ancestors` are explicit inputs so callers and tests never
+/// depend implicitly on the process tree they execute under.
+///
+/// Returns `Ok(None)` when the caller source cannot be determined unambiguously
+/// (e.g. multiple accounts configured for a harness with no thread binding or
+/// disambiguating environment/ancestor), so `route_batch` can report a per-launch
+/// error rather than warming the wrong cache key.
+pub(crate) fn resolve_source(
+    home: &std::path::Path,
+    own_env: &[String],
+    ancestors: &[ProcessAncestor],
+    query: SourceQuery<'_>,
+) -> anyhow::Result<Option<String>> {
+    let harness = query.harness.filter(|s| !s.is_empty());
+    if harness == Some("shell") {
+        return Ok(Some(query.explicit_source.unwrap_or_default().to_string()));
+    }
+    if let Some(src) = query.explicit_source.filter(|s| !s.is_empty()) {
+        return Ok(Some(src.to_string()));
+    }
+
+    // Prefer authoritative T3 thread binding (`threadId` or `T3CODE_THREAD_ID`).
+    let thread_id = query
+        .thread_id
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| env_lookup(own_env, agentdeck_core::thread_state::THREAD_ENV));
+    if let Some(tid) = thread_id.as_deref()
+        && let Some(inst) =
+            crate::load::thread_provider_instance(tid, &home.join(".t3/userdata/statev2.sqlite"))
+    {
+        return Ok(Some(inst));
+    }
+
+    let (eff_harness, matching_anc) = match harness {
+        Some(h) => (
+            h,
+            ancestors
+                .iter()
+                .find(|a| ancestor_harness(&a.cmdline) == Some(h)),
+        ),
+        None => {
+            let Some((h, anc)) = ancestors
+                .iter()
+                .find_map(|a| ancestor_harness(&a.cmdline).map(|h| (h, a)))
+            else {
+                return Ok(None);
+            };
+            (h, Some(anc))
+        }
+    };
+
+    match eff_harness {
+        "claude" => {
+            if let Some(dir) = env_var_from("CLAUDE_CONFIG_DIR", own_env, matching_anc) {
+                let settings = read_settings_required(home)?;
+                if let Some(id) = settings_instance(&settings, "claudeAgent", "homePath", &dir) {
+                    return Ok(Some(id));
+                }
+                if dir.contains(".claude-openrouter") {
+                    return Ok(Some("claudeAgent_openrouter".into()));
+                }
+                if has_secondary_driver_instance(&settings, "claudeAgent", "claudeAgent")
+                    && !query.from_hook
+                {
+                    return Ok(None);
+                }
+                return Ok(Some("claudeAgent".into()));
+            }
+            if !query.from_hook
+                && matching_anc.is_none()
+                && read_settings_optional(home).is_some_and(|s| {
+                    has_secondary_driver_instance(&s, "claudeAgent", "claudeAgent")
+                })
+            {
+                return Ok(None);
+            }
+            Ok(Some("claudeAgent".into()))
+        }
+        "codex" => {
+            if let Some(dir) = env_var_from("CODEX_HOME", own_env, matching_anc) {
+                let settings = read_settings_required(home)?;
+                if let Some(id) = codex_settings_instance(&settings, home, &dir) {
+                    return Ok(Some(id));
+                }
+                if has_secondary_driver_instance(&settings, "codex", "codex") && !query.from_hook {
+                    return Ok(None);
+                }
+                return Ok(Some("codex".into()));
+            }
+            if !query.from_hook
+                && matching_anc.is_none()
+                && read_settings_optional(home)
+                    .is_some_and(|s| has_secondary_driver_instance(&s, "codex", "codex"))
+            {
+                return Ok(None);
+            }
+            Ok(Some("codex".into()))
+        }
+        "agy" => {
+            let settings = read_settings_optional(home);
+            if let Some(s) = settings.as_ref() {
+                if let Some(id) = crate::policy::antigravity_instance(s, own_env, &[]) {
+                    return Ok(Some(id));
+                }
+                for anc in ancestors {
+                    if let Some(id) =
+                        crate::policy::antigravity_instance(s, &anc.environ, &anc.cmdline)
+                    {
+                        return Ok(Some(id));
+                    }
+                }
+                if !query.from_hook
+                    && has_secondary_driver_instance(s, "antigravity", "antigravity")
+                {
+                    return Ok(None);
+                }
+            }
+            Ok(Some("antigravity".into()))
+        }
+        "opencode" => Ok(Some("opencode".into())),
+        _ => Ok(None),
+    }
 }
 
 /// Older T3 ran a Node server; current T3 is a native `t3 serve` binary.
@@ -661,24 +1070,6 @@ impl Ctx {
     }
 }
 
-fn default_instance(harness: &str) -> Option<&str> {
-    match harness {
-        "claude" => Some(
-            if std::env::var_os("CLAUDE_CONFIG_DIR")
-                .is_some_and(|d| d.to_string_lossy().contains(".claude-openrouter"))
-            {
-                "claudeAgent_openrouter"
-            } else {
-                "claudeAgent"
-            },
-        ),
-        "codex" => Some("codex"),
-        "agy" => Some("antigravity"),
-        "opencode" => Some("opencode"),
-        _ => None,
-    }
-}
-
 /// Find the T3 provider instance id whose driver/config path matches.
 fn settings_instance(settings: &Value, driver: &str, key: &str, path: &str) -> Option<String> {
     settings
@@ -794,19 +1185,26 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
                 .to_string(),
         )
     };
+    let (tool_name, args, unwrapped_mcp) = {
+        let (name, inner) = unwrap_mcp_call(&tool_name, &args);
+        let unwrapped = tool_name == "call_mcp_tool" && name != "call_mcp_tool";
+        (name.to_string(), inner.clone(), unwrapped)
+    };
     let args_obj = if args.is_object() {
         args.clone()
     } else {
         Value::Object(Map::new())
     };
-    let native = is_native_tool(&tool_name);
-    let delegate = is_delegate_tool(&tool_name);
-    let workflow = tool_name == "Workflow";
-    if !native && !delegate && !workflow {
+    let parsed = parse_launch(&tool_name, &args_obj, &harness)?;
+    let tool_name = parsed.tool_name.clone();
+    let delegate = parsed.kind == LaunchKind::Delegate;
+    let workflow = parsed.kind == LaunchKind::Workflow;
+    if parsed.kind == LaunchKind::Other {
         ctx.emit(true, "");
         return Ok(());
     }
-    let chain = ancestors();
+    let ancestors = process_ancestors_full();
+    let chain: Vec<Vec<String>> = ancestors.iter().map(|a| a.cmdline.clone()).collect();
     // delegate_task exists only in T3, so it is always routed: a missed T3
     // detection must not skip routing.
     if !delegate && !in_t3(&harness, &chain, &input) {
@@ -832,35 +1230,20 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    let mut instance: Option<String> = default_instance(&harness).map(str::to_string);
-    if harness == "claude"
-        && let Some(dir) =
-            std::env::var_os("CLAUDE_CONFIG_DIR").map(|d| d.to_string_lossy().into_owned())
-        && !dir.is_empty()
-    {
-        let text = std::fs::read_to_string(home.join(".t3/userdata/settings.json"))?;
-        let settings: Value = serde_json::from_str(&text)?;
-        if let Some(id) = settings_instance(&settings, "claudeAgent", "homePath", &dir) {
-            instance = Some(id);
-        }
-    }
-    if harness == "agy" {
-        // Missing or unreadable settings keep the `antigravity` default.
-        let settings = std::fs::read_to_string(home.join(".t3/userdata/settings.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str::<Value>(&t).ok());
-        let environ: Vec<String> = std::env::vars_os()
-            .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
-            .collect();
-        if let Some(id) = settings
-            .and_then(|s| crate::policy::antigravity_instance(&s, &environ, &chain.concat()))
-        {
-            instance = Some(id);
-        }
-    }
+    let own_env = current_environ();
+    let instance = resolve_source(
+        &home,
+        &own_env,
+        &ancestors,
+        SourceQuery {
+            harness: Some(&harness),
+            explicit_source: str_field(&input, "source"),
+            thread_id,
+            from_hook: true,
+        },
+    )?;
     if harness == "shell" {
-        let source = str_field(&input, "source").unwrap_or_default();
-        instance = Some(source.to_string());
+        let source = instance.as_deref().unwrap_or_default();
         let catalog = read_catalog(&state_dir()?)?;
         let known = catalog
             .get("providers")
@@ -882,16 +1265,6 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
                 reason,
             );
             return Ok(());
-        }
-    }
-    if harness == "codex"
-        && let Some(dir) = std::env::var_os("CODEX_HOME").map(|d| d.to_string_lossy().into_owned())
-        && !dir.is_empty()
-    {
-        let text = std::fs::read_to_string(home.join(".t3/userdata/settings.json"))?;
-        let settings: Value = serde_json::from_str(&text)?;
-        if let Some(id) = settings_instance(&settings, "codex", "shadowHomePath", &dir) {
-            instance = Some(id);
         }
     }
     if std::env::var_os("MODEL_ROUTE_HOOK_DEBUG").is_some()
@@ -922,72 +1295,30 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    let get_str = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
-    let prompt = if !get_str("message").is_empty() {
-        get_str("message")
-    } else if !get_str("prompt").is_empty() {
-        get_str("prompt")
-    } else if !get_str("instructions").is_empty() {
-        get_str("instructions")
-    } else {
-        get_str("task")
-    }
-    .to_string();
-    if delegate {
-        let task = str_field(&args, "task").unwrap_or_default();
-        let target = args.get("target");
-        let valid = !task.trim().is_empty()
-            && target
-                .and_then(|t| t.get("providerInstanceId"))
-                .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty())
-            && target
-                .and_then(|t| t.get("model"))
-                .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty());
-        if !valid {
-            let reason = "model-route: delegate_task requires a task and an explicit exact providerInstanceId/model target.";
-            ctx.deny(
-                instance.as_deref(),
-                Some(&tool_name),
-                &args_obj,
-                None,
-                "deny:invalid-delegate",
-                reason,
-            );
-            return Ok(());
-        }
+    if delegate && (parsed.brief.trim().is_empty() || parsed.target.is_none()) {
+        let reason = "model-route: delegate_task requires a task and an explicit exact providerInstanceId/model target.";
+        ctx.deny(
+            instance.as_deref(),
+            Some(&tool_name),
+            &args_obj,
+            None,
+            "deny:invalid-delegate",
+            reason,
+        );
+        return Ok(());
     }
     let target = args.get("target");
-    let brief = if delegate {
-        str_field(&args, "task").unwrap_or_default().to_string()
-    } else if !prompt.trim().is_empty() {
-        prompt.clone()
-    } else {
-        format!(
-            "Subagent call from {harness}: {}",
-            serde_json::to_string(&args)?
-        )
-    };
-    let markers = crate::policy::parse_route_markers(&brief);
-    let is_review_role = delegate && args.get("role").and_then(Value::as_str) == Some("review");
+    let markers = &parsed.markers;
+    let is_review_role = parsed.is_review;
     let route = run_route(
         instance.as_deref().unwrap_or_default(),
-        delegate.then(|| {
-            (
-                target
-                    .and_then(|t| t.get("providerInstanceId"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                target
-                    .and_then(|t| t.get("model"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            )
-        }),
+        parsed
+            .target
+            .as_ref()
+            .map(|t| (t.provider.as_str(), t.model.as_str())),
         &markers.exclude,
         is_review_role,
-        &brief,
+        &parsed.brief,
     )?;
     let confidence = route
         .get("jevConfidence")
@@ -1126,6 +1457,7 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
             if !hint.is_empty()
                 && !str_field(&args, "task").unwrap_or_default().contains(hint)
                 && can_rewrite(&ctx.harness)
+                && !unwrapped_mcp
                 && !workflow_retry
             {
                 rewritten = Some(rewrite_args(&args, None, hint));
@@ -1170,6 +1502,7 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
             && !user_choice
             && !workflow_retry
             && can_rewrite(&ctx.harness)
+            && !unwrapped_mcp
             && let Some(t) = route
                 .get("target")
                 .filter(|t| !t.is_null() && !same_target(t, target))
@@ -1466,5 +1799,224 @@ mod tests {
         );
         // Plain angle brackets are untouched.
         assert_eq!(strip_tags("a < b > c"), "a < b > c");
+    }
+
+    #[test]
+    fn resolve_source_matches_codex_main_home_path_for_both_hook_and_mcp() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentdeck-hook-codex-homepath-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let main_codex = dir.join(".codex");
+        let shadow_codex = dir.join(".codex-b");
+        std::fs::create_dir_all(dir.join(".t3/userdata")).unwrap();
+        std::fs::write(
+            dir.join(".t3/userdata/settings.json"),
+            serde_json::json!({
+                "providerInstances": {
+                    "codex": {
+                        "driver": "codex",
+                        "config": { "homePath": main_codex.to_string_lossy() }
+                    },
+                    "codex_b": {
+                        "driver": "codex",
+                        "config": {
+                            "homePath": main_codex.to_string_lossy(),
+                            "shadowHomePath": shadow_codex.to_string_lossy()
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let main_anc = super::ProcessAncestor {
+            cmdline: vec!["codex".into()],
+            environ: vec![format!("CODEX_HOME={}", main_codex.display())],
+        };
+        let shadow_anc = super::ProcessAncestor {
+            cmdline: vec!["codex".into()],
+            environ: vec![format!("CODEX_HOME={}", shadow_codex.display())],
+        };
+
+        let hook_main = super::resolve_source(
+            &dir,
+            &[],
+            std::slice::from_ref(&main_anc),
+            super::SourceQuery {
+                harness: Some("codex"),
+                explicit_source: None,
+                thread_id: None,
+                from_hook: true,
+            },
+        )
+        .unwrap();
+        let mcp_main = super::resolve_source(
+            &dir,
+            &[],
+            std::slice::from_ref(&main_anc),
+            super::SourceQuery {
+                harness: Some("codex"),
+                explicit_source: None,
+                thread_id: None,
+                from_hook: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(hook_main.as_deref(), Some("codex"));
+        assert_eq!(
+            mcp_main.as_deref(),
+            Some("codex"),
+            "MCP source resolution must match main Codex homePath just like hook"
+        );
+
+        // Also match via explicit own_env with empty ancestors (independent of caller process).
+        let own_main = super::resolve_source(
+            &dir,
+            &[format!("CODEX_HOME={}", main_codex.display())],
+            &[],
+            super::SourceQuery {
+                harness: Some("codex"),
+                explicit_source: None,
+                thread_id: None,
+                from_hook: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(own_main.as_deref(), Some("codex"));
+
+        let mcp_shadow = super::resolve_source(
+            &dir,
+            &[],
+            std::slice::from_ref(&shadow_anc),
+            super::SourceQuery {
+                harness: Some("codex"),
+                explicit_source: None,
+                thread_id: None,
+                from_hook: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(mcp_shadow.as_deref(), Some("codex_b"));
+
+        // Empty own_env + empty ancestors with two Codex accounts must report ambiguous (None).
+        let ambiguous = super::resolve_source(
+            &dir,
+            &[],
+            &[],
+            super::SourceQuery {
+                harness: Some("codex"),
+                explicit_source: None,
+                thread_id: None,
+                from_hook: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(ambiguous, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_source_prefers_nearest_agy_ancestor_env_over_outer_gemini_dir() {
+        use sha2::{Digest, Sha256};
+
+        let dir =
+            std::env::temp_dir().join(format!("agentdeck-hook-agy-nearest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".t3/userdata")).unwrap();
+        std::fs::write(
+            dir.join(".t3/userdata/settings.json"),
+            serde_json::json!({
+                "providerInstances": {
+                    "antigravity": { "driver": "antigravity" },
+                    "antigravity_2": { "driver": "antigravity" }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let hash_outer = format!("{:x}", Sha256::digest(b"antigravity"));
+        let hash_inner = format!("{:x}", Sha256::digest(b"antigravity_2"));
+
+        let nearest_agy = super::ProcessAncestor {
+            cmdline: vec!["agy".into()],
+            environ: vec![format!(
+                "GEMINI_HOME=/home/u/.t3/userdata/providers/antigravity/{hash_inner}"
+            )],
+        };
+        let outer_proc = super::ProcessAncestor {
+            cmdline: vec![
+                "outer-wrapper".into(),
+                format!("--gemini-dir=/home/u/.t3/userdata/providers/antigravity/{hash_outer}"),
+            ],
+            environ: vec![],
+        };
+        let ancestors = vec![nearest_agy, outer_proc.clone()];
+
+        // Nearest agy ancestor env must beat outer process --gemini-dir.
+        let resolved = super::resolve_source(
+            &dir,
+            &[],
+            &ancestors,
+            super::SourceQuery {
+                harness: Some("agy"),
+                explicit_source: None,
+                thread_id: None,
+                from_hook: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some("antigravity_2"),
+            "nearest agy ancestor env must take precedence over outer --gemini-dir"
+        );
+
+        // Own env must also beat an outer process --gemini-dir even when outer id sorts first.
+        let own_env = vec![format!(
+            "GEMINI_HOME=/home/u/.t3/userdata/providers/antigravity/{hash_inner}"
+        )];
+        let from_own = super::resolve_source(
+            &dir,
+            &own_env,
+            std::slice::from_ref(&outer_proc),
+            super::SourceQuery {
+                harness: Some("agy"),
+                explicit_source: None,
+                thread_id: None,
+                from_hook: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            from_own.as_deref(),
+            Some("antigravity_2"),
+            "own env must take precedence over outer --gemini-dir"
+        );
+
+        // Outer --gemini-dir still resolves when no closer process carries a profile.
+        let bare_child = super::ProcessAncestor {
+            cmdline: vec!["bash".into(), "-c".into(), "true".into()],
+            environ: vec![],
+        };
+        let from_outer = super::resolve_source(
+            &dir,
+            &[],
+            &[bare_child, outer_proc],
+            super::SourceQuery {
+                harness: Some("agy"),
+                explicit_source: None,
+                thread_id: None,
+                from_hook: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(from_outer.as_deref(), Some("antigravity"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

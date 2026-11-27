@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use agentdeck_core::settings::JudgeFallbackSettings;
 use serde::{Deserialize, Serialize};
 
 fn default_weekly_reserve() -> f64 {
@@ -97,6 +98,8 @@ pub struct CoordinatorConfig {
     pub judge_provider: Option<String>,
     #[serde(default)]
     pub judge_model: Option<String>,
+    #[serde(default)]
+    pub judge_fallback: JudgeFallbackSettings,
 }
 
 impl Default for CoordinatorConfig {
@@ -115,6 +118,7 @@ impl Default for CoordinatorConfig {
             t3_token_file: None,
             judge_provider: None,
             judge_model: None,
+            judge_fallback: JudgeFallbackSettings::default(),
         }
     }
 }

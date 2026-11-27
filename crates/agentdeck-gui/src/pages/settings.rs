@@ -5,7 +5,8 @@ use std::path::PathBuf;
 
 use agentdeck_core::settings::{
     self, ApproverCredentialsStatus, ApproverCredentialsUpdate, ApproverSettings,
-    CoordinatorPoolEntry, CoordinatorSettings, Settings, UserRuleSource, UserRules,
+    CoordinatorPoolEntry, CoordinatorSettings, JudgeFallbackSettings, Settings, UserRuleSource,
+    UserRules,
 };
 use agentdeck_core::{Paths, Registry};
 use i18n_embed_fl::fl;
@@ -19,6 +20,7 @@ use crate::style as st;
 #[derive(Debug, Clone, Default)]
 pub struct Loaded {
     pub settings: Option<Settings>,
+    pub fallback: JudgeFallbackSettings,
     pub rules: UserRules,
     /// Whether a key is available, per provider (OpenRouter, Vercel).
     pub key_set: (bool, bool),
@@ -33,6 +35,13 @@ pub struct State {
     pub provider: Provider,
     pub decision_model: String,
     pub key: String,
+    pub fallback_provider: FallbackProvider,
+    pub fallback_model: String,
+    pub fallback_testing: bool,
+    /// Last fallback channel check: (text, is error), shown under the fallback form.
+    pub fallback_test: Option<(String, bool)>,
+    /// Inline validation error for the fallback channel form.
+    pub fallback_error: Option<String>,
     pub refresh: String,
     pub stale: String,
     /// Comma-separated rule patterns; saving stores them explicitly.
@@ -52,10 +61,15 @@ pub struct State {
 
 #[derive(Debug, Clone)]
 pub enum Msg {
-    Loaded(Loaded),
+    Loaded(Box<Loaded>),
     Provider(Provider),
     DecisionModel(String),
     Key(String),
+    FallbackProvider(FallbackProvider),
+    FallbackModel(String),
+    TestFallback,
+    TestedFallback(Result<String, String>),
+    SaveFallback,
     Refresh(String),
     Stale(String),
     NoReview(String),
@@ -71,6 +85,51 @@ pub enum Msg {
     HistoryLoaded(History),
     Approver(Box<ApproverMsg>),
     Coord(Box<CoordMsg>),
+}
+
+/// Optional shared fallback channel provider (`[judge_fallback]` in `instances.toml`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FallbackProvider {
+    #[default]
+    None,
+    OpenRouter,
+    Vercel,
+}
+
+impl std::fmt::Display for FallbackProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str(&fl!(loader(), "settings-fallback-none")),
+            Self::OpenRouter => f.write_str("OpenRouter"),
+            Self::Vercel => f.write_str("Vercel AI Gateway"),
+        }
+    }
+}
+
+impl FallbackProvider {
+    fn stored(self) -> Option<String> {
+        match self {
+            Self::None => None,
+            Self::OpenRouter => Some(settings::PROVIDER_OPENROUTER.to_string()),
+            Self::Vercel => Some(settings::PROVIDER_VERCEL.to_string()),
+        }
+    }
+
+    fn from_stored(provider: Option<&str>) -> Self {
+        match provider {
+            Some(p) if p == settings::PROVIDER_OPENROUTER => Self::OpenRouter,
+            Some(p) if p == settings::PROVIDER_VERCEL => Self::Vercel,
+            _ => Self::None,
+        }
+    }
+
+    fn as_provider(self) -> Option<Provider> {
+        match self {
+            Self::None => None,
+            Self::OpenRouter => Some(Provider::OpenRouter),
+            Self::Vercel => Some(Provider::Vercel),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -118,30 +177,44 @@ impl Provider {
 
 pub fn load(paths: &Paths) -> Msg {
     let key_set = (Provider::OpenRouter.key_set(), Provider::Vercel.key_set());
-    Msg::Loaded(match Registry::load(paths) {
+    Msg::Loaded(Box::new(match Registry::load(paths) {
         Ok(reg) => {
-            // A broken `[router.rules]` table keeps its error visible instead
-            // of silently falling back; the fields still edit from defaults.
-            let (rules, error) = match UserRules::from_registry(&reg) {
-                Ok(rules) => (rules, None),
-                Err(e) => (UserRules::default(), Some(format!("{e:#}"))),
+            // Broken `[router.rules]` or `[judge_fallback]` tables keep their
+            // errors visible instead of silently falling back; fields still
+            // edit from defaults.
+            let mut errors = Vec::new();
+            let rules = match UserRules::from_registry(&reg) {
+                Ok(rules) => rules,
+                Err(e) => {
+                    errors.push(format!("{e:#}"));
+                    UserRules::default()
+                }
+            };
+            let fallback = match settings::read_judge_fallback(&reg) {
+                Ok(fallback) => fallback,
+                Err(e) => {
+                    errors.push(format!("{e:#}"));
+                    JudgeFallbackSettings::default()
+                }
             };
             Loaded {
                 settings: Some(settings::read(&reg)),
+                fallback,
                 rules,
                 key_set,
-                error,
+                error: (!errors.is_empty()).then(|| errors.join("; ")),
                 history: eval_history::load(),
             }
         }
         Err(e) => Loaded {
             settings: None,
+            fallback: JudgeFallbackSettings::default(),
             rules: UserRules::default(),
             key_set,
             error: Some(format!("{e:#}")),
             history: eval_history::load(),
         },
-    })
+    }))
 }
 
 /// Blank means "default"; anything else must be a positive whole number.
@@ -205,20 +278,69 @@ fn save(paths: Paths, f: impl FnOnce(&mut Settings) + Send + 'static) -> Task<Ms
     )
 }
 
+async fn probe_endpoint(
+    provider: Option<&'static str>,
+    model: String,
+    key: Option<String>,
+) -> Result<String, String> {
+    let started = std::time::Instant::now();
+    agentdeck_router::route::probe_decision(provider, &model, key.as_deref())
+        .await
+        .map(|(size, difficulty, cost)| {
+            let ms = started.elapsed().as_millis().to_string();
+            let cost = cost.map(|c| format!(", ${c:.6}")).unwrap_or_default();
+            fl!(
+                loader(),
+                "settings-test-ok",
+                model = model,
+                size = format!("{size:.2}"),
+                difficulty = format!("{difficulty:.2}"),
+                ms = ms,
+                cost = cost
+            )
+        })
+        .map_err(|e| format!("{e:#}"))
+}
+
+fn fallback_probe_key(state: &State) -> Option<String> {
+    (state.fallback_provider.as_provider() == Some(state.provider))
+        .then(|| state.key.trim().to_string())
+        .filter(|k| !k.is_empty())
+}
+
+fn fallback_settings(state: &State) -> JudgeFallbackSettings {
+    match state.fallback_provider {
+        FallbackProvider::None => JudgeFallbackSettings::default(),
+        p => JudgeFallbackSettings {
+            provider: p.stored(),
+            model: blanked(&state.fallback_model),
+        },
+    }
+}
+
 pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
     match msg {
         Msg::Loaded(loaded) => {
+            let loaded = *loaded;
             if let Some(s) = &loaded.settings {
-                state.provider =
-                    if s.decision_provider.as_deref() == Some(settings::PROVIDER_VERCEL) {
-                        Provider::Vercel
-                    } else {
-                        Provider::OpenRouter
-                    };
+                let provider = if s.decision_provider.as_deref() == Some(settings::PROVIDER_VERCEL)
+                {
+                    Provider::Vercel
+                } else {
+                    Provider::OpenRouter
+                };
+                if state.provider != provider {
+                    state.key.clear();
+                }
+                state.provider = provider;
                 state.decision_model = s.decision_model.clone().unwrap_or_default();
                 state.refresh = s.refresh_seconds.map(|n| n.to_string()).unwrap_or_default();
                 state.stale = s.stale_seconds.map(|n| n.to_string()).unwrap_or_default();
             }
+            state.fallback_provider =
+                FallbackProvider::from_stored(loaded.fallback.provider.as_deref());
+            state.fallback_model = loaded.fallback.model.clone().unwrap_or_default();
+            state.fallback_error = None;
             state.no_review = format_patterns(&loaded.rules.no_review_models);
             state.deny = format_patterns(&loaded.rules.deny_models);
             state.rules_user = loaded.rules.source == UserRuleSource::User;
@@ -226,6 +348,9 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
             Task::none()
         }
         Msg::Provider(p) => {
+            if state.provider != p {
+                state.key.clear();
+            }
             state.provider = p;
             state.test = None;
             Task::none()
@@ -246,29 +371,8 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
             let key = Some(state.key.trim().to_string()).filter(|k| !k.is_empty());
             state.testing = true;
             state.test = None;
-            Task::perform(
-                async move {
-                    let started = std::time::Instant::now();
-                    let wire = (provider == Provider::Vercel).then_some(settings::PROVIDER_VERCEL);
-                    agentdeck_router::route::probe_decision(wire, &model, key.as_deref())
-                        .await
-                        .map(|(size, difficulty, cost)| {
-                            let ms = started.elapsed().as_millis().to_string();
-                            let cost = cost.map(|c| format!(", ${c:.6}")).unwrap_or_default();
-                            fl!(
-                                loader(),
-                                "settings-test-ok",
-                                model = model,
-                                size = format!("{size:.2}"),
-                                difficulty = format!("{difficulty:.2}"),
-                                ms = ms,
-                                cost = cost
-                            )
-                        })
-                        .map_err(|e| format!("{e:#}"))
-                },
-                Msg::Tested,
-            )
+            let wire = (provider == Provider::Vercel).then_some(settings::PROVIDER_VERCEL);
+            Task::perform(probe_endpoint(wire, model, key), Msg::Tested)
         }
         Msg::Tested(result) => {
             state.testing = false;
@@ -285,6 +389,71 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
         Msg::Key(v) => {
             state.key = v;
             Task::none()
+        }
+        Msg::FallbackProvider(p) => {
+            state.fallback_provider = p;
+            state.fallback_test = None;
+            state.fallback_error = None;
+            Task::none()
+        }
+        Msg::FallbackModel(v) => {
+            state.fallback_model = v;
+            state.fallback_error = None;
+            Task::none()
+        }
+        Msg::TestFallback => {
+            if state.fallback_testing || state.busy {
+                return Task::none();
+            }
+            let cfg = fallback_settings(state);
+            if let Err(e) = cfg.validate() {
+                state.fallback_error = Some(format!("{e:#}"));
+                return Task::none();
+            }
+            let Some(endpoint) = cfg.endpoint() else {
+                return Task::none();
+            };
+            let key = fallback_probe_key(state);
+            state.fallback_error = None;
+            state.fallback_testing = true;
+            state.fallback_test = None;
+            let wire = (endpoint.provider == settings::PROVIDER_VERCEL)
+                .then_some(settings::PROVIDER_VERCEL);
+            Task::perform(
+                probe_endpoint(wire, endpoint.model, key),
+                Msg::TestedFallback,
+            )
+        }
+        Msg::TestedFallback(result) => {
+            state.fallback_testing = false;
+            state.fallback_test = Some(match result {
+                Ok(text) => (text, false),
+                Err(e) => (e, true),
+            });
+            Task::none()
+        }
+        Msg::SaveFallback => {
+            if state.busy {
+                return Task::none();
+            }
+            let cfg = fallback_settings(state);
+            if let Err(e) = cfg.validate() {
+                state.fallback_error = Some(format!("{e:#}"));
+                return Task::none();
+            }
+            state.fallback_error = None;
+            state.busy = true;
+            Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        settings::write_judge_fallback(&paths, &cfg).map_err(|e| format!("{e:#}"))
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r)
+                },
+                Msg::Done,
+            )
         }
         Msg::Refresh(v) => {
             state.refresh = v;
@@ -415,8 +584,8 @@ fn save_row(state: &State, msg: Msg) -> Element<'_, Msg> {
 }
 
 /// The last check's outcome, filling the space left of the buttons.
-fn test_line(state: &State) -> Element<'_, Msg> {
-    let line: Element<'_, Msg> = match &state.test {
+fn test_line(test: &Option<(String, bool)>) -> Element<'_, Msg> {
+    let line: Element<'_, Msg> = match test {
         Some((text, false)) => st::pill(text.clone(), st::Tone::Ok),
         Some((text, true)) => st::body(text.as_str()).into(),
         None => iced::widget::Space::new().into(),
@@ -482,7 +651,7 @@ pub fn router_view(state: &State) -> Element<'_, Msg> {
             Some(key_hint),
         ),
         row![
-            test_line(state),
+            test_line(&state.test),
             st::btn(
                 st::Btn::Quiet,
                 if state.testing {
@@ -502,10 +671,88 @@ pub fn router_view(state: &State) -> Element<'_, Msg> {
     column![]
         .push(error_card(state))
         .push(st::card(form))
+        .push(fallback_card(state))
         .push(rules_card(state))
         .push(history_card(state))
         .spacing(st::SPACE_S)
         .into()
+}
+
+fn fallback_card(state: &State) -> Element<'_, Msg> {
+    let size = st::look().body;
+    let mut form = column![
+        column![
+            st::caption(fl!(loader(), "settings-fallback")),
+            st::muted(fl!(loader(), "settings-fallback-note")),
+        ]
+        .spacing(4),
+        field(
+            fl!(loader(), "settings-fallback-provider"),
+            pick_list(
+                [
+                    FallbackProvider::None,
+                    FallbackProvider::OpenRouter,
+                    FallbackProvider::Vercel,
+                ],
+                Some(state.fallback_provider),
+                Msg::FallbackProvider
+            )
+            .text_size(size)
+            .width(Length::Fill)
+            .into(),
+            None,
+        ),
+    ]
+    .spacing(st::SPACE_M);
+    if state.fallback_provider != FallbackProvider::None {
+        let (model_placeholder, model_hint) = match state.fallback_provider {
+            FallbackProvider::OpenRouter => (
+                settings::DEFAULT_DECISION_MODEL,
+                fl!(loader(), "settings-fallback-model-hint"),
+            ),
+            FallbackProvider::Vercel => (
+                "provider/model",
+                fl!(loader(), "settings-decision-model-vercel"),
+            ),
+            FallbackProvider::None => unreachable!(),
+        };
+        let mut model_field = column![
+            st::caption(fl!(loader(), "settings-fallback-model")),
+            text_input(model_placeholder, &state.fallback_model)
+                .on_input(Msg::FallbackModel)
+                .on_submit(Msg::SaveFallback)
+                .size(size),
+            st::muted(model_hint),
+        ]
+        .spacing(4);
+        if let Some(err) = &state.fallback_error {
+            model_field = model_field.push(st::body(err.as_str()));
+        }
+        form = form.push(model_field);
+    } else if let Some(err) = &state.fallback_error {
+        form = form.push(st::body(err.as_str()));
+    }
+    let can_test =
+        state.fallback_provider != FallbackProvider::None && !state.fallback_testing && !state.busy;
+    form = form.push(
+        row![
+            test_line(&state.fallback_test),
+            st::btn(
+                st::Btn::Quiet,
+                if state.fallback_testing {
+                    fl!(loader(), "settings-testing")
+                } else {
+                    fl!(loader(), "settings-test")
+                }
+            )
+            .on_press_maybe(can_test.then_some(Msg::TestFallback)),
+            st::btn(st::Btn::Primary, fl!(loader(), "settings-save"))
+                .on_press_maybe((!state.busy).then_some(Msg::SaveFallback)),
+        ]
+        .spacing(st::SPACE_S)
+        .align_y(Alignment::Center),
+    );
+    st::card(form)
 }
 
 fn rules_card(state: &State) -> Element<'_, Msg> {
@@ -1836,5 +2083,81 @@ mod tests {
             source: UserRuleSource::User,
         };
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn fallback_probe_never_reuses_draft_key_from_another_provider() {
+        use super::{FallbackProvider, Loaded, Msg, Provider, State, fallback_probe_key, update};
+        use agentdeck_core::Paths;
+        use agentdeck_core::settings::{JudgeFallbackSettings, PROVIDER_OPENROUTER, Settings};
+
+        let paths = Paths::new(
+            "/tmp/agentdeck-gui-test-cfg".into(),
+            "/tmp/agentdeck-gui-test-state".into(),
+        );
+        let mut state = State::default();
+        assert_eq!(state.provider, Provider::OpenRouter);
+
+        let _ = update(&mut state, paths.clone(), Msg::Key("sk-or-secret".into()));
+        let _ = update(
+            &mut state,
+            paths.clone(),
+            Msg::FallbackProvider(FallbackProvider::Vercel),
+        );
+        assert_eq!(fallback_probe_key(&state), None);
+
+        // Switching primary provider to Vercel must not let the OpenRouter draft key
+        // be reused by the Vercel fallback probe.
+        let _ = update(&mut state, paths.clone(), Msg::Provider(Provider::Vercel));
+        assert_eq!(
+            fallback_probe_key(&state),
+            None,
+            "OpenRouter draft key must not be sent to Vercel fallback after provider switch"
+        );
+        assert!(state.key.is_empty(), "provider switch must clear draft key");
+
+        // A draft key typed after switching to Vercel applies only to Vercel.
+        let _ = update(
+            &mut state,
+            paths.clone(),
+            Msg::Key("sk-vercel-draft".into()),
+        );
+        assert_eq!(
+            fallback_probe_key(&state).as_deref(),
+            Some("sk-vercel-draft")
+        );
+        let _ = update(
+            &mut state,
+            paths.clone(),
+            Msg::FallbackProvider(FallbackProvider::OpenRouter),
+        );
+        assert_eq!(fallback_probe_key(&state), None);
+
+        // Reloading settings that switch primary back to OpenRouter must also clear
+        // the Vercel draft key so OpenRouter fallback cannot receive it.
+        let _ = update(
+            &mut state,
+            paths,
+            Msg::Loaded(Box::new(Loaded {
+                settings: Some(Settings {
+                    decision_provider: None,
+                    decision_model: None,
+                    refresh_seconds: None,
+                    stale_seconds: None,
+                }),
+                fallback: JudgeFallbackSettings {
+                    provider: Some(PROVIDER_OPENROUTER.into()),
+                    model: None,
+                },
+                ..Loaded::default()
+            })),
+        );
+        assert_eq!(state.provider, Provider::OpenRouter);
+        assert_eq!(state.fallback_provider, FallbackProvider::OpenRouter);
+        assert_eq!(
+            fallback_probe_key(&state),
+            None,
+            "Vercel draft key must not leak to OpenRouter fallback after reload"
+        );
     }
 }

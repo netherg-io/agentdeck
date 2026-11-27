@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use agentdeck_core::judge::JudgeChannel;
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -228,6 +229,7 @@ fn host_authenticated_for_judge(req: &ApprovalRequest) -> bool {
 fn judge_error_code(err: &anyhow::Error) -> String {
     match err.downcast_ref::<JudgeError>() {
         Some(JudgeError::HttpStatus { status, .. }) => format!("judge_http_status_{status}"),
+        Some(JudgeError::RateLimited { .. }) => "judge_http_status_429".to_string(),
         Some(JudgeError::Parse) => "judge_error_parse".to_string(),
         Some(JudgeError::Network) => "judge_error_network".to_string(),
         None => "judge_error_http".to_string(),
@@ -243,6 +245,7 @@ fn record_audit(
     judge_allow: Option<bool>,
     judge_confidence: Option<f64>,
     judge_reason: Option<String>,
+    judge_channel: Option<JudgeChannel>,
     outcome: &str,
     source: AuditSource,
     elapsed_ms: u64,
@@ -261,6 +264,7 @@ fn record_audit(
         judge_allow,
         judge_confidence,
         judge_reason,
+        judge_channel,
         outcome: outcome.to_string(),
         source,
         elapsed_ms,
@@ -368,30 +372,39 @@ where
     let mut mandate = resolve_current();
     let mut autonomous = mandate.is_some();
     let mut perimeter = check_perimeter_with_config(req, mandate.as_ref(), ctx.config);
-    let complete =
-        |outcome, source, label, perimeter: &PerimeterVerdict, (allow, confidence, reason)| {
-            let elapsed_ms = started.elapsed().as_millis() as u64;
-            record_audit(
-                ctx.audit_path,
-                request_id,
-                req,
-                perimeter,
-                allow,
-                confidence,
-                reason,
-                label,
-                source,
-                elapsed_ms,
-            );
-            Ok(BrokerDecision {
-                request_id: request_id.into(),
-                outcome,
-                elapsed_ms,
-            })
-        };
+    let complete = |outcome,
+                    source,
+                    label,
+                    perimeter: &PerimeterVerdict,
+                    (allow, confidence, reason, channel)| {
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        record_audit(
+            ctx.audit_path,
+            request_id,
+            req,
+            perimeter,
+            allow,
+            confidence,
+            reason,
+            channel,
+            label,
+            source,
+            elapsed_ms,
+        );
+        Ok(BrokerDecision {
+            request_id: request_id.into(),
+            outcome,
+            elapsed_ms,
+        })
+    };
 
     tokio::pin!(client_disconnected);
-    let mut judge_fields: (Option<bool>, Option<f64>, Option<String>) = (None, None, None);
+    let mut judge_fields: (
+        Option<bool>,
+        Option<f64>,
+        Option<String>,
+        Option<JudgeChannel>,
+    ) = (None, None, None, None);
     if let Some(initial_mandate) = mandate
         .as_ref()
         .filter(|_| autonomous && !perimeter.is_hard_deny() && host_authenticated_for_judge(req))
@@ -418,6 +431,7 @@ where
                             Some(verdict.allow),
                             confidence,
                             Some("judge_approved".to_string()),
+                            verdict.channel,
                         );
                         return complete(
                             BrokerOutcome::ClientCancelled,
@@ -437,6 +451,7 @@ where
                             Some(verdict.allow),
                             confidence,
                             Some("judge_approved".to_string()),
+                            verdict.channel,
                         );
                         return complete(
                             BrokerOutcome::Approved { secret_value: None },
@@ -453,6 +468,7 @@ where
                         Some(verdict.allow),
                         confidence,
                         Some("judge_mandate_changed".to_string()),
+                        verdict.channel,
                     );
                 } else {
                     let reason_code = if verdict.allow {
@@ -468,6 +484,7 @@ where
                         Some(verdict.allow),
                         confidence,
                         Some(reason_code.to_string()),
+                        verdict.channel,
                     );
                     if ctx.mandate_resolver.is_some() {
                         mandate = resolve_current();
@@ -477,7 +494,7 @@ where
                 }
             }
             Err(err) => {
-                judge_fields = (Some(false), Some(0.0), Some(judge_error_code(&err)));
+                judge_fields = (Some(false), Some(0.0), Some(judge_error_code(&err)), None);
                 if ctx.mandate_resolver.is_some() {
                     mandate = resolve_current();
                     autonomous = mandate.is_some();

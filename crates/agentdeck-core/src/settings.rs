@@ -1260,6 +1260,149 @@ pub fn update_coordinator(
     })
 }
 
+/// Shared optional fallback channel `[judge_fallback]` in `instances.toml` for
+/// all three LLM judges (router, approver, coordinator checkpoint).
+/// Absent or empty fields mean no fallback is configured.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JudgeFallbackSettings {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+impl JudgeFallbackSettings {
+    /// Trim whitespace and convert blank strings into `None`.
+    pub fn normalized(&self) -> Self {
+        let clean = |s: &Option<String>| {
+            s.as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        Self {
+            provider: clean(&self.provider),
+            model: clean(&self.model),
+        }
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let n = self.normalized();
+        if let Some(m) = n.model.as_deref()
+            && m.chars().any(char::is_whitespace)
+        {
+            anyhow::bail!("[judge_fallback] model must not contain spaces");
+        }
+        match n.provider.as_deref() {
+            None => {
+                if n.model.is_some() {
+                    anyhow::bail!("[judge_fallback] model requires provider");
+                }
+            }
+            Some(p) => {
+                if p != PROVIDER_OPENROUTER && p != PROVIDER_VERCEL {
+                    anyhow::bail!(
+                        "[judge_fallback] provider must be {PROVIDER_OPENROUTER} or {PROVIDER_VERCEL}, got {p:?}"
+                    );
+                }
+                if p == PROVIDER_VERCEL && n.model.is_none() {
+                    anyhow::bail!(
+                        "[judge_fallback] provider \"vercel\" requires model, e.g. provider/model"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve to a concrete `(provider, model)` pair, or `None` when disabled.
+    pub fn endpoint(&self) -> Option<crate::judge::JudgeEndpoint> {
+        let n = self.normalized();
+        let provider = n.provider?;
+        let model = match n.model {
+            Some(m) => m,
+            None if provider == PROVIDER_VERCEL => return None,
+            None => DEFAULT_DECISION_MODEL.to_string(),
+        };
+        Some(crate::judge::JudgeEndpoint::new(provider, model))
+    }
+
+    /// JSON shape emitted into `router.json` (`None` when no fallback is configured).
+    pub fn to_json(&self) -> Option<serde_json::Value> {
+        let n = self.normalized();
+        let provider = n.provider?;
+        let mut o = serde_json::Map::new();
+        o.insert("provider".into(), serde_json::Value::String(provider));
+        if let Some(model) = n.model {
+            o.insert("model".into(), serde_json::Value::String(model));
+        }
+        Some(serde_json::Value::Object(o))
+    }
+
+    /// Parse the `router.json` `judgeFallback` field; absent or null means disabled.
+    pub fn from_json(v: Option<&serde_json::Value>) -> anyhow::Result<Self> {
+        let Some(v) = v.filter(|v| !v.is_null()) else {
+            return Ok(Self::default());
+        };
+        let o = v
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("judgeFallback must be an object"))?;
+        let str_field = |key: &str| -> anyhow::Result<Option<String>> {
+            match o.get(key) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+                Some(_) => anyhow::bail!("judgeFallback.{key} must be a string"),
+            }
+        };
+        let cfg = Self {
+            provider: str_field("provider")?,
+            model: str_field("model")?,
+        }
+        .normalized();
+        cfg.validate()?;
+        Ok(cfg)
+    }
+}
+
+/// Read `[judge_fallback]` from `instances.toml`; absent or empty means no fallback.
+/// Unknown keys are ignored for forward compatibility.
+pub fn read_judge_fallback(reg: &Registry) -> anyhow::Result<JudgeFallbackSettings> {
+    let Some(val) = reg.extra.get("judge_fallback") else {
+        return Ok(JudgeFallbackSettings::default());
+    };
+    if !val.is_table() {
+        anyhow::bail!("[judge_fallback] must be a TOML table");
+    }
+    let cfg: JudgeFallbackSettings = val
+        .clone()
+        .try_into()
+        .map_err(|e| anyhow::anyhow!("invalid [judge_fallback] config: {e}"))?;
+    let cfg = cfg.normalized();
+    cfg.validate()?;
+    Ok(cfg)
+}
+
+/// Validated write of `[judge_fallback]` into `instances.toml`, preserving unknown keys.
+/// Passing `provider = None, model = None` clears both keys (and removes the table if empty).
+pub fn write_judge_fallback(paths: &Paths, cfg: &JudgeFallbackSettings) -> anyhow::Result<()> {
+    let normalized = cfg.normalized();
+    normalized.validate()?;
+    Registry::update(paths, |reg| {
+        set(
+            reg,
+            "judge_fallback",
+            "provider",
+            normalized.provider.clone().map(toml::Value::String),
+        );
+        set(
+            reg,
+            "judge_fallback",
+            "model",
+            normalized.model.clone().map(toml::Value::String),
+        );
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1889,6 +2032,123 @@ mod tests {
         assert_eq!(cleared.owner_id, None);
         assert!(!approver_telegram_configured(&dir));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn judge_fallback_round_trip_validates_and_preserves_unknown_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentdeck-settings-judge-fallback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let paths = Paths::new(dir.join("config"), dir.join("state"));
+
+        // Absent or empty means no fallback.
+        assert_eq!(
+            read_judge_fallback(&Registry::empty()).unwrap(),
+            JudgeFallbackSettings::default()
+        );
+        assert!(
+            read_judge_fallback(&Registry::empty())
+                .unwrap()
+                .endpoint()
+                .is_none()
+        );
+
+        let blank =
+            Registry::from_toml("version = 1\n[judge_fallback]\nprovider = \"\"\nmodel = \"  \"\n")
+                .unwrap();
+        assert_eq!(
+            read_judge_fallback(&blank).unwrap(),
+            JudgeFallbackSettings::default()
+        );
+
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::write(
+            paths.registry_file(),
+            "version = 1\n[judge_fallback]\nfuture_knob = true\n",
+        )
+        .unwrap();
+
+        // OpenRouter without explicit model resolves to DEFAULT_DECISION_MODEL.
+        let or_default = JudgeFallbackSettings {
+            provider: Some(PROVIDER_OPENROUTER.into()),
+            model: None,
+        };
+        write_judge_fallback(&paths, &or_default).unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        let read_back = read_judge_fallback(&reg).unwrap();
+        assert_eq!(read_back, or_default);
+        assert_eq!(
+            read_back.endpoint(),
+            Some(crate::judge::JudgeEndpoint::new(
+                PROVIDER_OPENROUTER,
+                DEFAULT_DECISION_MODEL
+            ))
+        );
+        assert_eq!(
+            reg.extra["judge_fallback"]["future_knob"].as_bool(),
+            Some(true),
+            "unknown keys in [judge_fallback] must survive writes"
+        );
+
+        // Vercel with explicit model round-trips via TOML and JSON.
+        let vercel = JudgeFallbackSettings {
+            provider: Some(PROVIDER_VERCEL.into()),
+            model: Some("openai/gpt-4o-mini".into()),
+        };
+        write_judge_fallback(&paths, &vercel).unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        let read_back = read_judge_fallback(&reg).unwrap();
+        assert_eq!(read_back, vercel);
+        let json_val = read_back.to_json().unwrap();
+        assert_eq!(
+            JudgeFallbackSettings::from_json(Some(&json_val)).unwrap(),
+            vercel
+        );
+
+        // Invalid configs fail closed without overwriting.
+        for bad in [
+            JudgeFallbackSettings {
+                provider: Some(PROVIDER_VERCEL.into()),
+                model: None,
+            },
+            JudgeFallbackSettings {
+                provider: Some(PROVIDER_VERCEL.into()),
+                model: Some("  ".into()),
+            },
+            JudgeFallbackSettings {
+                provider: Some("anthropic".into()),
+                model: Some("claude-3".into()),
+            },
+            JudgeFallbackSettings {
+                provider: Some(PROVIDER_OPENROUTER.into()),
+                model: Some("bad model".into()),
+            },
+            JudgeFallbackSettings {
+                provider: None,
+                model: Some("openai/gpt-4o-mini".into()),
+            },
+        ] {
+            assert!(write_judge_fallback(&paths, &bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            read_judge_fallback(&Registry::load(&paths).unwrap()).unwrap(),
+            vercel
+        );
+
+        // Clearing removes provider and model while keeping unknown keys.
+        write_judge_fallback(&paths, &JudgeFallbackSettings::default()).unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        assert_eq!(
+            read_judge_fallback(&reg).unwrap(),
+            JudgeFallbackSettings::default()
+        );
+        assert_eq!(
+            reg.extra["judge_fallback"]["future_knob"].as_bool(),
+            Some(true)
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

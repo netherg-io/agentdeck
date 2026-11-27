@@ -333,6 +333,81 @@ fn reset_time(result: &str, finished: f64) -> Option<f64> {
     (found && seconds.is_finite()).then_some(finished + seconds)
 }
 
+/// Look up a T3 thread's bound `provider_instance_id` from `statev2.sqlite`.
+/// Checks the newest run first (matches `t3_control::observe_thread_sqlite`),
+/// then provider threads, then the thread row itself.
+pub fn thread_provider_instance(thread_id: &str, file: &std::path::Path) -> Option<String> {
+    if thread_id.is_empty() {
+        return None;
+    }
+    let db = rusqlite::Connection::open_with_flags(file, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let _ = db.execute_batch("PRAGMA busy_timeout=1000");
+
+    let non_empty = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+
+    // 1. Newest run on this thread (most authoritative after model/account rotation).
+    for sql in [
+        "SELECT COALESCE(
+            NULLIF(provider_instance_id, ''),
+            NULLIF(json_extract(payload_json, '$.providerInstanceId'), ''),
+            NULLIF(json_extract(payload_json, '$.modelSelection.instanceId'), '')
+         ) FROM orchestration_v2_projection_runs
+         WHERE thread_id = ?1
+         ORDER BY ordinal DESC, rowid DESC LIMIT 1",
+        "SELECT COALESCE(
+            NULLIF(provider_instance_id, ''),
+            NULLIF(json_extract(payload_json, '$.providerInstanceId'), ''),
+            NULLIF(json_extract(payload_json, '$.modelSelection.instanceId'), '')
+         ) FROM orchestration_v2_projection_runs
+         WHERE thread_id = ?1
+         ORDER BY rowid DESC LIMIT 1",
+    ] {
+        if let Ok(found) = db.query_row(sql, [thread_id], |r| r.get::<_, Option<String>>(0)) {
+            if let Some(id) = non_empty(found) {
+                return Some(id);
+            }
+            break;
+        }
+    }
+
+    // 2. Active/latest provider thread row.
+    if let Ok(found) = db.query_row(
+        "SELECT NULLIF(provider_instance_id, '')
+         FROM orchestration_v2_projection_provider_threads
+         WHERE thread_id = ?1
+         ORDER BY last_run_ordinal DESC, rowid DESC LIMIT 1",
+        [thread_id],
+        |r| r.get::<_, Option<String>>(0),
+    ) && let Some(id) = non_empty(found)
+    {
+        return Some(id);
+    }
+
+    // 3. Thread row itself.
+    for sql in [
+        "SELECT COALESCE(
+            NULLIF(provider_instance_id, ''),
+            NULLIF(json_extract(payload_json, '$.providerInstanceId'), ''),
+            NULLIF(json_extract(payload_json, '$.modelSelection.instanceId'), '')
+         ) FROM orchestration_v2_projection_threads
+         WHERE thread_id = ?1 LIMIT 1",
+        "SELECT COALESCE(
+            NULLIF(json_extract(payload_json, '$.providerInstanceId'), ''),
+            NULLIF(json_extract(payload_json, '$.modelSelection.instanceId'), '')
+         ) FROM orchestration_v2_projection_threads
+         WHERE thread_id = ?1 LIMIT 1",
+    ] {
+        if let Ok(found) = db.query_row(sql, [thread_id], |r| r.get::<_, Option<String>>(0)) {
+            if let Some(id) = non_empty(found) {
+                return Some(id);
+            }
+            break;
+        }
+    }
+
+    None
+}
+
 /// Hook helper (part 2 uses it): whether a native session/thread id belongs to
 /// an app-owned delegated child.
 pub fn is_delegated_child(

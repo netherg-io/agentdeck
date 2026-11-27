@@ -81,6 +81,7 @@ impl MockJudge {
                 allow: true,
                 confidence,
                 reason: reason.to_string(),
+                channel: None,
             }),
             calls: AtomicUsize::new(0),
             delay: Duration::ZERO,
@@ -93,6 +94,7 @@ impl MockJudge {
                 allow: false,
                 confidence,
                 reason: reason.to_string(),
+                channel: None,
             }),
             calls: AtomicUsize::new(0),
             delay: Duration::ZERO,
@@ -1371,6 +1373,7 @@ async fn mandate_revoked_or_scope_changed_mid_flight_escalates_to_telegram() {
                 allow: true,
                 confidence: 0.99,
                 reason: "judge_approved".into(),
+                channel: None,
             },
             calls: AtomicUsize::new(0),
         };
@@ -1429,6 +1432,7 @@ async fn mandate_revoked_or_scope_changed_mid_flight_escalates_to_telegram() {
                 allow: true,
                 confidence: 0.99,
                 reason: "judge_approved".into(),
+                channel: None,
             },
             calls: AtomicUsize::new(0),
         };
@@ -1735,5 +1739,295 @@ async fn provider_secret_marker_never_leaks_into_errors_or_audit_jsonl() {
         records[0].judge_reason.as_deref(),
         Some("judge_http_status_500")
     );
+    assert_eq!(records[0].judge_channel, None);
     assert_eq!(records[1].judge_reason.as_deref(), Some("judge_approved"));
+    assert_eq!(
+        records[1].judge_channel,
+        Some(agentdeck_core::judge::JudgeChannel::Primary)
+    );
+}
+
+#[tokio::test]
+async fn approver_broker_uses_fallback_on_429_and_records_judge_channel_in_audit() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    async fn spawn_server(
+        responses: Vec<(&'static str, &'static str, String)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            for (status, extra_headers, body) in responses {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut first = String::new();
+                stream.read_line(&mut first).await.unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        size = value.trim().parse().unwrap();
+                    }
+                }
+                let mut req_body = vec![0; size];
+                stream.read_exact(&mut req_body).await.unwrap();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        (base, handle)
+    }
+
+    let (primary_base, primary_srv) = spawn_server(vec![(
+        "429 Too Many Requests",
+        "Retry-After: 60\r\n",
+        r#"{"error":"rate limited"}"#.to_string(),
+    )])
+    .await;
+    let (fb_base, fb_srv) = spawn_server(vec![
+        (
+            "200 OK",
+            "",
+            json!({"answers": {"permit": {"score": 1, "confidence": 0.96}}}).to_string(),
+        ),
+        ("500 Internal Server Error", "", "{}".to_string()),
+    ])
+    .await;
+
+    let tmp = TempDir::new("fallback-audit");
+    let audit_path = audit_log_path(&tmp.0);
+    let blocks_dir = tmp.0.join("blocks");
+    let cfg = ApproverConfig::default();
+    let mandate = autonomous_mandate();
+    let req = sample_valid_approve_req();
+
+    let judge = HttpPolicyJudge::new(
+        Some("vercel".into()),
+        Some("perplexity/pplx-decider-v1.2".into()),
+        "primary-key".into(),
+    )
+    .unwrap()
+    .with_fallback("openrouter", None, "fallback-key".into())
+    .unwrap()
+    .with_base_url(primary_base)
+    .with_fallback_base_url(fb_base)
+    .with_blocks_dir(blocks_dir);
+
+    // 1) Primary 429 -> fallback auto-approves; audit records judge_channel="fallback".
+    let tg1 = Arc::new(MockTelegram::new());
+    let pending1 = PendingDecisions::new();
+    let ctx1 = BrokerContext {
+        config: &cfg,
+        mandate: Some(&mandate),
+        mandate_resolver: None,
+        pending: &pending1,
+        audit_path: Some(&audit_path),
+        timings: BrokerTimings::default(),
+    };
+    let d1 = evaluate_and_wait(&req, &ctx1, &judge, &tg1, std::future::pending(), None)
+        .await
+        .unwrap();
+    assert_eq!(d1.outcome, BrokerOutcome::Approved { secret_value: None });
+
+    // 2) Primary still blocked, fallback 500 -> escalates to human (Telegram), judge_channel=None.
+    let tg2 = Arc::new(MockTelegram::new());
+    let pending2 = Arc::new(PendingDecisions::new());
+    let tg2_bg = Arc::clone(&tg2);
+    let pending2_bg = Arc::clone(&pending2);
+    let deny = tokio::spawn(async move {
+        tg2_bg.wait_sent_count(1).await;
+        let id = tg2_bg.sent_records()[0].id.clone();
+        pending2_bg.resolve_callback(&id, CallbackAction::Deny);
+    });
+    let ctx2 = BrokerContext {
+        config: &cfg,
+        mandate: Some(&mandate),
+        mandate_resolver: None,
+        pending: &pending2,
+        audit_path: Some(&audit_path),
+        timings: BrokerTimings::default(),
+    };
+    let d2 = evaluate_and_wait(&req, &ctx2, &judge, &tg2, std::future::pending(), None)
+        .await
+        .unwrap();
+    deny.await.unwrap();
+    assert_eq!(d2.outcome, BrokerOutcome::Denied);
+
+    primary_srv.await.unwrap();
+    fb_srv.await.unwrap();
+
+    let records = read_recent(&audit_path, 10).unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].source, AuditSource::PolicyJudge);
+    assert_eq!(records[0].judge_reason.as_deref(), Some("judge_approved"));
+    assert_eq!(
+        records[0].judge_channel,
+        Some(agentdeck_core::judge::JudgeChannel::Fallback)
+    );
+    assert_eq!(
+        records[1].judge_reason.as_deref(),
+        Some("judge_http_status_500")
+    );
+    assert_eq!(records[1].judge_channel, None);
+}
+
+#[tokio::test]
+async fn broker_fallback_429_escalates_to_human_without_retrying_primary() {
+    use agentdeck_approver::audit::{AuditSource, audit_log_path, read_recent};
+    use agentdeck_approver::judge::HttpPolicyJudge;
+    use agentdeck_core::judge::{BlockStore, JudgeEndpoint};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    async fn spawn_server(
+        responses: Vec<(&'static str, &'static str, String)>,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_bg = Arc::clone(&count);
+        let handle = tokio::spawn(async move {
+            for (status, extra_headers, body) in responses {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                count_bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut stream = BufReader::new(stream);
+                let mut first = String::new();
+                stream.read_line(&mut first).await.unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        size = v.trim().parse().unwrap();
+                    }
+                }
+                let mut buf = vec![0; size];
+                stream.read_exact(&mut buf).await.unwrap();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        (base, count, handle)
+    }
+
+    // Primary would auto-approve with high confidence if retried after its short 1s block expires!
+    let (primary_base, primary_hits, primary_srv) = spawn_server(vec![(
+        "200 OK",
+        "",
+        json!({"answers": {"permit": {"score": 1, "confidence": 0.99}}}).to_string(),
+    )])
+    .await;
+    // Fallback responds 429 Retry-After: 60.
+    let (fb_base, fb_hits, fb_srv) = spawn_server(vec![(
+        "429 Too Many Requests",
+        "Retry-After: 60\r\n",
+        r#"{"error":"fallback rate limited"}"#.to_string(),
+    )])
+    .await;
+
+    let tmp = TempDir::new("fallback-429-escalate");
+    let audit_path = audit_log_path(&tmp.0);
+    let blocks_dir = tmp.0.join("blocks");
+    let blocks = BlockStore::new(blocks_dir.clone());
+    // Seed a short 500ms primary block (well inside the 10s approver deadline).
+    let primary_ep = JudgeEndpoint::new("vercel", "perplexity/pplx-decider-v1.2");
+    let fb_ep = JudgeEndpoint::new("openrouter", "~typesafe/jev-latest");
+    blocks
+        .record_rate_limit(&primary_ep, Duration::from_millis(500))
+        .unwrap();
+
+    let cfg = ApproverConfig::default();
+    let mandate = autonomous_mandate();
+    let req = sample_valid_approve_req();
+    let judge = HttpPolicyJudge::new(
+        Some("vercel".into()),
+        Some("perplexity/pplx-decider-v1.2".into()),
+        "primary-key".into(),
+    )
+    .unwrap()
+    .with_fallback("openrouter", None, "fallback-key".into())
+    .unwrap()
+    .with_base_url(primary_base)
+    .with_fallback_base_url(fb_base)
+    .with_blocks_dir(blocks_dir);
+
+    let tg = Arc::new(MockTelegram::new());
+    let pending = Arc::new(PendingDecisions::new());
+    let tg_bg = Arc::clone(&tg);
+    let pending_bg = Arc::clone(&pending);
+    let deny = tokio::spawn(async move {
+        tg_bg.wait_sent_count(1).await;
+        let id = tg_bg.sent_records()[0].id.clone();
+        pending_bg.resolve_callback(&id, CallbackAction::Deny);
+    });
+    let ctx = BrokerContext {
+        config: &cfg,
+        mandate: Some(&mandate),
+        mandate_resolver: None,
+        pending: &pending,
+        audit_path: Some(&audit_path),
+        timings: BrokerTimings::default(),
+    };
+    let decision = evaluate_and_wait(&req, &ctx, &judge, &tg, std::future::pending(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        decision.outcome,
+        BrokerOutcome::Denied,
+        "fallback 429 must escalate to human, never loop back to primary and auto-approve"
+    );
+    deny.await.unwrap();
+    assert_eq!(
+        primary_hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "primary must never be retried after fallback 429"
+    );
+    assert_eq!(fb_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        blocks.remaining(&fb_ep).is_some(),
+        "fallback 429 block must be recorded"
+    );
+    primary_srv.abort();
+    fb_srv.await.unwrap();
+
+    let records = read_recent(&audit_path, 10).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].judge_reason.as_deref(),
+        Some("judge_http_status_429")
+    );
+    assert_eq!(records[0].judge_channel, None);
+    assert_ne!(records[0].source, AuditSource::PolicyJudge);
 }

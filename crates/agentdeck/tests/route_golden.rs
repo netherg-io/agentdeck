@@ -91,6 +91,12 @@ impl Fixture {
         ] {
             std::fs::create_dir_all(dir.join(rel)).unwrap();
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join("rt-rust"), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
         std::fs::copy(
             workspace_root().join("crates/agentdeck/tests/fixtures/catalog.fixture.json"),
             dir.join(".local/state/model-route/catalog.json"),
@@ -211,6 +217,7 @@ fn to_golden_shape(args: &[&str], rout: &[u8]) -> Vec<u8> {
     }
     let mut v: serde_json::Value = serde_json::from_slice(rout).unwrap();
     v.as_object_mut().unwrap().remove("userRules");
+    v.as_object_mut().unwrap().remove("jevChannel");
     for entry in v["ranking"].as_array_mut().unwrap() {
         entry.as_object_mut().unwrap().remove("quotaEstimate");
     }
@@ -271,6 +278,7 @@ fn check_case(
     let strip = |bytes: &[u8]| -> Option<serde_json::Value> {
         let mut v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
         v.as_object_mut()?.remove("userRules");
+        v.as_object_mut()?.remove("jevChannel");
         let ranking = v.get_mut("ranking")?.as_array_mut()?;
         for entry in ranking.iter_mut() {
             entry.as_object_mut()?.remove("quotaEstimate");
@@ -280,6 +288,10 @@ fn check_case(
     if let (Some(n), Some(r)) = (strip(&nout), strip(&rout)) {
         assert_eq!(n, r, "{name}: non-additive output differs");
         let rust_v: serde_json::Value = serde_json::from_slice(&rout).unwrap();
+        assert_eq!(
+            rust_v["jevChannel"], "primary",
+            "{name}: unexpected jevChannel"
+        );
         assert_eq!(
             rust_v["userRules"],
             serde_json::json!({

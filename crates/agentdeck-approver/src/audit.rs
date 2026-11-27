@@ -12,6 +12,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agentdeck_core::judge::JudgeChannel;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +41,8 @@ pub struct AuditRecord {
     pub judge_confidence: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_channel: Option<JudgeChannel>,
     pub outcome: String,
     pub source: AuditSource,
     pub elapsed_ms: u64,
@@ -163,6 +166,7 @@ mod tests {
                 judge_allow: Some(true),
                 judge_confidence: Some(0.95),
                 judge_reason: Some("judge_approved".to_string()),
+                judge_channel: Some(JudgeChannel::Primary),
                 outcome: "approved".to_string(),
                 source: AuditSource::PolicyJudge,
                 elapsed_ms: 42,
@@ -194,6 +198,7 @@ mod tests {
             judge_allow: Some(false),
             judge_confidence: Some(0.0),
             judge_reason: Some("HTTP 500 echoed SECRET_TOKEN_12345".to_string()),
+            judge_channel: None,
             outcome: "denied".to_string(),
             source: AuditSource::Denied,
             elapsed_ms: 10,

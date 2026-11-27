@@ -99,6 +99,15 @@ pub fn format_utc_rfc3339(secs: i64) -> String {
 /// Convert `[coordinator]` registry settings into `agentdeck_coordinator::CoordinatorConfig`.
 pub fn coordinator_config(reg: &Registry) -> anyhow::Result<CoordinatorConfig> {
     let s = settings::read_coordinator(reg)?;
+    let judge_fallback = match settings::read_judge_fallback(reg) {
+        Ok(fb) => fb,
+        Err(e) => {
+            eprintln!(
+                "agentdeck coordinator: invalid [judge_fallback] config ({e:#}); continuing without fallback"
+            );
+            settings::JudgeFallbackSettings::default()
+        }
+    };
     Ok(CoordinatorConfig {
         pool: s
             .pool
@@ -122,6 +131,7 @@ pub fn coordinator_config(reg: &Registry) -> anyhow::Result<CoordinatorConfig> {
         t3_token_file: s.t3_token_file,
         judge_provider: s.judge_provider,
         judge_model: s.judge_model,
+        judge_fallback,
     })
 }
 
@@ -660,4 +670,92 @@ async fn eval(as_json: bool) -> anyhow::Result<i32> {
         }
     }
     Ok(if ok { 0 } else { 1 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coordinator_config_ignores_invalid_judge_fallback_and_logs_error() {
+        const CHILD: &str = "AGENTDECK_COORD_INVALID_FALLBACK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cmd_coordinator::tests::coordinator_config_ignores_invalid_judge_fallback_and_logs_error",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "child failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(
+                stderr.contains("[judge_fallback]") && stderr.contains("vercel"),
+                "expected invalid [judge_fallback] warning on stderr, got:\n{stderr}"
+            );
+            return;
+        }
+
+        let reg = Registry::from_toml(
+            r#"
+version = 1
+
+[coordinator]
+[[coordinator.pool]]
+instance_id = "claude_a"
+model = "claude-opus-5-5"
+
+[judge_fallback]
+provider = "vercel"
+"#,
+        )
+        .unwrap();
+        let cfg = coordinator_config(&reg)
+            .expect("invalid [judge_fallback] must not fail coordinator_config");
+        assert_eq!(cfg.pool.len(), 1);
+        assert_eq!(cfg.pool[0].instance_id, "claude_a");
+        assert_eq!(
+            cfg.judge_fallback,
+            settings::JudgeFallbackSettings::default()
+        );
+
+        // Valid [judge_fallback] is still loaded.
+        let valid_reg = Registry::from_toml(
+            r#"
+version = 1
+
+[judge_fallback]
+provider = "vercel"
+model = "openai/gpt-4o-mini"
+"#,
+        )
+        .unwrap();
+        let valid_cfg = coordinator_config(&valid_reg).unwrap();
+        assert_eq!(
+            valid_cfg.judge_fallback.provider.as_deref(),
+            Some(settings::PROVIDER_VERCEL)
+        );
+        assert_eq!(
+            valid_cfg.judge_fallback.model.as_deref(),
+            Some("openai/gpt-4o-mini")
+        );
+
+        // Invalid [coordinator] itself must still fail.
+        let bad_coord = Registry::from_toml(
+            r#"
+version = 1
+
+[coordinator]
+judge_provider = "vercel"
+"#,
+        )
+        .unwrap();
+        assert!(coordinator_config(&bad_coord).is_err());
+    }
 }

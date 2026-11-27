@@ -52,7 +52,7 @@ impl Env {
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
             home: home_dir()?,
-            runtime: runtime_dir(),
+            runtime: runtime_dir()?,
             state_home: state_home()?,
             router_json: std::env::var("MODEL_ROUTE_ROUTER_JSON").ok(),
         })
@@ -1001,112 +1001,6 @@ fn quota_estimate_json(c: &Candidate) -> Value {
     })
 }
 
-// --- source detection --------------------------------------------------------
-
-fn proc_stat_ppid(pid: u32) -> Option<u32> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after = text.split(") ").nth(1)?;
-    after.split(' ').nth(1)?.parse().ok()
-}
-
-fn detect_source(settings: &Value) -> Option<String> {
-    let mut pid = proc_stat_ppid(std::process::id())?;
-    let mut saw_agy = false;
-    for _ in 0..12 {
-        if pid <= 1 {
-            break;
-        }
-        let Some(cmd) = std::fs::read(format!("/proc/{pid}/cmdline")).ok() else {
-            break;
-        };
-        let parts: Vec<&str> = cmd
-            .split(|b| *b == 0)
-            .map(|b| std::str::from_utf8(b).unwrap_or_default())
-            .collect();
-        let names: Vec<String> = parts
-            .iter()
-            .take(2)
-            .map(|c| c.rsplit('/').next().unwrap_or_default().to_string())
-            .collect();
-        if names.iter().any(|n| n == "codex") {
-            let env = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
-            let codex_home = env.split(|b| *b == 0).find_map(|e| {
-                std::str::from_utf8(e)
-                    .ok()
-                    .and_then(|s| s.strip_prefix("CODEX_HOME=").map(str::to_string))
-            });
-            let found = settings
-                .get("providerInstances")
-                .and_then(Value::as_object)
-                .map(|insts| {
-                    insts
-                        .iter()
-                        .find(|(_, v)| {
-                            codex_home.is_some()
-                                && v.get("driver").and_then(Value::as_str) == Some("codex")
-                                && v.get("config")
-                                    .and_then(|c| c.get("shadowHomePath"))
-                                    .and_then(Value::as_str)
-                                    == codex_home.as_deref()
-                        })
-                        .map(|(k, _)| k.clone())
-                })
-                .unwrap_or(None);
-            return Some(found.unwrap_or_else(|| "codex".into()));
-        }
-        if names.iter().any(|n| n == "claude") {
-            let claude_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
-            let found = settings
-                .get("providerInstances")
-                .and_then(Value::as_object)
-                .and_then(|insts| {
-                    insts
-                        .iter()
-                        .find(|(_, v)| {
-                            v.get("driver").and_then(Value::as_str) == Some("claudeAgent")
-                                && claude_dir.is_some()
-                                && v.get("config")
-                                    .and_then(|c| c.get("homePath"))
-                                    .and_then(Value::as_str)
-                                    == claude_dir.as_deref()
-                        })
-                        .map(|(k, _)| k.clone())
-                });
-            return Some(found.unwrap_or_else(|| {
-                if claude_dir.is_some_and(|d| d.contains(".claude-openrouter")) {
-                    "claudeAgent_openrouter".into()
-                } else {
-                    "claudeAgent".into()
-                }
-            }));
-        }
-        if names.iter().any(|n| n == "opencode") {
-            return Some("opencode".into());
-        }
-        if names.iter().any(|n| n == "agy")
-            || parts
-                .first()
-                .is_some_and(|c| c.contains("/.t3/tools/antigravity-acp/"))
-        {
-            let env: Vec<String> = std::fs::read(format!("/proc/{pid}/environ"))
-                .unwrap_or_default()
-                .split(|b| *b == 0)
-                .map(|e| String::from_utf8_lossy(e).into_owned())
-                .collect();
-            let argv: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
-            if let Some(id) = crate::policy::antigravity_instance(settings, &env, &argv) {
-                return Some(id);
-            }
-            saw_agy = true;
-        }
-        let Some(parent) = proc_stat_ppid(pid) else {
-            break;
-        };
-        pid = parent;
-    }
-    saw_agy.then(|| "antigravity".into())
-}
-
 // --- Jev ---------------------------------------------------------------------
 
 /// Reads a key from `env` or `~/.config/model-route/<file>`.
@@ -1122,10 +1016,16 @@ fn decision_key(env: &str, file: &str) -> anyhow::Result<String> {
                 .filter(|k| !k.is_empty())
         })
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "decision key not found: set {env} or write {}",
-                key_file.display()
-            )
+            JevHttpError {
+                trigger: agentdeck_core::judge::FallbackTrigger::None,
+                is_language_model: false,
+                batch_kind: crate::jev_queue::BatchErrorKind::ChannelWide,
+                message: format!(
+                    "decision key not found: set {env} or write {}",
+                    key_file.display()
+                ),
+            }
+            .into()
         })
 }
 
@@ -1234,64 +1134,256 @@ fn gateway_answers(response: &Value) -> anyhow::Result<Value> {
     serde_json::from_str(json).map_err(|e| anyhow::anyhow!("gateway answer is not JSON: {e}"))
 }
 
-async fn post_json(url: &str, key: &str, body: String) -> anyhow::Result<Value> {
-    let res = reqwest::Client::new()
+const OPENROUTER_BASE: &str = "https://openrouter.ai";
+const VERCEL_BASE: &str = "https://ai-gateway.vercel.sh";
+const JEV_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Debug)]
+struct JevHttpError {
+    trigger: agentdeck_core::judge::FallbackTrigger,
+    is_language_model: bool,
+    batch_kind: crate::jev_queue::BatchErrorKind,
+    message: String,
+}
+
+impl std::fmt::Display for JevHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for JevHttpError {}
+
+fn classify_jev_error(err: &anyhow::Error) -> agentdeck_core::judge::FallbackTrigger {
+    if let Some(http) = err.downcast_ref::<JevHttpError>() {
+        return http.trigger;
+    }
+    if let Some(rl) = err.downcast_ref::<crate::jev_queue::RateLimited>() {
+        return agentdeck_core::judge::FallbackTrigger::RateLimited {
+            retry_after: rl.retry_after,
+        };
+    }
+    agentdeck_core::judge::FallbackTrigger::None
+}
+
+fn classify_jev_batch_error(err: &anyhow::Error) -> crate::jev_queue::BatchErrorKind {
+    if let Some(http) = err.downcast_ref::<JevHttpError>() {
+        return http.batch_kind;
+    }
+    if err
+        .downcast_ref::<crate::jev_queue::RateLimited>()
+        .is_some()
+    {
+        return crate::jev_queue::BatchErrorKind::ChannelWide;
+    }
+    crate::jev_queue::BatchErrorKind::RequestSpecific
+}
+
+#[derive(Clone, Debug)]
+struct JevBases {
+    openrouter: String,
+    vercel: String,
+}
+
+impl Default for JevBases {
+    fn default() -> Self {
+        Self {
+            openrouter: OPENROUTER_BASE.to_string(),
+            vercel: VERCEL_BASE.to_string(),
+        }
+    }
+}
+
+fn is_loopback_url(url: &str) -> bool {
+    url.starts_with("http://127.0.0.1")
+        || url.starts_with("http://[::1]")
+        || url.starts_with("http://localhost")
+}
+
+async fn post_json(
+    url: &str,
+    key: &str,
+    body: String,
+    deadline: std::time::Instant,
+    check_language_model: bool,
+) -> anyhow::Result<Value> {
+    let Some(timeout) = agentdeck_core::judge::request_timeout(JEV_REQUEST_TIMEOUT, deadline)
+    else {
+        return Err(JevHttpError {
+            trigger: agentdeck_core::judge::FallbackTrigger::Transient,
+            is_language_model: false,
+            batch_kind: crate::jev_queue::BatchErrorKind::LeaderTimeout,
+            message: "jev_error_timeout".into(),
+        }
+        .into());
+    };
+    let mut builder = reqwest::Client::builder();
+    if is_loopback_url(url) {
+        builder = builder.no_proxy();
+    }
+    let client = builder
+        .build()
+        .map_err(|_| anyhow::anyhow!("jev_error_client"))?;
+    let res = client
         .post(url)
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(timeout)
         .header("Authorization", format!("Bearer {key}"))
         .header("Content-Type", "application/json")
         .body(body)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("Jev request failed: {e}"))?;
+        .map_err(|e| JevHttpError {
+            trigger: agentdeck_core::judge::FallbackTrigger::Transient,
+            is_language_model: false,
+            batch_kind: if e.is_timeout() {
+                crate::jev_queue::BatchErrorKind::LeaderTimeout
+            } else {
+                crate::jev_queue::BatchErrorKind::ChannelWide
+            },
+            message: if e.is_timeout() {
+                "jev_error_timeout".into()
+            } else {
+                "jev_error_network".into()
+            },
+        })?;
     if !res.status().is_success() {
         let status = res.status().as_u16();
-        let retry_after = res
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok()?.trim().parse::<u64>().ok());
-        let text = res.text().await.unwrap_or_default();
-        let snippet: String = text.chars().take(300).collect();
-        let message = format!("Jev HTTP {status}: {snippet}");
+        // Decide 429 on status + Retry-After before reading the body, and never
+        // let a 429 body trigger the Vercel language-model chat retry.
         if status == 429 {
-            return Err(crate::jev_queue::RateLimited {
-                retry_after: std::time::Duration::from_secs(retry_after.unwrap_or(30)),
-                message,
+            let retry_after = agentdeck_core::judge::parse_retry_after(
+                res.headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+            );
+            return Err(JevHttpError {
+                trigger: agentdeck_core::judge::classify_http_status(429, Some(retry_after)),
+                is_language_model: false,
+                batch_kind: crate::jev_queue::BatchErrorKind::ChannelWide,
+                message: "jev_http_status_429".into(),
             }
             .into());
         }
-        return Err(anyhow::anyhow!(message));
+        // Only inspect non-429 4xx body for the Vercel language-model sentinel;
+        // never copy provider HTTP body text into errors or logs.
+        let is_language_model = check_language_model
+            && (400..500).contains(&status)
+            && res
+                .text()
+                .await
+                .is_ok_and(|text| text.contains("is a language model"));
+        let channel_wide = matches!(status, 401 | 403 | 404 | 405) || (500..=599).contains(&status);
+        return Err(JevHttpError {
+            trigger: agentdeck_core::judge::classify_http_status(status, None),
+            is_language_model,
+            batch_kind: if channel_wide {
+                crate::jev_queue::BatchErrorKind::ChannelWide
+            } else {
+                crate::jev_queue::BatchErrorKind::RequestSpecific
+            },
+            message: format!("jev_http_status_{status}"),
+        }
+        .into());
     }
-    res.json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Jev returned invalid JSON: {e}"))
+    let bytes = res.bytes().await.map_err(|e| JevHttpError {
+        trigger: agentdeck_core::judge::FallbackTrigger::Transient,
+        is_language_model: false,
+        batch_kind: if e.is_timeout() {
+            crate::jev_queue::BatchErrorKind::LeaderTimeout
+        } else {
+            crate::jev_queue::BatchErrorKind::ChannelWide
+        },
+        message: if e.is_timeout() {
+            "jev_error_timeout".into()
+        } else {
+            "jev_error_network".into()
+        },
+    })?;
+    serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("Jev returned invalid JSON"))
 }
 
-async fn jev_fetch(
-    provider: Option<&str>,
+async fn jev_fetch_endpoint(
+    endpoint: &agentdeck_core::judge::JudgeEndpoint,
     request: &Value,
     request_body: &str,
     key: Option<&str>,
+    deadline: std::time::Instant,
+    bases: &JevBases,
+    send_guard: Option<&crate::jev_queue::BatchSendGuard>,
 ) -> anyhow::Result<(Value, Option<f64>)> {
-    if let Ok(mock) = std::env::var("AGENTDECK_ROUTE_MOCK_JEV") {
+    if bases.openrouter == OPENROUTER_BASE
+        && bases.vercel == VERCEL_BASE
+        && let Ok(mock) = std::env::var("AGENTDECK_ROUTE_MOCK_JEV")
+    {
         let text = std::fs::read_to_string(mock)?;
         let v: Value = serde_json::from_str(&text)?;
+        let raw_answers = v.get("answers").cloned().unwrap_or(Value::Null);
+        let answers = if let (Some(req_qs), Some(ans_map)) = (
+            request.get("questions").and_then(Value::as_object),
+            raw_answers.as_object(),
+        ) && request.pointer("/state/tasks").is_some()
+        {
+            let mut out = serde_json::Map::new();
+            for qk in req_qs.keys() {
+                if let Some(val) = ans_map.get(qk) {
+                    out.insert(qk.clone(), val.clone());
+                } else if let Some((_, base)) = qk.split_once("__")
+                    && let Some(val) = ans_map.get(base)
+                {
+                    out.insert(qk.clone(), val.clone());
+                }
+            }
+            Value::Object(out)
+        } else {
+            raw_answers
+        };
         return Ok((
-            v.get("answers").cloned().unwrap_or(Value::Null),
+            answers,
             v.get("usage")
                 .and_then(|u| u.get("cost"))
                 .and_then(Value::as_f64),
         ));
     }
-    if provider == Some(agentdeck_core::settings::PROVIDER_VERCEL) {
+    // Rewrite only the outbound model when falling back so the caller's primary
+    // request (and Jev cache key) stay untouched.
+    fn with_endpoint_model<'a>(req: &'a Value, model: &str) -> std::borrow::Cow<'a, Value> {
+        if req.get("model").and_then(Value::as_str) == Some(model) {
+            std::borrow::Cow::Borrowed(req)
+        } else {
+            let mut r = req.clone();
+            if let Some(o) = r.as_object_mut() {
+                o.insert("model".into(), Value::from(model));
+            }
+            std::borrow::Cow::Owned(r)
+        }
+    }
+    let eff_request = with_endpoint_model(request, &endpoint.model);
+
+    if endpoint.provider == agentdeck_core::settings::PROVIDER_VERCEL {
         let key = match key {
             Some(k) => k.to_string(),
             None => decision_key("AI_GATEWAY_API_KEY", "vercel.key")?,
         };
+        let decisions_url = format!("{}/v1/decisions", bases.vercel.trim_end_matches('/'));
+        let chat_url = format!("{}/v1/chat/completions", bases.vercel.trim_end_matches('/'));
+        // One-by-one retries after a batch already learned this is a chat model go straight to chat.
+        if send_guard.is_some_and(|g| g.is_language_model(&endpoint.model)) {
+            let v = post_json(
+                &chat_url,
+                &key,
+                gateway_body(&eff_request).to_string(),
+                deadline,
+                false,
+            )
+            .await?;
+            return Ok((gateway_answers(&v)?, None));
+        }
         match post_json(
-            "https://ai-gateway.vercel.sh/v1/decisions",
+            &decisions_url,
             &key,
-            decisions_body(request).to_string(),
+            decisions_body(&eff_request).to_string(),
+            deadline,
+            true,
         )
         .await
         {
@@ -1301,28 +1393,67 @@ async fn jev_fetch(
                     .and_then(|c| c.as_f64().or_else(|| c.as_str()?.parse().ok()));
                 return Ok((decisions_answers(&v), cost));
             }
-            Err(e) if e.to_string().contains("is a language model") => {}
+            Err(e)
+                if e.downcast_ref::<JevHttpError>()
+                    .is_some_and(|he| he.is_language_model) =>
+            {
+                if let Some(guard) = send_guard {
+                    guard.mark_language_model(&endpoint.model);
+                }
+                let next_request = match send_guard {
+                    Some(guard) => {
+                        let (rebuilt, _) =
+                            guard.prepare_send(crate::jev_queue::monotonic_now_ms())?;
+                        Some(rebuilt)
+                    }
+                    None => None,
+                };
+                let chat_eff =
+                    with_endpoint_model(next_request.as_ref().unwrap_or(request), &endpoint.model);
+                let v = post_json(
+                    &chat_url,
+                    &key,
+                    gateway_body(&chat_eff).to_string(),
+                    deadline,
+                    false,
+                )
+                .await?;
+                // shortcut: the chat completion's cost is not read, so Jev cost reports as unknown.
+                return Ok((gateway_answers(&v)?, None));
+            }
             Err(e) => return Err(e),
         }
-        let v = post_json(
-            "https://ai-gateway.vercel.sh/v1/chat/completions",
-            &key,
-            gateway_body(request).to_string(),
-        )
-        .await?;
-        // shortcut: the chat completion's cost is not read, so Jev cost reports as unknown.
-        return Ok((gateway_answers(&v)?, None));
     }
     let key = match key {
         Some(k) => k.to_string(),
         None => decision_key("JEV_OPENROUTER_API_KEY", "openrouter.key")?,
     };
-    let v = post_json(
-        "https://openrouter.ai/api/alpha/decisions",
-        &key,
-        request_body.to_string(),
-    )
-    .await?;
+    // OpenRouter chat models only answer on chat completions.
+    if !agentdeck_core::judge::is_openrouter_decision_model(&endpoint.model) {
+        let url = format!(
+            "{}/api/v1/chat/completions",
+            bases.openrouter.trim_end_matches('/')
+        );
+        let v = post_json(
+            &url,
+            &key,
+            gateway_body(&eff_request).to_string(),
+            deadline,
+            false,
+        )
+        .await?;
+        // shortcut: the chat completion's cost is not read, so Jev cost reports as unknown; read `usage.cost` when OpenRouter chat cost matters.
+        return Ok((gateway_answers(&v)?, None));
+    }
+    let eff_body = match eff_request {
+        std::borrow::Cow::Owned(r) => stringify_like_node(&r),
+        std::borrow::Cow::Borrowed(_) => request_body.to_string(),
+    };
+    let url = format!(
+        "{}/api/alpha/decisions",
+        bases.openrouter.trim_end_matches('/')
+    );
+    let v = post_json(&url, &key, eff_body, deadline, false).await?;
     Ok((
         v.get("answers").cloned().unwrap_or(Value::Null),
         v.get("usage")
@@ -1331,47 +1462,118 @@ async fn jev_fetch(
     ))
 }
 
+fn primary_endpoint(cfg: &RouterConfig) -> anyhow::Result<agentdeck_core::judge::JudgeEndpoint> {
+    let provider = cfg
+        .decision_provider
+        .clone()
+        .unwrap_or_else(|| agentdeck_core::settings::PROVIDER_OPENROUTER.to_string());
+    if provider == agentdeck_core::settings::PROVIDER_VERCEL && cfg.decision_model.is_none() {
+        return Err(anyhow::anyhow!(
+            "decision provider vercel needs [router] decision_model"
+        ));
+    }
+    let model = cfg
+        .decision_model
+        .clone()
+        .unwrap_or_else(|| agentdeck_core::settings::DEFAULT_DECISION_MODEL.to_string());
+    Ok(agentdeck_core::judge::JudgeEndpoint::new(provider, model))
+}
+
 /// One live decision through the configured provider (explicit only).
 ///
 /// Builds a one-question Jev decision over caller-supplied `state` (task +
 /// evidence, already size-checked) and returns the raw `answers`, the reported
 /// judge cost (`None` when the provider reports none), and the judge identity
-/// (`provider` label, `model`). Reuses the routing decision provider, model and
-/// keys; adds no model settings. Honours `AGENTDECK_ROUTE_MOCK_JEV` like routing.
+/// (`provider` label, `model`). Reuses the routing decision provider, model,
+/// shared `[judge_fallback]`, cross-process 429 blocks, and keys.
+/// Honours `AGENTDECK_ROUTE_MOCK_JEV` like routing.
 pub async fn judge_evaluation(
     state: Value,
     questions: Value,
 ) -> anyhow::Result<(Value, Option<f64>, String, String)> {
     let env = Env::from_env()?;
     let cfg = load_router_config(&env)?;
-    let provider = cfg
-        .decision_provider
-        .clone()
-        .unwrap_or_else(|| agentdeck_core::settings::PROVIDER_OPENROUTER.to_string());
-    let model = cfg
-        .decision_model
-        .clone()
-        .unwrap_or_else(|| agentdeck_core::settings::DEFAULT_DECISION_MODEL.to_string());
-    if provider == agentdeck_core::settings::PROVIDER_VERCEL && cfg.decision_model.is_none() {
-        return Err(anyhow::anyhow!(
-            "decision provider vercel needs [router] decision_model"
-        ));
-    }
-    let request = serde_json::json!({"model": &model, "state": state, "questions": questions});
+    let primary = primary_endpoint(&cfg)?;
+    let fallback = cfg.judge_fallback.endpoint();
+    let request =
+        serde_json::json!({"model": &primary.model, "state": state, "questions": questions});
     let body = stringify_like_node(&request);
-    let (answers, cost) =
-        jev_fetch(cfg.decision_provider.as_deref(), &request, &body, None).await?;
-    Ok((answers, cost, provider, model))
+    if std::env::var_os("AGENTDECK_ROUTE_MOCK_JEV").is_some() {
+        let (answers, cost) = jev_fetch_endpoint(
+            &primary,
+            &request,
+            &body,
+            None,
+            std::time::Instant::now() + JEV_REQUEST_TIMEOUT,
+            &JevBases::default(),
+            None,
+        )
+        .await?;
+        return Ok((answers, cost, primary.provider, primary.model));
+    }
+    let blocks = agentdeck_core::judge::BlockStore::for_runtime_dir(&env.runtime);
+    let bases = JevBases::default();
+    let ((answers, cost), channel) = agentdeck_core::judge::dispatch_with_deadline(
+        &blocks,
+        &primary,
+        fallback.as_ref(),
+        agentdeck_core::judge::DispatchBudget::new(
+            crate::jev_queue::BUDGET,
+            crate::jev_queue::FALLBACK_RESERVE,
+        ),
+        std::time::Instant::now,
+        std::time::SystemTime::now,
+        tokio::time::sleep,
+        |ep, attempt_deadline| {
+            let ep = ep.clone();
+            let req = request.clone();
+            let body = body.clone();
+            let bases = bases.clone();
+            async move {
+                jev_fetch_endpoint(&ep, &req, &body, None, attempt_deadline, &bases, None).await
+            }
+        },
+        classify_jev_error,
+        |ep, ra, rem| {
+            anyhow::anyhow!(
+                "{}",
+                agentdeck_core::judge::format_rate_limit_exceeded(ep, ra, rem)
+            )
+        },
+    )
+    .await?;
+    let used = match (channel, fallback) {
+        (agentdeck_core::judge::JudgeChannel::Fallback, Some(fb)) => fb,
+        _ => primary,
+    };
+    Ok((answers, cost, used.provider, used.model))
 }
 
-/// One live decision on a fixed small task, bypassing the cache: checks that
-/// the provider, model and key work. `key` overrides the stored key.
-/// Returns (size score, difficulty score, cost in USD when reported).
+/// One live decision on a fixed small task, bypassing the cache and fallback:
+/// checks that the specific provider, model and key work while honouring and
+/// updating the shared cross-process 429 block store. `key` overrides the
+/// stored key. Returns (size score, difficulty score, cost in USD when reported).
 pub async fn probe_decision(
     provider: Option<&str>,
     model: &str,
     key: Option<&str>,
 ) -> anyhow::Result<(f64, f64, Option<f64>)> {
+    let runtime_base = agentdeck_core::judge::default_runtime_base()?;
+    let blocks = agentdeck_core::judge::BlockStore::for_runtime_dir(&runtime_base);
+    probe_decision_with_bases(provider, model, key, &blocks, &JevBases::default()).await
+}
+
+async fn probe_decision_with_bases(
+    provider: Option<&str>,
+    model: &str,
+    key: Option<&str>,
+    blocks: &agentdeck_core::judge::BlockStore,
+    bases: &JevBases,
+) -> anyhow::Result<(f64, f64, Option<f64>)> {
+    let endpoint = agentdeck_core::judge::JudgeEndpoint::new(
+        provider.unwrap_or(agentdeck_core::settings::PROVIDER_OPENROUTER),
+        model,
+    );
     let request = serde_json::json!({
         "model": model,
         "state": {"task": "Rename one local variable in a 20-line Python script.", "models": {}},
@@ -1381,7 +1583,58 @@ pub async fn probe_decision(
         },
     });
     let body = stringify_like_node(&request);
-    let (answers, cost) = jev_fetch(provider, &request, &body, key).await?;
+    let deadline = std::time::Instant::now() + JEV_REQUEST_TIMEOUT;
+    let step = agentdeck_core::judge::dispatch_once(
+        blocks,
+        &endpoint,
+        None,
+        deadline,
+        std::time::Duration::ZERO,
+        None,
+        std::time::Instant::now,
+        std::time::SystemTime::now,
+        |ep, attempt_deadline| {
+            let ep = ep.clone();
+            let req = request.clone();
+            let body = body.clone();
+            let bases = bases.clone();
+            let key_owned = key.map(str::to_string);
+            async move {
+                jev_fetch_endpoint(
+                    &ep,
+                    &req,
+                    &body,
+                    key_owned.as_deref(),
+                    attempt_deadline,
+                    &bases,
+                    None,
+                )
+                .await
+            }
+        },
+        classify_jev_error,
+        |ep, ra, _rem| {
+            anyhow::anyhow!(
+                "{}",
+                agentdeck_core::judge::format_blocked_until(ep, ra, std::time::SystemTime::now())
+            )
+        },
+    )
+    .await;
+    let (answers, cost) = match step {
+        agentdeck_core::judge::DispatchStep::Done(v, _) => v,
+        agentdeck_core::judge::DispatchStep::Wait(rem) => {
+            return Err(anyhow::anyhow!(
+                "{}",
+                agentdeck_core::judge::format_blocked_until(
+                    &endpoint,
+                    rem,
+                    std::time::SystemTime::now(),
+                )
+            ));
+        }
+        agentdeck_core::judge::DispatchStep::Fail(e) => return Err(e),
+    };
     let score = |k: &str| {
         answers
             .get(k)
@@ -1389,7 +1642,7 @@ pub async fn probe_decision(
             .and_then(|a| a.get("score"))
             .and_then(Value::as_f64)
             .ok_or_else(|| {
-                anyhow::anyhow!("the model answered, but {k} is missing or out of range: {answers}")
+                anyhow::anyhow!("the model answered, but {k} is missing or out of range")
             })
     };
     Ok((score("size")?, score("difficulty")?, cost))
@@ -1397,126 +1650,52 @@ pub async fn probe_decision(
 
 // --- CLI ---------------------------------------------------------------------
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatedTarget {
     pub provider: String,
     pub model: String,
 }
 
-pub async fn run(argv: Vec<String>) -> i32 {
-    match run_inner(argv).await {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("{e}");
-            1
+/// Total deadline for one `route_batch` call (fits a 60s 429 block when no
+/// fallback is configured, or falls back immediately when configured).
+pub const BATCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+#[derive(Clone, Debug)]
+pub struct BatchOptions {
+    pub harness: Option<String>,
+    pub source: Option<String>,
+    pub budget: std::time::Duration,
+}
+
+impl Default for BatchOptions {
+    fn default() -> Self {
+        Self {
+            harness: None,
+            source: None,
+            budget: BATCH_BUDGET,
         }
     }
 }
 
-async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
-    match argv.first().map(String::as_str) {
-        Some("hook") => return Ok(crate::hook::run(&argv[1..])),
-        Some("claude-shell") => return Ok(crate::shell::run(&argv[1..])),
-        Some("t3-mcp-call") => return Ok(crate::mcp_call::run(&argv[1..]).await),
-        Some("workflow") => return Ok(crate::workflow::run(&argv[1..]).await),
-        Some("outcomes") => return Ok(crate::outcomes::run(&argv[1..]).await),
-        _ => {}
-    }
-    let env = Env::from_env()?;
-    if argv.len() == 1 && argv[0] == "--catalog" {
-        let mut stdin = String::new();
-        use std::io::Read;
-        std::io::stdin().read_to_string(&mut stdin)?;
-        let data: Value = serde_json::from_str(&stdin).map_err(|_| {
-            anyhow::anyhow!(
-                "expected orchestrator_capabilities structuredContent with model option descriptors"
-            )
-        })?;
-        match save_catalog(&env.state_home, data) {
-            Ok(()) => {
-                println!("model option catalog updated");
-                return Ok(0);
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                return Ok(1);
-            }
-        }
-    }
-    let mut args = argv.as_slice();
-    let mut source: Option<String> = None;
-    let mut requested: Option<ValidatedTarget> = None;
-    let mut exclude: Vec<String> = Vec::new();
-    let mut force_review = false;
-    let mut effort: Option<i64> = None;
-    while args.first().is_some_and(|a| a.starts_with("--")) && args[0] != "--check" {
-        let flag = args[0].clone();
-        args = &args[1..];
-        if flag == "--" {
-            break;
-        }
-        if flag == "--source" && !args.is_empty() {
-            source = Some(args[0].clone());
-            args = &args[1..];
-        } else if flag == "--validate-target" && args.len() >= 2 {
-            requested = Some(ValidatedTarget {
-                provider: args[0].clone(),
-                model: args[1].clone(),
-            });
-            args = &args[2..];
-        } else if flag == "--exclude" && !args.is_empty() {
-            exclude.push(args[0].clone());
-            args = &args[1..];
-        } else if flag == "--review" {
-            force_review = true;
-        } else if flag == "--effort"
-            && let Some(level) = args
-                .first()
-                .and_then(|l| ["medium", "high", "xhigh"].iter().position(|x| x == l))
-        {
-            // Same scale as `reasoning_target`: difficulty 0 medium, 1 high, 2 xhigh.
-            effort = Some(level as i64);
-            args = &args[1..];
-        } else {
-            eprintln!("{USAGE}");
-            return Ok(2);
-        }
-    }
-    let settings =
-        read_settings(&env.home).map_err(|e| anyhow::anyhow!("cannot read T3 settings: {e}"))?;
-    if source.is_none() {
-        source = detect_source(&settings);
-    }
-    let cfg = match load_router_config(&env) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{e}");
-            return Ok(1);
-        }
-    };
-    let source_warning = match &source {
-        Some(s) if !cfg.account.contains_key(s) => Some(format!(
-            "unknown source instance \"{s}\": no shared-quota protection"
-        )),
-        _ => None,
-    };
-    let usage_path = cfg
-        .usage_state_path
+fn usage_state_path(env: &Env, cfg: &RouterConfig) -> std::path::PathBuf {
+    cfg.usage_state_path
         .clone()
         .map(|p| {
             p.strip_prefix("~/")
                 .map(|rest| env.home.join(rest))
                 .unwrap_or_else(|| std::path::PathBuf::from(p))
         })
-        .unwrap_or_else(|| env.home.join(".local/state/ai-usage/state.json"));
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    let mut usage = parse_usage_state(&usage_path)
-        .map_err(|e| anyhow::anyhow!("cannot read usage state {}: {e}", usage_path.display()))?;
-    let mut load = read_active_agents(&env.home.join(".t3/userdata/statev2.sqlite"));
-    let measured = codex_costs(&env);
+        .unwrap_or_else(|| env.home.join(".local/state/ai-usage/state.json"))
+}
 
+/// (provider instance, model, capability profile) per enabled favorite.
+type Favorites = Vec<(String, String, Option<String>)>;
+
+fn resolve_favorites(
+    cfg: &RouterConfig,
+    settings: &Value,
+    state_home: &std::path::Path,
+) -> anyhow::Result<(Favorites, Vec<String>)> {
     let configured: Vec<Value> = enabled_favorites(
         cfg.pool
             .iter()
@@ -1537,13 +1716,13 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                 Value::Object(m)
             })
             .collect(),
-        &settings,
+        settings,
     );
     let opencode_models: Vec<String> = if configured
         .iter()
         .any(|f| f.get("provider").and_then(Value::as_str) == Some("opencode"))
     {
-        let catalog = read_live_catalog(&env.state_home)?;
+        let catalog = read_live_catalog(state_home)?;
         catalog
             .get("providers")
             .and_then(Value::as_array)
@@ -1595,124 +1774,52 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         .filter(|(_, _, p)| p.is_none())
         .map(|(pr, m, _)| format!("{pr}/{m}"))
         .collect();
+    Ok((favorites, unprofiled))
+}
 
-    if args.first().is_some_and(|a| a == "--check") {
-        println!(
-            "source: {}",
-            source
-                .as_deref()
-                .unwrap_or("unknown (use --source to preserve orchestrator quota)")
-        );
-        // Source is visible so the GUI/operator can tell a default ban from
-        // an explicit user override.
-        println!(
-            "user rules (source: {}): no-review: {}; denied: {}",
-            cfg.user_rules.source.as_str(),
-            if cfg.user_rules.no_review_models.is_empty() {
-                "(none)".to_string()
-            } else {
-                cfg.user_rules.no_review_models.join(", ")
-            },
-            if cfg.user_rules.deny_models.is_empty() {
-                "(none)".to_string()
-            } else {
-                cfg.user_rules.deny_models.join(", ")
-            }
-        );
-        if !load.known {
-            println!("live T3 agent metadata unavailable");
-        }
-        for (provider, model, profile) in &favorites {
-            let q = quota(&cfg, &measured, &usage, &load, provider, model, now);
-            print!(
-                "{}{}  {provider}/{model}\n    left: {}",
-                if profile.is_some() {
-                    "ok"
-                } else {
-                    "UNPROFILED"
-                },
-                if cfg.user_rules.is_denied(model) {
-                    " DENIED by user rule"
-                } else {
-                    ""
-                },
-                q.note
-            );
-            if let (Some(w), Some(b)) = (q.weekly, q.basis) {
-                print!(
-                    "\n    weekly % per size 0..3: {} ({b})",
-                    w.iter()
-                        .map(|c| format_js(round2(*c)))
-                        .collect::<Vec<_>>()
-                        .join(" / ")
-                );
-            }
-            let allowed: Vec<String> = [0, 1, 2, 3]
-                .iter()
-                .filter(|s| q.allowed[**s])
-                .map(|s| s.to_string())
-                .collect();
-            println!(
-                "\n    allowed sizes: {}",
-                if allowed.is_empty() {
-                    "none".to_string()
-                } else {
-                    allowed.join(",")
-                }
-            );
-        }
-        // UNPROFILED is an informational flag (conservative max-burn quota,
-        // profiled:false in JSON): unknown-profile favorites route on their
-        // Jev judgment like any other, so --check reports and exits 0.
-        return Ok(0);
-    }
-
-    let mut task = if args.len() == 1 && args[0] == "-" {
-        let mut s = String::new();
-        use std::io::Read;
-        std::io::stdin().read_to_string(&mut s)?;
-        s
-    } else {
-        args.join(" ")
-    }
-    .trim()
-    .to_string();
+fn known_brief_hints() -> Vec<String> {
     let brief_hint = crate::policy::roster_brief_hint();
-    let known_hints: Vec<String> = {
-        let mut v: Vec<String> = crate::policy::roster()["families"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|f| {
-                let fh = f
-                    .get("briefHint")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let parts: Vec<&str> = [brief_hint.as_str(), fh]
-                    .into_iter()
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if parts.is_empty() {
-                    None
-                } else {
-                    Some(parts.join("\n\n"))
-                }
-            })
-            .collect();
-        v.push(brief_hint.clone());
-        if let Some(a) = crate::policy::roster()["antigravityBriefHint"].as_str() {
-            v.push(format!("{brief_hint}\n\n{a}"));
-        }
-        // Dedupe (first wins), drop empties, longest first.
-        let mut seen = std::collections::HashSet::new();
-        let mut out: Vec<String> = v
-            .into_iter()
-            .filter(|s| !s.is_empty() && seen.insert(s.clone()))
-            .collect();
-        out.sort_by_key(|s| std::cmp::Reverse(s.len()));
-        out
-    };
+    let mut v: Vec<String> = crate::policy::roster()["families"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|f| {
+            let fh = f
+                .get("briefHint")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let parts: Vec<&str> = [brief_hint.as_str(), fh]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n\n"))
+            }
+        })
+        .collect();
+    v.push(brief_hint.clone());
+    if let Some(a) = crate::policy::roster()["antigravityBriefHint"].as_str() {
+        v.push(format!("{brief_hint}\n\n{a}"));
+    }
+    // Dedupe (first wins), drop empties, longest first.
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = v
+        .into_iter()
+        .filter(|s| !s.is_empty() && seen.insert(s.clone()))
+        .collect();
+    out.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    out
+}
+
+fn normalize_task(
+    raw: &str,
+    known_hints: &[String],
+    exclude: &mut Vec<String>,
+) -> (String, crate::policy::RouteMarkers) {
+    let mut task = raw.trim().to_string();
     if let Some(h) = known_hints
         .iter()
         .find(|h| task.ends_with(h.as_str()) && task.len() > h.len())
@@ -1726,12 +1833,11 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         }
     }
     task = markers.cleaned_task().trim().to_string();
-    if task.is_empty() {
-        eprintln!("{USAGE}");
-        return Ok(2);
-    }
+    (task, markers)
+}
 
-    let criteria: Vec<(String, String)> = favorites
+fn build_criteria(favorites: &[(String, String, Option<String>)]) -> Vec<(String, String)> {
+    favorites
         .iter()
         .map(|(p, m, prof)| {
             (
@@ -1742,13 +1848,20 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                 ),
             )
         })
-        .collect();
-    // Build the Jev request with Node's exact key order.
+        .collect()
+}
+
+/// Build the Jev request with Node's exact key order.
+fn build_jev_request(
+    primary_model: &str,
+    task: &str,
+    criteria: &[(String, String)],
+) -> (Value, String) {
     let mut questions = serde_json::Map::new();
     questions.insert("size".into(), serde_json::json!({"type": "score", "instructions": "How much work will the actual delegated task take? Scope is not difficulty. Do not assume a large task from a long prompt, repository name or safeguards.", "criteria": SIZES}));
     questions.insert("difficulty".into(), serde_json::json!({"type": "score", "instructions": "How difficult is the actual task, independently of its volume? Many files, a large repository, long inputs or a request to use Sonnet/Opus do not by themselves make work difficult.", "criteria": DIFFICULTY}));
     questions.insert("review".into(), serde_json::json!({"type": "score", "instructions": "Is the delegated task itself a review or audit of existing work? Mentioning a review, or fixing what a review found, does not make the task a review.", "criteria": REVIEW}));
-    for (k, _) in &criteria {
+    for (k, _) in criteria {
         questions.insert(
             k.clone(),
             serde_json::json!({"type": "score",
@@ -1757,167 +1870,74 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         );
     }
     let mut state = serde_json::Map::new();
-    state.insert("task".into(), Value::from(task.clone()));
+    state.insert("task".into(), Value::from(task));
     let mut models = serde_json::Map::new();
-    for (k, c) in &criteria {
+    for (k, c) in criteria {
         models.insert(k.clone(), Value::from(c.clone()));
     }
     state.insert("models".into(), Value::Object(models));
     let mut request = serde_json::Map::new();
-    if cfg.decision_provider.as_deref() == Some(agentdeck_core::settings::PROVIDER_VERCEL)
-        && cfg.decision_model.is_none()
-    {
-        return Err(anyhow::anyhow!(
-            "decision provider vercel needs [router] decision_model"
-        ));
-    }
-    request.insert(
-        "model".into(),
-        Value::from(
-            cfg.decision_model
-                .as_deref()
-                .unwrap_or(agentdeck_core::settings::DEFAULT_DECISION_MODEL),
-        ),
-    );
+    request.insert("model".into(), Value::from(primary_model));
     request.insert("state".into(), Value::Object(state));
     request.insert("questions".into(), Value::Object(questions));
     let request_value = Value::Object(request);
     let body_json = stringify_like_node(&request_value);
-    let hash_input = stringify_like_node(&serde_json::json!([
-        source.as_deref(),
-        cfg.version,
-        request_value
-    ]));
+    (request_value, body_json)
+}
 
-    let complete = |a: &Value| {
-        let size_ok = a.get("size").is_some_and(|s| valid_answer(s, false));
-        let diff_ok = a.get("difficulty").is_some_and(|d| valid_answer(d, false));
-        size_ok
-            && diff_ok
-            && criteria
-                .iter()
-                .all(|(k, _)| a.get(k).is_some_and(|x| valid_answer(x, true)))
-    };
-    let cache_dir = env.runtime.join("model-route-jev-cache");
-    let mut hasher = Sha256::new();
-    hasher.update(hash_input.as_bytes());
-    let cache_file = cache_dir.join(format!("{:x}.json", hasher.finalize()));
-    let fresh = |t: f64| {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as f64)
-            .unwrap_or(0.0);
-        now_ms - t >= 0.0 && now_ms - t < 10.0 * 60e3
-    };
-    let mut cached: Option<Value> = None;
-    if let Ok(text) = std::fs::read_to_string(&cache_file)
-        && let Ok(entry) = serde_json::from_str::<Value>(&text)
-        && entry.get("t").and_then(Value::as_f64).is_some_and(fresh)
-        && complete(entry.get("answers").unwrap_or(&Value::Null))
-    {
-        cached = entry.get("answers").cloned();
-    }
-    let jev_hit = cached.is_some();
-    // A hit reuses the cached judgment; like the Node router it reports zero
-    // additional Jev cost for the reused answer.
-    let (answers, cost) = match cached {
-        Some(a) => (a, Some(0.0)),
-        None => {
-            let provider = cfg.decision_provider.clone();
-            let (answers, cost) = crate::jev_queue::ask(
-                &env.runtime.join("model-route-jev-queue"),
-                &request_value,
-                &body_json,
-                move |request, body| {
-                    let provider = provider.clone();
-                    async move { jev_fetch(provider.as_deref(), &request, &body, None).await }
-                },
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-            if !complete(&answers) {
-                return Err(anyhow::anyhow!(
-                    "Jev returned incomplete or out-of-range routing answers"
-                ));
-            }
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as f64)
-                .unwrap_or(0.0);
-            let _ = (|| {
-                std::fs::create_dir_all(&cache_dir)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &cache_dir,
-                        std::fs::Permissions::from_mode(0o700),
-                    );
-                }
-                for f in std::fs::read_dir(&cache_dir)? {
-                    let f = f?;
-                    let name = f.file_name().to_string_lossy().into_owned();
-                    if name.len() == 69
-                        && name.ends_with(".json")
-                        && name[..64]
-                            .chars()
-                            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
-                    {
-                        let stale = std::fs::metadata(f.path())
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .map(|t| {
-                                std::time::SystemTime::now()
-                                    .duration_since(t)
-                                    .map(|d| d.as_millis() as f64)
-                                    .unwrap_or(f64::NAN)
-                            });
-                        if stale.is_some_and(|age| !(0.0..10.0 * 60e3).contains(&age)) {
-                            let _ = std::fs::remove_file(f.path());
-                        }
-                    }
-                }
-                let tmp = cache_dir.join(format!(
-                    "{}.{}.tmp",
-                    cache_file
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("jev-cache"),
-                    std::process::id()
-                ));
-                std::fs::write(
-                    &tmp,
-                    serde_json::to_string(&serde_json::json!({"t": now_ms, "answers": answers}))?,
-                )?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-                }
-                std::fs::rename(&tmp, &cache_file)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &cache_file,
-                        std::fs::Permissions::from_mode(0o600),
-                    );
-                }
-                Ok::<(), anyhow::Error>(())
-            })();
-            (answers, cost)
-        }
-    };
-    let jev_cache = if jev_hit { "hit" } else { "miss" };
-    // Re-read quota/load snapshots after Jev before ranking.
+fn jev_cache_key(
+    source: Option<&str>,
+    cfg_version: &Value,
+    primary: &agentdeck_core::judge::JudgeEndpoint,
+    fallback: Option<&agentdeck_core::judge::JudgeEndpoint>,
+    request_value: &Value,
+) -> String {
+    let eff_fallback = fallback
+        .filter(|f| *f != primary)
+        .map(|f| (&f.provider, &f.model));
+    stringify_like_node(&serde_json::json!([
+        source,
+        cfg_version,
+        (&primary.provider, &primary.model),
+        eff_fallback,
+        request_value,
+    ]))
+}
+
+fn answers_complete(a: &Value, criteria: &[(String, String)]) -> bool {
+    let size_ok = a.get("size").is_some_and(|s| valid_answer(s, false));
+    let diff_ok = a.get("difficulty").is_some_and(|d| valid_answer(d, false));
+    size_ok
+        && diff_ok
+        && criteria
+            .iter()
+            .all(|(k, _)| a.get(k).is_some_and(|x| valid_answer(x, true)))
+}
+
+struct RoutingSnapshot {
+    now: f64,
+    usage: Vec<UsageAccountFull>,
+    load: AgentLoad,
+    current_cfg: RouterConfig,
+    pending: std::collections::HashMap<String, usize>,
+    capacity_error: Option<String>,
+    catalog: Value,
+    failures: std::collections::HashMap<String, crate::load::InstanceFailures>,
+}
+
+fn read_routing_snapshot(
+    env: &Env,
+    usage_path: &std::path::Path,
+    fallback_now: f64,
+) -> anyhow::Result<RoutingSnapshot> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
-        .unwrap_or(now);
-    usage = parse_usage_state(&usage_path)
+        .unwrap_or(fallback_now);
+    let usage = parse_usage_state(usage_path)
         .map_err(|e| anyhow::anyhow!("cannot read usage state {}: {e}", usage_path.display()))?;
-    load = read_active_agents(&env.home.join(".t3/userdata/statev2.sqlite"));
-    let current_cfg = load_router_config(&env)?;
+    let mut load = read_active_agents(&env.home.join(".t3/userdata/statev2.sqlite"));
+    let current_cfg = load_router_config(env)?;
     let mut pending = std::collections::HashMap::new();
     let mut capacity_error = None;
     if !current_cfg.instance_limits.is_empty() {
@@ -1930,6 +1950,43 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         }
     }
     let catalog = read_live_catalog(&env.state_home)?;
+    let failures = read_instance_failures(&env.home.join(".t3/userdata/statev2.sqlite"), now);
+    Ok(RoutingSnapshot {
+        now,
+        usage,
+        load,
+        current_cfg,
+        pending,
+        capacity_error,
+        catalog,
+        failures,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_route_output(
+    cfg: &RouterConfig,
+    measured: &Measured,
+    snapshot: &RoutingSnapshot,
+    favorites: &[(String, String, Option<String>)],
+    unprofiled: &[String],
+    source: Option<&str>,
+    source_warning: Option<&str>,
+    task: &str,
+    requested: Option<&ValidatedTarget>,
+    exclude: &[String],
+    force_review: bool,
+    effort: Option<i64>,
+    answers: &Value,
+    cost: Option<f64>,
+    jev_hit: bool,
+    jev_channel: agentdeck_core::judge::JudgeChannel,
+) -> Value {
+    let jev_cache = if jev_hit { "hit" } else { "miss" };
+    let now = snapshot.now;
+    let current_cfg = &snapshot.current_cfg;
+    let load = &snapshot.load;
+    let pending = &snapshot.pending;
 
     let size = (answers
         .get("size")
@@ -1956,26 +2013,29 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                     .round()
                     >= 2.0
             }
-            None => is_review_task(&task),
+            None => is_review_task(task),
         };
-    let failures = read_instance_failures(&env.home.join(".t3/userdata/statev2.sqlite"), now);
     let mut candidates: Vec<Candidate> = vec![];
-    for (provider, model, profile) in &favorites {
+    for (provider, model, profile) in favorites {
         let a = answers
             .get(key_of(provider, model).as_str())
             .cloned()
             .unwrap_or(Value::Null);
-        let (target, reasoning_error) =
-            match reasoning_target(&catalog, provider, model, effort.unwrap_or(difficulty)) {
-                Ok(mut t) => {
-                    crate::reasoning::with_worker_agent(&catalog, &mut t);
-                    (t, None)
-                }
-                Err(e) => (
-                    serde_json::json!({"providerInstanceId": provider, "model": model}),
-                    Some(e.to_string()),
-                ),
-            };
+        let (target, reasoning_error) = match reasoning_target(
+            &snapshot.catalog,
+            provider,
+            model,
+            effort.unwrap_or(difficulty),
+        ) {
+            Ok(mut t) => {
+                crate::reasoning::with_worker_agent(&snapshot.catalog, &mut t);
+                (t, None)
+            }
+            Err(e) => (
+                serde_json::json!({"providerInstanceId": provider, "model": model}),
+                Some(e.to_string()),
+            ),
+        };
         let fam = family_of(model);
         // User rules (defaults preserve the embedded Argon ban): deny wins,
         // then the audit/review ban, then the instance capacity ban.
@@ -1989,11 +2049,12 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
             None
         };
         if let Some(limit) = current_cfg.instance_limits.get(provider) {
-            policy_ban = capacity_error
+            policy_ban = snapshot
+                .capacity_error
                 .clone()
                 .or_else(|| {
                     crate::admission::reason(
-                        &load,
+                        load,
                         pending.get(provider).copied().unwrap_or_default(),
                         provider,
                         *limit,
@@ -2016,8 +2077,8 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         {
             policy_ban = Some("excluded for this route".to_string());
         }
-        let q = quota(&cfg, &measured, &usage, &load, provider, model, now);
-        let failure = failures.get(provider);
+        let q = quota(cfg, measured, &snapshot.usage, load, provider, model, now);
+        let failure = snapshot.failures.get(provider);
         if let Some(block) = failure.and_then(|f| f.quota_block_for(model))
             && !q.refilled_since(block, now)
         {
@@ -2084,10 +2145,10 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     }
     let (shared_w, paid_w, cheap_w, _) = routing_weights();
     let ranking = rank_candidates(
-        &cfg,
+        cfg,
         candidates,
         difficulty,
-        source.as_deref(),
+        source,
         (shared_w, paid_w, if is_review { 0.0 } else { cheap_w }),
     );
     let best = ranking.iter().find(|r| r.eligible);
@@ -2201,12 +2262,11 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     }
     out.insert(
         "source".into(),
-        source.clone().map(Value::String).unwrap_or(Value::Null),
+        source.map(Value::from).unwrap_or(Value::Null),
     );
     out.insert(
         "sourceAccount".into(),
         source
-            .as_deref()
             .and_then(|s| cfg.account.get(s))
             .cloned()
             .map(Value::String)
@@ -2251,7 +2311,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
             }),
         );
     }
-    if let Some(req) = &requested {
+    if let Some(req) = requested {
         if let Some(h) = hint_of_on(&req.provider, &req.model) {
             out.insert("requestedBriefHint".into(), Value::from(h));
         }
@@ -2309,16 +2369,802 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                 .collect::<Vec<_>>(),
         ),
     );
-    if let Some(n) = load.note {
-        load_json.insert("note".into(), Value::from(n));
+    if let Some(n) = &load.note {
+        load_json.insert("note".into(), Value::from(n.clone()));
     }
     out.insert("activeLoad".into(), Value::Object(load_json));
     if let Some(c) = cost {
         out.insert("cost".into(), js_num(c));
     }
     out.insert("jevCache".into(), Value::from(jev_cache));
-    println!("{}", serde_json::to_string_pretty(&Value::Object(out))?);
+    out.insert("jevChannel".into(), Value::from(jev_channel.as_str()));
+    Value::Object(out)
+}
+
+/// Pre-route a wave of planned launches in as few Jev calls as possible (up to
+/// `jev_queue::MAX_TASKS` per call), warming the Jev cache so later hook
+/// invocations hit the cache. Returns one JSON object per input launch in order:
+/// either the exact `agentdeck route` JSON or `{"error": "..."}`.
+pub async fn route_batch(
+    env: &Env,
+    launches: &[Value],
+    opts: BatchOptions,
+) -> anyhow::Result<Vec<Value>> {
+    let own_env = crate::hook::current_environ();
+    let ancestors = crate::hook::process_ancestors_full();
+    route_batch_with_bases(
+        env,
+        launches,
+        opts,
+        &JevBases::default(),
+        None,
+        &own_env,
+        &ancestors,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn route_batch_with_bases(
+    env: &Env,
+    launches: &[Value],
+    opts: BatchOptions,
+    bases: &JevBases,
+    key_override: Option<&str>,
+    own_env: &[String],
+    ancestors: &[crate::hook::ProcessAncestor],
+) -> anyhow::Result<Vec<Value>> {
+    if launches.is_empty() {
+        return Ok(Vec::new());
+    }
+    let settings =
+        read_settings(&env.home).map_err(|e| anyhow::anyhow!("cannot read T3 settings: {e}"))?;
+    let harness = opts.harness.as_deref().unwrap_or_default();
+    let source = match crate::hook::resolve_source(
+        &env.home,
+        own_env,
+        ancestors,
+        crate::hook::SourceQuery {
+            harness: opts.harness.as_deref(),
+            explicit_source: opts.source.as_deref(),
+            thread_id: None,
+            from_hook: false,
+        },
+    ) {
+        Ok(Some(s)) if !s.is_empty() => Some(s),
+        Ok(_) => {
+            let msg = "cannot determine routing source unambiguously; pass source or run with T3CODE_THREAD_ID";
+            return Ok(vec![serde_json::json!({"error": msg}); launches.len()]);
+        }
+        Err(e) => {
+            let msg = format!("cannot resolve routing source: {e}");
+            return Ok(vec![serde_json::json!({"error": msg}); launches.len()]);
+        }
+    };
+    let cfg = load_router_config(env)?;
+    let source_warning = match &source {
+        Some(s) if !cfg.account.contains_key(s) => Some(format!(
+            "unknown source instance \"{s}\": no shared-quota protection"
+        )),
+        _ => None,
+    };
+    let usage_path = usage_state_path(env, &cfg);
+    let now_before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let (favorites, unprofiled) = resolve_favorites(&cfg, &settings, &env.state_home)?;
+    let criteria = build_criteria(&favorites);
+    let primary = primary_endpoint(&cfg)?;
+    let fallback = cfg.judge_fallback.endpoint();
+    let known_hints = known_brief_hints();
+    let complete = |a: &Value| answers_complete(a, &criteria);
+
+    enum BatchSlot {
+        Error(String),
+        Cached {
+            task: String,
+            requested: Option<ValidatedTarget>,
+            exclude: Vec<String>,
+            is_review: bool,
+            effort: Option<i64>,
+            answers: Value,
+            channel: agentdeck_core::judge::JudgeChannel,
+        },
+        Pending {
+            task: String,
+            requested: Option<ValidatedTarget>,
+            exclude: Vec<String>,
+            is_review: bool,
+            effort: Option<i64>,
+            fetch_idx: usize,
+            duplicate: bool,
+        },
+    }
+
+    let mut slots: Vec<BatchSlot> = Vec::with_capacity(launches.len());
+    let mut to_fetch: Vec<(String, Value, String)> = Vec::new();
+    let mut hash_to_fetch: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+
+    for item in launches {
+        let Some(obj) = item.as_object() else {
+            slots.push(BatchSlot::Error(
+                "each launch must be an object with tool and input".into(),
+            ));
+            continue;
+        };
+        let Some(tool) = obj
+            .get("tool")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            slots.push(BatchSlot::Error("launch requires non-empty tool".into()));
+            continue;
+        };
+        let Some(input) = obj.get("input").filter(|v| v.is_object()) else {
+            slots.push(BatchSlot::Error("launch input must be an object".into()));
+            continue;
+        };
+        let effort = match obj.get("effort") {
+            None | Some(Value::Null) => None,
+            Some(v) => {
+                match v
+                    .as_str()
+                    .and_then(|l| ["medium", "high", "xhigh"].iter().position(|x| *x == l))
+                {
+                    Some(level) => Some(level as i64),
+                    None => {
+                        slots.push(BatchSlot::Error(
+                            "effort must be medium, high, or xhigh".into(),
+                        ));
+                        continue;
+                    }
+                }
+            }
+        };
+        let parsed = match crate::hook::parse_launch(tool, input, harness) {
+            Ok(p) => p,
+            Err(e) => {
+                slots.push(BatchSlot::Error(format!("{e}")));
+                continue;
+            }
+        };
+        match parsed.kind {
+            crate::hook::LaunchKind::Other => {
+                slots.push(BatchSlot::Error(format!(
+                    "unsupported launch tool {:?}",
+                    parsed.tool_name
+                )));
+                continue;
+            }
+            crate::hook::LaunchKind::Workflow => {
+                slots.push(BatchSlot::Error(
+                    "Workflow cannot be pre-routed; route each child launch separately".into(),
+                ));
+                continue;
+            }
+            crate::hook::LaunchKind::Delegate => {
+                if parsed.brief.trim().is_empty() {
+                    slots.push(BatchSlot::Error(
+                        "delegate_task requires a non-empty task".into(),
+                    ));
+                    continue;
+                }
+                if parsed.target_malformed {
+                    slots.push(BatchSlot::Error(
+                        "delegate_task target requires non-empty providerInstanceId and model"
+                            .into(),
+                    ));
+                    continue;
+                }
+            }
+            crate::hook::LaunchKind::Native => {}
+        }
+
+        let mut exclude = parsed.markers.exclude.clone();
+        let (task, _) = normalize_task(&parsed.brief, &known_hints, &mut exclude);
+        if task.is_empty() {
+            slots.push(BatchSlot::Error("empty task brief".into()));
+            continue;
+        }
+
+        let (request_value, body_json) = build_jev_request(&primary.model, &task, &criteria);
+        let hash_input = jev_cache_key(
+            source.as_deref(),
+            &cfg.version,
+            &primary,
+            fallback.as_ref(),
+            &request_value,
+        );
+        if let Some((answers, channel)) = read_jev_cache(&env.runtime, &hash_input, &complete) {
+            slots.push(BatchSlot::Cached {
+                task,
+                requested: parsed.target,
+                exclude,
+                is_review: parsed.is_review,
+                effort,
+                answers,
+                channel,
+            });
+            continue;
+        }
+        let (fetch_idx, duplicate) = match hash_to_fetch.get(&hash_input).copied() {
+            Some(idx) => (idx, true),
+            None => {
+                let idx = to_fetch.len();
+                to_fetch.push((hash_input.clone(), request_value, body_json));
+                hash_to_fetch.insert(hash_input, idx);
+                (idx, false)
+            }
+        };
+        slots.push(BatchSlot::Pending {
+            task,
+            requested: parsed.target,
+            exclude,
+            is_review: parsed.is_review,
+            effort,
+            fetch_idx,
+            duplicate,
+        });
+    }
+
+    let mut fetched: Vec<anyhow::Result<crate::jev_queue::QueueAnswer>> = Vec::new();
+    if !to_fetch.is_empty() {
+        let blocks = agentdeck_core::judge::BlockStore::for_runtime_dir(&env.runtime);
+        let queue_items: Vec<(Value, String)> = to_fetch
+            .iter()
+            .map(|(_, req, body)| (req.clone(), body.clone()))
+            .collect();
+        let bases_owned = bases.clone();
+        let key_owned = key_override.map(str::to_string);
+        let raw_outcomes = crate::jev_queue::ask_many_with_deadline(
+            &env.runtime.join("model-route-jev-queue"),
+            &queue_items,
+            opts.budget,
+            &blocks,
+            &primary,
+            fallback.as_ref(),
+            move |endpoint, request, body, attempt_deadline, send_guard| {
+                let bases = bases_owned.clone();
+                let key_owned = key_owned.clone();
+                async move {
+                    jev_fetch_endpoint(
+                        &endpoint,
+                        &request,
+                        &body,
+                        key_owned.as_deref(),
+                        attempt_deadline,
+                        &bases,
+                        Some(&send_guard),
+                    )
+                    .await
+                }
+            },
+            classify_jev_error,
+            classify_jev_batch_error,
+        )
+        .await;
+        for (idx, outcome) in raw_outcomes.into_iter().enumerate() {
+            match outcome {
+                Ok(queued) if complete(&queued.answers) => {
+                    write_jev_cache(
+                        &env.runtime,
+                        &to_fetch[idx].0,
+                        &queued.answers,
+                        queued.channel,
+                    );
+                    fetched.push(Ok(queued));
+                }
+                Ok(_) => fetched.push(Err(anyhow::anyhow!(
+                    "Jev returned incomplete or out-of-range routing answers"
+                ))),
+                Err(e) => fetched.push(Err(e)),
+            }
+        }
+    }
+
+    let needs_snapshot = slots
+        .iter()
+        .any(|s| matches!(s, BatchSlot::Cached { .. } | BatchSlot::Pending { .. }));
+    if !needs_snapshot {
+        return Ok(slots
+            .into_iter()
+            .map(|s| match s {
+                BatchSlot::Error(msg) => serde_json::json!({"error": msg}),
+                _ => unreachable!(),
+            })
+            .collect());
+    }
+    let snapshot = read_routing_snapshot(env, &usage_path, now_before)?;
+    let measured = codex_costs(env);
+
+    let mut out = Vec::with_capacity(slots.len());
+    for slot in slots {
+        match slot {
+            BatchSlot::Error(msg) => out.push(serde_json::json!({"error": msg})),
+            BatchSlot::Cached {
+                task,
+                requested,
+                exclude,
+                is_review,
+                effort,
+                answers,
+                channel,
+            } => {
+                out.push(build_route_output(
+                    &cfg,
+                    &measured,
+                    &snapshot,
+                    &favorites,
+                    &unprofiled,
+                    source.as_deref(),
+                    source_warning.as_deref(),
+                    &task,
+                    requested.as_ref(),
+                    &exclude,
+                    is_review,
+                    effort,
+                    &answers,
+                    Some(0.0),
+                    true,
+                    channel,
+                ));
+            }
+            BatchSlot::Pending {
+                task,
+                requested,
+                exclude,
+                is_review,
+                effort,
+                fetch_idx,
+                duplicate,
+            } => match &fetched[fetch_idx] {
+                Ok(queued) => {
+                    let (hit, cost) = if duplicate {
+                        (true, Some(0.0))
+                    } else {
+                        (false, queued.cost)
+                    };
+                    out.push(build_route_output(
+                        &cfg,
+                        &measured,
+                        &snapshot,
+                        &favorites,
+                        &unprofiled,
+                        source.as_deref(),
+                        source_warning.as_deref(),
+                        &task,
+                        requested.as_ref(),
+                        &exclude,
+                        is_review,
+                        effort,
+                        &queued.answers,
+                        cost,
+                        hit,
+                        queued.channel,
+                    ));
+                }
+                Err(e) => out.push(serde_json::json!({"error": format!("{e:#}")})),
+            },
+        }
+    }
+    Ok(out)
+}
+
+pub async fn run(argv: Vec<String>) -> i32 {
+    match run_inner(argv).await {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
+async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
+    match argv.first().map(String::as_str) {
+        Some("hook") => return Ok(crate::hook::run(&argv[1..])),
+        Some("claude-shell") => return Ok(crate::shell::run(&argv[1..])),
+        Some("t3-mcp-call") => return Ok(crate::mcp_call::run(&argv[1..]).await),
+        Some("workflow") => return Ok(crate::workflow::run(&argv[1..]).await),
+        Some("outcomes") => return Ok(crate::outcomes::run(&argv[1..]).await),
+        _ => {}
+    }
+    let env = Env::from_env()?;
+    if argv.len() == 1 && argv[0] == "--catalog" {
+        let mut stdin = String::new();
+        use std::io::Read;
+        std::io::stdin().read_to_string(&mut stdin)?;
+        let data: Value = serde_json::from_str(&stdin).map_err(|_| {
+            anyhow::anyhow!(
+                "expected orchestrator_capabilities structuredContent with model option descriptors"
+            )
+        })?;
+        match save_catalog(&env.state_home, data) {
+            Ok(()) => {
+                println!("model option catalog updated");
+                return Ok(0);
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return Ok(1);
+            }
+        }
+    }
+    let mut args = argv.as_slice();
+    let mut source: Option<String> = None;
+    let mut requested: Option<ValidatedTarget> = None;
+    let mut exclude: Vec<String> = Vec::new();
+    let mut force_review = false;
+    let mut effort: Option<i64> = None;
+    while args.first().is_some_and(|a| a.starts_with("--")) && args[0] != "--check" {
+        let flag = args[0].clone();
+        args = &args[1..];
+        if flag == "--" {
+            break;
+        }
+        if flag == "--source" && !args.is_empty() {
+            source = Some(args[0].clone());
+            args = &args[1..];
+        } else if flag == "--validate-target" && args.len() >= 2 {
+            requested = Some(ValidatedTarget {
+                provider: args[0].clone(),
+                model: args[1].clone(),
+            });
+            args = &args[2..];
+        } else if flag == "--exclude" && !args.is_empty() {
+            exclude.push(args[0].clone());
+            args = &args[1..];
+        } else if flag == "--review" {
+            force_review = true;
+        } else if flag == "--effort"
+            && let Some(level) = args
+                .first()
+                .and_then(|l| ["medium", "high", "xhigh"].iter().position(|x| x == l))
+        {
+            // Same scale as `reasoning_target`: difficulty 0 medium, 1 high, 2 xhigh.
+            effort = Some(level as i64);
+            args = &args[1..];
+        } else {
+            eprintln!("{USAGE}");
+            return Ok(2);
+        }
+    }
+    let settings =
+        read_settings(&env.home).map_err(|e| anyhow::anyhow!("cannot read T3 settings: {e}"))?;
+    if source.is_none() {
+        let own_env = crate::hook::current_environ();
+        let ancestors = crate::hook::process_ancestors_full();
+        source = crate::hook::resolve_source(
+            &env.home,
+            &own_env,
+            &ancestors,
+            crate::hook::SourceQuery::default(),
+        )
+        .ok()
+        .flatten();
+    }
+    let cfg = match load_router_config(&env) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return Ok(1);
+        }
+    };
+    let source_warning = match &source {
+        Some(s) if !cfg.account.contains_key(s) => Some(format!(
+            "unknown source instance \"{s}\": no shared-quota protection"
+        )),
+        _ => None,
+    };
+    let usage_path = usage_state_path(&env, &cfg);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let usage = parse_usage_state(&usage_path)
+        .map_err(|e| anyhow::anyhow!("cannot read usage state {}: {e}", usage_path.display()))?;
+    let load = read_active_agents(&env.home.join(".t3/userdata/statev2.sqlite"));
+    let measured = codex_costs(&env);
+
+    let (favorites, unprofiled) = resolve_favorites(&cfg, &settings, &env.state_home)?;
+
+    if args.first().is_some_and(|a| a == "--check") {
+        println!(
+            "source: {}",
+            source
+                .as_deref()
+                .unwrap_or("unknown (use --source to preserve orchestrator quota)")
+        );
+        // Source is visible so the GUI/operator can tell a default ban from
+        // an explicit user override.
+        println!(
+            "user rules (source: {}): no-review: {}; denied: {}",
+            cfg.user_rules.source.as_str(),
+            if cfg.user_rules.no_review_models.is_empty() {
+                "(none)".to_string()
+            } else {
+                cfg.user_rules.no_review_models.join(", ")
+            },
+            if cfg.user_rules.deny_models.is_empty() {
+                "(none)".to_string()
+            } else {
+                cfg.user_rules.deny_models.join(", ")
+            }
+        );
+        if !load.known {
+            println!("live T3 agent metadata unavailable");
+        }
+        for (provider, model, profile) in &favorites {
+            let q = quota(&cfg, &measured, &usage, &load, provider, model, now);
+            print!(
+                "{}{}  {provider}/{model}\n    left: {}",
+                if profile.is_some() {
+                    "ok"
+                } else {
+                    "UNPROFILED"
+                },
+                if cfg.user_rules.is_denied(model) {
+                    " DENIED by user rule"
+                } else {
+                    ""
+                },
+                q.note
+            );
+            if let (Some(w), Some(b)) = (q.weekly, q.basis) {
+                print!(
+                    "\n    weekly % per size 0..3: {} ({b})",
+                    w.iter()
+                        .map(|c| format_js(round2(*c)))
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                );
+            }
+            let allowed: Vec<String> = [0, 1, 2, 3]
+                .iter()
+                .filter(|s| q.allowed[**s])
+                .map(|s| s.to_string())
+                .collect();
+            println!(
+                "\n    allowed sizes: {}",
+                if allowed.is_empty() {
+                    "none".to_string()
+                } else {
+                    allowed.join(",")
+                }
+            );
+        }
+        // UNPROFILED is an informational flag (conservative max-burn quota,
+        // profiled:false in JSON): unknown-profile favorites route on their
+        // Jev judgment like any other, so --check reports and exits 0.
+        return Ok(0);
+    }
+
+    let raw_task = if args.len() == 1 && args[0] == "-" {
+        let mut s = String::new();
+        use std::io::Read;
+        std::io::stdin().read_to_string(&mut s)?;
+        s
+    } else {
+        args.join(" ")
+    };
+    let known_hints = known_brief_hints();
+    let (task, _) = normalize_task(&raw_task, &known_hints, &mut exclude);
+    if task.is_empty() {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    }
+
+    let criteria = build_criteria(&favorites);
+    let primary = primary_endpoint(&cfg)?;
+    let fallback = cfg.judge_fallback.endpoint();
+    let (request_value, body_json) = build_jev_request(&primary.model, &task, &criteria);
+    let hash_input = jev_cache_key(
+        source.as_deref(),
+        &cfg.version,
+        &primary,
+        fallback.as_ref(),
+        &request_value,
+    );
+    let complete = |a: &Value| answers_complete(a, &criteria);
+    let blocks = agentdeck_core::judge::BlockStore::for_runtime_dir(&env.runtime);
+    let (answers, cost, jev_hit, jev_channel) = fetch_jev_cached(
+        &env.runtime,
+        &hash_input,
+        &request_value,
+        &body_json,
+        &primary,
+        fallback.as_ref(),
+        crate::jev_queue::BUDGET,
+        &blocks,
+        &JevBases::default(),
+        None,
+        &complete,
+    )
+    .await?;
+    // Re-read quota/load snapshots after Jev before ranking.
+    let snapshot = read_routing_snapshot(&env, &usage_path, now)?;
+    let out = build_route_output(
+        &cfg,
+        &measured,
+        &snapshot,
+        &favorites,
+        &unprofiled,
+        source.as_deref(),
+        source_warning.as_deref(),
+        &task,
+        requested.as_ref(),
+        &exclude,
+        force_review,
+        effort,
+        &answers,
+        cost,
+        jev_hit,
+        jev_channel,
+    );
+    println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(0)
+}
+
+fn jev_cache_path(runtime_dir: &std::path::Path, hash_input: &str) -> std::path::PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(hash_input.as_bytes());
+    runtime_dir
+        .join("model-route-jev-cache")
+        .join(format!("{:x}.json", hasher.finalize()))
+}
+
+fn read_jev_cache(
+    runtime_dir: &std::path::Path,
+    hash_input: &str,
+    complete: &dyn Fn(&Value) -> bool,
+) -> Option<(Value, agentdeck_core::judge::JudgeChannel)> {
+    let cache_dir = runtime_dir.join("model-route-jev-cache");
+    let cache_file = jev_cache_path(runtime_dir, hash_input);
+    let fresh = |t: f64| {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0);
+        now_ms - t >= 0.0 && now_ms - t < 10.0 * 60e3
+    };
+    let text = match agentdeck_core::judge::read_private_entry(&cache_dir, &cache_file) {
+        Ok(Some(t)) => t,
+        Ok(None) => return None,
+        Err(e) => {
+            eprintln!(
+                "agentdeck: refusing untrusted Jev cache entry {}: {e}",
+                cache_file.display()
+            );
+            return None;
+        }
+    };
+    let entry: Value = serde_json::from_str(&text).ok()?;
+    if !entry.get("t").and_then(Value::as_f64).is_some_and(fresh) {
+        return None;
+    }
+    let answers = entry.get("answers").filter(|a| complete(a)).cloned()?;
+    let channel = match entry.get("channel").and_then(Value::as_str) {
+        Some("fallback") => agentdeck_core::judge::JudgeChannel::Fallback,
+        _ => agentdeck_core::judge::JudgeChannel::Primary,
+    };
+    Some((answers, channel))
+}
+
+fn write_jev_cache(
+    runtime_dir: &std::path::Path,
+    hash_input: &str,
+    answers: &Value,
+    channel: agentdeck_core::judge::JudgeChannel,
+) {
+    let cache_dir = runtime_dir.join("model-route-jev-cache");
+    let cache_file = jev_cache_path(runtime_dir, hash_input);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0);
+    let _ = (|| {
+        agentdeck_core::judge::create_private_dir(&cache_dir)?;
+        for f in std::fs::read_dir(&cache_dir)? {
+            let f = f?;
+            let name = f.file_name().to_string_lossy().into_owned();
+            if name.len() == 69
+                && name.ends_with(".json")
+                && name[..64]
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+            {
+                let stale = std::fs::metadata(f.path())
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map(|t| {
+                        std::time::SystemTime::now()
+                            .duration_since(t)
+                            .map(|d| d.as_millis() as f64)
+                            .unwrap_or(f64::NAN)
+                    });
+                if stale.is_some_and(|age| !(0.0..10.0 * 60e3).contains(&age)) {
+                    let _ = std::fs::remove_file(f.path());
+                }
+            }
+        }
+        let payload = serde_json::to_string(&serde_json::json!({
+            "t": now_ms,
+            "answers": answers,
+            "channel": channel.as_str(),
+        }))?;
+        agentdeck_core::judge::write_atomic(&cache_file, &payload)?;
+        Ok::<(), anyhow::Error>(())
+    })();
+}
+
+/// Lookup or fetch a Jev routing judgment through the shared queue, storing
+/// answers (including fallback answers) under the primary request's cache key.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_jev_cached(
+    runtime_dir: &std::path::Path,
+    hash_input: &str,
+    request_value: &Value,
+    body_json: &str,
+    primary: &agentdeck_core::judge::JudgeEndpoint,
+    fallback: Option<&agentdeck_core::judge::JudgeEndpoint>,
+    budget: std::time::Duration,
+    blocks: &agentdeck_core::judge::BlockStore,
+    bases: &JevBases,
+    key_override: Option<&str>,
+    complete: &dyn Fn(&Value) -> bool,
+) -> anyhow::Result<(
+    Value,
+    Option<f64>,
+    bool,
+    agentdeck_core::judge::JudgeChannel,
+)> {
+    if let Some((answers, channel)) = read_jev_cache(runtime_dir, hash_input, complete) {
+        // A hit reuses the cached judgment; like the Node router it reports zero
+        // additional Jev cost for the reused answer.
+        return Ok((answers, Some(0.0), true, channel));
+    }
+
+    let bases = bases.clone();
+    let key_owned = key_override.map(str::to_string);
+    let queued = crate::jev_queue::ask_with_deadline(
+        &runtime_dir.join("model-route-jev-queue"),
+        request_value,
+        body_json,
+        budget,
+        blocks,
+        primary,
+        fallback,
+        move |endpoint, request, body, attempt_deadline, send_guard| {
+            let bases = bases.clone();
+            let key_owned = key_owned.clone();
+            async move {
+                jev_fetch_endpoint(
+                    &endpoint,
+                    &request,
+                    &body,
+                    key_owned.as_deref(),
+                    attempt_deadline,
+                    &bases,
+                    Some(&send_guard),
+                )
+                .await
+            }
+        },
+        classify_jev_error,
+        classify_jev_batch_error,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if !complete(&queued.answers) {
+        return Err(anyhow::anyhow!(
+            "Jev returned incomplete or out-of-range routing answers"
+        ));
+    }
+    write_jev_cache(runtime_dir, hash_input, &queued.answers, queued.channel);
+    Ok((queued.answers, queued.cost, false, queued.channel))
 }
 
 /// Serialize exactly like `JSON.stringify` for the Jev body and the cache-key
@@ -2351,6 +3197,68 @@ fn format_js(v: f64) -> String {
 #[cfg(test)]
 mod gateway_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn openrouter_chat_model_uses_chat_completions() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            let mut len = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((n, v)) = line.split_once(':')
+                    && n.eq_ignore_ascii_case("content-length")
+                {
+                    len = v.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; len];
+            reader.read_exact(&mut body).unwrap();
+            let content = r#"{"size":{"score":1,"confidence":0.9}}"#;
+            let response =
+                serde_json::json!({"choices": [{"message": {"content": content}}]}).to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+            (first, serde_json::from_slice::<Value>(&body).unwrap())
+        });
+        let request = serde_json::json!({"model": "~typesafe/jev-latest", "state": {"task": "t"}, "questions": {"size": {}}});
+        let body = stringify_like_node(&request);
+        let ep = agentdeck_core::judge::JudgeEndpoint::new("openrouter", "openai/gpt-4o-mini");
+        let (answers, _) = jev_fetch_endpoint(
+            &ep,
+            &request,
+            &body,
+            Some("test-key"),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            &JevBases {
+                openrouter: base,
+                vercel: "http://127.0.0.1:1".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let (first, sent) = server.join().unwrap();
+        assert!(
+            first.starts_with("POST /api/v1/chat/completions "),
+            "{first}"
+        );
+        assert_eq!(sent["model"], "openai/gpt-4o-mini");
+        assert_eq!(answers["size"]["score"], 1);
+    }
 
     #[test]
     fn gateway_round_trip_shapes() {
@@ -2386,6 +3294,1691 @@ mod gateway_tests {
         assert!(valid_answer(&a["size"], true));
         assert!(a.get("difficulty").is_none());
     }
+
+    async fn mock_http_server(
+        responses: Vec<(&'static str, &'static str, String)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<(String, Value)>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::task::spawn_blocking(move || {
+            let mut seen = Vec::new();
+            for (status, extra_headers, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        size = value.trim().parse().unwrap();
+                    }
+                }
+                let mut req_body = vec![0; size];
+                reader.read_exact(&mut req_body).unwrap();
+                let parsed: Value = serde_json::from_slice(&req_body).unwrap_or(Value::Null);
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                seen.push((first, parsed));
+            }
+            seen
+        });
+        (base, task)
+    }
+
+    #[tokio::test]
+    async fn cache_stores_fallback_answer_under_primary_key_and_honours_triggers() {
+        let rt = std::env::temp_dir().join(format!(
+            "agentdeck-route-fallback-cache-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(&rt).unwrap();
+
+        let ok_or = serde_json::json!({
+            "answers": {
+                "size": {"score": 1, "confidence": 0.9},
+                "difficulty": {"score": 1, "confidence": 0.9},
+            },
+            "usage": {"cost": 0.002}
+        })
+        .to_string();
+        // Primary (Vercel): first 429 Retry-After: 60 (triggers block + fallback),
+        // then on a separate model: 503 (fallback), 401 (no fallback), invalid JSON (no fallback).
+        let (vercel_base, vercel_srv) = mock_http_server(vec![
+            (
+                "429 Too Many Requests",
+                "Retry-After: 60\r\n",
+                r#"{"error":"rate limit"}"#.into(),
+            ),
+            ("503 Service Unavailable", "", "{}".into()),
+            ("401 Unauthorized", "", "{}".into()),
+            ("200 OK", "", "not-json".into()),
+        ])
+        .await;
+        let (or_base, or_srv) = mock_http_server(vec![
+            ("200 OK", "", ok_or.clone()),
+            ("200 OK", "", ok_or.clone()),
+            ("200 OK", "", ok_or),
+        ])
+        .await;
+
+        let bases = JevBases {
+            openrouter: or_base,
+            vercel: vercel_base,
+        };
+        let blocks = agentdeck_core::judge::BlockStore::new(
+            rt.join(agentdeck_core::judge::JUDGE_BLOCKS_DIR_NAME),
+        );
+        let primary = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_VERCEL,
+            "perplexity/pplx-decider-v1.2",
+        );
+        let fallback = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_OPENROUTER,
+            "~typesafe/jev-latest",
+        );
+        let req = serde_json::json!({
+            "model": primary.model,
+            "state": {"task": "fix bug", "models": {}},
+            "questions": {
+                "size": {"type": "score", "instructions": "size?", "criteria": SIZES},
+                "difficulty": {"type": "score", "instructions": "diff?", "criteria": DIFFICULTY},
+            }
+        });
+        let body = stringify_like_node(&req);
+        let hash_input = stringify_like_node(&serde_json::json!([Value::Null, 1, req]));
+        let complete = |a: &Value| {
+            a.get("size").is_some_and(|s| valid_answer(s, false))
+                && a.get("difficulty").is_some_and(|d| valid_answer(d, false))
+        };
+
+        // Call 1: primary 429 -> answered by fallback, cached under primary request's key.
+        let (a1, cost1, hit1, ch1) = fetch_jev_cached(
+            &rt,
+            &hash_input,
+            &req,
+            &body,
+            &primary,
+            Some(&fallback),
+            std::time::Duration::from_secs(10),
+            &blocks,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await
+        .unwrap();
+        assert!(!hit1);
+        assert_eq!(ch1, agentdeck_core::judge::JudgeChannel::Fallback);
+        assert_eq!(cost1, Some(0.002));
+        assert_eq!(a1["size"]["score"], 1);
+
+        // Call 2 (same primary key, even with NO fallback configured!): hits cache immediately!
+        let (a2, cost2, hit2, ch2) = fetch_jev_cached(
+            &rt,
+            &hash_input,
+            &req,
+            &body,
+            &primary,
+            None,
+            std::time::Duration::from_secs(10),
+            &blocks,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await
+        .unwrap();
+        assert!(hit2, "fallback answer must hit cache under primary key");
+        assert_eq!(ch2, agentdeck_core::judge::JudgeChannel::Fallback);
+        assert_eq!(cost2, Some(0.0));
+        assert_eq!(a2, a1);
+
+        // Call 3 (different task, same blocked primary, new BlockStore = second process):
+        // skips blocked primary and hits fallback directly.
+        let blocks2 = agentdeck_core::judge::BlockStore::new(
+            rt.join(agentdeck_core::judge::JUDGE_BLOCKS_DIR_NAME),
+        );
+        let (_, _, hit3, ch3) = fetch_jev_cached(
+            &rt,
+            "different-task-hash",
+            &req,
+            &body,
+            &primary,
+            Some(&fallback),
+            std::time::Duration::from_secs(10),
+            &blocks2,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await
+        .unwrap();
+        assert!(!hit3);
+        assert_eq!(ch3, agentdeck_core::judge::JudgeChannel::Fallback);
+
+        // Call 4..6 on an unblocked primary model: 503 -> fallback, 401 -> err, parse -> err.
+        let unblocked = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_VERCEL,
+            "perplexity/other-model",
+        );
+        let (_, _, _, ch4) = fetch_jev_cached(
+            &rt,
+            "hash-503",
+            &req,
+            &body,
+            &unblocked,
+            Some(&fallback),
+            std::time::Duration::from_secs(10),
+            &blocks,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ch4, agentdeck_core::judge::JudgeChannel::Fallback);
+
+        let err401 = fetch_jev_cached(
+            &rt,
+            "hash-401",
+            &req,
+            &body,
+            &unblocked,
+            Some(&fallback),
+            std::time::Duration::from_secs(10),
+            &blocks,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await
+        .unwrap_err();
+        assert!(err401.to_string().contains("401"), "{err401}");
+
+        let err_parse = fetch_jev_cached(
+            &rt,
+            "hash-parse",
+            &req,
+            &body,
+            &unblocked,
+            Some(&fallback),
+            std::time::Duration::from_secs(10),
+            &blocks,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err_parse.to_string().contains("invalid JSON"),
+            "{err_parse}"
+        );
+
+        let vercel_seen = vercel_srv.await.unwrap();
+        assert_eq!(vercel_seen.len(), 4);
+        let or_seen = or_srv.await.unwrap();
+        assert_eq!(or_seen.len(), 3);
+        assert_eq!(or_seen[0].1["model"], "~typesafe/jev-latest");
+        let _ = std::fs::remove_dir_all(&rt);
+    }
+
+    fn setup_batch_env(tag: &str) -> (std::path::PathBuf, Env) {
+        let dir = std::env::temp_dir().join(format!(
+            "agentdeck-route-batch-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        let runtime = dir.join("rt");
+        let state_home = home.join(".local/state");
+        for p in [
+            home.join(".t3/userdata"),
+            state_home.join("ai-usage"),
+            state_home.join("model-route"),
+            runtime.clone(),
+        ] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::fs::write(home.join(".t3/userdata/settings.json"), "{}").unwrap();
+        let catalog = serde_json::json!({
+            "providers": [
+                {
+                    "providerInstanceId": "codex",
+                    "driverKind": "codex",
+                    "models": [
+                        {
+                            "id": "gpt-6.1-sol",
+                            "options": [
+                                {
+                                    "id": "reasoningEffort",
+                                    "type": "select",
+                                    "options": [
+                                        {"id": "medium"},
+                                        {"id": "high"},
+                                        {"id": "xhigh"}
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "providerInstanceId": "claudeAgent",
+                    "driverKind": "claudeAgent",
+                    "models": [
+                        {
+                            "id": "claude-opus-5-5",
+                            "options": [
+                                {
+                                    "id": "effort",
+                                    "type": "select",
+                                    "options": [
+                                        {"id": "medium"},
+                                        {"id": "high"},
+                                        {"id": "xhigh"}
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+        std::fs::write(
+            state_home.join("model-route/catalog.json"),
+            catalog.to_string(),
+        )
+        .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64() as i64;
+        let usage = serde_json::json!({"accounts": [
+            {"provider": "codex", "id": "codex-main", "plan": "Pro 5x", "status": "ok", "updated_at": now, "balances": [],
+             "windows": [
+                {"key": "weekly", "label": "Week", "remaining_percent": 90, "duration_mins": 10080, "resets_at": now + 5 * 86400},
+                {"key": "5h", "label": "5h", "remaining_percent": 90, "duration_mins": 300, "resets_at": now + 3 * 3600}
+             ]},
+            {"provider": "claude", "id": "claude-main", "plan": "Max 5x", "status": "ok", "updated_at": now, "balances": [],
+             "windows": [
+                {"key": "weekly_all", "label": "Week", "remaining_percent": 80, "duration_mins": 10080, "resets_at": now + 5 * 86400},
+                {"key": "session", "label": "5h", "remaining_percent": 80, "duration_mins": 300, "resets_at": now + 3 * 3600}
+             ]}
+        ]});
+        std::fs::write(state_home.join("ai-usage/state.json"), usage.to_string()).unwrap();
+        let router_json = dir.join("router.json");
+        let cfg = serde_json::json!({
+            "version": 1,
+            "decisionProvider": "openrouter",
+            "decisionModel": "~typesafe/jev-latest",
+            "pool": [
+                {"providerInstanceId": "codex", "model": "gpt-6.1-sol", "enabled": true},
+                {"providerInstanceId": "claudeAgent", "model": "claude-opus-5-5", "enabled": true}
+            ],
+            "accounts": {
+                "codex": {"instances": ["codex"], "usageProvider": "codex", "usageId": "codex-main"},
+                "claude": {"instances": ["claudeAgent"], "usageProvider": "claude", "usageId": "claude-main"}
+            }
+        });
+        std::fs::write(&router_json, cfg.to_string()).unwrap();
+        let env = Env {
+            home,
+            runtime,
+            state_home,
+            router_json: Some(router_json.to_string_lossy().into_owned()),
+        };
+        (dir, env)
+    }
+
+    async fn dynamic_openrouter_server(
+        expected_calls: usize,
+    ) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::task::spawn_blocking(move || {
+            let mut seen = Vec::new();
+            for _ in 0..expected_calls {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        size = value.trim().parse().unwrap();
+                    }
+                }
+                let mut req_body = vec![0; size];
+                reader.read_exact(&mut req_body).unwrap();
+                let parsed: Value = serde_json::from_slice(&req_body).unwrap();
+                // Encode task index (0..3) into `size.score` so tests can verify
+                // per-launch ordering matches the input launches.
+                let mut answers = serde_json::Map::new();
+                for qk in parsed["questions"].as_object().unwrap().keys() {
+                    let (task_text, base_q) = if let Some((prefix, rest)) = qk.split_once("__") {
+                        (
+                            parsed["state"]["tasks"][prefix]
+                                .as_str()
+                                .unwrap_or_default(),
+                            rest,
+                        )
+                    } else {
+                        (
+                            parsed["state"]["task"].as_str().unwrap_or_default(),
+                            qk.as_str(),
+                        )
+                    };
+                    let idx_mod = task_text
+                        .split('#')
+                        .nth(1)
+                        .and_then(|s| s.split_whitespace().next())
+                        .and_then(|n| n.parse::<i64>().ok())
+                        .unwrap_or(1)
+                        % 4;
+                    let entry = match base_q {
+                        "size" => serde_json::json!({"score": idx_mod, "confidence": 0.9}),
+                        "difficulty" => serde_json::json!({"score": 1, "confidence": 0.9}),
+                        "review" => serde_json::json!({"score": 0, "confidence": 0.95}),
+                        "codex_gpt_6_1_sol" => serde_json::json!({
+                            "score": 2.8, "confidence": 0.9,
+                            "probabilities": {"0": 0.0, "1": 0.05, "2": 0.15, "3": 0.8}
+                        }),
+                        _ => serde_json::json!({
+                            "score": 2.2, "confidence": 0.85,
+                            "probabilities": {"0": 0.0, "1": 0.1, "2": 0.7, "3": 0.2}
+                        }),
+                    };
+                    answers.insert(qk.clone(), entry);
+                }
+                let body =
+                    serde_json::json!({"answers": answers, "usage": {"cost": 0.01}}).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                seen.push(parsed);
+            }
+            seen
+        });
+        (base, handle)
+    }
+
+    #[tokio::test]
+    async fn route_batch_3_launches_uses_1_request_and_preserves_order_and_warms_cache() {
+        let (dir, env) = setup_batch_env("three");
+        let (or_base, srv) = dynamic_openrouter_server(1).await;
+        let bases = JevBases {
+            openrouter: or_base,
+            vercel: VERCEL_BASE.into(),
+        };
+        let launches = vec![
+            serde_json::json!({
+                "tool": "mcp__t3-code__delegate_task",
+                "input": {"task": "Implement unit #0 parser"}
+            }),
+            serde_json::json!({
+                "tool": "Agent",
+                "input": {"prompt": "Implement unit #1 formatter"}
+            }),
+            serde_json::json!({
+                "tool": "mcp__t3-code__delegate_task",
+                "input": {
+                    "task": "Implement unit #2 tests",
+                    "target": {"providerInstanceId": "codex", "model": "gpt-6.1-sol"}
+                }
+            }),
+        ];
+        let results = route_batch_with_bases(
+            &env,
+            &launches,
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: None,
+                budget: BATCH_BUDGET,
+            },
+            &bases,
+            Some("test-key"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        let seen = srv.await.unwrap();
+        assert_eq!(
+            seen.len(),
+            1,
+            "3 launches must send exactly 1 judge request"
+        );
+        assert_eq!(seen[0]["state"]["tasks"].as_object().unwrap().len(), 3);
+        assert_eq!(results.len(), 3);
+        for (i, r) in results.iter().enumerate() {
+            assert!(r.get("error").is_none(), "unexpected error at {i}: {r}");
+            assert!(
+                r["size"].as_str().unwrap().starts_with(&format!("{i}:")),
+                "order mismatch at {i}: {}",
+                r["size"]
+            );
+            assert_eq!(r["source"], "claudeAgent");
+            assert_eq!(r["jevCache"], "miss");
+            assert_eq!(r["jevChannel"], "primary");
+            assert_eq!(r["target"]["providerInstanceId"], "codex");
+        }
+        assert!(results[2].get("validation").is_some());
+
+        // Re-running the same launches must hit the cache with 0 judge requests.
+        let dead_bases = JevBases {
+            openrouter: "http://127.0.0.1:1".into(),
+            vercel: "http://127.0.0.1:1".into(),
+        };
+        let cached = route_batch_with_bases(
+            &env,
+            &launches,
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: None,
+                budget: BATCH_BUDGET,
+            },
+            &dead_bases,
+            Some("test-key"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(cached.len(), 3);
+        for r in &cached {
+            assert_eq!(r["jevCache"], "hit");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn route_batch_10_launches_uses_2_requests_and_skips_invalid_and_user_choice() {
+        let (dir, env) = setup_batch_env("ten");
+        let (or_base, srv) = dynamic_openrouter_server(2).await;
+        let bases = JevBases {
+            openrouter: or_base,
+            vercel: VERCEL_BASE.into(),
+        };
+        // 10 real launches + 1 invalid + 1 [route:user-choice] = 12 entries,
+        // only 10 need judge calls -> 2 judge requests (8 + 2).
+        let mut launches: Vec<Value> = (0..10)
+            .map(|i| {
+                serde_json::json!({
+                    "tool": "mcp__t3-code__delegate_task",
+                    "input": {"task": format!("Task #{i} for wave")}
+                })
+            })
+            .collect();
+        launches.insert(
+            4,
+            serde_json::json!({
+                "tool": "Bash",
+                "input": {"command": "ls"}
+            }),
+        );
+        launches.insert(
+            7,
+            serde_json::json!({
+                "tool": "mcp__t3-code__delegate_task",
+                "input": {
+                    "task": "[route:user-choice] Audit auth with chosen model",
+                    "target": {"providerInstanceId": "claudeAgent", "model": "claude-opus-5-5"}
+                }
+            }),
+        );
+
+        let results = route_batch_with_bases(
+            &env,
+            &launches,
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: None,
+                budget: BATCH_BUDGET,
+            },
+            &bases,
+            Some("test-key"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        let seen = srv.await.unwrap();
+        assert_eq!(seen.len(), 2, "11 judged launches must use 2 requests");
+        assert_eq!(seen[0]["state"]["tasks"].as_object().unwrap().len(), 8);
+        assert_eq!(seen[1]["state"]["tasks"].as_object().unwrap().len(), 3);
+        assert_eq!(results.len(), 12);
+        assert!(
+            results[4].get("error").is_some(),
+            "invalid launch must yield {{error}}: {}",
+            results[4]
+        );
+        assert_eq!(results[7]["jevCache"], "miss");
+        assert!(results[7].get("validation").is_some());
+        for (idx, r) in results.iter().enumerate() {
+            if idx != 4 {
+                assert!(r.get("error").is_none(), "unexpected error at {idx}: {r}");
+                assert_eq!(r["jevCache"], "miss");
+                assert_eq!(r["target"]["providerInstanceId"], "codex");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn route_batch_returns_per_launch_error_when_source_ambiguous_or_unknown() {
+        let (dir, env) = setup_batch_env("ambig-src");
+        // Configure two codex instances so harness="codex" without CODEX_HOME or T3CODE_THREAD_ID is ambiguous.
+        std::fs::write(
+            env.home.join(".t3/userdata/settings.json"),
+            serde_json::json!({
+                "providerInstances": {
+                    "codex": {"driver": "codex", "config": {}},
+                    "codex_b": {"driver": "codex", "config": {"shadowHomePath": "/tmp/codex-b"}}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let dead_bases = JevBases {
+            openrouter: "http://127.0.0.1:1".into(),
+            vercel: "http://127.0.0.1:1".into(),
+        };
+        let launches = vec![serde_json::json!({
+            "tool": "mcp__t3-code__delegate_task",
+            "input": {"task": "Refactor auth"}
+        })];
+        // Explicit empty own_env and ancestors: independent of whether `cargo test` runs under Codex.
+        let res = route_batch_with_bases(
+            &env,
+            &launches,
+            BatchOptions {
+                harness: Some("codex".into()),
+                source: None,
+                budget: BATCH_BUDGET,
+            },
+            &dead_bases,
+            Some("test-key"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.len(), 1);
+        let err = res[0]["error"]
+            .as_str()
+            .expect("ambiguous source must return per-launch error");
+        assert!(
+            err.to_lowercase().contains("source"),
+            "error must explain missing/ambiguous source, not network failure: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn http_errors_never_leak_provider_body_in_route_or_batch() {
+        let (dir, env) = setup_batch_env("no-body-leak");
+        let (or_base, or_srv) = mock_http_server(vec![(
+            "401 Unauthorized",
+            "",
+            r#"{"error":"echoed SECRET_PROXY_REFLECTION_999"}"#.into(),
+        )])
+        .await;
+        let bases = JevBases {
+            openrouter: or_base,
+            vercel: VERCEL_BASE.into(),
+        };
+        let launches = vec![serde_json::json!({
+            "tool": "mcp__t3-code__delegate_task",
+            "input": {"task": "Test body redaction"}
+        })];
+        let results = route_batch_with_bases(
+            &env,
+            &launches,
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: Some("claudeAgent".into()),
+                budget: BATCH_BUDGET,
+            },
+            &bases,
+            Some("test-key"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        or_srv.await.unwrap();
+        let err = results[0]["error"].as_str().expect("must error on 401");
+        assert!(
+            !err.contains("SECRET_PROXY_REFLECTION_999"),
+            "provider HTTP body must never leak into error: {err}"
+        );
+        assert!(
+            err.contains("jev_http_status_401"),
+            "error must return fixed status code: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn route_body_abort_falls_back_and_429_language_model_does_not_retry_chat() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let rt =
+            std::env::temp_dir().join(format!("agentdeck-route-body-429-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(&rt).unwrap();
+
+        let vercel_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let vercel_base = format!("http://{}", vercel_listener.local_addr().unwrap());
+        let vercel_paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let vp = vercel_paths.clone();
+        let vercel_srv = std::thread::spawn(move || {
+            for idx in 0..2 {
+                let (mut stream, _) = vercel_listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        size = v.trim().parse().unwrap();
+                    }
+                }
+                let mut buf = vec![0; size];
+                reader.read_exact(&mut buf).unwrap();
+                vp.lock().unwrap().push(first);
+                if idx == 0 {
+                    // Truncated 200 body -> body-read error -> transient -> fallback.
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\nConnection: close\r\n\r\n{\"answers\":",
+                    );
+                } else {
+                    // 429 with "is a language model" body must NOT trigger /v1/chat/completions.
+                    let body = r#"{"error":"model is a language model"}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            }
+        });
+
+        let ok_or = serde_json::json!({
+            "answers": {
+                "size": {"score": 1, "confidence": 0.9},
+                "difficulty": {"score": 1, "confidence": 0.9},
+            },
+            "usage": {"cost": 0.002}
+        })
+        .to_string();
+        let or_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let or_base = format!("http://{}", or_listener.local_addr().unwrap());
+        let or_srv = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = or_listener.accept().unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        size = v.trim().parse().unwrap();
+                    }
+                }
+                let mut buf = vec![0; size];
+                reader.read_exact(&mut buf).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok_or}",
+                    ok_or.len()
+                )
+                .unwrap();
+            }
+        });
+
+        let bases = JevBases {
+            openrouter: or_base,
+            vercel: vercel_base,
+        };
+        let blocks = agentdeck_core::judge::BlockStore::new(rt.join("blocks"));
+        let primary = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_VERCEL,
+            "perplexity/pplx-decider-v1.2",
+        );
+        let fallback = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_OPENROUTER,
+            "~typesafe/jev-latest",
+        );
+        let req = serde_json::json!({
+            "model": primary.model,
+            "state": {"task": "fix bug", "models": {}},
+            "questions": {
+                "size": {"type": "score", "instructions": "size?", "criteria": SIZES},
+                "difficulty": {"type": "score", "instructions": "diff?", "criteria": DIFFICULTY},
+            }
+        });
+        let body = stringify_like_node(&req);
+        let complete = |a: &Value| {
+            a.get("size").is_some_and(|s| valid_answer(s, false))
+                && a.get("difficulty").is_some_and(|d| valid_answer(d, false))
+        };
+
+        let (_, _, _, ch1) = fetch_jev_cached(
+            &rt,
+            "h-trunc",
+            &req,
+            &body,
+            &primary,
+            Some(&fallback),
+            std::time::Duration::from_secs(10),
+            &blocks,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ch1, agentdeck_core::judge::JudgeChannel::Fallback);
+
+        let (_, _, _, ch2) = fetch_jev_cached(
+            &rt,
+            "h-429-lm",
+            &req,
+            &body,
+            &primary,
+            Some(&fallback),
+            std::time::Duration::from_secs(10),
+            &blocks,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ch2, agentdeck_core::judge::JudgeChannel::Fallback);
+
+        vercel_srv.join().unwrap();
+        or_srv.join().unwrap();
+        let seen = vercel_paths.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            2,
+            "must not retry /v1/chat/completions on 429: {seen:?}"
+        );
+        assert!(seen.iter().all(|p| p.contains("/v1/decisions")));
+        assert!(blocks.remaining(&primary).is_some());
+        let _ = std::fs::remove_dir_all(&rt);
+    }
+
+    #[tokio::test]
+    async fn vercel_language_model_retry_and_fallback_share_single_deadline() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let rt =
+            std::env::temp_dir().join(format!("agentdeck-route-deadline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(&rt).unwrap();
+
+        // Hanging Vercel server (stalls 2s) + fast OpenRouter fallback with 800ms overall deadline.
+        let vercel_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let vercel_base = format!("http://{}", vercel_listener.local_addr().unwrap());
+        let _vercel_srv = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = vercel_listener.accept() {
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        });
+        let ok_or = serde_json::json!({
+            "answers": {
+                "size": {"score": 1, "confidence": 0.9},
+                "difficulty": {"score": 1, "confidence": 0.9},
+            },
+            "usage": {"cost": 0.002}
+        })
+        .to_string();
+        let or_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let or_base = format!("http://{}", or_listener.local_addr().unwrap());
+        let or_srv = std::thread::spawn(move || {
+            let (mut stream, _) = or_listener.accept().unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            let mut size = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((n, v)) = line.split_once(':')
+                    && n.eq_ignore_ascii_case("content-length")
+                {
+                    size = v.trim().parse().unwrap();
+                }
+            }
+            let mut buf = vec![0; size];
+            reader.read_exact(&mut buf).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok_or}",
+                ok_or.len()
+            )
+            .unwrap();
+        });
+
+        let bases = JevBases {
+            openrouter: or_base,
+            vercel: vercel_base,
+        };
+        let blocks = agentdeck_core::judge::BlockStore::new(rt.join("blocks"));
+        let primary = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_VERCEL,
+            "perplexity/pplx-decider-v1.2",
+        );
+        let fallback = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_OPENROUTER,
+            "~typesafe/jev-latest",
+        );
+        let req = serde_json::json!({
+            "model": primary.model,
+            "state": {"task": "fix bug", "models": {}},
+            "questions": {
+                "size": {"type": "score", "instructions": "size?", "criteria": SIZES},
+                "difficulty": {"type": "score", "instructions": "diff?", "criteria": DIFFICULTY},
+            }
+        });
+        let body = stringify_like_node(&req);
+        let complete = |a: &Value| {
+            a.get("size").is_some_and(|s| valid_answer(s, false))
+                && a.get("difficulty").is_some_and(|d| valid_answer(d, false))
+        };
+
+        let started = std::time::Instant::now();
+        let (_, _, _, ch) = fetch_jev_cached(
+            &rt,
+            "h-deadline",
+            &req,
+            &body,
+            &primary,
+            Some(&fallback),
+            std::time::Duration::from_millis(800),
+            &blocks,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(ch, agentdeck_core::judge::JudgeChannel::Fallback);
+        assert!(
+            elapsed < std::time::Duration::from_millis(1200),
+            "fallback must succeed within single 800ms deadline, took {elapsed:?}"
+        );
+        or_srv.join().unwrap();
+
+        // Also check Vercel /decisions (450ms delay) -> /chat/completions (hangs) respects single 800ms deadline.
+        let v2_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let v2_base = format!("http://{}", v2_listener.local_addr().unwrap());
+        let _v2_srv = std::thread::spawn(move || {
+            for idx in 0..2 {
+                let Ok((mut stream, _)) = v2_listener.accept() else {
+                    break;
+                };
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                let _ = reader.read_line(&mut first);
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        size = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut buf = vec![0; size];
+                let _ = reader.read_exact(&mut buf);
+                if idx == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(450));
+                    let b = r#"{"error":"model is a language model"}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+                        b.len()
+                    );
+                } else {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            }
+        });
+        let bases2 = JevBases {
+            openrouter: "http://127.0.0.1:1".into(),
+            vercel: v2_base,
+        };
+        let started2 = std::time::Instant::now();
+        let res2 = fetch_jev_cached(
+            &rt,
+            "h-vercel-chat-deadline",
+            &req,
+            &body,
+            &primary,
+            None,
+            std::time::Duration::from_millis(800),
+            &blocks,
+            &bases2,
+            Some("test-key"),
+            &complete,
+        )
+        .await;
+        let elapsed2 = started2.elapsed();
+        assert!(res2.is_err());
+        assert!(
+            elapsed2 < std::time::Duration::from_millis(1100),
+            "Vercel /decisions + /chat/completions must share one 800ms deadline, took {elapsed2:?}"
+        );
+        let _ = std::fs::remove_dir_all(&rt);
+    }
+
+    #[tokio::test]
+    async fn route_batch_user_choice_warms_cache_and_fails_when_judge_down() {
+        let (dir, env) = setup_batch_env("user-choice-warm");
+        let launch = serde_json::json!({
+            "tool": "mcp__t3-code__delegate_task",
+            "input": {
+                "task": "[route:user-choice] Audit auth with chosen model",
+                "target": {"providerInstanceId": "claudeAgent", "model": "claude-opus-5-5"}
+            }
+        });
+
+        // 1. With judge down, route_batch must NOT falsely claim allowed: true.
+        let dead_bases = JevBases {
+            openrouter: "http://127.0.0.1:1".into(),
+            vercel: "http://127.0.0.1:1".into(),
+        };
+        let down = route_batch_with_bases(
+            &env,
+            std::slice::from_ref(&launch),
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: Some("claudeAgent".into()),
+                budget: std::time::Duration::from_secs(5),
+            },
+            &dead_bases,
+            Some("test-key"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(
+            down[0].get("error").is_some(),
+            "[route:user-choice] must fail when judge is down, not fabricate allowed:true: {}",
+            down[0]
+        );
+
+        // 2. With judge up, route_batch calls judge, returns normal route output, and warms cache.
+        let (or_base, srv) = dynamic_openrouter_server(1).await;
+        let bases = JevBases {
+            openrouter: or_base,
+            vercel: VERCEL_BASE.into(),
+        };
+        let warmed = route_batch_with_bases(
+            &env,
+            std::slice::from_ref(&launch),
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: Some("claudeAgent".into()),
+                budget: BATCH_BUDGET,
+            },
+            &bases,
+            Some("test-key"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(srv.await.unwrap().len(), 1);
+        assert_eq!(warmed[0]["jevCache"], "miss", "{}", warmed[0]);
+        assert!(warmed[0].get("ranking").is_some(), "{}", warmed[0]);
+
+        // 3. Re-running with judge down now hits the warmed cache!
+        let hit = route_batch_with_bases(
+            &env,
+            std::slice::from_ref(&launch),
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: Some("claudeAgent".into()),
+                budget: std::time::Duration::from_secs(5),
+            },
+            &dead_bases,
+            Some("test-key"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(hit[0]["jevCache"], "hit", "{}", hit[0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_jev_cache_refuses_loose_permissions_and_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let rt =
+            std::env::temp_dir().join(format!("agentdeck-jev-cache-perms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(&rt).unwrap();
+
+        let answers = serde_json::json!({
+            "size": {"score": 1, "confidence": 0.9},
+            "difficulty": {"score": 1, "confidence": 0.9},
+        });
+        let complete = |a: &Value| {
+            a.get("size").is_some_and(|s| valid_answer(s, false))
+                && a.get("difficulty").is_some_and(|d| valid_answer(d, false))
+        };
+        let key = "cache-perms-test-key";
+        write_jev_cache(
+            &rt,
+            key,
+            &answers,
+            agentdeck_core::judge::JudgeChannel::Primary,
+        );
+        assert!(read_jev_cache(&rt, key, &complete).is_some());
+
+        let cache_dir = rt.join("model-route-jev-cache");
+        let cache_file = jev_cache_path(&rt, key);
+
+        // 1. Loose file permissions (0644) must be refused.
+        std::fs::set_permissions(&cache_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            read_jev_cache(&rt, key, &complete).is_none(),
+            "world/group-readable Jev cache file must be refused"
+        );
+        std::fs::set_permissions(&cache_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // 2. Symlinked cache file must be refused.
+        let decoy = cache_dir.join("decoy.json");
+        std::fs::copy(&cache_file, &decoy).unwrap();
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_file(&cache_file).unwrap();
+        symlink(&decoy, &cache_file).unwrap();
+        assert!(
+            read_jev_cache(&rt, key, &complete).is_none(),
+            "symlinked Jev cache file must be refused"
+        );
+        std::fs::remove_file(&cache_file).unwrap();
+        std::fs::rename(&decoy, &cache_file).unwrap();
+
+        // 3. Loose directory permissions (0755) must be refused.
+        std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            read_jev_cache(&rt, key, &complete).is_none(),
+            "world/group-accessible Jev cache dir must be refused"
+        );
+
+        let _ = std::fs::remove_dir_all(&rt);
+    }
+
+    #[tokio::test]
+    async fn jev_cache_invalidates_when_primary_provider_or_fallback_changes() {
+        let (dir, env) = setup_batch_env("cache-key-channels");
+        let router_json = std::path::PathBuf::from(env.router_json.as_ref().unwrap());
+
+        // Start with openrouter primary + vercel fallback.
+        let mut cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(&router_json).unwrap()).unwrap();
+        cfg["judgeFallback"] = serde_json::json!({
+            "provider": "vercel",
+            "model": "perplexity/pplx-decider-v1.2"
+        });
+        std::fs::write(&router_json, cfg.to_string()).unwrap();
+
+        let (or_base, or_srv) = {
+            use std::io::{BufRead, BufReader, Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let handle = std::thread::spawn(move || {
+                let mut seen = 0usize;
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap();
+                    let mut size = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((n, v)) = line.split_once(':')
+                            && n.eq_ignore_ascii_case("content-length")
+                        {
+                            size = v.trim().parse().unwrap();
+                        }
+                    }
+                    let mut buf = vec![0; size];
+                    reader.read_exact(&mut buf).unwrap();
+                    let body = serde_json::json!({
+                        "answers": {
+                            "size": {"score": 1, "confidence": 0.9},
+                            "difficulty": {"score": 1, "confidence": 0.9},
+                            "review": {"score": 0, "confidence": 0.95},
+                            "codex_gpt_6_1_sol": {
+                                "score": 2.8, "confidence": 0.9,
+                                "probabilities": {"0": 0.0, "1": 0.05, "2": 0.15, "3": 0.8}
+                            },
+                            "claudeagent_claude_opus_5_5": {
+                                "score": 2.2, "confidence": 0.85,
+                                "probabilities": {"0": 0.0, "1": 0.1, "2": 0.7, "3": 0.2}
+                            }
+                        },
+                        "usage": {"cost": 0.01}
+                    })
+                    .to_string();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                    seen += 1;
+                }
+                seen
+            });
+            (base, handle)
+        };
+        let bases = JevBases {
+            openrouter: or_base,
+            vercel: VERCEL_BASE.into(),
+        };
+        let launches = vec![serde_json::json!({
+            "tool": "mcp__t3-code__delegate_task",
+            "input": {"task": "Implement unit #0 channel cache test"}
+        })];
+
+        // 1. Initial call warms cache under (openrouter/~typesafe/jev-latest, vercel/pplx).
+        let r1 = route_batch_with_bases(
+            &env,
+            &launches,
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: Some("claudeAgent".into()),
+                budget: BATCH_BUDGET,
+            },
+            &bases,
+            Some("test-key"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(r1[0]["jevCache"], "miss");
+
+        // 2. Remove [judge_fallback]: must MISS cache and re-query judge!
+        cfg.as_object_mut().unwrap().remove("judgeFallback");
+        std::fs::write(&router_json, cfg.to_string()).unwrap();
+        let r2 = route_batch_with_bases(
+            &env,
+            &launches,
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: Some("claudeAgent".into()),
+                budget: BATCH_BUDGET,
+            },
+            &bases,
+            Some("test-key"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r2[0]["jevCache"], "miss",
+            "removing [judge_fallback] must invalidate the Jev cache key"
+        );
+        assert_eq!(or_srv.join().unwrap(), 2);
+
+        // 3. Switch primary provider from openrouter -> vercel (keeping exact same model string!):
+        // must also miss cache instead of reusing openrouter's cached entry.
+        cfg["decisionProvider"] = serde_json::json!("vercel");
+        std::fs::write(&router_json, cfg.to_string()).unwrap();
+        let ok_vercel = serde_json::json!({
+            "answers": [
+                {"type": "score", "name": "size", "score": 1, "confidence": 0.9},
+                {"type": "score", "name": "difficulty", "score": 1, "confidence": 0.9},
+                {"type": "score", "name": "review", "score": 0, "confidence": 0.95},
+                {"type": "score", "name": "codex_gpt_6_1_sol", "score": 2.8, "confidence": 0.9,
+                 "probabilities": [
+                     {"value": 0, "probability": 0.0},
+                     {"value": 1, "probability": 0.05},
+                     {"value": 2, "probability": 0.15},
+                     {"value": 3, "probability": 0.8}
+                 ]},
+                {"type": "score", "name": "claudeagent_claude_opus_5_5", "score": 2.2, "confidence": 0.85,
+                 "probabilities": [
+                     {"value": 0, "probability": 0.0},
+                     {"value": 1, "probability": 0.1},
+                     {"value": 2, "probability": 0.7},
+                     {"value": 3, "probability": 0.2}
+                 ]}
+            ]
+        })
+        .to_string();
+        let (vercel_base, vercel_srv) = mock_http_server(vec![("200 OK", "", ok_vercel)]).await;
+        let bases_v = JevBases {
+            openrouter: "http://127.0.0.1:1".into(),
+            vercel: vercel_base,
+        };
+        let r3 = route_batch_with_bases(
+            &env,
+            &launches,
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: Some("claudeAgent".into()),
+                budget: BATCH_BUDGET,
+            },
+            &bases_v,
+            Some("test-key"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r3[0]["jevCache"], "miss",
+            "changing primary decisionProvider must invalidate the Jev cache key"
+        );
+        assert_eq!(vercel_srv.await.unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn batch_400_and_primary_503_fallback_400_cap_actual_http_sends() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        fn spawn_http_server(
+            responder: impl Fn(&str, &Value) -> (&'static str, String) + Send + 'static,
+        ) -> (
+            String,
+            std::sync::Arc<AtomicBool>,
+            std::sync::Arc<std::sync::Mutex<usize>>,
+            std::thread::JoinHandle<()>,
+        ) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let stop_bg = stop.clone();
+            let hits = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+            let hits_bg = hits.clone();
+            let handle = std::thread::spawn(move || {
+                while !stop_bg.load(Ordering::SeqCst) {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(pair) => pair,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap();
+                    let mut size = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((n, v)) = line.split_once(':')
+                            && n.eq_ignore_ascii_case("content-length")
+                        {
+                            size = v.trim().parse().unwrap();
+                        }
+                    }
+                    let mut req_body = vec![0; size];
+                    reader.read_exact(&mut req_body).unwrap();
+                    let parsed: Value = serde_json::from_slice(&req_body).unwrap_or(Value::Null);
+                    *hits_bg.lock().unwrap() += 1;
+                    let (status, body) = responder(&first, &parsed);
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+            });
+            (base, stop, hits, handle)
+        }
+
+        let make_launches = |prefix: &str| -> Vec<Value> {
+            (0..8)
+                .map(|i| {
+                    serde_json::json!({
+                        "tool": "mcp__t3-code__delegate_task",
+                        "input": {"task": format!("{prefix} unit #{i}")}
+                    })
+                })
+                .collect()
+        };
+
+        // 1. Primary 503 + fallback ambiguous 400 for 8 tasks -> total HTTP calls <= 9,
+        // no body leak, remaining tasks fail with fixed cap error.
+        let (dir1, env1) = setup_batch_env("503-fb-400");
+        let router_json1 = std::path::PathBuf::from(env1.router_json.as_ref().unwrap());
+        let mut cfg1: Value =
+            serde_json::from_str(&std::fs::read_to_string(&router_json1).unwrap()).unwrap();
+        cfg1["judgeFallback"] = serde_json::json!({
+            "provider": "vercel",
+            "model": "perplexity/pplx-decider-v1.2"
+        });
+        std::fs::write(&router_json1, cfg1.to_string()).unwrap();
+
+        let (or_base1, stop_or1, hits_or1, srv_or1) =
+            spawn_http_server(|_, _| ("503 Service Unavailable", "{}".into()));
+        let (vc_base1, stop_vc1, hits_vc1, srv_vc1) = spawn_http_server(|_, _| {
+            (
+                "400 Bad Request",
+                r#"{"error":"bad request SECRET_FB_400"}"#.into(),
+            )
+        });
+        let res1 = route_batch_with_bases(
+            &env1,
+            &make_launches("p503-fb400"),
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: Some("claudeAgent".into()),
+                budget: std::time::Duration::from_secs(10),
+            },
+            &JevBases {
+                openrouter: or_base1,
+                vercel: vc_base1,
+            },
+            Some("test-key"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        stop_or1.store(true, Ordering::SeqCst);
+        stop_vc1.store(true, Ordering::SeqCst);
+        srv_or1.join().unwrap();
+        srv_vc1.join().unwrap();
+        let total1 = *hits_or1.lock().unwrap() + *hits_vc1.lock().unwrap();
+        assert!(
+            total1 <= 9,
+            "primary 503 + fallback 400 for 8 tasks must make <= 9 total HTTP calls, got {total1}"
+        );
+        for r in &res1 {
+            let err = r["error"].as_str().expect("must fail");
+            assert!(!err.contains("SECRET_FB_400"));
+        }
+        assert!(
+            res1.iter()
+                .any(|r| r["error"].as_str() == Some(crate::jev_queue::BATCH_SEND_CAP_ERROR)),
+            "cap-stopped tasks must fail with fixed cap error: {res1:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir1);
+
+        // 2. Vercel /v1/decisions LM 400 + /v1/chat/completions 400 for 8 tasks -> total HTTP calls <= 9.
+        let (dir2, env2) = setup_batch_env("vc-lm-cap");
+        let router_json2 = std::path::PathBuf::from(env2.router_json.as_ref().unwrap());
+        let mut cfg2: Value =
+            serde_json::from_str(&std::fs::read_to_string(&router_json2).unwrap()).unwrap();
+        cfg2["decisionProvider"] = serde_json::json!("vercel");
+        cfg2["decisionModel"] = serde_json::json!("openai/gpt-4o-mini");
+        std::fs::write(&router_json2, cfg2.to_string()).unwrap();
+
+        let (vc_base2, stop_vc2, hits_vc2, srv_vc2) = spawn_http_server(|first, _| {
+            if first.contains("/v1/decisions") {
+                (
+                    "400 Bad Request",
+                    r#"{"error":"openai/gpt-4o-mini is a language model"}"#.into(),
+                )
+            } else {
+                ("400 Bad Request", r#"{"error":"bad chat request"}"#.into())
+            }
+        });
+        let res2 = route_batch_with_bases(
+            &env2,
+            &make_launches("vc-lm"),
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: Some("claudeAgent".into()),
+                budget: std::time::Duration::from_secs(10),
+            },
+            &JevBases {
+                openrouter: "http://127.0.0.1:1".into(),
+                vercel: vc_base2,
+            },
+            Some("test-key"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        stop_vc2.store(true, Ordering::SeqCst);
+        srv_vc2.join().unwrap();
+        let total2 = *hits_vc2.lock().unwrap();
+        assert!(
+            total2 <= 9,
+            "Vercel /v1/decisions + /v1/chat/completions for 8 tasks must make <= 9 total HTTP calls, got {total2}"
+        );
+        assert!(
+            res2.iter()
+                .any(|r| r["error"].as_str() == Some(crate::jev_queue::BATCH_SEND_CAP_ERROR)),
+            "cap-stopped tasks must fail with fixed cap error: {res2:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir2);
+
+        // 3. Context-length 400 on combined batch recovers all 8 tasks one-by-one in 9 sends.
+        let (dir3, env3) = setup_batch_env("400-context-len");
+        let (base3, stop3, hits3, srv3) = spawn_http_server(|_, req| {
+            if req.pointer("/state/tasks").is_some() {
+                return (
+                    "400 Bad Request",
+                    r#"{"error":{"message":"maximum context length exceeded"}}"#.into(),
+                );
+            }
+            let body = serde_json::json!({
+                "answers": {
+                    "size": {"score": 1, "confidence": 0.9},
+                    "difficulty": {"score": 1, "confidence": 0.9},
+                    "review": {"score": 0, "confidence": 0.95},
+                    "codex_gpt_6_1_sol": {
+                        "score": 2.8, "confidence": 0.9,
+                        "probabilities": {"0": 0.0, "1": 0.05, "2": 0.15, "3": 0.8}
+                    },
+                    "claudeagent_claude_opus_5_5": {
+                        "score": 2.2, "confidence": 0.85,
+                        "probabilities": {"0": 0.0, "1": 0.1, "2": 0.7, "3": 0.2}
+                    }
+                },
+                "usage": {"cost": 0.01}
+            })
+            .to_string();
+            ("200 OK", body)
+        });
+        let res3 = route_batch_with_bases(
+            &env3,
+            &make_launches("ctx-len"),
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: Some("claudeAgent".into()),
+                budget: std::time::Duration::from_secs(10),
+            },
+            &JevBases {
+                openrouter: base3,
+                vercel: "http://127.0.0.1:1".into(),
+            },
+            Some("test-key"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        stop3.store(true, Ordering::SeqCst);
+        srv3.join().unwrap();
+        assert_eq!(
+            *hits3.lock().unwrap(),
+            9,
+            "context-length 400 must recover all 8 tasks one-by-one in 9 sends"
+        );
+        for (i, r) in res3.iter().enumerate() {
+            assert!(
+                r.get("error").is_none(),
+                "task {i} should succeed after one-by-one fallback: {r}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir3);
+
+        // 4. Vercel chat model, no fallback: the batch chat answer omits t1, so t1 is retried
+        // alone and must go straight to chat (decisions already said "language model"):
+        // decisions + batch chat + single chat = 3 = cap for 2 tasks.
+        let (dir4, env4) = setup_batch_env("vc-lm-partial");
+        let router_json4 = std::path::PathBuf::from(env4.router_json.as_ref().unwrap());
+        let mut cfg4: Value =
+            serde_json::from_str(&std::fs::read_to_string(&router_json4).unwrap()).unwrap();
+        cfg4["decisionProvider"] = serde_json::json!("vercel");
+        cfg4["decisionModel"] = serde_json::json!("openai/gpt-4o-mini");
+        std::fs::write(&router_json4, cfg4.to_string()).unwrap();
+        let decisions4 = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let decisions4_bg = decisions4.clone();
+        let (vc_base4, stop_vc4, hits_vc4, srv_vc4) = spawn_http_server(move |first, req| {
+            if first.contains("/v1/decisions") {
+                *decisions4_bg.lock().unwrap() += 1;
+                return (
+                    "400 Bad Request",
+                    r#"{"error":"openai/gpt-4o-mini is a language model"}"#.into(),
+                );
+            }
+            let user: Value = req
+                .pointer("/messages/1/content")
+                .and_then(Value::as_str)
+                .and_then(|c| serde_json::from_str(c).ok())
+                .unwrap_or(Value::Null);
+            let combined = user.pointer("/state/tasks").is_some();
+            let mut answers = serde_json::Map::new();
+            for key in user["questions"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(k, _)| k)
+            {
+                if combined && !key.starts_with("t0__") {
+                    continue;
+                }
+                let score = if key.ends_with("review") { 0 } else { 1 };
+                answers.insert(
+                    key.clone(),
+                    serde_json::json!({"score": score, "confidence": 0.9,
+                        "probabilities": {"0": 0.1, "1": 0.7, "2": 0.1, "3": 0.1}}),
+                );
+            }
+            let content = Value::Object(answers).to_string();
+            let body = serde_json::json!({"choices": [{"message": {"content": content}}]});
+            ("200 OK", body.to_string())
+        });
+        let launches4: Vec<Value> = make_launches("vc-lm-partial").into_iter().take(2).collect();
+        let res4 = route_batch_with_bases(
+            &env4,
+            &launches4,
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: Some("claudeAgent".into()),
+                budget: std::time::Duration::from_secs(10),
+            },
+            &JevBases {
+                openrouter: "http://127.0.0.1:1".into(),
+                vercel: vc_base4,
+            },
+            Some("test-key"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        stop_vc4.store(true, Ordering::SeqCst);
+        srv_vc4.join().unwrap();
+        for (i, r) in res4.iter().enumerate() {
+            assert!(
+                r.get("error").is_none(),
+                "task {i} must be answered via chat: {r}"
+            );
+        }
+        assert_eq!(
+            *decisions4.lock().unwrap(),
+            1,
+            "one-by-one retry must skip /v1/decisions"
+        );
+        assert_eq!(*hits_vc4.lock().unwrap(), 3);
+        let _ = std::fs::remove_dir_all(&dir4);
+    }
 }
 
 #[cfg(test)]
@@ -2404,6 +4997,7 @@ mod quota_estimate_tests {
             usage_state_path: None,
             decision_model: None,
             decision_provider: None,
+            judge_fallback: agentdeck_core::settings::JudgeFallbackSettings::default(),
             workflow_eval: crate::policy::WorkflowEvalConfig::default(),
             user_rules: agentdeck_core::settings::UserRules::default(),
             account: [("codex".to_string(), "codex".to_string())]
@@ -2846,12 +5440,114 @@ mod probe_tests {
             r#"{"answers":{"size":{"score":0,"confidence":0.9},"difficulty":{"score":0,"confidence":0.8}},"usage":{"cost":0.001}}"#,
         )
         .unwrap();
+        let blocks = agentdeck_core::judge::BlockStore::new(dir.join("blocks"));
         // SAFETY: test-only env override read by jev_fetch.
         unsafe { std::env::set_var("AGENTDECK_ROUTE_MOCK_JEV", &mock) };
-        let r = super::probe_decision(None, "m", Some("k")).await;
+        let r = super::probe_decision_with_bases(
+            None,
+            "m",
+            Some("k"),
+            &blocks,
+            &super::JevBases::default(),
+        )
+        .await;
         unsafe { std::env::remove_var("AGENTDECK_ROUTE_MOCK_JEV") };
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(r.unwrap(), (0.0, 0.0, Some(0.001)));
+    }
+
+    #[tokio::test]
+    async fn probe_decision_records_429_block_and_honours_active_block() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let dir = std::env::temp_dir().join(format!("agentdeck-probe-429-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_bg = hits.clone();
+        let srv = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            hits_bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut reader = BufReader::new(&mut stream);
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            let mut size = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((n, v)) = line.split_once(':')
+                    && n.eq_ignore_ascii_case("content-length")
+                {
+                    size = v.trim().parse().unwrap();
+                }
+            }
+            let mut buf = vec![0; size];
+            reader.read_exact(&mut buf).unwrap();
+            let body = r#"{"error":"rate limited"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        let blocks = agentdeck_core::judge::BlockStore::new(dir.join("blocks"));
+        let bases = super::JevBases {
+            openrouter: base,
+            vercel: "http://127.0.0.1:1".into(),
+        };
+
+        // 1. First probe hits 429 -> records block and returns blocked-until error.
+        let err1 =
+            super::probe_decision_with_bases(None, "probe-model", Some("k"), &blocks, &bases)
+                .await
+                .unwrap_err();
+        assert!(
+            err1.to_string().contains("blocked until"),
+            "expected blocked-until error: {err1}"
+        );
+        let ep = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_OPENROUTER,
+            "probe-model",
+        );
+        assert!(
+            blocks.remaining(&ep).is_some(),
+            "probe 429 must persist cross-process block"
+        );
+
+        // 2. Second probe sees active block -> 0 HTTP requests, returns blocked-until error.
+        let err2 =
+            super::probe_decision_with_bases(None, "probe-model", Some("k"), &blocks, &bases)
+                .await
+                .unwrap_err();
+        assert!(
+            err2.to_string().contains("blocked until"),
+            "expected blocked-until error on cached block: {err2}"
+        );
+        srv.join().unwrap();
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "second probe must not hit network while 429 block is active"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn router_and_core_block_stores_resolve_same_dir() {
+        let rt = crate::runtime_dir().unwrap();
+        assert_eq!(
+            agentdeck_core::judge::BlockStore::default_runtime()
+                .unwrap()
+                .dir(),
+            agentdeck_core::judge::BlockStore::for_runtime_dir(&rt).dir()
+        );
     }
 }
 
