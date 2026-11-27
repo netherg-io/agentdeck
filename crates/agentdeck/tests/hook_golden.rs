@@ -1270,3 +1270,120 @@ fn review_role_disables_cheap_model_bonus_in_hook() {
         .unwrap();
     assert_eq!(haiku_row["cheapModelBonus"].as_f64(), Some(0.0), "{rec}");
 }
+
+#[test]
+fn agy_top_level_call_mcp_tool_envelope_uses_inner_args_for_checks_and_record() {
+    let hint = shared_hint();
+    let sol = serde_json::json!({
+        "providerInstanceId": "codex",
+        "model": "gpt-6.1-sol",
+        "options": {"reasoningEffort": "medium"}
+    });
+    let envelope = |args: serde_json::Value| {
+        serde_json::json!({
+            "tool_name": "call_mcp_tool",
+            "tool_input": {
+                "ServerName": "t3-code",
+                "ToolName": "delegate_task",
+                "Arguments": args
+            },
+            "conversationId": "root"
+        })
+    };
+
+    // 1. Valid inner Arguments (with required hint): must allow and record inner requestedTarget.
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        let input = envelope(serde_json::json!({
+            "task": format!("Fix the typo\n\n{hint}"),
+            "target": sol
+        }));
+        let (code, out, err) = run_rust(&fx, "agy", &input.to_string());
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        let verdict: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(verdict["decision"], "allow", "{verdict}");
+        let rec = last_record(&fx);
+        assert_eq!(rec["decision"], "allow:delegate", "{rec}");
+        assert_eq!(rec["requestedTarget"], sol, "{rec}");
+    }
+
+    // 2. Foreign reasoning option + workflow clientRequestId inside inner Arguments:
+    //    must fail reasoning validation with the workflow retry hint (not bypass it).
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        let bad_target = serde_json::json!({
+            "providerInstanceId": "codex",
+            "model": "gpt-6.1-sol",
+            "options": {"effort": "medium"}
+        });
+        let input = envelope(serde_json::json!({
+            "task": format!("Fix the typo\n\n{hint}"),
+            "target": bad_target,
+            "clientRequestId": "routed-workflow-42"
+        }));
+        let (code, out, err) = run_rust(&fx, "agy", &input.to_string());
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        let verdict: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(verdict["decision"], "deny", "{verdict}");
+        assert!(
+            verdict["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("--not-dispatched"),
+            "workflow clientRequestId inside inner Arguments must produce workflow retry hint: {verdict}"
+        );
+        let rec = last_record(&fx);
+        assert_eq!(rec["decision"], "deny:reasoning", "{rec}");
+        assert_eq!(rec["requestedTarget"], bad_target, "{rec}");
+    }
+
+    // 3. Instance capacity limit must apply to inner target/task (second launch denied).
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        let path = fx.dir.join("router.json");
+        let mut cfg: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        cfg["instanceLimits"] = serde_json::json!({"codex": 1});
+        std::fs::write(path, cfg.to_string()).unwrap();
+        let t3 = fx.dir.join(".t3/userdata/statev2.sqlite");
+        rusqlite::Connection::open(&t3)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE orchestration_v2_projection_subagents (
+                    subagent_id TEXT, provider_instance_id TEXT, payload_json TEXT, started_at TEXT,
+                    origin TEXT, status TEXT, provider_thread_id TEXT, run_id TEXT, child_thread_id TEXT);
+                 CREATE TABLE orchestration_v2_projection_provider_threads (
+                    provider_thread_id TEXT, provider_instance_id TEXT, provider_session_id TEXT, status TEXT);
+                 CREATE TABLE orchestration_v2_projection_provider_sessions (provider_session_id TEXT, model TEXT, status TEXT);
+                 CREATE TABLE orchestration_v2_projection_provider_turns (provider_thread_id TEXT, run_attempt_id TEXT, status TEXT);
+                 CREATE TABLE orchestration_v2_projection_runs (run_id TEXT, provider_instance_id TEXT, provider_thread_id TEXT, payload_json TEXT, status TEXT, thread_id TEXT);
+                 CREATE TABLE orchestration_v2_projection_run_attempts (attempt_id TEXT, run_id TEXT);",
+            )
+            .unwrap();
+
+        let req1 = envelope(serde_json::json!({
+            "task": format!("First task\n\n{hint}"),
+            "target": sol
+        }));
+        let (c1, o1, e1) = run_rust(&fx, "agy", &req1.to_string());
+        assert_eq!(c1, 0, "{}", String::from_utf8_lossy(&e1));
+        let v1: serde_json::Value = serde_json::from_slice(&o1).unwrap();
+        assert_eq!(v1["decision"], "allow", "{v1}");
+
+        let req2 = envelope(serde_json::json!({
+            "task": format!("Second task\n\n{hint}"),
+            "target": sol
+        }));
+        let (c2, o2, e2) = run_rust(&fx, "agy", &req2.to_string());
+        assert_eq!(c2, 0, "{}", String::from_utf8_lossy(&e2));
+        let v2: serde_json::Value = serde_json::from_slice(&o2).unwrap();
+        assert_eq!(v2["decision"], "deny", "{v2}");
+        assert!(
+            v2["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("instance parallel limit"),
+            "second enveloped launch must hit capacity limit: {v2}"
+        );
+    }
+}

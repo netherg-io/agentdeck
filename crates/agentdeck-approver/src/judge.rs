@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use agentdeck_core::judge::{
     BlockStore, DispatchBudget, FallbackTrigger, JudgeChannel, JudgeEndpoint, classify_http_status,
-    default_runtime_base, dispatch_with_deadline, parse_retry_after, request_timeout,
+    dispatch_with_deadline, parse_retry_after, request_timeout,
 };
 use agentdeck_core::settings::{DEFAULT_DECISION_MODEL, PROVIDER_OPENROUTER, PROVIDER_VERCEL};
 use anyhow::{Context, Result, bail};
@@ -225,9 +225,7 @@ impl HttpPolicyJudge {
             .timeout(JUDGE_TIMEOUT)
             .build()
             .context("failed to build policy judge HTTP client")?;
-        let runtime_base =
-            default_runtime_base().context("failed to resolve policy judge runtime base")?;
-        let blocks = BlockStore::for_runtime_dir(&runtime_base);
+        let blocks = BlockStore::default_runtime_or_disabled();
         Ok(Self {
             client,
             primary,
@@ -1248,5 +1246,113 @@ mod tests {
         );
         assert_eq!(primary_srv.await.unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&blocks_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approver_judge_runs_in_memory_when_runtime_base_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "AGENTDECK_APPROVER_NO_RUNTIME_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = std::env::temp_dir()
+                .join(format!("agentdeck-approver-no-rt-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let untrusted_xdg = root.join("xdg-0755");
+            let bad_home = root.join("home");
+            std::fs::create_dir_all(&untrusted_xdg).unwrap();
+            std::fs::set_permissions(&untrusted_xdg, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            std::fs::create_dir_all(&bad_home).unwrap();
+            // File at $HOME/.cache prevents creating $HOME/.cache/agentdeck/runtime.
+            std::fs::write(bad_home.join(".cache"), "not-a-dir").unwrap();
+
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "judge::tests::approver_judge_runs_in_memory_when_runtime_base_unavailable",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("XDG_RUNTIME_DIR", &untrusted_xdg)
+                .env("HOME", &bad_home)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let xdg_entries: Vec<_> = std::fs::read_dir(&untrusted_xdg).unwrap().collect();
+            let _ = std::fs::remove_dir_all(&root);
+
+            assert!(
+                output.status.success(),
+                "child failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(
+                xdg_entries.is_empty(),
+                "must never write into untrusted XDG_RUNTIME_DIR: {xdg_entries:?}"
+            );
+            let warn_count = stderr
+                .lines()
+                .filter(|line| line.contains("rate-limit persistence disabled"))
+                .count();
+            assert_eq!(
+                warn_count, 1,
+                "must log rate-limit persistence warning once to stderr:\n{stderr}"
+            );
+            return;
+        }
+
+        // Deliberately unconfigured judges still fail closed.
+        assert!(
+            HttpPolicyJudge::new(Some(PROVIDER_OPENROUTER.into()), None, String::new()).is_err()
+        );
+        assert!(HttpPolicyJudge::new(Some(PROVIDER_VERCEL.into()), None, "k".into()).is_err());
+
+        let (primary_base, primary_srv) = mock_judge_server_with_headers(vec![(
+            "429 Too Many Requests",
+            "Retry-After: 60\r\n",
+            r#"{"error":"rate limit"}"#.to_string(),
+        )])
+        .await;
+        let (fb_base, fb_srv) = mock_judge_server_with_headers(vec![(
+            "200 OK",
+            "",
+            json!({"answers": {"permit": {"score": 1, "confidence": 0.95}}}).to_string(),
+        )])
+        .await;
+
+        let judge1 = HttpPolicyJudge::new(
+            Some(PROVIDER_VERCEL.into()),
+            Some("perplexity/pplx-decider-v1.2".into()),
+            "primary-key".into(),
+        )
+        .expect("configured approver judge must succeed without runtime base")
+        .with_fallback(PROVIDER_OPENROUTER, None, "fb-key".into())
+        .unwrap()
+        .with_base_url(primary_base)
+        .with_fallback_base_url(fb_base);
+        // Second construction in the same process verifies the stderr warning logs once.
+        let _judge2 =
+            HttpPolicyJudge::new(Some(PROVIDER_OPENROUTER.into()), None, "second-key".into())
+                .expect("second approver judge must succeed without runtime base");
+
+        let req: ApprovalRequest = serde_json::from_value(json!({
+            "kind": "confirm",
+            "title": "Redeploy",
+            "text": "staging",
+            "host": "local",
+            "thread_id": "t-1"
+        }))
+        .unwrap();
+        let mandate = MandateContext {
+            active_autonomous_run: true,
+            owner_granted: true,
+            thread_id: Some("t-1".into()),
+            ..Default::default()
+        };
+        let verdict = judge1.evaluate(&req, &mandate).await.unwrap();
+        assert!(verdict.allow);
+        assert_eq!(verdict.channel, Some(JudgeChannel::Fallback));
+        assert_eq!(primary_srv.await.unwrap().len(), 1);
+        assert_eq!(fb_srv.await.unwrap().len(), 1);
     }
 }

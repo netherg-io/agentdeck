@@ -563,10 +563,11 @@ fn endpoint_stem(endpoint: &JudgeEndpoint) -> String {
     format!("{:x}", h.finalize())
 }
 
-/// Cross-process 429 block store backed by private JSON files per `(provider, model)`.
+/// Cross-process 429 block store backed by private JSON files per `(provider, model)`,
+/// or an in-memory disabled store when no trusted runtime directory is available.
 #[derive(Debug, Clone)]
 pub struct BlockStore {
-    dir: PathBuf,
+    dir: Option<PathBuf>,
 }
 
 impl BlockStore {
@@ -574,33 +575,61 @@ impl BlockStore {
         Ok(Self::for_runtime_dir(&default_runtime_base()?))
     }
 
+    /// Resolve the shared per-user block store, falling back to a disabled
+    /// (in-memory only) store and logging once to stderr when no trusted
+    /// runtime base can be set up. Never falls back to an untrusted dir.
+    pub fn default_runtime_or_disabled() -> Self {
+        match Self::default_runtime() {
+            Ok(store) => store,
+            Err(err) => {
+                static LOGGED: std::sync::Once = std::sync::Once::new();
+                LOGGED.call_once(|| {
+                    eprintln!(
+                        "agentdeck: judge rate-limit persistence disabled (no trusted runtime dir: {err})"
+                    );
+                });
+                Self::disabled()
+            }
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self { dir: None }
+    }
+
     /// Resolve the shared per-user block directory inside `runtime_dir` so all
     /// consumers (router, approver, coordinator, probes) share one location.
     pub fn for_runtime_dir(runtime_dir: &Path) -> Self {
         Self {
-            dir: blocks_dir_for_runtime(runtime_dir),
+            dir: Some(blocks_dir_for_runtime(runtime_dir)),
         }
     }
 
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self { dir: Some(dir) }
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
+    pub fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
     }
 
-    pub fn block_path(&self, endpoint: &JudgeEndpoint) -> PathBuf {
-        self.dir.join(format!("{}.json", endpoint_stem(endpoint)))
+    pub fn block_path(&self, endpoint: &JudgeEndpoint) -> Option<PathBuf> {
+        self.dir
+            .as_deref()
+            .map(|d| d.join(format!("{}.json", endpoint_stem(endpoint))))
     }
 
-    fn lock_path(&self, endpoint: &JudgeEndpoint) -> PathBuf {
-        self.dir.join(format!("{}.lock", endpoint_stem(endpoint)))
+    #[cfg(test)]
+    fn lock_path(&self, endpoint: &JudgeEndpoint) -> Option<PathBuf> {
+        self.dir
+            .as_deref()
+            .map(|d| d.join(format!("{}.lock", endpoint_stem(endpoint))))
     }
 
     fn read_until_ms(&self, endpoint: &JudgeEndpoint) -> Option<u64> {
-        let path = self.block_path(endpoint);
-        let text = match read_private_entry(&self.dir, &path) {
+        let dir = self.dir.as_deref()?;
+        let path = dir.join(format!("{}.json", endpoint_stem(endpoint)));
+        let text = match read_private_entry(dir, &path) {
             Ok(Some(t)) => t,
             Ok(None) => return None,
             Err(e) => {
@@ -655,8 +684,11 @@ impl BlockStore {
         now: SystemTime,
         max_wait: Duration,
     ) -> std::io::Result<()> {
-        create_private_dir(&self.dir)?;
-        let lock_path = self.lock_path(endpoint);
+        let Some(dir) = self.dir.as_deref() else {
+            return Ok(());
+        };
+        create_private_dir(dir)?;
+        let lock_path = dir.join(format!("{}.lock", endpoint_stem(endpoint)));
         let mut lock_opts = std::fs::File::options();
         lock_opts.create(true).truncate(false).write(true);
         #[cfg(unix)]
@@ -699,7 +731,10 @@ impl BlockStore {
             blocked_until_ms,
         };
         let text = serde_json::to_string(&rec).map_err(std::io::Error::other)?;
-        let res = write_atomic(&self.block_path(endpoint), &text);
+        let res = write_atomic(
+            &dir.join(format!("{}.json", endpoint_stem(endpoint))),
+            &text,
+        );
         drop(lock_file);
         res
     }
@@ -1290,7 +1325,7 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-            let file_mode = std::fs::metadata(blocks.block_path(&primary()))
+            let file_mode = std::fs::metadata(blocks.block_path(&primary()).unwrap())
                 .unwrap()
                 .permissions()
                 .mode()
@@ -1520,7 +1555,7 @@ mod tests {
         blocks
             .record_rate_limit_at(&ep, Duration::from_secs(1), t0)
             .unwrap();
-        let lock_path = blocks.lock_path(&ep);
+        let lock_path = blocks.lock_path(&ep).unwrap();
         let lock_file = std::fs::File::options()
             .create(true)
             .truncate(false)
@@ -1552,7 +1587,7 @@ mod tests {
             blocked_until_ms: system_time_ms(t0) + 60_000,
         };
         write_atomic(
-            &blocks.block_path(&ep),
+            &blocks.block_path(&ep).unwrap(),
             &serde_json::to_string(&long_rec).unwrap(),
         )
         .unwrap();
@@ -1649,7 +1684,7 @@ mod tests {
             .unwrap();
 
         // 1. Loose file permissions (0644) must not be trusted on read.
-        let p = blocks.block_path(&ep);
+        let p = blocks.block_path(&ep).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(
             blocks.remaining_at(&ep, t0).is_none(),
@@ -1722,7 +1757,7 @@ mod tests {
         let shared = std::env::temp_dir().join(JUDGE_BLOCKS_DIR_NAME);
         assert_ne!(
             store.dir(),
-            shared.as_path(),
+            Some(shared.as_path()),
             "BlockStore::default_runtime() without XDG_RUNTIME_DIR must use a per-user directory, not shared {}",
             shared.display()
         );
@@ -1737,7 +1772,7 @@ mod tests {
         blocks
             .record_rate_limit_at(&ep, Duration::from_secs(1), t0)
             .unwrap();
-        let lock_path = blocks.lock_path(&ep);
+        let lock_path = blocks.lock_path(&ep).unwrap();
         let lock_file = std::fs::File::options()
             .create(true)
             .truncate(false)

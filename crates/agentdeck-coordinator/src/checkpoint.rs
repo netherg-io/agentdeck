@@ -8,8 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use agentdeck_core::judge::{
     BlockStore, DispatchBudget, FallbackTrigger, JudgeEndpoint, classify_http_status,
-    default_runtime_base, dispatch_with_deadline, format_rate_limit_exceeded, parse_retry_after,
-    request_timeout,
+    dispatch_with_deadline, format_rate_limit_exceeded, parse_retry_after, request_timeout,
 };
 use agentdeck_core::settings::{DEFAULT_DECISION_MODEL, PROVIDER_OPENROUTER, PROVIDER_VERCEL};
 use serde::{Deserialize, Serialize};
@@ -278,7 +277,6 @@ impl HttpCheckpointJudge {
                 id: ep,
             })
         });
-        let runtime_base = default_runtime_base()?;
         Ok(Self {
             endpoint: endpoint.to_string(),
             api_key,
@@ -287,7 +285,7 @@ impl HttpCheckpointJudge {
             fallback,
             timeout: CHECKPOINT_JUDGE_TIMEOUT,
             deadline: CHECKPOINT_JUDGE_DEADLINE,
-            blocks: BlockStore::for_runtime_dir(&runtime_base),
+            blocks: BlockStore::default_runtime_or_disabled(),
             client: reqwest::Client::builder()
                 .timeout(CHECKPOINT_JUDGE_TIMEOUT)
                 .build()?,
@@ -1174,5 +1172,121 @@ mod tests {
                 >= CHECKPOINT_FALLBACK_RESERVE,
             "checkpoint must reserve {CHECKPOINT_FALLBACK_RESERVE:?} for fallback"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checkpoint_judge_runs_in_memory_when_runtime_base_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "AGENTDECK_CHECKPOINT_NO_RUNTIME_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = std::env::temp_dir()
+                .join(format!("agentdeck-checkpoint-no-rt-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let untrusted_xdg = root.join("xdg-0755");
+            let bad_home = root.join("home");
+            std::fs::create_dir_all(&untrusted_xdg).unwrap();
+            std::fs::set_permissions(&untrusted_xdg, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            std::fs::create_dir_all(&bad_home).unwrap();
+            std::fs::write(bad_home.join(".cache"), "not-a-dir").unwrap();
+
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "checkpoint::tests::checkpoint_judge_runs_in_memory_when_runtime_base_unavailable",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("XDG_RUNTIME_DIR", &untrusted_xdg)
+                .env("HOME", &bad_home)
+                .env("OPENROUTER_API_KEY", "test-or-key")
+                .env_remove("JEV_OPENROUTER_API_KEY")
+                .env_remove("AI_GATEWAY_API_KEY")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let xdg_entries: Vec<_> = std::fs::read_dir(&untrusted_xdg).unwrap().collect();
+            let _ = std::fs::remove_dir_all(&root);
+
+            assert!(
+                output.status.success(),
+                "child failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(
+                xdg_entries.is_empty(),
+                "must never write into untrusted XDG_RUNTIME_DIR: {xdg_entries:?}"
+            );
+            let warn_count = stderr
+                .lines()
+                .filter(|line| line.contains("rate-limit persistence disabled"))
+                .count();
+            assert_eq!(
+                warn_count, 1,
+                "must log rate-limit persistence warning once to stderr:\n{stderr}"
+            );
+            return;
+        }
+
+        // Deliberately unconfigured provider/model still fails closed.
+        let unconfigured = CoordinatorConfig {
+            judge_provider: Some(PROVIDER_VERCEL.to_string()),
+            judge_model: None,
+            ..Default::default()
+        };
+        assert!(HttpCheckpointJudge::from_env(&unconfigured).is_err());
+
+        let cfg = CoordinatorConfig::default();
+        let mut judge = HttpCheckpointJudge::from_env(&cfg)
+            .expect("configured checkpoint judge must succeed without runtime base");
+        // Second construction in the same process verifies the stderr warning logs once.
+        let _judge2 = HttpCheckpointJudge::from_env(&cfg)
+            .expect("second checkpoint judge must succeed without runtime base");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        judge.endpoint = format!(
+            "http://{}/api/alpha/decisions",
+            listener.local_addr().unwrap()
+        );
+        judge.client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            let mut len = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((n, v)) = line.split_once(':')
+                    && n.eq_ignore_ascii_case("content-length")
+                {
+                    len = v.trim().parse().unwrap();
+                }
+            }
+            let mut buf = vec![0; len];
+            reader.read_exact(&mut buf).unwrap();
+            let body = json!({"answers": {"checkpoint_safe": {"score": 3, "confidence": 0.92}}})
+                .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        let verdict =
+            tokio::time::timeout(Duration::from_secs(3), judge.judge(&sample_input(), &cfg))
+                .await
+                .unwrap()
+                .unwrap();
+        server.join().unwrap();
+        assert!(verdict.should_checkpoint);
+        assert_eq!(verdict.confidence, 0.92);
     }
 }

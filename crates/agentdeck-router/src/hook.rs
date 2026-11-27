@@ -177,11 +177,8 @@ pub struct ParsedLaunch {
     pub is_review: bool,
 }
 
-/// Shared launch parser used by both the pre-tool hook and `route_batch`:
-/// unwraps Antigravity `call_mcp_tool` envelopes, classifies the tool, extracts
-/// the task brief, `[route:...]` markers, review flag and optional target.
-pub fn parse_launch(tool_name: &str, args: &Value, harness: &str) -> anyhow::Result<ParsedLaunch> {
-    let (effective_name, effective_args) = if tool_name == "call_mcp_tool"
+fn unwrap_mcp_call<'a>(tool_name: &'a str, args: &'a Value) -> (&'a str, &'a Value) {
+    if tool_name == "call_mcp_tool"
         && args
             .get("ServerName")
             .and_then(Value::as_str)
@@ -193,7 +190,14 @@ pub fn parse_launch(tool_name: &str, args: &Value, harness: &str) -> anyhow::Res
         )
     } else {
         (tool_name, args)
-    };
+    }
+}
+
+/// Shared launch parser used by both the pre-tool hook and `route_batch`:
+/// unwraps Antigravity `call_mcp_tool` envelopes, classifies the tool, extracts
+/// the task brief, `[route:...]` markers, review flag and optional target.
+pub fn parse_launch(tool_name: &str, args: &Value, harness: &str) -> anyhow::Result<ParsedLaunch> {
+    let (effective_name, effective_args) = unwrap_mcp_call(tool_name, args);
     let kind = if is_delegate_tool(effective_name) {
         LaunchKind::Delegate
     } else if is_native_tool(effective_name) {
@@ -891,17 +895,10 @@ pub(crate) fn resolve_source(
         "agy" => {
             let settings = read_settings_optional(home);
             if let Some(s) = settings.as_ref() {
-                let all_argv: Vec<String> = ancestors
-                    .iter()
-                    .flat_map(|a| a.cmdline.iter().cloned())
-                    .collect();
-                if let Some(id) = crate::policy::antigravity_instance(s, own_env, &all_argv) {
+                if let Some(id) = crate::policy::antigravity_instance(s, own_env, &[]) {
                     return Ok(Some(id));
                 }
-                for anc in ancestors
-                    .iter()
-                    .filter(|a| ancestor_harness(&a.cmdline) == Some("agy"))
-                {
+                for anc in ancestors {
                     if let Some(id) =
                         crate::policy::antigravity_instance(s, &anc.environ, &anc.cmdline)
                     {
@@ -1188,6 +1185,11 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
                 .to_string(),
         )
     };
+    let (tool_name, args, unwrapped_mcp) = {
+        let (name, inner) = unwrap_mcp_call(&tool_name, &args);
+        let unwrapped = tool_name == "call_mcp_tool" && name != "call_mcp_tool";
+        (name.to_string(), inner.clone(), unwrapped)
+    };
     let args_obj = if args.is_object() {
         args.clone()
     } else {
@@ -1455,6 +1457,7 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
             if !hint.is_empty()
                 && !str_field(&args, "task").unwrap_or_default().contains(hint)
                 && can_rewrite(&ctx.harness)
+                && !unwrapped_mcp
                 && !workflow_retry
             {
                 rewritten = Some(rewrite_args(&args, None, hint));
@@ -1499,6 +1502,7 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
             && !user_choice
             && !workflow_retry
             && can_rewrite(&ctx.harness)
+            && !unwrapped_mcp
             && let Some(t) = route
                 .get("target")
                 .filter(|t| !t.is_null() && !same_target(t, target))
@@ -1911,6 +1915,107 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ambiguous, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_source_prefers_nearest_agy_ancestor_env_over_outer_gemini_dir() {
+        use sha2::{Digest, Sha256};
+
+        let dir =
+            std::env::temp_dir().join(format!("agentdeck-hook-agy-nearest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".t3/userdata")).unwrap();
+        std::fs::write(
+            dir.join(".t3/userdata/settings.json"),
+            serde_json::json!({
+                "providerInstances": {
+                    "antigravity": { "driver": "antigravity" },
+                    "antigravity_2": { "driver": "antigravity" }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let hash_outer = format!("{:x}", Sha256::digest(b"antigravity"));
+        let hash_inner = format!("{:x}", Sha256::digest(b"antigravity_2"));
+
+        let nearest_agy = super::ProcessAncestor {
+            cmdline: vec!["agy".into()],
+            environ: vec![format!(
+                "GEMINI_HOME=/home/u/.t3/userdata/providers/antigravity/{hash_inner}"
+            )],
+        };
+        let outer_proc = super::ProcessAncestor {
+            cmdline: vec![
+                "outer-wrapper".into(),
+                format!("--gemini-dir=/home/u/.t3/userdata/providers/antigravity/{hash_outer}"),
+            ],
+            environ: vec![],
+        };
+        let ancestors = vec![nearest_agy, outer_proc.clone()];
+
+        // Nearest agy ancestor env must beat outer process --gemini-dir.
+        let resolved = super::resolve_source(
+            &dir,
+            &[],
+            &ancestors,
+            super::SourceQuery {
+                harness: Some("agy"),
+                explicit_source: None,
+                thread_id: None,
+                from_hook: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some("antigravity_2"),
+            "nearest agy ancestor env must take precedence over outer --gemini-dir"
+        );
+
+        // Own env must also beat an outer process --gemini-dir even when outer id sorts first.
+        let own_env = vec![format!(
+            "GEMINI_HOME=/home/u/.t3/userdata/providers/antigravity/{hash_inner}"
+        )];
+        let from_own = super::resolve_source(
+            &dir,
+            &own_env,
+            std::slice::from_ref(&outer_proc),
+            super::SourceQuery {
+                harness: Some("agy"),
+                explicit_source: None,
+                thread_id: None,
+                from_hook: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            from_own.as_deref(),
+            Some("antigravity_2"),
+            "own env must take precedence over outer --gemini-dir"
+        );
+
+        // Outer --gemini-dir still resolves when no closer process carries a profile.
+        let bare_child = super::ProcessAncestor {
+            cmdline: vec!["bash".into(), "-c".into(), "true".into()],
+            environ: vec![],
+        };
+        let from_outer = super::resolve_source(
+            &dir,
+            &[],
+            &[bare_child, outer_proc],
+            super::SourceQuery {
+                harness: Some("agy"),
+                explicit_source: None,
+                thread_id: None,
+                from_hook: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(from_outer.as_deref(), Some("antigravity"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

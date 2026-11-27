@@ -302,6 +302,12 @@ async fn probe_endpoint(
         .map_err(|e| format!("{e:#}"))
 }
 
+fn fallback_probe_key(state: &State) -> Option<String> {
+    (state.fallback_provider.as_provider() == Some(state.provider))
+        .then(|| state.key.trim().to_string())
+        .filter(|k| !k.is_empty())
+}
+
 fn fallback_settings(state: &State) -> JudgeFallbackSettings {
     match state.fallback_provider {
         FallbackProvider::None => JudgeFallbackSettings::default(),
@@ -317,12 +323,16 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
         Msg::Loaded(loaded) => {
             let loaded = *loaded;
             if let Some(s) = &loaded.settings {
-                state.provider =
-                    if s.decision_provider.as_deref() == Some(settings::PROVIDER_VERCEL) {
-                        Provider::Vercel
-                    } else {
-                        Provider::OpenRouter
-                    };
+                let provider = if s.decision_provider.as_deref() == Some(settings::PROVIDER_VERCEL)
+                {
+                    Provider::Vercel
+                } else {
+                    Provider::OpenRouter
+                };
+                if state.provider != provider {
+                    state.key.clear();
+                }
+                state.provider = provider;
                 state.decision_model = s.decision_model.clone().unwrap_or_default();
                 state.refresh = s.refresh_seconds.map(|n| n.to_string()).unwrap_or_default();
                 state.stale = s.stale_seconds.map(|n| n.to_string()).unwrap_or_default();
@@ -338,6 +348,9 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
             Task::none()
         }
         Msg::Provider(p) => {
+            if state.provider != p {
+                state.key.clear();
+            }
             state.provider = p;
             state.test = None;
             Task::none()
@@ -400,9 +413,7 @@ pub fn update(state: &mut State, paths: Paths, msg: Msg) -> Task<Msg> {
             let Some(endpoint) = cfg.endpoint() else {
                 return Task::none();
             };
-            let key = (state.fallback_provider.as_provider() == Some(state.provider))
-                .then(|| state.key.trim().to_string())
-                .filter(|k| !k.is_empty());
+            let key = fallback_probe_key(state);
             state.fallback_error = None;
             state.fallback_testing = true;
             state.fallback_test = None;
@@ -2072,5 +2083,81 @@ mod tests {
             source: UserRuleSource::User,
         };
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn fallback_probe_never_reuses_draft_key_from_another_provider() {
+        use super::{FallbackProvider, Loaded, Msg, Provider, State, fallback_probe_key, update};
+        use agentdeck_core::Paths;
+        use agentdeck_core::settings::{JudgeFallbackSettings, PROVIDER_OPENROUTER, Settings};
+
+        let paths = Paths::new(
+            "/tmp/agentdeck-gui-test-cfg".into(),
+            "/tmp/agentdeck-gui-test-state".into(),
+        );
+        let mut state = State::default();
+        assert_eq!(state.provider, Provider::OpenRouter);
+
+        let _ = update(&mut state, paths.clone(), Msg::Key("sk-or-secret".into()));
+        let _ = update(
+            &mut state,
+            paths.clone(),
+            Msg::FallbackProvider(FallbackProvider::Vercel),
+        );
+        assert_eq!(fallback_probe_key(&state), None);
+
+        // Switching primary provider to Vercel must not let the OpenRouter draft key
+        // be reused by the Vercel fallback probe.
+        let _ = update(&mut state, paths.clone(), Msg::Provider(Provider::Vercel));
+        assert_eq!(
+            fallback_probe_key(&state),
+            None,
+            "OpenRouter draft key must not be sent to Vercel fallback after provider switch"
+        );
+        assert!(state.key.is_empty(), "provider switch must clear draft key");
+
+        // A draft key typed after switching to Vercel applies only to Vercel.
+        let _ = update(
+            &mut state,
+            paths.clone(),
+            Msg::Key("sk-vercel-draft".into()),
+        );
+        assert_eq!(
+            fallback_probe_key(&state).as_deref(),
+            Some("sk-vercel-draft")
+        );
+        let _ = update(
+            &mut state,
+            paths.clone(),
+            Msg::FallbackProvider(FallbackProvider::OpenRouter),
+        );
+        assert_eq!(fallback_probe_key(&state), None);
+
+        // Reloading settings that switch primary back to OpenRouter must also clear
+        // the Vercel draft key so OpenRouter fallback cannot receive it.
+        let _ = update(
+            &mut state,
+            paths,
+            Msg::Loaded(Box::new(Loaded {
+                settings: Some(Settings {
+                    decision_provider: None,
+                    decision_model: None,
+                    refresh_seconds: None,
+                    stale_seconds: None,
+                }),
+                fallback: JudgeFallbackSettings {
+                    provider: Some(PROVIDER_OPENROUTER.into()),
+                    model: None,
+                },
+                ..Loaded::default()
+            })),
+        );
+        assert_eq!(state.provider, Provider::OpenRouter);
+        assert_eq!(state.fallback_provider, FallbackProvider::OpenRouter);
+        assert_eq!(
+            fallback_probe_key(&state),
+            None,
+            "Vercel draft key must not leak to OpenRouter fallback after reload"
+        );
     }
 }
