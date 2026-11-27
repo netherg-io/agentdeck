@@ -1098,12 +1098,68 @@ fn decisions_answers(response: &Value) -> Value {
 }
 
 /// The same questions asked as one JSON chat completion, for a Vercel
-/// language model (the gateway's decisions endpoint takes decision models only).
+/// language model (the gateway's decisions endpoint takes decision models only)
+/// or an OpenRouter chat model.
 fn gateway_body(request: &Value) -> Value {
-    let system = "You answer routing questions for an AI agent router. Reply with one JSON object and nothing else. \
-For every key of `questions` return {\"score\": n, \"confidence\": c, \"probabilities\": {\"0\": p0, \"1\": p1, \"2\": p2, \"3\": p3}}: \
-n is the index (0-3) of the best-matching entry in that question's `criteria`, c in [0,1] is your confidence, \
-and the probabilities over the four criteria sum to 1. Follow each question's `instructions`; `state` is the context.";
+    let qs = request.get("questions").and_then(Value::as_object);
+    let total_qs = qs.map_or(0, serde_json::Map::len);
+    let counts: Vec<(&str, usize)> = qs
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, q)| {
+            let len = q.get("criteria").and_then(Value::as_array)?.len();
+            (len > 0).then_some((k.as_str(), len))
+        })
+        .collect();
+    let uniform = (total_qs > 0 && counts.len() == total_qs)
+        .then(|| counts[0].1)
+        .filter(|n| counts.iter().all(|(_, m)| m == n));
+    let format_spec = match uniform {
+        Some(n) => {
+            let probs = (0..n)
+                .map(|i| format!("\"{i}\": p{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let range = if n == 1 {
+                "0".to_string()
+            } else {
+                format!("0-{}", n - 1)
+            };
+            format!(
+                "For every key of `questions` return {{\"score\": n, \"confidence\": c, \"probabilities\": {{{probs}}}}}: \
+n is the 0-based index ({range}) of the best-matching entry in that question's `criteria`, c in [0,1] is your confidence, \
+and the probabilities over its {n} criteria sum to 1."
+            )
+        }
+        None if !counts.is_empty() => {
+            let per_q = counts
+                .iter()
+                .map(|(k, n)| {
+                    if *n == 1 {
+                        format!("{k}: 0 (1 criterion)")
+                    } else {
+                        format!("{k}: 0-{} ({n} criteria)", n - 1)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!(
+                "For every key of `questions` return {{\"score\": n, \"confidence\": c, \"probabilities\": {{\"0\": p0, ...}}}} \
+with string keys \"0\"..\"N-1\" for that question's N `criteria` ({per_q}): \
+n is the 0-based index of the best-matching entry in that question's `criteria`, c in [0,1] is your confidence, \
+and the probabilities over that question's criteria sum to 1."
+            )
+        }
+        None => "For every key of `questions` return {\"score\": n, \"confidence\": c, \"probabilities\": {\"0\": p0, ...}} \
+with string keys \"0\"..\"N-1\" matching the length N of that question's `criteria`: \
+n is the 0-based index of the best-matching entry in that question's `criteria`, c in [0,1] is your confidence, \
+and the probabilities over that question's criteria sum to 1."
+            .to_string(),
+    };
+    let system = format!(
+        "You answer routing questions for an AI agent router. Reply with one JSON object and nothing else. \
+{format_spec} Follow each question's `instructions`; `state` is the context."
+    );
     let user = serde_json::json!({
         "state": request.get("state"),
         "questions": request.get("questions"),
@@ -1200,6 +1256,23 @@ fn is_loopback_url(url: &str) -> bool {
         || url.starts_with("http://localhost")
 }
 
+fn jev_transport_error(e: &reqwest::Error) -> JevHttpError {
+    JevHttpError {
+        trigger: agentdeck_core::judge::FallbackTrigger::Transient,
+        is_language_model: false,
+        batch_kind: if e.is_timeout() {
+            crate::jev_queue::BatchErrorKind::LeaderTimeout
+        } else {
+            crate::jev_queue::BatchErrorKind::ChannelWide
+        },
+        message: if e.is_timeout() {
+            "jev_error_timeout".into()
+        } else {
+            "jev_error_network".into()
+        },
+    }
+}
+
 async fn post_json(
     url: &str,
     key: &str,
@@ -1217,7 +1290,8 @@ async fn post_json(
         }
         .into());
     };
-    let mut builder = reqwest::Client::builder();
+    // Disable redirects so one send = one HTTP request and 3xx fails without fallback.
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
     if is_loopback_url(url) {
         builder = builder.no_proxy();
     }
@@ -1232,20 +1306,7 @@ async fn post_json(
         .body(body)
         .send()
         .await
-        .map_err(|e| JevHttpError {
-            trigger: agentdeck_core::judge::FallbackTrigger::Transient,
-            is_language_model: false,
-            batch_kind: if e.is_timeout() {
-                crate::jev_queue::BatchErrorKind::LeaderTimeout
-            } else {
-                crate::jev_queue::BatchErrorKind::ChannelWide
-            },
-            message: if e.is_timeout() {
-                "jev_error_timeout".into()
-            } else {
-                "jev_error_network".into()
-            },
-        })?;
+        .map_err(|e| jev_transport_error(&e))?;
     if !res.status().is_success() {
         let status = res.status().as_u16();
         // Decide 429 on status + Retry-After before reading the body, and never
@@ -1265,14 +1326,18 @@ async fn post_json(
             .into());
         }
         // Only inspect non-429 4xx body for the Vercel language-model sentinel;
-        // never copy provider HTTP body text into errors or logs.
-        let is_language_model = check_language_model
-            && (400..500).contains(&status)
-            && res
-                .text()
+        // body-read aborts are transient regardless of status, and provider
+        // HTTP body text is never copied into errors or logs.
+        let is_language_model = if check_language_model && (400..500).contains(&status) {
+            res.text()
                 .await
-                .is_ok_and(|text| text.contains("is a language model"));
-        let channel_wide = matches!(status, 401 | 403 | 404 | 405) || (500..=599).contains(&status);
+                .map_err(|e| jev_transport_error(&e))?
+                .contains("is a language model")
+        } else {
+            false
+        };
+        let channel_wide =
+            matches!(status, 300..=399 | 401 | 403 | 404 | 405) || (500..=599).contains(&status);
         return Err(JevHttpError {
             trigger: agentdeck_core::judge::classify_http_status(status, None),
             is_language_model,
@@ -1285,20 +1350,7 @@ async fn post_json(
         }
         .into());
     }
-    let bytes = res.bytes().await.map_err(|e| JevHttpError {
-        trigger: agentdeck_core::judge::FallbackTrigger::Transient,
-        is_language_model: false,
-        batch_kind: if e.is_timeout() {
-            crate::jev_queue::BatchErrorKind::LeaderTimeout
-        } else {
-            crate::jev_queue::BatchErrorKind::ChannelWide
-        },
-        message: if e.is_timeout() {
-            "jev_error_timeout".into()
-        } else {
-            "jev_error_network".into()
-        },
-    })?;
+    let bytes = res.bytes().await.map_err(|e| jev_transport_error(&e))?;
     serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("Jev returned invalid JSON"))
 }
 
@@ -2643,6 +2695,7 @@ async fn route_batch_with_bases(
             },
             classify_jev_error,
             classify_jev_batch_error,
+            &complete,
         )
         .await;
         for (idx, outcome) in raw_outcomes.into_iter().enumerate() {
@@ -3154,6 +3207,7 @@ async fn fetch_jev_cached(
         },
         classify_jev_error,
         classify_jev_batch_error,
+        complete,
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -3195,44 +3249,102 @@ fn format_js(v: f64) -> String {
 }
 
 #[cfg(test)]
+fn accept_until(
+    listener: &std::net::TcpListener,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+    deadline: std::time::Instant,
+) -> Option<std::net::TcpStream> {
+    listener.set_nonblocking(true).ok()?;
+    while std::time::Instant::now() < deadline {
+        if stop.is_some_and(|s| s.load(std::sync::atomic::Ordering::SeqCst)) {
+            return None;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+                return Some(stream);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+struct MockServerHandle<T> {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+#[cfg(test)]
+impl<T> MockServerHandle<T> {
+    async fn finish(mut self) -> T {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.handle.take().unwrap().await.unwrap()
+    }
+
+    async fn wait(mut self) -> T {
+        self.handle.take().unwrap().await.unwrap()
+    }
+}
+
+#[cfg(test)]
+impl<T> Drop for MockServerHandle<T> {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
 mod gateway_tests {
     use super::*;
 
     #[tokio::test]
     async fn openrouter_chat_model_uses_chat_completions() {
         use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_bg = stop.clone();
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(&mut stream);
-            let mut first = String::new();
-            reader.read_line(&mut first).unwrap();
-            let mut len = 0usize;
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" {
-                    break;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut seen = Vec::new();
+            if let Some(mut stream) = accept_until(&listener, Some(&stop_bg), deadline) {
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        len = v.trim().parse().unwrap();
+                    }
                 }
-                if let Some((n, v)) = line.split_once(':')
-                    && n.eq_ignore_ascii_case("content-length")
-                {
-                    len = v.trim().parse().unwrap();
-                }
+                let mut body = vec![0; len];
+                reader.read_exact(&mut body).unwrap();
+                let content = r#"{"size":{"score":1,"confidence":0.9}}"#;
+                let response =
+                    serde_json::json!({"choices": [{"message": {"content": content}}]}).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                )
+                .unwrap();
+                seen.push((first, serde_json::from_slice::<Value>(&body).unwrap()));
             }
-            let mut body = vec![0; len];
-            reader.read_exact(&mut body).unwrap();
-            let content = r#"{"size":{"score":1,"confidence":0.9}}"#;
-            let response =
-                serde_json::json!({"choices": [{"message": {"content": content}}]}).to_string();
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
-                response.len()
-            )
-            .unwrap();
-            (first, serde_json::from_slice::<Value>(&body).unwrap())
+            seen
         });
         let request = serde_json::json!({"model": "~typesafe/jev-latest", "state": {"task": "t"}, "questions": {"size": {}}});
         let body = stringify_like_node(&request);
@@ -3251,7 +3363,10 @@ mod gateway_tests {
         )
         .await
         .unwrap();
-        let (first, sent) = server.join().unwrap();
+        stop.store(true, Ordering::SeqCst);
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 1, "expected 1 chat request, got {}", seen.len());
+        let (first, sent) = &seen[0];
         assert!(
             first.starts_with("POST /api/v1/chat/completions "),
             "{first}"
@@ -3297,17 +3412,27 @@ mod gateway_tests {
 
     async fn mock_http_server(
         responses: Vec<(&'static str, &'static str, String)>,
-    ) -> (String, tokio::task::JoinHandle<Vec<(String, Value)>>) {
+    ) -> (String, MockServerHandle<Vec<(String, Value)>>) {
+        mock_http_server_with_deadline(responses, std::time::Duration::from_secs(10)).await
+    }
+
+    async fn mock_http_server_with_deadline(
+        responses: Vec<(&'static str, &'static str, String)>,
+        accept_timeout: std::time::Duration,
+    ) -> (String, MockServerHandle<Vec<(String, Value)>>) {
         use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::AtomicBool;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_bg = stop.clone();
         let task = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + accept_timeout;
             let mut seen = Vec::new();
             for (status, extra_headers, body) in responses {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(std::time::Duration::from_secs(3)))
-                    .unwrap();
+                let Some(mut stream) = accept_until(&listener, Some(&stop_bg), deadline) else {
+                    break;
+                };
                 let mut reader = BufReader::new(&mut stream);
                 let mut first = String::new();
                 reader.read_line(&mut first).unwrap();
@@ -3337,7 +3462,13 @@ mod gateway_tests {
             }
             seen
         });
-        (base, task)
+        (
+            base,
+            MockServerHandle {
+                stop,
+                handle: Some(task),
+            },
+        )
     }
 
     #[tokio::test]
@@ -3531,9 +3662,9 @@ mod gateway_tests {
             "{err_parse}"
         );
 
-        let vercel_seen = vercel_srv.await.unwrap();
+        let vercel_seen = vercel_srv.finish().await;
         assert_eq!(vercel_seen.len(), 4);
-        let or_seen = or_srv.await.unwrap();
+        let or_seen = or_srv.finish().await;
         assert_eq!(or_seen.len(), 3);
         assert_eq!(or_seen[0].1["model"], "~typesafe/jev-latest");
         let _ = std::fs::remove_dir_all(&rt);
@@ -3653,14 +3784,20 @@ mod gateway_tests {
 
     async fn dynamic_openrouter_server(
         expected_calls: usize,
-    ) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+    ) -> (String, MockServerHandle<Vec<Value>>) {
         use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::AtomicBool;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_bg = stop.clone();
         let handle = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             let mut seen = Vec::new();
             for _ in 0..expected_calls {
-                let (mut stream, _) = listener.accept().unwrap();
+                let Some(mut stream) = accept_until(&listener, Some(&stop_bg), deadline) else {
+                    break;
+                };
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                     .unwrap();
@@ -3734,7 +3871,13 @@ mod gateway_tests {
             }
             seen
         });
-        (base, handle)
+        (
+            base,
+            MockServerHandle {
+                stop,
+                handle: Some(handle),
+            },
+        )
     }
 
     #[tokio::test]
@@ -3777,7 +3920,7 @@ mod gateway_tests {
         )
         .await
         .unwrap();
-        let seen = srv.await.unwrap();
+        let seen = srv.finish().await;
         assert_eq!(
             seen.len(),
             1,
@@ -3877,7 +4020,7 @@ mod gateway_tests {
         )
         .await
         .unwrap();
-        let seen = srv.await.unwrap();
+        let seen = srv.finish().await;
         assert_eq!(seen.len(), 2, "11 judged launches must use 2 requests");
         assert_eq!(seen[0]["state"]["tasks"].as_object().unwrap().len(), 8);
         assert_eq!(seen[1]["state"]["tasks"].as_object().unwrap().len(), 3);
@@ -3981,7 +4124,7 @@ mod gateway_tests {
         )
         .await
         .unwrap();
-        or_srv.await.unwrap();
+        assert_eq!(or_srv.finish().await.len(), 1);
         let err = results[0]["error"].as_str().expect("must error on 401");
         assert!(
             !err.contains("SECRET_PROXY_REFLECTION_999"),
@@ -4006,12 +4149,15 @@ mod gateway_tests {
         let vercel_base = format!("http://{}", vercel_listener.local_addr().unwrap());
         let vercel_paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let vp = vercel_paths.clone();
+        let vc_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let vc_stop_bg = vc_stop.clone();
         let vercel_srv = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             for idx in 0..2 {
-                let (mut stream, _) = vercel_listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                    .unwrap();
+                let Some(mut stream) = accept_until(&vercel_listener, Some(&vc_stop_bg), deadline)
+                else {
+                    break;
+                };
                 let mut reader = BufReader::new(&mut stream);
                 let mut first = String::new();
                 reader.read_line(&mut first).unwrap();
@@ -4058,9 +4204,16 @@ mod gateway_tests {
         .to_string();
         let or_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let or_base = format!("http://{}", or_listener.local_addr().unwrap());
+        let or_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let or_stop_bg = or_stop.clone();
         let or_srv = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut seen = 0usize;
             for _ in 0..2 {
-                let (mut stream, _) = or_listener.accept().unwrap();
+                let Some(mut stream) = accept_until(&or_listener, Some(&or_stop_bg), deadline)
+                else {
+                    break;
+                };
                 let mut reader = BufReader::new(&mut stream);
                 let mut first = String::new();
                 reader.read_line(&mut first).unwrap();
@@ -4085,7 +4238,9 @@ mod gateway_tests {
                     ok_or.len()
                 )
                 .unwrap();
+                seen += 1;
             }
+            seen
         });
 
         let bases = JevBases {
@@ -4149,8 +4304,10 @@ mod gateway_tests {
         .unwrap();
         assert_eq!(ch2, agentdeck_core::judge::JudgeChannel::Fallback);
 
+        vc_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        or_stop.store(true, std::sync::atomic::Ordering::SeqCst);
         vercel_srv.join().unwrap();
-        or_srv.join().unwrap();
+        assert_eq!(or_srv.join().unwrap(), 2);
         let seen = vercel_paths.lock().unwrap();
         assert_eq!(
             seen.len(),
@@ -4173,13 +4330,24 @@ mod gateway_tests {
         // Hanging Vercel server (stalls 2s) + fast OpenRouter fallback with 800ms overall deadline.
         let vercel_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let vercel_base = format!("http://{}", vercel_listener.local_addr().unwrap());
-        let _vercel_srv = std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = vercel_listener.accept() {
+        let vc_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let vc_stop_bg = vc_stop.clone();
+        let vercel_srv = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut seen = 0usize;
+            if let Some(mut stream) = accept_until(&vercel_listener, Some(&vc_stop_bg), deadline) {
+                seen += 1;
                 let mut reader = BufReader::new(&mut stream);
                 let mut line = String::new();
                 let _ = reader.read_line(&mut line);
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                let sleep_until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !vc_stop_bg.load(std::sync::atomic::Ordering::SeqCst)
+                    && std::time::Instant::now() < sleep_until
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
             }
+            seen
         });
         let ok_or = serde_json::json!({
             "answers": {
@@ -4191,32 +4359,39 @@ mod gateway_tests {
         .to_string();
         let or_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let or_base = format!("http://{}", or_listener.local_addr().unwrap());
+        let or_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let or_stop_bg = or_stop.clone();
         let or_srv = std::thread::spawn(move || {
-            let (mut stream, _) = or_listener.accept().unwrap();
-            let mut reader = BufReader::new(&mut stream);
-            let mut first = String::new();
-            reader.read_line(&mut first).unwrap();
-            let mut size = 0usize;
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" {
-                    break;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut seen = 0usize;
+            if let Some(mut stream) = accept_until(&or_listener, Some(&or_stop_bg), deadline) {
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        size = v.trim().parse().unwrap();
+                    }
                 }
-                if let Some((n, v)) = line.split_once(':')
-                    && n.eq_ignore_ascii_case("content-length")
-                {
-                    size = v.trim().parse().unwrap();
-                }
+                let mut buf = vec![0; size];
+                reader.read_exact(&mut buf).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok_or}",
+                    ok_or.len()
+                )
+                .unwrap();
+                seen += 1;
             }
-            let mut buf = vec![0; size];
-            reader.read_exact(&mut buf).unwrap();
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok_or}",
-                ok_or.len()
-            )
-            .unwrap();
+            seen
         });
 
         let bases = JevBases {
@@ -4268,16 +4443,25 @@ mod gateway_tests {
             elapsed < std::time::Duration::from_millis(1200),
             "fallback must succeed within single 800ms deadline, took {elapsed:?}"
         );
-        or_srv.join().unwrap();
+        vc_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        or_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(vercel_srv.join().unwrap(), 1);
+        assert_eq!(or_srv.join().unwrap(), 1);
 
         // Also check Vercel /decisions (450ms delay) -> /chat/completions (hangs) respects single 800ms deadline.
         let v2_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let v2_base = format!("http://{}", v2_listener.local_addr().unwrap());
-        let _v2_srv = std::thread::spawn(move || {
+        let v2_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let v2_stop_bg = v2_stop.clone();
+        let v2_srv = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut seen = 0usize;
             for idx in 0..2 {
-                let Ok((mut stream, _)) = v2_listener.accept() else {
+                let Some(mut stream) = accept_until(&v2_listener, Some(&v2_stop_bg), deadline)
+                else {
                     break;
                 };
+                seen += 1;
                 let mut reader = BufReader::new(&mut stream);
                 let mut first = String::new();
                 let _ = reader.read_line(&mut first);
@@ -4304,9 +4488,15 @@ mod gateway_tests {
                         b.len()
                     );
                 } else {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let sleep_until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    while !v2_stop_bg.load(std::sync::atomic::Ordering::SeqCst)
+                        && std::time::Instant::now() < sleep_until
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
                 }
             }
+            seen
         });
         let bases2 = JevBases {
             openrouter: "http://127.0.0.1:1".into(),
@@ -4328,6 +4518,8 @@ mod gateway_tests {
         )
         .await;
         let elapsed2 = started2.elapsed();
+        v2_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(v2_srv.join().unwrap(), 2);
         assert!(res2.is_err());
         assert!(
             elapsed2 < std::time::Duration::from_millis(1100),
@@ -4394,7 +4586,7 @@ mod gateway_tests {
         )
         .await
         .unwrap();
-        assert_eq!(srv.await.unwrap().len(), 1);
+        assert_eq!(srv.finish().await.len(), 1);
         assert_eq!(warmed[0]["jevCache"], "miss", "{}", warmed[0]);
         assert!(warmed[0].get("ranking").is_some(), "{}", warmed[0]);
 
@@ -4492,14 +4684,19 @@ mod gateway_tests {
         });
         std::fs::write(&router_json, cfg.to_string()).unwrap();
 
-        let (or_base, or_srv) = {
+        let (or_base, or_stop, or_srv) = {
             use std::io::{BufRead, BufReader, Read, Write};
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_bg = stop.clone();
             let handle = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                 let mut seen = 0usize;
                 for _ in 0..2 {
-                    let (mut stream, _) = listener.accept().unwrap();
+                    let Some(mut stream) = accept_until(&listener, Some(&stop_bg), deadline) else {
+                        break;
+                    };
                     let mut reader = BufReader::new(&mut stream);
                     let mut first = String::new();
                     reader.read_line(&mut first).unwrap();
@@ -4545,7 +4742,7 @@ mod gateway_tests {
                 }
                 seen
             });
-            (base, handle)
+            (base, stop, handle)
         };
         let bases = JevBases {
             openrouter: or_base,
@@ -4596,6 +4793,7 @@ mod gateway_tests {
             r2[0]["jevCache"], "miss",
             "removing [judge_fallback] must invalidate the Jev cache key"
         );
+        or_stop.store(true, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(or_srv.join().unwrap(), 2);
 
         // 3. Switch primary provider from openrouter -> vercel (keeping exact same model string!):
@@ -4648,7 +4846,7 @@ mod gateway_tests {
             r3[0]["jevCache"], "miss",
             "changing primary decisionProvider must invalidate the Jev cache key"
         );
-        assert_eq!(vercel_srv.await.unwrap().len(), 1);
+        assert_eq!(vercel_srv.finish().await.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4668,22 +4866,13 @@ mod gateway_tests {
         ) {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
-            listener.set_nonblocking(true).unwrap();
             let stop = std::sync::Arc::new(AtomicBool::new(false));
             let stop_bg = stop.clone();
             let hits = std::sync::Arc::new(std::sync::Mutex::new(0usize));
             let hits_bg = hits.clone();
             let handle = std::thread::spawn(move || {
-                while !stop_bg.load(Ordering::SeqCst) {
-                    let (mut stream, _) = match listener.accept() {
-                        Ok(pair) => pair,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(std::time::Duration::from_millis(5));
-                            continue;
-                        }
-                        Err(_) => break,
-                    };
-                    stream.set_nonblocking(false).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while let Some(mut stream) = accept_until(&listener, Some(&stop_bg), deadline) {
                     let mut reader = BufReader::new(&mut stream);
                     let mut first = String::new();
                     reader.read_line(&mut first).unwrap();
@@ -4978,6 +5167,706 @@ mod gateway_tests {
         );
         assert_eq!(*hits_vc4.lock().unwrap(), 3);
         let _ = std::fs::remove_dir_all(&dir4);
+    }
+
+    #[tokio::test]
+    async fn post_json_disables_redirects_and_fails_without_fallback() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let rt = std::env::temp_dir().join(format!(
+            "agentdeck-route-no-redirect-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(&rt).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let target_url = format!("{base}/redirected");
+        listener.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_bg = stop.clone();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits_bg = hits.clone();
+        let srv = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !stop_bg.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(p) => p,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        size = v.trim().parse().unwrap();
+                    }
+                }
+                let mut req_body = vec![0; size];
+                reader.read_exact(&mut req_body).unwrap();
+                let n = hits_bg.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    let body = "{}";
+                    write!(
+                        stream,
+                        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target_url}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                } else {
+                    let body = serde_json::json!({
+                        "answers": {
+                            "size": {"score": 1, "confidence": 0.9},
+                            "difficulty": {"score": 1, "confidence": 0.9},
+                        }
+                    })
+                    .to_string();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+            }
+        });
+
+        let fb_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fb_base = format!("http://{}", fb_listener.local_addr().unwrap());
+        fb_listener.set_nonblocking(true).unwrap();
+        let fb_stop = std::sync::Arc::new(AtomicBool::new(false));
+        let fb_stop_bg = fb_stop.clone();
+        let fb_hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let fb_hits_bg = fb_hits.clone();
+        let fb_srv = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !fb_stop_bg.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                if let Ok((mut stream, _)) = fb_listener.accept() {
+                    fb_hits_bg.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    );
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        });
+
+        let bases = JevBases {
+            openrouter: base,
+            vercel: fb_base,
+        };
+        let blocks = agentdeck_core::judge::BlockStore::new(rt.join("blocks"));
+        let primary = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_OPENROUTER,
+            "~typesafe/jev-latest",
+        );
+        let fallback = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_VERCEL,
+            "perplexity/pplx-decider-v1.2",
+        );
+        let req = serde_json::json!({
+            "model": primary.model,
+            "state": {"task": "redirect check", "models": {}},
+            "questions": {
+                "size": {"type": "score", "instructions": "size?", "criteria": SIZES},
+                "difficulty": {"type": "score", "instructions": "diff?", "criteria": DIFFICULTY},
+            }
+        });
+        let body = stringify_like_node(&req);
+        let complete = |a: &Value| {
+            a.get("size").is_some_and(|s| valid_answer(s, false))
+                && a.get("difficulty").is_some_and(|d| valid_answer(d, false))
+        };
+
+        let res = fetch_jev_cached(
+            &rt,
+            "h-redirect",
+            &req,
+            &body,
+            &primary,
+            Some(&fallback),
+            std::time::Duration::from_secs(5),
+            &blocks,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await;
+        stop.store(true, Ordering::SeqCst);
+        fb_stop.store(true, Ordering::SeqCst);
+        srv.join().unwrap();
+        fb_srv.join().unwrap();
+
+        let err = res.expect_err("307 redirect must fail instead of following");
+        assert!(
+            err.to_string().contains("jev_http_status_307"),
+            "expected 307 error, got {err}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "redirect must not issue a second HTTP request"
+        );
+        assert_eq!(
+            fb_hits.load(Ordering::SeqCst),
+            0,
+            "307 redirect must not trigger fallback"
+        );
+        let _ = std::fs::remove_dir_all(&rt);
+    }
+
+    #[tokio::test]
+    async fn vercel_400_body_read_abort_triggers_fallback() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let rt =
+            std::env::temp_dir().join(format!("agentdeck-route-400-abort-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(&rt).unwrap();
+
+        let vc_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let vc_base = format!("http://{}", vc_listener.local_addr().unwrap());
+        vc_listener.set_nonblocking(true).unwrap();
+        let vc_stop = std::sync::Arc::new(AtomicBool::new(false));
+        let vc_stop_bg = vc_stop.clone();
+        let vc_srv = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !vc_stop_bg.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                let (mut stream, _) = match vc_listener.accept() {
+                    Ok(p) => p,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        size = v.trim().parse().unwrap();
+                    }
+                }
+                let mut buf = vec![0; size];
+                reader.read_exact(&mut buf).unwrap();
+                // Truncated 400 body -> body-read abort must be transient -> fallback.
+                let _ = stream.write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 500\r\nConnection: close\r\n\r\n{\"error\":\"trunc",
+                );
+                break;
+            }
+        });
+
+        let ok_or = serde_json::json!({
+            "answers": {
+                "size": {"score": 1, "confidence": 0.9},
+                "difficulty": {"score": 1, "confidence": 0.9},
+            },
+            "usage": {"cost": 0.002}
+        })
+        .to_string();
+        let or_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let or_base = format!("http://{}", or_listener.local_addr().unwrap());
+        or_listener.set_nonblocking(true).unwrap();
+        let or_stop = std::sync::Arc::new(AtomicBool::new(false));
+        let or_stop_bg = or_stop.clone();
+        let or_srv = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !or_stop_bg.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                let (mut stream, _) = match or_listener.accept() {
+                    Ok(p) => p,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        size = v.trim().parse().unwrap();
+                    }
+                }
+                let mut buf = vec![0; size];
+                reader.read_exact(&mut buf).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok_or}",
+                    ok_or.len()
+                )
+                .unwrap();
+                break;
+            }
+        });
+
+        let bases = JevBases {
+            openrouter: or_base,
+            vercel: vc_base,
+        };
+        let blocks = agentdeck_core::judge::BlockStore::new(rt.join("blocks"));
+        let primary = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_VERCEL,
+            "perplexity/pplx-decider-v1.2",
+        );
+        let fallback = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_OPENROUTER,
+            "~typesafe/jev-latest",
+        );
+        let req = serde_json::json!({
+            "model": primary.model,
+            "state": {"task": "vercel 400 abort", "models": {}},
+            "questions": {
+                "size": {"type": "score", "instructions": "size?", "criteria": SIZES},
+                "difficulty": {"type": "score", "instructions": "diff?", "criteria": DIFFICULTY},
+            }
+        });
+        let body = stringify_like_node(&req);
+        let complete = |a: &Value| {
+            a.get("size").is_some_and(|s| valid_answer(s, false))
+                && a.get("difficulty").is_some_and(|d| valid_answer(d, false))
+        };
+
+        let res = fetch_jev_cached(
+            &rt,
+            "h-400-abort",
+            &req,
+            &body,
+            &primary,
+            Some(&fallback),
+            std::time::Duration::from_secs(5),
+            &blocks,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await;
+        vc_stop.store(true, Ordering::SeqCst);
+        or_stop.store(true, Ordering::SeqCst);
+        vc_srv.join().unwrap();
+        or_srv.join().unwrap();
+
+        let (_, _, _, ch) = res.expect("body-read abort on Vercel 400 must fall back");
+        assert_eq!(ch, agentdeck_core::judge::JudgeChannel::Fallback);
+        let _ = std::fs::remove_dir_all(&rt);
+    }
+
+    #[tokio::test]
+    async fn route_batch_retries_out_of_range_split_answer_solo_within_send_cap() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (dir, env) = setup_batch_env("split-out-of-range");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_bg = stop.clone();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits_bg = hits.clone();
+        let srv = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !stop_bg.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(p) => p,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        size = v.trim().parse().unwrap();
+                    }
+                }
+                let mut req_body = vec![0; size];
+                reader.read_exact(&mut req_body).unwrap();
+                let parsed: Value = serde_json::from_slice(&req_body).unwrap();
+                hits_bg.fetch_add(1, Ordering::SeqCst);
+                let combined = parsed.pointer("/state/tasks").is_some();
+                let mut answers = serde_json::Map::new();
+                for qk in parsed["questions"].as_object().unwrap().keys() {
+                    let base_q = qk.split_once("__").map_or(qk.as_str(), |(_, r)| r);
+                    let entry = if combined && qk == "t1__size" {
+                        // Out-of-range score for t1 in combined batch -> must trigger solo retry.
+                        serde_json::json!({"score": 9, "confidence": 0.9})
+                    } else {
+                        match base_q {
+                            "size" => {
+                                serde_json::json!({"score": if combined { 1 } else { 2 }, "confidence": 0.9})
+                            }
+                            "difficulty" => serde_json::json!({"score": 1, "confidence": 0.9}),
+                            "review" => serde_json::json!({"score": 0, "confidence": 0.95}),
+                            "codex_gpt_6_1_sol" => serde_json::json!({
+                                "score": 2.8, "confidence": 0.9,
+                                "probabilities": {"0": 0.0, "1": 0.05, "2": 0.15, "3": 0.8}
+                            }),
+                            _ => serde_json::json!({
+                                "score": 2.2, "confidence": 0.85,
+                                "probabilities": {"0": 0.0, "1": 0.1, "2": 0.7, "3": 0.2}
+                            }),
+                        }
+                    };
+                    answers.insert(qk.clone(), entry);
+                }
+                let body =
+                    serde_json::json!({"answers": answers, "usage": {"cost": 0.01}}).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+
+        let launches = vec![
+            serde_json::json!({
+                "tool": "mcp__t3-code__delegate_task",
+                "input": {"task": "Split valid task #0"}
+            }),
+            serde_json::json!({
+                "tool": "mcp__t3-code__delegate_task",
+                "input": {"task": "Split out-of-range task #1"}
+            }),
+        ];
+        let results = route_batch_with_bases(
+            &env,
+            &launches,
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: Some("claudeAgent".into()),
+                budget: std::time::Duration::from_secs(10),
+            },
+            &JevBases {
+                openrouter: base,
+                vercel: "http://127.0.0.1:1".into(),
+            },
+            Some("test-key"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        stop.store(true, Ordering::SeqCst);
+        srv.join().unwrap();
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "invalid split answer for t1 must trigger 1 solo retry (2 HTTP calls total)"
+        );
+        assert!(
+            results[0].get("error").is_none(),
+            "t0 failed: {}",
+            results[0]
+        );
+        assert!(
+            results[1].get("error").is_none(),
+            "t1 must recover via solo retry instead of failing validation: {}",
+            results[1]
+        );
+        assert!(
+            results[1]["size"].as_str().unwrap().starts_with("2:"),
+            "t1 must use solo retry answer (score 2), got {}",
+            results[1]["size"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Also verify invalid split retries stay bounded by batch_size + 1:
+        // 2 tasks, primary 503 (1 send) -> fallback batch returns out-of-range for both
+        // (2nd send) -> only 1 solo retry fits in cap=3, remaining task gets cap error.
+        let (dir2, env2) = setup_batch_env("split-oor-cap");
+        let router_json2 = std::path::PathBuf::from(env2.router_json.as_ref().unwrap());
+        let mut cfg2: Value =
+            serde_json::from_str(&std::fs::read_to_string(&router_json2).unwrap()).unwrap();
+        cfg2["judgeFallback"] = serde_json::json!({
+            "provider": "vercel",
+            "model": "perplexity/pplx-decider-v1.2"
+        });
+        std::fs::write(&router_json2, cfg2.to_string()).unwrap();
+
+        let (p_base, p_srv) = mock_http_server(vec![
+            ("503 Service Unavailable", "", "{}".into()),
+            ("503 Service Unavailable", "", "{}".into()),
+            ("503 Service Unavailable", "", "{}".into()),
+        ])
+        .await;
+        let oor_vercel = serde_json::json!({
+            "answers": [
+                {"type": "score", "name": "t0__size", "score": 9, "confidence": 0.9},
+                {"type": "score", "name": "t0__difficulty", "score": 1, "confidence": 0.9},
+                {"type": "score", "name": "t0__review", "score": 0, "confidence": 0.9},
+                {"type": "score", "name": "t0__codex_gpt_6_1_sol", "score": 2.8, "confidence": 0.9,
+                 "probabilities": [{"value": 0, "probability": 0.0}, {"value": 1, "probability": 0.05}, {"value": 2, "probability": 0.15}, {"value": 3, "probability": 0.8}]},
+                {"type": "score", "name": "t0__claudeagent_claude_opus_5_5", "score": 2.2, "confidence": 0.85,
+                 "probabilities": [{"value": 0, "probability": 0.0}, {"value": 1, "probability": 0.1}, {"value": 2, "probability": 0.7}, {"value": 3, "probability": 0.2}]},
+                {"type": "score", "name": "t1__size", "score": 9, "confidence": 0.9},
+                {"type": "score", "name": "t1__difficulty", "score": 1, "confidence": 0.9},
+                {"type": "score", "name": "t1__review", "score": 0, "confidence": 0.9},
+                {"type": "score", "name": "t1__codex_gpt_6_1_sol", "score": 2.8, "confidence": 0.9,
+                 "probabilities": [{"value": 0, "probability": 0.0}, {"value": 1, "probability": 0.05}, {"value": 2, "probability": 0.15}, {"value": 3, "probability": 0.8}]},
+                {"type": "score", "name": "t1__claudeagent_claude_opus_5_5", "score": 2.2, "confidence": 0.85,
+                 "probabilities": [{"value": 0, "probability": 0.0}, {"value": 1, "probability": 0.1}, {"value": 2, "probability": 0.7}, {"value": 3, "probability": 0.2}]}
+            ]
+        })
+        .to_string();
+        let (fb_base, fb_srv) = mock_http_server(vec![
+            ("200 OK", "", oor_vercel.clone()),
+            ("200 OK", "", oor_vercel),
+        ])
+        .await;
+        let res2 = route_batch_with_bases(
+            &env2,
+            &launches,
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: Some("claudeAgent".into()),
+                budget: std::time::Duration::from_secs(10),
+            },
+            &JevBases {
+                openrouter: p_base,
+                vercel: fb_base,
+            },
+            Some("test-key"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        let total_sends = p_srv.finish().await.len() + fb_srv.finish().await.len();
+        assert!(
+            total_sends <= 3,
+            "2-task batch invalid split retries must stay within cap=3 sends, got {total_sends}"
+        );
+        assert!(
+            res2.iter()
+                .any(|r| r["error"].as_str() == Some(crate::jev_queue::BATCH_SEND_CAP_ERROR)),
+            "cap-stopped invalid split task must report fixed cap error: {res2:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[tokio::test]
+    async fn mock_http_server_exits_at_deadline_and_reports_request_count() {
+        let (_base, srv) = mock_http_server_with_deadline(
+            vec![("200 OK", "", "{}".into()), ("200 OK", "", "{}".into())],
+            std::time::Duration::from_millis(120),
+        )
+        .await;
+        // Without a deadline/shutdown on accept(), waiting for unreceived requests hangs forever.
+        let seen = tokio::time::timeout(std::time::Duration::from_millis(600), srv.wait())
+            .await
+            .expect("mock_http_server must exit on deadline instead of hanging in accept()");
+        assert_eq!(seen.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn gateway_body_follows_each_questions_criteria_count_on_vercel_and_openrouter() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // 1. Uniform 2-criteria request: must use 0-1 and 2 criteria, never 0-3 / four.
+        let req2 = serde_json::json!({
+            "model": "openai/gpt-4o-mini",
+            "state": {"task": "binary check"},
+            "questions": {
+                "permit": {"type": "score", "instructions": "allow?", "criteria": ["deny", "allow"]}
+            }
+        });
+        let sys2 = gateway_body(&req2)["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(sys2.contains("0-1"), "expected 0-1 in prompt: {sys2}");
+        assert!(
+            sys2.contains("\"1\": p1"),
+            "expected \"1\": p1 in prompt: {sys2}"
+        );
+        assert!(!sys2.contains("0-3"), "must not hardcode 0-3: {sys2}");
+        assert!(!sys2.contains("four"), "must not hardcode four: {sys2}");
+
+        // 2. Mixed criteria counts (2 and 5): must reflect each question's own count.
+        let req_mixed = serde_json::json!({
+            "model": "openai/gpt-4o-mini",
+            "state": {"task": "mixed check"},
+            "questions": {
+                "binary": {"type": "score", "instructions": "b?", "criteria": ["no", "yes"]},
+                "five": {"type": "score", "instructions": "f?", "criteria": ["c0", "c1", "c2", "c3", "c4"]}
+            }
+        });
+        let sys_mixed = gateway_body(&req_mixed)["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            sys_mixed.contains("binary: 0-1 (2 criteria)"),
+            "{sys_mixed}"
+        );
+        assert!(sys_mixed.contains("five: 0-4 (5 criteria)"), "{sys_mixed}");
+        assert!(
+            !sys_mixed.contains("0-3"),
+            "must not hardcode 0-3: {sys_mixed}"
+        );
+        assert!(
+            !sys_mixed.contains("four"),
+            "must not hardcode four: {sys_mixed}"
+        );
+
+        // 3. End-to-end: both Vercel language-model path and OpenRouter chat path send the
+        // per-question criteria count in the system prompt.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_bg = stop.clone();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, Value)>::new()));
+        let cap_bg = captured.clone();
+        let srv = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !stop_bg.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(p) => p,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        size = v.trim().parse().unwrap();
+                    }
+                }
+                let mut req_body = vec![0; size];
+                reader.read_exact(&mut req_body).unwrap();
+                let parsed: Value = serde_json::from_slice(&req_body).unwrap_or(Value::Null);
+                cap_bg.lock().unwrap().push((first.clone(), parsed));
+                let (status, body) = if first.contains("/v1/decisions") {
+                    (
+                        "400 Bad Request",
+                        r#"{"error":"openai/gpt-4o-mini is a language model"}"#.to_string(),
+                    )
+                } else {
+                    let content = r#"{"permit":{"score":1,"confidence":0.9,"probabilities":{"0":0.1,"1":0.9}}}"#;
+                    (
+                        "200 OK",
+                        serde_json::json!({"choices": [{"message": {"content": content}}]})
+                            .to_string(),
+                    )
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+
+        let body2 = stringify_like_node(&req2);
+        let bases = JevBases {
+            openrouter: base.clone(),
+            vercel: base,
+        };
+        let vercel_ep = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_VERCEL,
+            "openai/gpt-4o-mini",
+        );
+        let or_ep = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_OPENROUTER,
+            "openai/gpt-4o-mini",
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        jev_fetch_endpoint(&vercel_ep, &req2, &body2, Some("k"), deadline, &bases, None)
+            .await
+            .unwrap();
+        jev_fetch_endpoint(&or_ep, &req2, &body2, Some("k"), deadline, &bases, None)
+            .await
+            .unwrap();
+
+        stop.store(true, Ordering::SeqCst);
+        srv.join().unwrap();
+
+        let cap = captured.lock().unwrap();
+        let chat_reqs: Vec<&(String, Value)> = cap
+            .iter()
+            .filter(|(first, _)| first.contains("/chat/completions"))
+            .collect();
+        assert_eq!(
+            chat_reqs.len(),
+            2,
+            "expected Vercel + OpenRouter chat calls: {cap:?}"
+        );
+        for (first, payload) in chat_reqs {
+            let sys = payload["messages"][0]["content"].as_str().unwrap();
+            assert!(
+                sys.contains("0-1") && !sys.contains("0-3"),
+                "chat prompt on {first} must use 2-criteria 0-1, got: {sys}"
+            );
+        }
     }
 }
 
@@ -5467,34 +6356,38 @@ mod probe_tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let hits_bg = hits.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_bg = stop.clone();
         let srv = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            hits_bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let mut reader = BufReader::new(&mut stream);
-            let mut first = String::new();
-            reader.read_line(&mut first).unwrap();
-            let mut size = 0usize;
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" {
-                    break;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            if let Some(mut stream) = super::accept_until(&listener, Some(&stop_bg), deadline) {
+                hits_bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        size = v.trim().parse().unwrap();
+                    }
                 }
-                if let Some((n, v)) = line.split_once(':')
-                    && n.eq_ignore_ascii_case("content-length")
-                {
-                    size = v.trim().parse().unwrap();
-                }
+                let mut buf = vec![0; size];
+                reader.read_exact(&mut buf).unwrap();
+                let body = r#"{"error":"rate limited"}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
             }
-            let mut buf = vec![0; size];
-            reader.read_exact(&mut buf).unwrap();
-            let body = r#"{"error":"rate limited"}"#;
-            write!(
-                stream,
-                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
         });
 
         let blocks = agentdeck_core::judge::BlockStore::new(dir.join("blocks"));
@@ -5530,6 +6423,7 @@ mod probe_tests {
             err2.to_string().contains("blocked until"),
             "expected blocked-until error on cached block: {err2}"
         );
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
         srv.join().unwrap();
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),

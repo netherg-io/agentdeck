@@ -293,6 +293,7 @@ impl HttpCheckpointJudge {
             deadline: CHECKPOINT_JUDGE_DEADLINE,
             blocks: BlockStore::default_runtime_or_disabled(),
             client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .timeout(CHECKPOINT_JUDGE_TIMEOUT)
                 .build()?,
         })
@@ -410,12 +411,18 @@ impl HttpCheckpointJudge {
                 }
                 .into());
             }
-            let is_language_model = check_language_model
-                && (400..500).contains(&status)
-                && res
-                    .text()
+            let is_language_model = if check_language_model && (400..500).contains(&status) {
+                res.text()
                     .await
-                    .is_ok_and(|text| text.contains("is a language model"));
+                    .map_err(|e| CheckpointHttpError {
+                        trigger: FallbackTrigger::Transient,
+                        is_language_model: false,
+                        message: format!("checkpoint judge response read failed: {e}"),
+                    })?
+                    .contains("is a language model")
+            } else {
+                false
+            };
             return Err(CheckpointHttpError {
                 trigger: classify_http_status(status, None),
                 is_language_model,

@@ -922,10 +922,23 @@ where
                 FallbackTrigger::RateLimited { retry_after } => {
                     let lock_wait = dispatch_lock_budget(remaining_after);
                     record_block_logged(blocks, primary, retry_after, received_w, lock_wait);
-                    let remaining_after = deadline.saturating_duration_since(mono_now());
+                    let after_persist_w = wall_now();
+                    let after_persist_m = mono_now();
+                    let remaining_after = deadline.saturating_duration_since(after_persist_m);
+                    // Keep receipt time as block start; recompute remaining waits against fresh
+                    // post-persistence time, honouring any longer stored block and preserving the
+                    // local expiry if persistence failed.
+                    let elapsed = after_persist_w
+                        .duration_since(received_w)
+                        .unwrap_or_else(|_| after_persist_m.saturating_duration_since(received_m));
+                    let local_rem = retry_after.saturating_sub(elapsed);
+                    let stored_rem = blocks
+                        .remaining_at(primary, after_persist_w)
+                        .unwrap_or(Duration::ZERO);
+                    let primary_rem = local_rem.max(stored_rem);
                     if let Some(fb) = fb {
-                        if let Some(fb_rem) = blocks.remaining_at(fb, received_w) {
-                            let wait = retry_after.min(fb_rem);
+                        if let Some(fb_rem) = blocks.remaining_at(fb, after_persist_w) {
+                            let wait = primary_rem.min(fb_rem);
                             return if can_wait(wait, remaining_after) {
                                 DispatchStep::Wait(wait)
                             } else {
@@ -939,7 +952,7 @@ where
                         if remaining_after.is_zero() {
                             return DispatchStep::Fail(rate_limit_err(
                                 primary,
-                                retry_after,
+                                primary_rem,
                                 Duration::ZERO,
                             ));
                         }
@@ -965,12 +978,12 @@ where
                             }
                         };
                     }
-                    if can_wait(retry_after, remaining_after) {
-                        DispatchStep::Wait(retry_after)
+                    if can_wait(primary_rem, remaining_after) {
+                        DispatchStep::Wait(primary_rem)
                     } else {
                         DispatchStep::Fail(rate_limit_err(
                             primary,
-                            retry_after,
+                            primary_rem,
                             wait_budget(remaining_after),
                         ))
                     }
@@ -2071,5 +2084,234 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rate_limit_wait_recomputes_after_persistence_honours_longer_stored_and_keeps_local_on_failure()
+     {
+        // 1. Lock wait elapses ~120ms: block start stays at receipt time, so remaining
+        // wait after persistence is recomputed against fresh wall time (< 5s).
+        let (dir1, blocks1) = temp_blocks("recompute-wait");
+        let ep = primary();
+        let seed_t = SystemTime::now() - Duration::from_secs(60);
+        blocks1
+            .record_rate_limit_at(&ep, Duration::from_secs(1), seed_t)
+            .unwrap();
+        let lock_file1 = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(blocks1.lock_path(&ep).unwrap())
+            .unwrap();
+        lock_file1.lock().unwrap();
+        let holder1 = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            drop(lock_file1);
+        });
+        let step1 = run_block(dispatch_once(
+            &blocks1,
+            &ep,
+            None,
+            Instant::now() + Duration::from_secs(30),
+            Duration::ZERO,
+            None,
+            Instant::now,
+            SystemTime::now,
+            |_ep, _| async {
+                Err::<&str, TestErr>(TestErr {
+                    trigger: FallbackTrigger::RateLimited {
+                        retry_after: Duration::from_secs(5),
+                    },
+                    msg: "429".into(),
+                })
+            },
+            |e| e.trigger,
+            |ep, ra, rem| TestErr {
+                trigger: FallbackTrigger::None,
+                msg: format_rate_limit_exceeded(ep, ra, rem),
+            },
+        ));
+        holder1.join().unwrap();
+        match step1 {
+            DispatchStep::Wait(wait) => {
+                assert!(
+                    wait < Duration::from_millis(4950) && wait > Duration::from_secs(4),
+                    "expected wait recomputed from receipt time after ~120ms lock wait, got {wait:?}"
+                );
+            }
+            other => panic!("expected Wait, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir1);
+
+        // 2. Concurrent writer holds lock and writes a longer 40s block before releasing:
+        // caller received retry_after=5s, must honour the longer stored block (> 35s).
+        let (dir2, blocks2) = temp_blocks("longer-stored");
+        blocks2
+            .record_rate_limit_at(&ep, Duration::from_secs(1), seed_t)
+            .unwrap();
+        let lock_file2 = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(blocks2.lock_path(&ep).unwrap())
+            .unwrap();
+        lock_file2.lock().unwrap();
+        let bp2 = blocks2.block_path(&ep).unwrap();
+        let ep2 = ep.clone();
+        let holder2 = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let rec = BlockRecord {
+                provider: ep2.provider,
+                model: ep2.model,
+                blocked_until_ms: system_time_ms(SystemTime::now()) + 40_000,
+            };
+            write_atomic(&bp2, &serde_json::to_string(&rec).unwrap()).unwrap();
+            drop(lock_file2);
+        });
+        let step2 = run_block(dispatch_once(
+            &blocks2,
+            &ep,
+            None,
+            Instant::now() + Duration::from_secs(60),
+            Duration::ZERO,
+            None,
+            Instant::now,
+            SystemTime::now,
+            |_ep, _| async {
+                Err::<&str, TestErr>(TestErr {
+                    trigger: FallbackTrigger::RateLimited {
+                        retry_after: Duration::from_secs(5),
+                    },
+                    msg: "429".into(),
+                })
+            },
+            |e| e.trigger,
+            |ep, ra, rem| TestErr {
+                trigger: FallbackTrigger::None,
+                msg: format_rate_limit_exceeded(ep, ra, rem),
+            },
+        ));
+        holder2.join().unwrap();
+        match step2 {
+            DispatchStep::Wait(wait) => {
+                assert!(
+                    wait > Duration::from_secs(35),
+                    "must honour longer stored 40s block instead of local 5s retry_after, got {wait:?}"
+                );
+            }
+            other => panic!("expected Wait(>35s), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir2);
+
+        // 3. Fallback block expires during primary lock wait: fresh post-persistence time
+        // sees fallback unblocked and calls fallback immediately instead of returning Wait.
+        let (dir3, blocks3) = temp_blocks("fb-expires-during-lock");
+        let fb = fallback();
+        blocks3
+            .record_rate_limit_at(&ep, Duration::from_secs(1), seed_t)
+            .unwrap();
+        let lock_file3 = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(blocks3.lock_path(&ep).unwrap())
+            .unwrap();
+        lock_file3.lock().unwrap();
+        blocks3
+            .record_rate_limit_at(&fb, Duration::from_millis(60), SystemTime::now())
+            .unwrap();
+        let holder3 = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(130));
+            drop(lock_file3);
+        });
+        let step3 = run_block(dispatch_once(
+            &blocks3,
+            &ep,
+            Some(&fb),
+            Instant::now() + Duration::from_secs(30),
+            Duration::from_secs(5),
+            None,
+            Instant::now,
+            SystemTime::now,
+            |target, _| {
+                let is_primary = target.provider == "vercel";
+                async move {
+                    if is_primary {
+                        Err(TestErr {
+                            trigger: FallbackTrigger::RateLimited {
+                                retry_after: Duration::from_secs(30),
+                            },
+                            msg: "429".into(),
+                        })
+                    } else {
+                        Ok("fb-after-lock")
+                    }
+                }
+            },
+            |e| e.trigger,
+            |ep, ra, rem| TestErr {
+                trigger: FallbackTrigger::None,
+                msg: format_rate_limit_exceeded(ep, ra, rem),
+            },
+        ));
+        holder3.join().unwrap();
+        match step3 {
+            DispatchStep::Done(val, ch) => {
+                assert_eq!((val, ch), ("fb-after-lock", JudgeChannel::Fallback));
+            }
+            other => panic!(
+                "expected immediate Fallback call once fb block expired during lock wait, got {other:?}"
+            ),
+        }
+        let _ = std::fs::remove_dir_all(&dir3);
+
+        // 4. Persistence times out on held lock (no stored block on disk): keeps local
+        // expiry (receipt_time + 5s) recomputed against fresh post-persistence time.
+        let (dir4, blocks4) = temp_blocks("persist-fail-local");
+        blocks4
+            .record_rate_limit_at(&ep, Duration::from_secs(1), seed_t)
+            .unwrap();
+        let _ = std::fs::remove_file(blocks4.block_path(&ep).unwrap());
+        let lock_file4 = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(blocks4.lock_path(&ep).unwrap())
+            .unwrap();
+        lock_file4.lock().unwrap();
+        let step4 = run_block(dispatch_once(
+            &blocks4,
+            &ep,
+            None,
+            Instant::now() + Duration::from_secs(30),
+            Duration::ZERO,
+            None,
+            Instant::now,
+            SystemTime::now,
+            |_ep, _| async {
+                Err::<&str, TestErr>(TestErr {
+                    trigger: FallbackTrigger::RateLimited {
+                        retry_after: Duration::from_secs(5),
+                    },
+                    msg: "429".into(),
+                })
+            },
+            |e| e.trigger,
+            |ep, ra, rem| TestErr {
+                trigger: FallbackTrigger::None,
+                msg: format_rate_limit_exceeded(ep, ra, rem),
+            },
+        ));
+        drop(lock_file4);
+        match step4 {
+            DispatchStep::Wait(wait) => {
+                assert!(
+                    wait < Duration::from_millis(4900) && wait > Duration::from_secs(4),
+                    "on persistence failure, must keep local expiry recomputed after lock timeout (~4.8s), got {wait:?}"
+                );
+            }
+            other => panic!("expected Wait(~4.8s), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir4);
     }
 }

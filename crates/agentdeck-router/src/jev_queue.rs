@@ -236,9 +236,23 @@ pub struct QueueAnswer {
     pub channel: JudgeChannel,
 }
 
+/// Removes only this caller's own outstanding `.req` files when `ask_many_inner`
+/// exits or its future is dropped/cancelled mid-flight.
+struct ReqCleanupGuard {
+    paths: Vec<PathBuf>,
+}
+
+impl Drop for ReqCleanupGuard {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Asks Jev through the shared queue with the default hook-path budget ([`BUDGET`]).
 #[allow(clippy::too_many_arguments)]
-pub async fn ask<F, Fut, C, Cb>(
+pub async fn ask<F, Fut, C, Cb, V>(
     spool: &Path,
     request: &Value,
     body: &str,
@@ -248,12 +262,14 @@ pub async fn ask<F, Fut, C, Cb>(
     fetch: F,
     classify: C,
     classify_batch: Cb,
+    validate: V,
 ) -> anyhow::Result<QueueAnswer>
 where
     F: FnMut(JudgeEndpoint, Value, String, Instant, BatchSendGuard) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
     Cb: Fn(&anyhow::Error) -> BatchErrorKind,
+    V: Fn(&Value) -> bool,
 {
     ask_with_deadline(
         spool,
@@ -266,6 +282,7 @@ where
         fetch,
         classify,
         classify_batch,
+        validate,
     )
     .await
 }
@@ -273,7 +290,7 @@ where
 /// Asks Jev through the shared queue with an explicit `budget` deadline (so
 /// callers such as `route_batch` can pass e.g. 120 s).
 #[allow(clippy::too_many_arguments)]
-pub async fn ask_with_deadline<F, Fut, C, Cb>(
+pub async fn ask_with_deadline<F, Fut, C, Cb, V>(
     spool: &Path,
     request: &Value,
     body: &str,
@@ -284,12 +301,14 @@ pub async fn ask_with_deadline<F, Fut, C, Cb>(
     fetch: F,
     classify: C,
     classify_batch: Cb,
+    validate: V,
 ) -> anyhow::Result<QueueAnswer>
 where
     F: FnMut(JudgeEndpoint, Value, String, Instant, BatchSendGuard) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
     Cb: Fn(&anyhow::Error) -> BatchErrorKind,
+    V: Fn(&Value) -> bool,
 {
     ask_inner(
         spool,
@@ -307,6 +326,7 @@ where
         fetch,
         classify,
         classify_batch,
+        validate,
     )
     .await
 }
@@ -315,7 +335,7 @@ where
 /// leader batches up to [`MAX_TASKS`] compatible requests per judge call within
 /// the shared `budget` deadline. Returns one result per input item in order.
 #[allow(clippy::too_many_arguments)]
-pub async fn ask_many_with_deadline<F, Fut, C, Cb>(
+pub async fn ask_many_with_deadline<F, Fut, C, Cb, V>(
     spool: &Path,
     items: &[(Value, String)],
     budget: Duration,
@@ -325,12 +345,14 @@ pub async fn ask_many_with_deadline<F, Fut, C, Cb>(
     fetch: F,
     classify: C,
     classify_batch: Cb,
+    validate: V,
 ) -> Vec<anyhow::Result<QueueAnswer>>
 where
     F: FnMut(JudgeEndpoint, Value, String, Instant, BatchSendGuard) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
     Cb: Fn(&anyhow::Error) -> BatchErrorKind,
+    V: Fn(&Value) -> bool,
 {
     ask_many_inner(
         spool,
@@ -347,12 +369,13 @@ where
         fetch,
         classify,
         classify_batch,
+        validate,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn ask_inner<MonoNow, MonoMs, WallNow, Sleep, SleepFut, F, Fut, C, Cb>(
+async fn ask_inner<MonoNow, MonoMs, WallNow, Sleep, SleepFut, F, Fut, C, Cb, V>(
     spool: &Path,
     request: &Value,
     body: &str,
@@ -368,6 +391,7 @@ async fn ask_inner<MonoNow, MonoMs, WallNow, Sleep, SleepFut, F, Fut, C, Cb>(
     fetch: F,
     classify: C,
     classify_batch: Cb,
+    validate: V,
 ) -> anyhow::Result<QueueAnswer>
 where
     MonoNow: FnMut() -> Instant,
@@ -379,6 +403,7 @@ where
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
     Cb: Fn(&anyhow::Error) -> BatchErrorKind,
+    V: Fn(&Value) -> bool,
 {
     ask_many_inner(
         spool,
@@ -395,6 +420,7 @@ where
         fetch,
         classify,
         classify_batch,
+        validate,
     )
     .await
     .into_iter()
@@ -403,7 +429,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn ask_many_inner<MonoNow, MonoMs, WallNow, Sleep, SleepFut, F, Fut, C, Cb>(
+async fn ask_many_inner<MonoNow, MonoMs, WallNow, Sleep, SleepFut, F, Fut, C, Cb, V>(
     spool: &Path,
     items: &[(Value, String)],
     budget: Duration,
@@ -418,6 +444,7 @@ async fn ask_many_inner<MonoNow, MonoMs, WallNow, Sleep, SleepFut, F, Fut, C, Cb
     mut fetch: F,
     classify: C,
     classify_batch: Cb,
+    validate: V,
 ) -> Vec<anyhow::Result<QueueAnswer>>
 where
     MonoNow: FnMut() -> Instant,
@@ -429,6 +456,7 @@ where
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
     Cb: Fn(&anyhow::Error) -> BatchErrorKind,
+    V: Fn(&Value) -> bool,
 {
     if items.is_empty() {
         return Vec::new();
@@ -445,7 +473,9 @@ where
     // leader turn sees the whole wave and packs up to MAX_TASKS into one judge request.
     let mut ids = Vec::with_capacity(items.len());
     let mut groups = Vec::with_capacity(items.len());
-    let mut req_paths = Vec::with_capacity(items.len());
+    let mut req_guard = ReqCleanupGuard {
+        paths: Vec::with_capacity(items.len()),
+    };
     let mut done_paths = Vec::with_capacity(items.len());
     let mut results: Vec<Option<anyhow::Result<QueueAnswer>>> =
         (0..items.len()).map(|_| None).collect();
@@ -465,7 +495,7 @@ where
         }
         ids.push(id);
         groups.push(group);
-        req_paths.push(req_path);
+        req_guard.paths.push(req_path);
         done_paths.push(done_path);
     }
     let own_ids: HashSet<&str> = ids.iter().map(String::as_str).collect();
@@ -503,7 +533,7 @@ where
         if remaining.is_zero() {
             for (i, slot) in results.iter_mut().enumerate() {
                 if slot.is_none() {
-                    let _ = std::fs::remove_file(&req_paths[i]);
+                    let _ = std::fs::remove_file(&req_guard.paths[i]);
                     *slot = Some(take_done(spool, &done_paths[i]).unwrap_or_else(|| {
                         Err(anyhow::anyhow!(
                             "Jev queue: no answer within {}s (decision rate limit)",
@@ -526,7 +556,7 @@ where
                         &e.to_string(),
                         spool,
                         &groups,
-                        &req_paths,
+                        &req_guard.paths,
                         &done_paths,
                         &mut results,
                     );
@@ -551,6 +581,7 @@ where
                     &mut fetch,
                     &classify,
                     &classify_batch,
+                    &validate,
                 )
                 .await;
                 // Release the per-group lock immediately so we NEVER hold it while sleeping
@@ -582,7 +613,7 @@ where
                                 &msg,
                                 spool,
                                 &groups,
-                                &req_paths,
+                                &req_guard.paths,
                                 &done_paths,
                                 &mut results,
                             );
@@ -598,13 +629,13 @@ where
                             &msg,
                             spool,
                             &groups,
-                            &req_paths,
+                            &req_guard.paths,
                             &done_paths,
                             &mut results,
                         );
                     }
                     LeadOutcome::OwnError(msg) => {
-                        let _ = std::fs::remove_file(&req_paths[first]);
+                        let _ = std::fs::remove_file(&req_guard.paths[first]);
                         if results[first].is_none() {
                             results[first] = Some(
                                 take_done(spool, &done_paths[first])
@@ -623,7 +654,7 @@ where
                     &e.to_string(),
                     spool,
                     &groups,
-                    &req_paths,
+                    &req_guard.paths,
                     &done_paths,
                     &mut results,
                 );
@@ -723,7 +754,7 @@ fn expected_keys_present(p: &Pending, split_answers: &Value) -> bool {
 /// by the composition actually sent, keeps leader timeouts local, and caps
 /// total actual HTTP sends per batch round at `batch_size + 1`.
 #[allow(clippy::too_many_arguments)]
-async fn lead_once<MonoNow, MonoMs, WallNow, F, Fut, C, Cb>(
+async fn lead_once<MonoNow, MonoMs, WallNow, F, Fut, C, Cb, V>(
     spool: &Path,
     own: &str,
     own_ids: &HashSet<&str>,
@@ -737,6 +768,7 @@ async fn lead_once<MonoNow, MonoMs, WallNow, F, Fut, C, Cb>(
     fetch: &mut F,
     classify: &C,
     classify_batch: &Cb,
+    validate: &V,
 ) -> LeadOutcome
 where
     MonoNow: FnMut() -> Instant,
@@ -746,6 +778,7 @@ where
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
     Cb: Fn(&anyhow::Error) -> BatchErrorKind,
+    V: Fn(&Value) -> bool,
 {
     let batch = match collect(spool, own, mono_now_ms(), wall_now()) {
         Ok(b) => b,
@@ -828,7 +861,7 @@ where
                 if answers.is_object() {
                     for (i, p) in sent.into_iter().enumerate() {
                         let a = split(&answers, i);
-                        if expected_keys_present(&p, &a) {
+                        if expected_keys_present(&p, &a) && validate(&a) {
                             good.push((p, a));
                         } else {
                             bad.push(p);
@@ -1233,6 +1266,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await
         .unwrap();
@@ -1296,6 +1330,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await
         .unwrap_err();
@@ -1331,6 +1366,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await
         .unwrap();
@@ -1362,6 +1398,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await
         .unwrap();
@@ -1431,6 +1468,7 @@ mod tests {
             make_fetch(calls.clone()),
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await;
         assert_eq!(*calls.lock().unwrap(), vec![3]);
@@ -1458,6 +1496,7 @@ mod tests {
             make_fetch(calls.clone()),
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await;
         let counts = calls.lock().unwrap().clone();
@@ -1513,6 +1552,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await
         .unwrap();
@@ -1564,6 +1604,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await;
         assert_eq!(outcomes.len(), 8);
@@ -1612,6 +1653,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await;
         assert_eq!(*req_calls.lock().unwrap(), 4);
@@ -1670,6 +1712,7 @@ mod tests {
                 },
                 classify_rl,
                 classify_batch_test,
+                |_| true,
             )
             .await
         });
@@ -1692,6 +1735,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await
         .expect("group B must succeed immediately");
@@ -1718,6 +1762,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await
         .unwrap_err();
@@ -1782,6 +1827,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await;
         assert_eq!(outcomes.len(), 4);
@@ -1827,6 +1873,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await;
         assert_eq!(parsed_outcomes.len(), 3);
@@ -1878,6 +1925,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await
         .expect("100 000-char brief must succeed without hanging in the queue");
@@ -1908,6 +1956,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await
         .unwrap_err();
@@ -1990,6 +2039,7 @@ mod tests {
                     }
                 },
                 classify_batch_test,
+                |_| true,
             )
             .await
         });
@@ -2042,6 +2092,7 @@ mod tests {
                 }
             },
             classify_batch_test,
+            |_| true,
         )
         .await
         .unwrap_err();
@@ -2133,6 +2184,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await
         .unwrap();
@@ -2200,6 +2252,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await
         .unwrap();
@@ -2242,6 +2295,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await;
         assert_eq!(outcomes.len(), 8);
@@ -2296,6 +2350,7 @@ mod tests {
                 }
             },
             classify_batch_test,
+            |_| true,
         )
         .await;
         assert_eq!(outcomes.len(), 8);
@@ -2338,6 +2393,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await;
         assert_eq!(outcomes2.len(), 8);
@@ -2477,6 +2533,7 @@ mod tests {
                 }
             },
             classify_batch_test,
+            |_| true,
         )
         .await
         .unwrap();
@@ -2571,6 +2628,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await
         .unwrap();
@@ -2632,6 +2690,7 @@ mod tests {
             },
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await
         .unwrap();
@@ -2673,6 +2732,7 @@ mod tests {
             ok_fetch,
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await
         .unwrap();
@@ -2696,6 +2756,7 @@ mod tests {
             ok_fetch,
             classify_rl,
             classify_batch_test,
+            |_| true,
         )
         .await
         .unwrap();
@@ -2703,6 +2764,77 @@ mod tests {
             !orphan.exists(),
             "stale GC must collect orphaned .done files older than STALE"
         );
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_ask_removes_only_own_outstanding_req_files() {
+        let (dir, blocks) = temp_dirs("drop-guard");
+        let primary = JudgeEndpoint::new("vercel", "judge");
+        let peer_req = request("peer-stays");
+        let group = group_of(&peer_req, &primary, None);
+        let peer_id = format!("{}-peer-drop-guard", std::process::id());
+        let peer_path = dir.join(format!("{peer_id}.req"));
+        write_atomic(
+            &peer_path,
+            &serde_json::json!({
+                "group": group,
+                "request": peer_req,
+                "body": "peer-body",
+                "deadline_mono_ms": monotonic_now_ms().saturating_add(60_000),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // Hold the group lock so the in-process ask_many enqueues its own .req files
+        // and then pends on the lock poll without sending them.
+        let held_lock = open_group_lock(&dir, &group).unwrap();
+        held_lock.lock().unwrap();
+
+        let items = vec![
+            (request("cancelled-0"), "b0".to_string()),
+            (request("cancelled-1"), "b1".to_string()),
+        ];
+        let req_count = |spool: &Path| -> usize {
+            std::fs::read_dir(spool)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".req"))
+                .count()
+        };
+
+        let mut fut = Box::pin(ask_many_with_deadline(
+            &dir,
+            &items,
+            Duration::from_secs(30),
+            &blocks,
+            &primary,
+            None,
+            |_ep, _req, _body, _deadline, _guard| async { Ok((serde_json::json!({}), None)) },
+            classify_rl,
+            classify_batch_test,
+            |_| true,
+        ));
+        // Poll once: enqueues both own .req files and hits WouldBlock -> Pending.
+        let timed = tokio::time::timeout(Duration::from_millis(20), &mut fut).await;
+        assert!(timed.is_err(), "ask_many must pend while lock is held");
+        assert_eq!(
+            req_count(&dir),
+            3,
+            "expected peer .req plus 2 own .req files while ask_many is alive"
+        );
+
+        // Dropping the cancelled future must immediately remove ONLY its own .req files.
+        drop(fut);
+        assert!(peer_path.exists(), "peer .req file must remain untouched");
+        assert_eq!(
+            req_count(&dir),
+            1,
+            "dropped ask_many must remove all of its own outstanding .req files"
+        );
+
+        drop(held_lock);
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }

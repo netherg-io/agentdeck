@@ -222,6 +222,7 @@ impl HttpPolicyJudge {
     pub fn new(provider: Option<String>, model: Option<String>, api_key: String) -> Result<Self> {
         let primary = JudgeTarget::new(provider, model, api_key)?;
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(JUDGE_TIMEOUT)
             .build()
             .context("failed to build policy judge HTTP client")?;
@@ -252,6 +253,7 @@ impl HttpPolicyJudge {
         let trimmed = base_url.trim_end_matches('/').to_string();
         if is_loopback(&trimmed)
             && let Ok(client) = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .timeout(self.timeout)
                 .no_proxy()
                 .build()
@@ -266,6 +268,7 @@ impl HttpPolicyJudge {
         let trimmed = base_url.trim_end_matches('/').to_string();
         if is_loopback(&trimmed)
             && let Ok(client) = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .timeout(self.timeout)
                 .no_proxy()
                 .build()
@@ -331,12 +334,14 @@ impl HttpPolicyJudge {
                 return Err(JudgeError::RateLimited { retry_after }.into());
             }
             // Inspect body only for the Vercel chat fallback sentinel on non-429 4xx; never leak body text.
-            let is_language_model = check_language_model
-                && (400..500).contains(&code)
-                && res
-                    .text()
+            let is_language_model = if check_language_model && (400..500).contains(&code) {
+                res.text()
                     .await
-                    .is_ok_and(|text| text.contains("is a language model"));
+                    .map_err(|_| JudgeError::Network)?
+                    .contains("is a language model")
+            } else {
+                false
+            };
             return Err(JudgeError::HttpStatus {
                 status: code,
                 is_language_model,
