@@ -1616,11 +1616,14 @@ fn usage_state_path(env: &Env, cfg: &RouterConfig) -> std::path::PathBuf {
         .unwrap_or_else(|| env.home.join(".local/state/ai-usage/state.json"))
 }
 
+/// (provider instance, model, capability profile) per enabled favorite.
+type Favorites = Vec<(String, String, Option<String>)>;
+
 fn resolve_favorites(
     cfg: &RouterConfig,
     settings: &Value,
     state_home: &std::path::Path,
-) -> anyhow::Result<(Vec<(String, String, Option<String>)>, Vec<String>)> {
+) -> anyhow::Result<(Favorites, Vec<String>)> {
     let configured: Vec<Value> = enabled_favorites(
         cfg.pool
             .iter()
