@@ -344,7 +344,7 @@ fn fallback_check_honours_active_429_block_and_displays_error() {
         settings::PROVIDER_OPENROUTER,
         settings::DEFAULT_DECISION_MODEL,
     );
-    let blocks = agentdeck_core::judge::BlockStore::default_runtime();
+    let blocks = agentdeck_core::judge::BlockStore::default_runtime().unwrap();
     blocks
         .record_rate_limit(&ep, std::time::Duration::from_secs(60))
         .unwrap();

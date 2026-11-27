@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use agentdeck_core::judge::{
-    BlockStore, FallbackTrigger, JudgeEndpoint, classify_http_status, dispatch_with_deadline,
-    format_rate_limit_exceeded, parse_retry_after, request_timeout,
+    BlockStore, DispatchBudget, FallbackTrigger, JudgeEndpoint, classify_http_status,
+    dispatch_with_deadline, format_rate_limit_exceeded, parse_retry_after, request_timeout,
 };
 use agentdeck_core::settings::{DEFAULT_DECISION_MODEL, PROVIDER_OPENROUTER, PROVIDER_VERCEL};
 use serde::{Deserialize, Serialize};
@@ -16,8 +16,14 @@ use serde_json::{Value, json};
 
 use crate::config::CoordinatorConfig;
 
-/// Default end-to-end deadline and HTTP timeout for the checkpoint judge.
+/// Per-request HTTP timeout for the checkpoint judge (matches previous 30 s limit).
 pub const CHECKPOINT_JUDGE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Fixed reserve held for an unblocked fallback so a hanging primary still
+/// leaves time for fallback without cutting normal slow primary calls.
+pub const CHECKPOINT_FALLBACK_RESERVE: Duration = Duration::from_secs(10);
+/// Default end-to-end deadline (`30 s` HTTP + `10 s` fallback reserve) so
+/// primary keeps its full 30 s HTTP timeout even when a fallback is configured.
+pub const CHECKPOINT_JUDGE_DEADLINE: Duration = Duration::from_secs(40);
 
 /// What the daemon knows about the run since the last Checkpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -237,6 +243,7 @@ pub struct HttpCheckpointJudge {
     pub model: String,
     provider: String,
     fallback: Option<CheckpointTarget>,
+    timeout: Duration,
     deadline: Duration,
     blocks: BlockStore,
     client: reqwest::Client,
@@ -276,8 +283,9 @@ impl HttpCheckpointJudge {
             model: model.to_string(),
             provider: provider.to_string(),
             fallback,
-            deadline: CHECKPOINT_JUDGE_TIMEOUT,
-            blocks: BlockStore::default_runtime(),
+            timeout: CHECKPOINT_JUDGE_TIMEOUT,
+            deadline: CHECKPOINT_JUDGE_DEADLINE,
+            blocks: BlockStore::default_runtime()?,
             client: reqwest::Client::builder()
                 .timeout(CHECKPOINT_JUDGE_TIMEOUT)
                 .build()?,
@@ -360,7 +368,7 @@ impl HttpCheckpointJudge {
         deadline: Instant,
         check_language_model: bool,
     ) -> anyhow::Result<Value> {
-        let Some(timeout) = request_timeout(self.deadline, deadline) else {
+        let Some(timeout) = request_timeout(self.timeout, deadline) else {
             return Err(CheckpointHttpError {
                 trigger: FallbackTrigger::Transient,
                 is_language_model: false,
@@ -529,7 +537,7 @@ impl CheckpointJudge for HttpCheckpointJudge {
             &self.blocks,
             &primary.id,
             fallback_id,
-            self.deadline,
+            DispatchBudget::new(self.deadline, CHECKPOINT_FALLBACK_RESERVE),
             Instant::now,
             SystemTime::now,
             tokio::time::sleep,
@@ -638,7 +646,8 @@ mod tests {
             model: "test-model".to_string(),
             provider: provider.to_string(),
             fallback: None,
-            deadline: CHECKPOINT_JUDGE_TIMEOUT,
+            timeout: CHECKPOINT_JUDGE_TIMEOUT,
+            deadline: CHECKPOINT_JUDGE_DEADLINE,
             blocks: BlockStore::new(std::env::temp_dir().join(format!(
                 "agentdeck-coord-test-blocks-{}-{provider}",
                 std::process::id()
@@ -1076,5 +1085,24 @@ mod tests {
         );
         assert!(seen.iter().all(|p| p.contains("/v1/decisions")));
         let _ = std::fs::remove_dir_all(&blocks_dir);
+    }
+
+    #[test]
+    fn checkpoint_budget_preserves_30s_primary_timeout_with_fallback_reserve() {
+        let now = Instant::now();
+        let primary_dl = agentdeck_core::judge::primary_attempt_deadline(
+            now,
+            now + CHECKPOINT_JUDGE_DEADLINE,
+            CHECKPOINT_FALLBACK_RESERVE,
+        );
+        assert!(
+            primary_dl.saturating_duration_since(now) >= CHECKPOINT_JUDGE_TIMEOUT,
+            "checkpoint primary must keep full 30s HTTP timeout even with fallback configured"
+        );
+        assert!(
+            (now + CHECKPOINT_JUDGE_DEADLINE).saturating_duration_since(primary_dl)
+                >= CHECKPOINT_FALLBACK_RESERVE,
+            "checkpoint must reserve {CHECKPOINT_FALLBACK_RESERVE:?} for fallback"
+        );
     }
 }

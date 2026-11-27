@@ -4,6 +4,7 @@
 //! primary/fallback block dispatcher, then writes each answer back. A request
 //! alone in the queue is sent unchanged.
 
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentdeck_core::judge::{
     BlockStore, DispatchStep, FallbackTrigger, JudgeChannel, JudgeEndpoint, create_private_dir,
-    dispatch_once, format_rate_limit_exceeded, write_atomic,
+    dispatch_once, format_rate_limit_exceeded, read_private_entry, write_atomic,
 };
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -19,6 +20,10 @@ use sha2::{Digest, Sha256};
 /// Total wait for one answer on the hook path, queue and 429 back-off included:
 /// the hook kills `route` after 55 s.
 pub const BUDGET: Duration = Duration::from_secs(50);
+/// Fixed budget reserved for an unblocked fallback on router judge calls:
+/// leaves primary its full 30 s HTTP timeout on the 50 s hook path (`50 - 15 = 35 >= 30`)
+/// while guaranteeing at least 15 s for fallback if primary hangs.
+pub const FALLBACK_RESERVE: Duration = Duration::from_secs(15);
 /// Tasks per batched decision; 7 real briefs measured about 11k input tokens.
 pub const MAX_TASKS: usize = 8;
 const POLL: Duration = Duration::from_millis(150);
@@ -271,19 +276,21 @@ where
             .map(|_| Err(anyhow::anyhow!("{msg}")))
             .collect();
     }
-    // Enqueue every request before acquiring the lock so the first leader turn
-    // sees the whole wave and packs up to MAX_TASKS into one judge request.
+    // Enqueue every request before acquiring the per-group lock so the first
+    // leader turn sees the whole wave and packs up to MAX_TASKS into one judge request.
     let mut ids = Vec::with_capacity(items.len());
+    let mut groups = Vec::with_capacity(items.len());
     let mut req_paths = Vec::with_capacity(items.len());
     let mut done_paths = Vec::with_capacity(items.len());
     let mut results: Vec<Option<anyhow::Result<QueueAnswer>>> =
         (0..items.len()).map(|_| None).collect();
     for (i, (request, body)) in items.iter().enumerate() {
         let id = next_request_id();
+        let group = group_of(request, primary, fallback);
         let req_path = spool.join(format!("{id}.req"));
         let done_path = spool.join(format!("{id}.done"));
         let entry = serde_json::json!({
-            "group": group_of(request, primary, fallback),
+            "group": group,
             "request": request,
             "body": body,
         });
@@ -291,31 +298,33 @@ where
             results[i] = Some(Err(e.into()));
         }
         ids.push(id);
+        groups.push(group);
         req_paths.push(req_path);
         done_paths.push(done_path);
     }
-    let lock = match std::fs::File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(spool.join("lock"))
-    {
-        Ok(f) => f,
-        Err(e) => {
-            let msg = e.to_string();
-            for (i, slot) in results.iter_mut().enumerate() {
-                if slot.is_none() {
-                    let _ = std::fs::remove_file(&req_paths[i]);
-                    *slot = Some(Err(anyhow::anyhow!("{msg}")));
-                }
+    let mut locks: HashMap<String, std::fs::File> = HashMap::new();
+    let mut wait_retries: HashMap<String, usize> = HashMap::new();
+    let fail_group = |target_group: &str,
+                      msg: &str,
+                      spool: &Path,
+                      groups: &[String],
+                      req_paths: &[PathBuf],
+                      done_paths: &[PathBuf],
+                      results: &mut [Option<anyhow::Result<QueueAnswer>>]| {
+        for (i, slot) in results.iter_mut().enumerate() {
+            if slot.is_none() && groups[i] == target_group {
+                let _ = std::fs::remove_file(&req_paths[i]);
+                *slot = Some(
+                    take_done(spool, &done_paths[i])
+                        .unwrap_or_else(|| Err(anyhow::anyhow!("{msg}"))),
+                );
             }
-            return results.into_iter().map(Option::unwrap).collect();
         }
     };
     loop {
         for (i, slot) in results.iter_mut().enumerate() {
             if slot.is_none()
-                && let Some(r) = take_done(&done_paths[i])
+                && let Some(r) = take_done(spool, &done_paths[i])
             {
                 *slot = Some(r);
             }
@@ -323,11 +332,12 @@ where
         let Some(first) = results.iter().position(Option::is_none) else {
             break;
         };
-        if mono_now() >= deadline {
+        let remaining = deadline.saturating_duration_since(mono_now());
+        if remaining.is_zero() {
             for (i, slot) in results.iter_mut().enumerate() {
                 if slot.is_none() {
                     let _ = std::fs::remove_file(&req_paths[i]);
-                    *slot = Some(take_done(&done_paths[i]).unwrap_or_else(|| {
+                    *slot = Some(take_done(spool, &done_paths[i]).unwrap_or_else(|| {
                         Err(anyhow::anyhow!(
                             "Jev queue: no answer within {}s (decision rate limit)",
                             budget.as_secs()
@@ -337,9 +347,30 @@ where
             }
             break;
         }
+        let group = groups[first].clone();
+        if !locks.contains_key(&group) {
+            match open_group_lock(spool, &group) {
+                Ok(f) => {
+                    locks.insert(group.clone(), f);
+                }
+                Err(e) => {
+                    fail_group(
+                        &group,
+                        &e.to_string(),
+                        spool,
+                        &groups,
+                        &req_paths,
+                        &done_paths,
+                        &mut results,
+                    );
+                    continue;
+                }
+            }
+        }
+        let lock = &locks[&group];
         match lock.try_lock() {
             Ok(()) => {
-                let led = lead(
+                let outcome = lead_once(
                     spool,
                     &ids[first],
                     deadline,
@@ -348,45 +379,104 @@ where
                     fallback,
                     &mut mono_now,
                     &mut wall_now,
-                    &mut sleep,
-                    add_jitter,
                     &mut fetch,
                     &classify,
                     &is_channel_wide,
                 )
                 .await;
+                // Release the per-group lock immediately so we NEVER hold it while sleeping
+                // out a 429 block or blocking shorter-deadline waiters in the same group.
                 let _ = lock.unlock();
-                if let Err(e) = led {
-                    let _ = std::fs::remove_file(&req_paths[first]);
-                    results[first] = Some(Err(e));
-                    continue;
-                }
                 for (i, slot) in results.iter_mut().enumerate() {
                     if slot.is_none()
-                        && let Some(r) = take_done(&done_paths[i])
+                        && let Some(r) = take_done(spool, &done_paths[i])
                     {
                         *slot = Some(r);
                     }
                 }
-                if results[first].is_none() {
-                    // Not answered (own request unreadable): don't spin on the lock.
-                    sleep(POLL).await;
-                }
-            }
-            Err(std::fs::TryLockError::WouldBlock) => sleep(POLL).await,
-            Err(std::fs::TryLockError::Error(e)) => {
-                let msg = e.to_string();
-                for (i, slot) in results.iter_mut().enumerate() {
-                    if slot.is_none() {
-                        let _ = std::fs::remove_file(&req_paths[i]);
-                        *slot = Some(Err(anyhow::anyhow!("{msg}")));
+                match outcome {
+                    LeadOutcome::Done => {
+                        if results[first].is_none() {
+                            let rem = deadline.saturating_duration_since(mono_now());
+                            if !rem.is_zero() {
+                                sleep(POLL.min(rem)).await;
+                            }
+                        }
+                    }
+                    LeadOutcome::Wait(wait) => {
+                        let rem = deadline.saturating_duration_since(mono_now());
+                        let retries = wait_retries.entry(group.clone()).or_insert(0);
+                        if *retries >= MAX_WAIT_RETRIES || wait >= rem {
+                            let msg = format_rate_limit_exceeded(primary, wait, rem);
+                            fail_group(
+                                &group,
+                                &msg,
+                                spool,
+                                &groups,
+                                &req_paths,
+                                &done_paths,
+                                &mut results,
+                            );
+                        } else {
+                            *retries += 1;
+                            let dur = with_bounded_jitter(wait, rem, add_jitter).min(rem);
+                            sleep(dur).await;
+                        }
+                    }
+                    LeadOutcome::RateLimitExceeded(msg) => {
+                        fail_group(
+                            &group,
+                            &msg,
+                            spool,
+                            &groups,
+                            &req_paths,
+                            &done_paths,
+                            &mut results,
+                        );
                     }
                 }
-                break;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                sleep(POLL.min(remaining)).await;
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                fail_group(
+                    &group,
+                    &e.to_string(),
+                    spool,
+                    &groups,
+                    &req_paths,
+                    &done_paths,
+                    &mut results,
+                );
             }
         }
     }
     results.into_iter().map(Option::unwrap).collect()
+}
+
+fn open_group_lock(spool: &Path, group: &str) -> std::io::Result<std::fs::File> {
+    let lock_path = spool.join(format!("lock-{group}"));
+    let mut opts = std::fs::File::options();
+    opts.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(&lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+enum LeadOutcome {
+    Done,
+    Wait(Duration),
+    RateLimitExceeded(String),
 }
 
 struct Pending {
@@ -414,12 +504,23 @@ fn with_bounded_jitter(wait: Duration, remaining: Duration, add_jitter: bool) ->
     }
 }
 
+fn expected_keys_present(p: &Pending, split_answers: &Value) -> bool {
+    let Some(ans_obj) = split_answers.as_object() else {
+        return false;
+    };
+    match p.request.get("questions").and_then(Value::as_object) {
+        Some(qs) if !qs.is_empty() => qs.keys().all(|k| ans_obj.contains_key(k)),
+        _ => !ans_obj.is_empty(),
+    }
+}
+
 /// Sends this process's request together with every compatible pending one
-/// through the shared block/fallback dispatcher. When waiting out a 429 block
-/// (no fallback, block ends before deadline), loops back so newcomers join the
-/// retried batch.
+/// through the shared block/fallback dispatcher without sleeping under the lock.
+/// On request-specific errors (HTTP 400 or combined-answer parse/split errors),
+/// bisects the batch and retries parts within the original `deadline` so healthy
+/// tasks are never lost to a single bad task.
 #[allow(clippy::too_many_arguments)]
-async fn lead<MonoNow, WallNow, Sleep, SleepFut, F, Fut, C, Cw>(
+async fn lead_once<MonoNow, WallNow, F, Fut, C, Cw>(
     spool: &Path,
     own: &str,
     deadline: Instant,
@@ -428,31 +529,34 @@ async fn lead<MonoNow, WallNow, Sleep, SleepFut, F, Fut, C, Cw>(
     fallback: Option<&JudgeEndpoint>,
     mono_now: &mut MonoNow,
     wall_now: &mut WallNow,
-    sleep: &mut Sleep,
-    add_jitter: bool,
     fetch: &mut F,
     classify: &C,
     is_channel_wide: &Cw,
-) -> anyhow::Result<()>
+) -> LeadOutcome
 where
     MonoNow: FnMut() -> Instant,
     WallNow: FnMut() -> SystemTime,
-    Sleep: FnMut(Duration) -> SleepFut,
-    SleepFut: Future<Output = ()>,
     F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
     Cw: Fn(&anyhow::Error) -> bool,
 {
-    for attempt in 0..=MAX_WAIT_RETRIES {
-        let batch = collect(spool, own);
-        if batch.is_empty() || batch[0].id != own {
-            return Ok(());
+    let batch = collect(spool, own);
+    if batch.is_empty() || batch[0].id != own {
+        return LeadOutcome::Done;
+    }
+    let mut work: VecDeque<Vec<Pending>> = VecDeque::from([batch]);
+    while let Some(sub) = work.pop_front() {
+        if sub.is_empty() {
+            continue;
         }
-        let (request, body) = if batch.len() == 1 {
-            (batch[0].request.clone(), batch[0].body.clone())
+        if mono_now() >= deadline {
+            return LeadOutcome::Done;
+        }
+        let (request, body) = if sub.len() == 1 {
+            (sub[0].request.clone(), sub[0].body.clone())
         } else {
-            let r = combine(&batch);
+            let r = combine(&sub);
             let b = crate::route::stringify_like_node(&r);
             (r, b)
         };
@@ -461,6 +565,8 @@ where
             primary,
             fallback,
             deadline,
+            FALLBACK_RESERVE,
+            None,
             &mut *mono_now,
             &mut *wall_now,
             |ep, attempt_deadline| {
@@ -472,61 +578,99 @@ where
         .await;
         match step {
             DispatchStep::Done((answers, cost), channel) => {
-                let n = batch.len();
-                for (i, p) in batch.iter().enumerate() {
-                    let a = if n == 1 {
-                        answers.clone()
-                    } else {
-                        split(&answers, i)
-                    };
-                    let cost = cost.map(|c| c / n as f64);
+                let n = sub.len();
+                if n == 1 {
                     finish(
                         spool,
-                        p,
+                        &sub[0],
                         &serde_json::json!({
-                            "answers": a,
+                            "answers": answers,
                             "cost": cost,
                             "channel": channel.as_str(),
                         }),
                     );
+                    continue;
                 }
-                return Ok(());
-            }
-            DispatchStep::Wait(wait) => {
-                let remaining = deadline.saturating_duration_since(mono_now());
-                if attempt == MAX_WAIT_RETRIES {
-                    let err_payload = serde_json::json!({
-                        "error": format_rate_limit_exceeded(primary, wait, remaining),
-                    });
-                    for p in &batch {
-                        finish(spool, p, &err_payload);
-                    }
-                    return Ok(());
-                }
-                sleep(with_bounded_jitter(wait, remaining, add_jitter)).await;
-            }
-            DispatchStep::Fail(e) => {
-                let channel_wide = e.downcast_ref::<ChannelWideRateLimit>().is_some()
-                    || !matches!(classify(&e), FallbackTrigger::None)
-                    || is_channel_wide(&e);
-                let err_payload = serde_json::json!({"error": e.to_string()});
-                if channel_wide {
-                    // Channel-wide failure (401/403, missing key, fallback exhausted,
-                    // rate-limit exceeded): fail the whole batch at once instead of
-                    // making N separate failing requests for a wave of N.
-                    for p in &batch {
-                        finish(spool, p, &err_payload);
+                let mut good = Vec::new();
+                let mut bad = Vec::new();
+                if answers.is_object() {
+                    for (i, p) in sub.into_iter().enumerate() {
+                        let a = split(&answers, i);
+                        if expected_keys_present(&p, &a) {
+                            good.push((p, a));
+                        } else {
+                            bad.push(p);
+                        }
                     }
                 } else {
-                    // Request-specific failure (400 / invalid JSON): only this request
-                    // fails; a combined body may be what the judge rejected.
-                    finish(spool, &batch[0], &err_payload);
+                    bad = sub;
                 }
-                return Ok(());
+                for (p, a) in good {
+                    let per_cost = cost.map(|c| c / n as f64);
+                    finish(
+                        spool,
+                        &p,
+                        &serde_json::json!({
+                            "answers": a,
+                            "cost": per_cost,
+                            "channel": channel.as_str(),
+                        }),
+                    );
+                }
+                if !bad.is_empty() {
+                    if bad.len() == 1 {
+                        work.push_front(bad);
+                    } else {
+                        let mid = bad.len() / 2;
+                        let right = bad.split_off(mid);
+                        work.push_front(right);
+                        work.push_front(bad);
+                    }
+                }
+            }
+            DispatchStep::Wait(wait) => {
+                // Already-finished tasks have their .done written; unfinished ones
+                // remain as .req files and will be re-collected after sleeping unlocked.
+                return LeadOutcome::Wait(wait);
+            }
+            DispatchStep::Fail(e) => {
+                if e.downcast_ref::<ChannelWideRateLimit>().is_some() {
+                    // Caller-deadline rate-limit failure: only fail this caller's items
+                    // so longer-deadline waiters in the same group survive.
+                    return LeadOutcome::RateLimitExceeded(e.to_string());
+                }
+                let channel_wide =
+                    !matches!(classify(&e), FallbackTrigger::None) || is_channel_wide(&e);
+                let err_payload = serde_json::json!({"error": e.to_string()});
+                if channel_wide {
+                    // Server/channel-wide failure (401/403, missing key, fallback exhausted):
+                    // fail the whole remaining batch at once instead of N failing calls.
+                    for p in &sub {
+                        finish(spool, p, &err_payload);
+                    }
+                    for rest in &work {
+                        for p in rest {
+                            finish(spool, p, &err_payload);
+                        }
+                    }
+                    return LeadOutcome::Done;
+                }
+                // Request-specific failure (400 / invalid JSON parse error):
+                // if solo, attribute the error to this task; if batched, bisect and retry
+                // both halves within the original deadline.
+                if sub.len() == 1 {
+                    finish(spool, &sub[0], &err_payload);
+                } else {
+                    let mut left = sub;
+                    let mid = left.len() / 2;
+                    let right = left.split_off(mid);
+                    work.push_front(right);
+                    work.push_front(left);
+                }
             }
         }
     }
-    Ok(())
+    LeadOutcome::Done
 }
 
 /// Own request first, then the oldest compatible ones. Requests of exited
@@ -549,8 +693,9 @@ fn collect(spool: &Path, own: &str) -> Vec<Pending> {
                 let _ = std::fs::remove_file(&path);
                 continue;
             }
-            let Some(v) = std::fs::read_to_string(&path)
+            let Some(v) = read_private_entry(spool, &path)
                 .ok()
+                .flatten()
                 .and_then(|t| serde_json::from_str::<Value>(&t).ok())
             else {
                 continue;
@@ -642,8 +787,9 @@ fn finish(spool: &Path, p: &Pending, result: &Value) {
     let _ = std::fs::remove_file(&p.path);
 }
 
-fn take_done(path: &Path) -> Option<anyhow::Result<QueueAnswer>> {
-    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+fn take_done(spool: &Path, path: &Path) -> Option<anyhow::Result<QueueAnswer>> {
+    let text = read_private_entry(spool, path).ok()??;
+    let v: Value = serde_json::from_str(&text).ok()?;
     let _ = std::fs::remove_file(path);
     Some(match v["error"].as_str() {
         Some(e) => Err(anyhow::anyhow!("{e}")),
@@ -809,7 +955,7 @@ mod tests {
         );
         assert_eq!(answer.cost, Some(0.01));
         assert_eq!(answer.channel, JudgeChannel::Primary);
-        let other_done = take_done(&dir.join(format!("{}-1.done", std::process::id())));
+        let other_done = take_done(&dir, &dir.join(format!("{}-1.done", std::process::id())));
         assert!(other_done.unwrap().is_ok(), "queued request answered too");
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
@@ -1127,7 +1273,8 @@ mod tests {
             "channel-wide 401 must fail the entire wave of 8 in 1 judge call, not 8"
         );
 
-        // Request-specific error (400): fails only the first task so remaining tasks retry and succeed!
+        // Combined-body 400 (e.g. payload rejected only when combined): bisecting splits
+        // into smaller parts and recovers ALL 3 healthy tasks instead of losing task 0.
         let three: Vec<(Value, String)> = (0..3)
             .map(|i| {
                 let r = request(&format!("req-{i}"));
@@ -1147,9 +1294,12 @@ mod tests {
             move |_ep, req, _body, _deadline| {
                 let rc = rc.clone();
                 async move {
-                    let mut n = rc.lock().unwrap();
-                    *n += 1;
-                    if *n == 1 {
+                    *rc.lock().unwrap() += 1;
+                    if req
+                        .pointer("/state/tasks")
+                        .and_then(Value::as_object)
+                        .is_some_and(|m| m.len() >= 3)
+                    {
                         return Err(anyhow::anyhow!("jev_http_status_400"));
                     }
                     let mut answers = Map::new();
@@ -1163,10 +1313,231 @@ mod tests {
             is_channel_wide_test,
         )
         .await;
-        assert_eq!(*req_calls.lock().unwrap(), 2);
-        assert!(res_req[0].is_err(), "first request fails on 400");
-        assert!(res_req[1].is_ok(), "second request must retry and succeed");
-        assert!(res_req[2].is_ok(), "third request must retry and succeed");
+        assert_eq!(*req_calls.lock().unwrap(), 3);
+        assert!(res_req[0].is_ok(), "first request recovered after bisect");
+        assert!(res_req[1].is_ok(), "second request recovered after bisect");
+        assert!(res_req[2].is_ok(), "third request recovered after bisect");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn different_group_is_not_blocked_by_429_sleep_and_short_waiter_fails_fast() {
+        let (dir, blocks) = temp_dirs("per-group-lock");
+        let group_a = JudgeEndpoint::new("vercel", "judge-a");
+        let group_b = JudgeEndpoint::new("openrouter", "judge-b");
+
+        let slept_notify = Arc::new(tokio::sync::Notify::new());
+        let a_calls = Arc::new(Mutex::new(0usize));
+
+        // Task A (group A, 5s budget) gets 429 Retry-After: 2s and sleeps out the block.
+        let dir_a = dir.clone();
+        let blocks_a = blocks.clone();
+        let ep_a = group_a.clone();
+        let notify_a = slept_notify.clone();
+        let calls_a = a_calls.clone();
+        let task_a = tokio::spawn(async move {
+            ask_with_deadline(
+                &dir_a,
+                &request("group-a-task"),
+                "body-a",
+                Duration::from_secs(5),
+                &blocks_a,
+                &ep_a,
+                None,
+                move |_ep, _req, _body, _deadline| {
+                    let notify = notify_a.clone();
+                    let calls = calls_a.clone();
+                    async move {
+                        let n = {
+                            let mut c = calls.lock().unwrap();
+                            *c += 1;
+                            *c
+                        };
+                        if n == 1 {
+                            notify.notify_one();
+                            return Err(RateLimited {
+                                retry_after: Duration::from_secs(2),
+                                message: "Jev HTTP 429".into(),
+                            }
+                            .into());
+                        }
+                        Ok((serde_json::json!({"size": {"score": 1}}), Some(0.01)))
+                    }
+                },
+                classify_rl,
+                is_channel_wide_test,
+            )
+            .await
+        });
+
+        slept_notify.notified().await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // 1. Different group (group B) must NOT be blocked by group A's 2s 429 sleep.
+        let started_b = Instant::now();
+        let ans_b = ask_with_deadline(
+            &dir,
+            &request("group-b-task"),
+            "body-b",
+            Duration::from_secs(2),
+            &blocks,
+            &group_b,
+            None,
+            |_ep, _req, _body, _deadline| async {
+                Ok((serde_json::json!({"size": {"score": 2}}), Some(0.01)))
+            },
+            classify_rl,
+            is_channel_wide_test,
+        )
+        .await
+        .expect("group B must succeed immediately");
+        let elapsed_b = started_b.elapsed();
+        assert_eq!(ans_b.answers["size"]["score"], 2);
+        assert!(
+            elapsed_b < Duration::from_millis(600),
+            "group B must not wait on group A's 2s 429 sleep; took {elapsed_b:?}"
+        );
+
+        // 2. Same group A with shorter budget (500ms < remaining ~1.9s block) must fail fast
+        // without waiting out its deadline and without cancelling Task A.
+        let started_c = Instant::now();
+        let err_c = ask_with_deadline(
+            &dir,
+            &request("group-a-short-hook"),
+            "body-c",
+            Duration::from_millis(500),
+            &blocks,
+            &group_a,
+            None,
+            |_ep, _req, _body, _deadline| async {
+                Ok((serde_json::json!({"size": {"score": 9}}), Some(0.01)))
+            },
+            classify_rl,
+            is_channel_wide_test,
+        )
+        .await
+        .unwrap_err();
+        let elapsed_c = started_c.elapsed();
+        assert!(
+            err_c.to_string().contains("rate limited (429)"),
+            "short waiter should fail fast on recorded 429 block, got: {err_c}"
+        );
+        assert!(
+            elapsed_c < Duration::from_millis(400),
+            "short waiter must not hang on leader lock while leader sleeps; took {elapsed_c:?}"
+        );
+
+        // Task A must still wake up after its 2s sleep and succeed.
+        let ans_a = task_a
+            .await
+            .unwrap()
+            .expect("long-budget Task A must survive short waiter and succeed after 2s block");
+        assert_eq!(ans_a.answers["size"]["score"], 1);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_bisects_on_content_based_400_and_combined_parse_error() {
+        let (dir, blocks) = temp_dirs("bisect-400");
+        let primary = JudgeEndpoint::new("vercel", "judge");
+
+        // 1. Content-based 400: mock rejects ANY request whose payload contains "BAD-TASK"
+        // (positioned at index 2, NOT index 0!). Healthy tasks 0, 1, 3 must all succeed.
+        let items: Vec<(Value, String)> = ["ok-0", "ok-1", "BAD-TASK", "ok-3"]
+            .into_iter()
+            .map(|t| {
+                let r = request(t);
+                let b = r.to_string();
+                (r, b)
+            })
+            .collect();
+        let outcomes = ask_many_with_deadline(
+            &dir,
+            &items,
+            Duration::from_secs(30),
+            &blocks,
+            &primary,
+            None,
+            |_ep, req, _body, _deadline| async move {
+                let contains_bad = req
+                    .pointer("/state/task")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s == "BAD-TASK")
+                    || req
+                        .pointer("/state/tasks")
+                        .and_then(Value::as_object)
+                        .is_some_and(|m| m.values().any(|v| v.as_str() == Some("BAD-TASK")));
+                if contains_bad {
+                    return Err(anyhow::anyhow!("jev_http_status_400"));
+                }
+                let mut answers = Map::new();
+                for (k, _) in req["questions"].as_object().unwrap() {
+                    answers.insert(k.clone(), serde_json::json!({"score": 1}));
+                }
+                Ok((Value::Object(answers), Some(0.01)))
+            },
+            classify_rl,
+            is_channel_wide_test,
+        )
+        .await;
+        assert_eq!(outcomes.len(), 4);
+        assert!(outcomes[0].is_ok(), "ok-0 must succeed: {:?}", outcomes[0]);
+        assert!(outcomes[1].is_ok(), "ok-1 must succeed: {:?}", outcomes[1]);
+        assert!(
+            outcomes[2]
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.to_string().contains("400")),
+            "BAD-TASK must fail with 400: {:?}",
+            outcomes[2]
+        );
+        assert!(outcomes[3].is_ok(), "ok-3 must succeed: {:?}", outcomes[3]);
+
+        // 2. Combined-answer parse error: combined request returns malformed/unprefixed JSON
+        // while solo requests succeed; bisecting must recover all 3 healthy tasks.
+        let three: Vec<(Value, String)> = ["p-0", "p-1", "p-2"]
+            .into_iter()
+            .map(|t| {
+                let r = request(t);
+                let b = r.to_string();
+                (r, b)
+            })
+            .collect();
+        let parsed_outcomes = ask_many_with_deadline(
+            &dir,
+            &three,
+            Duration::from_secs(30),
+            &blocks,
+            &primary,
+            None,
+            |_ep, req, _body, _deadline| async move {
+                if req.pointer("/state/tasks").is_some() {
+                    // Malformed combined answer (missing tN__ prefixes).
+                    return Ok((serde_json::json!({"size": {"score": 1}}), Some(0.01)));
+                }
+                let mut answers = Map::new();
+                for (k, _) in req["questions"].as_object().unwrap() {
+                    answers.insert(k.clone(), serde_json::json!({"score": 2}));
+                }
+                Ok((Value::Object(answers), Some(0.01)))
+            },
+            classify_rl,
+            is_channel_wide_test,
+        )
+        .await;
+        assert_eq!(parsed_outcomes.len(), 3);
+        for (i, res) in parsed_outcomes.iter().enumerate() {
+            let ans = res
+                .as_ref()
+                .unwrap_or_else(|e| panic!("task {i} should succeed after split: {e}"));
+            assert_eq!(
+                ans.answers["size"]["score"], 2,
+                "task {i} missing split answer: {:?}",
+                ans.answers
+            );
+            assert_eq!(ans.answers["m"]["score"], 2);
+        }
+
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }

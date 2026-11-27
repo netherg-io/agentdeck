@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use agentdeck_core::judge::{
-    BlockStore, FallbackTrigger, JudgeChannel, JudgeEndpoint, classify_http_status,
+    BlockStore, DispatchBudget, FallbackTrigger, JudgeChannel, JudgeEndpoint, classify_http_status,
     dispatch_with_deadline, parse_retry_after, request_timeout,
 };
 use agentdeck_core::settings::{DEFAULT_DECISION_MODEL, PROVIDER_OPENROUTER, PROVIDER_VERCEL};
@@ -21,9 +21,18 @@ use serde_json::{Value, json};
 
 use crate::perimeter::{ApprovalRequest, MandateContext};
 
+/// Per-request HTTP timeout for approver Policy Judge calls.
 pub const JUDGE_TIMEOUT: Duration = Duration::from_secs(20);
-/// Default end-to-end deadline for approver judge evaluation (including 429 wait / fallback).
-pub const DEFAULT_JUDGE_DEADLINE: Duration = Duration::from_secs(10);
+/// Maximum time the approver waits for a 429 block to expire (applies ONLY to
+/// 429 block waits, never cuts the 20 s per-request HTTP timeout).
+pub const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(10);
+/// Fixed reserve held for an unblocked fallback so a hanging primary still
+/// leaves time for fallback without cutting normal slow primary calls.
+pub const APPROVER_FALLBACK_RESERVE: Duration = Duration::from_secs(8);
+/// Default end-to-end deadline (`20 s` HTTP + `10 s` 429 wait room): keeps the
+/// full 20 s HTTP timeout for primary even with the 8 s fallback reserve
+/// (`30 - 8 = 22 >= 20`) or after waiting up to 10 s for a 429 block.
+pub const DEFAULT_JUDGE_DEADLINE: Duration = Duration::from_secs(30);
 const OPENROUTER_BASE: &str = "https://openrouter.ai";
 const VERCEL_BASE: &str = "https://ai-gateway.vercel.sh";
 
@@ -193,6 +202,7 @@ pub struct HttpPolicyJudge {
     fallback: Option<JudgeTarget>,
     timeout: Duration,
     deadline: Duration,
+    max_rate_limit_wait: Duration,
     blocks: BlockStore,
 }
 
@@ -203,6 +213,7 @@ impl fmt::Debug for HttpPolicyJudge {
             .field("fallback", &self.fallback)
             .field("timeout", &self.timeout)
             .field("deadline", &self.deadline)
+            .field("max_rate_limit_wait", &self.max_rate_limit_wait)
             .finish()
     }
 }
@@ -214,13 +225,16 @@ impl HttpPolicyJudge {
             .timeout(JUDGE_TIMEOUT)
             .build()
             .context("failed to build policy judge HTTP client")?;
+        let blocks =
+            BlockStore::default_runtime().context("failed to resolve policy judge block store")?;
         Ok(Self {
             client,
             primary,
             fallback: None,
             timeout: JUDGE_TIMEOUT,
             deadline: DEFAULT_JUDGE_DEADLINE,
-            blocks: BlockStore::default_runtime(),
+            max_rate_limit_wait: MAX_RATE_LIMIT_WAIT,
+            blocks,
         })
     }
 
@@ -272,6 +286,11 @@ impl HttpPolicyJudge {
 
     pub fn with_deadline(mut self, deadline: Duration) -> Self {
         self.deadline = deadline;
+        self
+    }
+
+    pub fn with_max_rate_limit_wait(mut self, max_wait: Duration) -> Self {
+        self.max_rate_limit_wait = max_wait;
         self
     }
 
@@ -535,7 +554,8 @@ impl PolicyJudge for HttpPolicyJudge {
             &self.blocks,
             &self.primary.endpoint,
             fallback_ep,
-            self.deadline,
+            DispatchBudget::new(self.deadline, APPROVER_FALLBACK_RESERVE)
+                .with_max_rate_limit_wait(self.max_rate_limit_wait),
             Instant::now,
             SystemTime::now,
             tokio::time::sleep,
@@ -1147,6 +1167,78 @@ mod tests {
 
         assert_eq!(fb_srv.await.unwrap().len(), 2);
         primary_srv.abort();
+        let _ = std::fs::remove_dir_all(&blocks_dir);
+    }
+
+    #[tokio::test]
+    async fn approver_preserves_20s_http_timeout_and_caps_only_429_wait_at_10s() {
+        assert!(
+            DEFAULT_JUDGE_DEADLINE >= JUDGE_TIMEOUT,
+            "approver default deadline ({DEFAULT_JUDGE_DEADLINE:?}) must not cut the 20s HTTP timeout ({JUDGE_TIMEOUT:?})"
+        );
+        let now = Instant::now();
+        let primary_dl = agentdeck_core::judge::primary_attempt_deadline(
+            now,
+            now + DEFAULT_JUDGE_DEADLINE,
+            APPROVER_FALLBACK_RESERVE,
+        );
+        assert!(
+            primary_dl.saturating_duration_since(now) >= JUDGE_TIMEOUT,
+            "approver primary attempt must retain full 20s HTTP timeout even with fallback configured"
+        );
+        assert!(
+            (now + DEFAULT_JUDGE_DEADLINE).saturating_duration_since(primary_dl)
+                >= APPROVER_FALLBACK_RESERVE,
+            "approver must still reserve {APPROVER_FALLBACK_RESERVE:?} for fallback"
+        );
+
+        let blocks_dir = std::env::temp_dir().join(format!(
+            "agentdeck-approver-10s-wait-cap-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&blocks_dir);
+
+        // Primary returns 429 Retry-After: 11s (exceeds 10s block-wait cap, even though total HTTP budget >= 20s).
+        let (primary_base, primary_srv) = mock_judge_server_with_headers(vec![(
+            "429 Too Many Requests",
+            "Retry-After: 11\r\n",
+            r#"{"error":"rate limit"}"#.to_string(),
+        )])
+        .await;
+
+        let req: ApprovalRequest = serde_json::from_value(json!({
+            "kind": "confirm",
+            "title": "Redeploy",
+            "text": "staging",
+            "host": "local",
+            "thread_id": "t-1"
+        }))
+        .unwrap();
+        let mandate = MandateContext {
+            active_autonomous_run: true,
+            owner_granted: true,
+            thread_id: Some("t-1".into()),
+            ..Default::default()
+        };
+
+        let judge = HttpPolicyJudge::new(
+            Some(PROVIDER_OPENROUTER.into()),
+            Some("~typesafe/jev-latest".into()),
+            "k1".into(),
+        )
+        .unwrap()
+        .with_base_url(primary_base)
+        .with_blocks_dir(blocks_dir.clone());
+
+        let started = Instant::now();
+        let err = judge.evaluate(&req, &mandate).await.unwrap_err();
+        let elapsed = started.elapsed();
+        assert_eq!(err.to_string(), "judge_http_status_429");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "11s 429 block must fail fast instead of waiting past the 10s cap; took {elapsed:?}"
+        );
+        assert_eq!(primary_srv.await.unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&blocks_dir);
     }
 }

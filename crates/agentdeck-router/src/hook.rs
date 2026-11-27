@@ -681,20 +681,83 @@ fn ancestor_harness(cmdline: &[String]) -> Option<&'static str> {
     }
 }
 
-fn env_var_from(key: &str, ancestor: Option<&ProcessAncestor>) -> Option<String> {
-    if let Some(v) = std::env::var_os(key) {
-        let s = v.to_string_lossy().into_owned();
-        if !s.is_empty() {
-            return Some(s);
-        }
-    }
+pub(crate) fn current_environ() -> Vec<String> {
+    std::env::vars_os()
+        .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
+        .collect()
+}
+
+fn env_lookup(env: &[String], key: &str) -> Option<String> {
     let prefix = format!("{key}=");
-    ancestor.and_then(|a| {
-        a.environ
-            .iter()
-            .find_map(|e| e.strip_prefix(&prefix).filter(|v| !v.is_empty()))
-            .map(str::to_string)
-    })
+    env.iter()
+        .find_map(|e| e.strip_prefix(&prefix).filter(|v| !v.is_empty()))
+        .map(str::to_string)
+}
+
+fn env_var_from(
+    key: &str,
+    own_env: &[String],
+    ancestor: Option<&ProcessAncestor>,
+) -> Option<String> {
+    env_lookup(own_env, key).or_else(|| ancestor.and_then(|a| env_lookup(&a.environ, key)))
+}
+
+fn expand_home_path(raw: &str, home: &std::path::Path) -> std::path::PathBuf {
+    if raw == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        std::path::PathBuf::from(raw)
+    }
+}
+
+/// Match `CODEX_HOME` against T3's `providerInstances`: check `shadowHomePath`
+/// first (secondary profiles), then `homePath` (or default `<home>/.codex` when
+/// empty) on non-shadow profiles so secondary entries sharing the main
+/// `homePath` are never misidentified as the main profile.
+fn codex_settings_instance(settings: &Value, home: &std::path::Path, dir: &str) -> Option<String> {
+    let pi = settings.get("providerInstances")?.as_object()?;
+    let target = expand_home_path(dir, home);
+    if let Some((id, _)) = pi.iter().find(|(_, v)| {
+        v.get("driver").and_then(Value::as_str) == Some("codex")
+            && v.get("config")
+                .and_then(|c| c.get("shadowHomePath"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .is_some_and(|p| expand_home_path(p, home) == target)
+    }) {
+        return Some(id.clone());
+    }
+    let non_shadow = |v: &Value| {
+        v.get("driver").and_then(Value::as_str) == Some("codex")
+            && v.get("config")
+                .and_then(|c| c.get("shadowHomePath"))
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+    };
+    if let Some((id, _)) = pi.iter().find(|(_, v)| {
+        non_shadow(v)
+            && v.get("config")
+                .and_then(|c| c.get("homePath"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .is_some_and(|p| expand_home_path(p, home) == target)
+    }) {
+        return Some(id.clone());
+    }
+    if target == home.join(".codex")
+        && let Some((id, _)) = pi.iter().find(|(_, v)| {
+            non_shadow(v)
+                && v.get("config")
+                    .and_then(|c| c.get("homePath"))
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+        })
+    {
+        return Some(id.clone());
+    }
+    None
 }
 
 fn has_secondary_driver_instance(settings: &Value, driver: &str, default_id: &str) -> bool {
@@ -723,8 +786,11 @@ fn read_settings_optional(home: &std::path::Path) -> Option<Value> {
 /// Precedence:
 /// 1. Explicit `source` (and `shell` harness always requires explicit source).
 /// 2. Authoritative T3 thread binding (`thread_id` / `T3CODE_THREAD_ID` in `statev2.sqlite`).
-/// 3. Harness + own/ancestor environment (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, Antigravity profile)
-///    matched against `~/.t3/userdata/settings.json`.
+/// 3. Harness + explicit `own_env`/ancestor environment (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`,
+///    Antigravity profile) matched against `~/.t3/userdata/settings.json`.
+///
+/// Both `own_env` and `ancestors` are explicit inputs so callers and tests never
+/// depend implicitly on the process tree they execute under.
 ///
 /// Returns `Ok(None)` when the caller source cannot be determined unambiguously
 /// (e.g. multiple accounts configured for a harness with no thread binding or
@@ -732,6 +798,7 @@ fn read_settings_optional(home: &std::path::Path) -> Option<Value> {
 /// error rather than warming the wrong cache key.
 pub(crate) fn resolve_source(
     home: &std::path::Path,
+    own_env: &[String],
     ancestors: &[ProcessAncestor],
     query: SourceQuery<'_>,
 ) -> anyhow::Result<Option<String>> {
@@ -748,11 +815,7 @@ pub(crate) fn resolve_source(
         .thread_id
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .or_else(|| {
-            std::env::var(agentdeck_core::thread_state::THREAD_ENV)
-                .ok()
-                .filter(|s| !s.is_empty())
-        });
+        .or_else(|| env_lookup(own_env, agentdeck_core::thread_state::THREAD_ENV));
     if let Some(tid) = thread_id.as_deref()
         && let Some(inst) =
             crate::load::thread_provider_instance(tid, &home.join(".t3/userdata/statev2.sqlite"))
@@ -780,7 +843,7 @@ pub(crate) fn resolve_source(
 
     match eff_harness {
         "claude" => {
-            if let Some(dir) = env_var_from("CLAUDE_CONFIG_DIR", matching_anc) {
+            if let Some(dir) = env_var_from("CLAUDE_CONFIG_DIR", own_env, matching_anc) {
                 let settings = read_settings_required(home)?;
                 if let Some(id) = settings_instance(&settings, "claudeAgent", "homePath", &dir) {
                     return Ok(Some(id));
@@ -806,9 +869,9 @@ pub(crate) fn resolve_source(
             Ok(Some("claudeAgent".into()))
         }
         "codex" => {
-            if let Some(dir) = env_var_from("CODEX_HOME", matching_anc) {
+            if let Some(dir) = env_var_from("CODEX_HOME", own_env, matching_anc) {
                 let settings = read_settings_required(home)?;
-                if let Some(id) = settings_instance(&settings, "codex", "shadowHomePath", &dir) {
+                if let Some(id) = codex_settings_instance(&settings, home, &dir) {
                     return Ok(Some(id));
                 }
                 if has_secondary_driver_instance(&settings, "codex", "codex") && !query.from_hook {
@@ -828,14 +891,11 @@ pub(crate) fn resolve_source(
         "agy" => {
             let settings = read_settings_optional(home);
             if let Some(s) = settings.as_ref() {
-                let own_env: Vec<String> = std::env::vars_os()
-                    .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
-                    .collect();
                 let all_argv: Vec<String> = ancestors
                     .iter()
                     .flat_map(|a| a.cmdline.iter().cloned())
                     .collect();
-                if let Some(id) = crate::policy::antigravity_instance(s, &own_env, &all_argv) {
+                if let Some(id) = crate::policy::antigravity_instance(s, own_env, &all_argv) {
                     return Ok(Some(id));
                 }
                 for anc in ancestors
@@ -1168,8 +1228,10 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
         );
         return Ok(());
     }
+    let own_env = current_environ();
     let instance = resolve_source(
         &home,
+        &own_env,
         &ancestors,
         SourceQuery {
             harness: Some(&harness),
@@ -1733,5 +1795,123 @@ mod tests {
         );
         // Plain angle brackets are untouched.
         assert_eq!(strip_tags("a < b > c"), "a < b > c");
+    }
+
+    #[test]
+    fn resolve_source_matches_codex_main_home_path_for_both_hook_and_mcp() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentdeck-hook-codex-homepath-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let main_codex = dir.join(".codex");
+        let shadow_codex = dir.join(".codex-b");
+        std::fs::create_dir_all(dir.join(".t3/userdata")).unwrap();
+        std::fs::write(
+            dir.join(".t3/userdata/settings.json"),
+            serde_json::json!({
+                "providerInstances": {
+                    "codex": {
+                        "driver": "codex",
+                        "config": { "homePath": main_codex.to_string_lossy() }
+                    },
+                    "codex_b": {
+                        "driver": "codex",
+                        "config": {
+                            "homePath": main_codex.to_string_lossy(),
+                            "shadowHomePath": shadow_codex.to_string_lossy()
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let main_anc = super::ProcessAncestor {
+            cmdline: vec!["codex".into()],
+            environ: vec![format!("CODEX_HOME={}", main_codex.display())],
+        };
+        let shadow_anc = super::ProcessAncestor {
+            cmdline: vec!["codex".into()],
+            environ: vec![format!("CODEX_HOME={}", shadow_codex.display())],
+        };
+
+        let hook_main = super::resolve_source(
+            &dir,
+            &[],
+            std::slice::from_ref(&main_anc),
+            super::SourceQuery {
+                harness: Some("codex"),
+                explicit_source: None,
+                thread_id: None,
+                from_hook: true,
+            },
+        )
+        .unwrap();
+        let mcp_main = super::resolve_source(
+            &dir,
+            &[],
+            std::slice::from_ref(&main_anc),
+            super::SourceQuery {
+                harness: Some("codex"),
+                explicit_source: None,
+                thread_id: None,
+                from_hook: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(hook_main.as_deref(), Some("codex"));
+        assert_eq!(
+            mcp_main.as_deref(),
+            Some("codex"),
+            "MCP source resolution must match main Codex homePath just like hook"
+        );
+
+        // Also match via explicit own_env with empty ancestors (independent of caller process).
+        let own_main = super::resolve_source(
+            &dir,
+            &[format!("CODEX_HOME={}", main_codex.display())],
+            &[],
+            super::SourceQuery {
+                harness: Some("codex"),
+                explicit_source: None,
+                thread_id: None,
+                from_hook: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(own_main.as_deref(), Some("codex"));
+
+        let mcp_shadow = super::resolve_source(
+            &dir,
+            &[],
+            std::slice::from_ref(&shadow_anc),
+            super::SourceQuery {
+                harness: Some("codex"),
+                explicit_source: None,
+                thread_id: None,
+                from_hook: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(mcp_shadow.as_deref(), Some("codex_b"));
+
+        // Empty own_env + empty ancestors with two Codex accounts must report ambiguous (None).
+        let ambiguous = super::resolve_source(
+            &dir,
+            &[],
+            &[],
+            super::SourceQuery {
+                harness: Some("codex"),
+                explicit_source: None,
+                thread_id: None,
+                from_hook: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(ambiguous, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
