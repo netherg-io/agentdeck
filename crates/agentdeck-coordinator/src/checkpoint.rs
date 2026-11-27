@@ -3,14 +3,21 @@
 //! the judge confirms a clean boundary. Hard invariants run before any judge
 //! so a stale state or a quiet turn never pays for a reset.
 
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
+use agentdeck_core::judge::{
+    BlockStore, FallbackTrigger, JudgeEndpoint, classify_http_status, dispatch_with_deadline,
+    format_rate_limit_exceeded, parse_retry_after,
+};
 use agentdeck_core::settings::{DEFAULT_DECISION_MODEL, PROVIDER_OPENROUTER, PROVIDER_VERCEL};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::CoordinatorConfig;
+
+/// Default end-to-end deadline and HTTP timeout for the checkpoint judge.
+pub const CHECKPOINT_JUDGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What the daemon knows about the run since the last Checkpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -167,29 +174,78 @@ const CHECKPOINT_CRITERIA: [&str; 4] = [
     "Ideal: a milestone boundary with fresh state and no loose ends.",
 ];
 
+#[derive(Debug)]
+struct CheckpointHttpError {
+    trigger: FallbackTrigger,
+    is_language_model: bool,
+    message: String,
+}
+
+impl std::fmt::Display for CheckpointHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CheckpointHttpError {}
+
+fn classify_checkpoint_error(err: &anyhow::Error) -> FallbackTrigger {
+    err.downcast_ref::<CheckpointHttpError>()
+        .map_or(FallbackTrigger::None, |he| he.trigger)
+}
+
+#[derive(Clone)]
+struct CheckpointTarget {
+    endpoint: String,
+    api_key: String,
+    id: JudgeEndpoint,
+}
+
+fn default_endpoint_for(provider: &str) -> anyhow::Result<&'static str> {
+    match provider {
+        PROVIDER_OPENROUTER => Ok("https://openrouter.ai/api/alpha/decisions"),
+        PROVIDER_VERCEL => Ok("https://ai-gateway.vercel.sh/v1/decisions"),
+        _ => anyhow::bail!("unsupported checkpoint judge provider {provider:?}"),
+    }
+}
+
+fn resolve_api_key(provider: &str) -> Option<String> {
+    let env_keys: &[&str] = match provider {
+        PROVIDER_OPENROUTER => &["OPENROUTER_API_KEY", "JEV_OPENROUTER_API_KEY"],
+        PROVIDER_VERCEL => &["AI_GATEWAY_API_KEY"],
+        _ => return None,
+    };
+    env_keys
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .map(|key| key.trim().to_string())
+        .find(|key| !key.is_empty())
+        .or_else(|| {
+            let path = Path::new(&std::env::var_os("HOME")?)
+                .join(".config/model-route")
+                .join(format!("{provider}.key"));
+            let key = std::fs::read_to_string(path).ok()?;
+            let key = key.trim();
+            (!key.is_empty()).then(|| key.to_string())
+        })
+}
+
 /// Live checkpoint judge over OpenRouter or Vercel AI Gateway.
 pub struct HttpCheckpointJudge {
     pub endpoint: String,
     pub api_key: String,
     pub model: String,
     provider: String,
+    fallback: Option<CheckpointTarget>,
+    deadline: Duration,
+    blocks: BlockStore,
     client: reqwest::Client,
 }
 
 impl HttpCheckpointJudge {
     pub fn from_env(cfg: &CoordinatorConfig) -> anyhow::Result<Self> {
         let provider = cfg.judge_provider.as_deref().unwrap_or(PROVIDER_OPENROUTER);
-        let (endpoint, env_keys): (&str, &[&str]) = match provider {
-            PROVIDER_OPENROUTER => (
-                "https://openrouter.ai/api/alpha/decisions",
-                &["OPENROUTER_API_KEY", "JEV_OPENROUTER_API_KEY"],
-            ),
-            PROVIDER_VERCEL => (
-                "https://ai-gateway.vercel.sh/v1/decisions",
-                &["AI_GATEWAY_API_KEY"],
-            ),
-            _ => anyhow::bail!("unsupported checkpoint judge provider {provider:?}"),
-        };
+        let endpoint = default_endpoint_for(provider)?;
         let model = match cfg
             .judge_model
             .as_deref()
@@ -202,34 +258,62 @@ impl HttpCheckpointJudge {
             }
             None => DEFAULT_DECISION_MODEL,
         };
-        let api_key = env_keys
-            .iter()
-            .filter_map(|name| std::env::var(name).ok())
-            .map(|key| key.trim().to_string())
-            .find(|key| !key.is_empty())
-            .or_else(|| {
-                let path = Path::new(&std::env::var_os("HOME")?)
-                    .join(".config/model-route")
-                    .join(format!("{provider}.key"));
-                let key = std::fs::read_to_string(path).ok()?;
-                let key = key.trim();
-                (!key.is_empty()).then(|| key.to_string())
+        let api_key = resolve_api_key(provider).ok_or_else(|| {
+            anyhow::anyhow!("no API key configured for the {provider} checkpoint judge")
+        })?;
+        let fallback = cfg.judge_fallback.endpoint().and_then(|ep| {
+            let fb_endpoint = default_endpoint_for(&ep.provider).ok()?;
+            let fb_key = resolve_api_key(&ep.provider)?;
+            Some(CheckpointTarget {
+                endpoint: fb_endpoint.to_string(),
+                api_key: fb_key,
+                id: ep,
             })
-            .ok_or_else(|| {
-                anyhow::anyhow!("no API key configured for the {provider} checkpoint judge")
-            })?;
+        });
         Ok(Self {
             endpoint: endpoint.to_string(),
             api_key,
             model: model.to_string(),
             provider: provider.to_string(),
+            fallback,
+            deadline: CHECKPOINT_JUDGE_TIMEOUT,
+            blocks: BlockStore::default_runtime(),
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
+                .timeout(CHECKPOINT_JUDGE_TIMEOUT)
                 .build()?,
         })
     }
 
-    fn request_body(&self, input: &CheckpointInput) -> Value {
+    pub fn with_fallback(
+        mut self,
+        provider: &str,
+        model: &str,
+        api_key: String,
+        endpoint: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let ep = match endpoint {
+            Some(u) => u,
+            None => default_endpoint_for(provider)?.to_string(),
+        };
+        self.fallback = Some(CheckpointTarget {
+            endpoint: ep,
+            api_key,
+            id: JudgeEndpoint::new(provider, model),
+        });
+        Ok(self)
+    }
+
+    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    pub fn with_blocks_dir(mut self, dir: PathBuf) -> Self {
+        self.blocks = BlockStore::new(dir);
+        self
+    }
+
+    fn request_body_for(provider: &str, model: &str, input: &CheckpointInput) -> Value {
         let state = json!({
                 "runCountSinceCheckpoint": input.run_count_since_checkpoint,
                 "itemCountSinceCheckpoint": input.item_count_since_checkpoint,
@@ -237,14 +321,14 @@ impl HttpCheckpointJudge {
                 "activeChildren": input.active_children,
                 "recentEventsTail": input.recent_events_tail.join("\n"),
         });
-        if self.provider == PROVIDER_VERCEL {
+        if provider == PROVIDER_VERCEL {
             let levels: Vec<_> = CHECKPOINT_CRITERIA
                 .iter()
                 .enumerate()
                 .map(|(i, description)| json!({"label": i.to_string(), "description": description}))
                 .collect();
             return json!({
-                "model": self.model,
+                "model": model,
                 "input": json!({"state": state}).to_string(),
                 "questions": [{
                     "type": "score", "name": "checkpoint_safe",
@@ -253,7 +337,7 @@ impl HttpCheckpointJudge {
             });
         }
         json!({
-            "model": self.model,
+            "model": model,
             "state": state,
             "questions": {"checkpoint_safe": {
                 "type": "score",
@@ -263,11 +347,52 @@ impl HttpCheckpointJudge {
         })
     }
 
-    fn request(&self, endpoint: &str, body: &Value) -> reqwest::RequestBuilder {
-        self.client
+    #[cfg(test)]
+    fn request_body(&self, input: &CheckpointInput) -> Value {
+        Self::request_body_for(&self.provider, &self.model, input)
+    }
+
+    async fn post_target(
+        &self,
+        endpoint: &str,
+        api_key: &str,
+        body: &Value,
+        timeout: Duration,
+    ) -> anyhow::Result<Value> {
+        let res = self
+            .client
             .post(endpoint)
-            .bearer_auth(&self.api_key)
+            .timeout(timeout)
+            .bearer_auth(api_key)
             .json(body)
+            .send()
+            .await
+            .map_err(|e| CheckpointHttpError {
+                trigger: FallbackTrigger::Transient,
+                is_language_model: false,
+                message: format!("checkpoint judge request failed: {e}"),
+            })?;
+        if !res.status().is_success() {
+            let status = res.status().as_u16();
+            let retry_after = (status == 429).then(|| {
+                parse_retry_after(
+                    res.headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok()),
+                )
+            });
+            let text = res.text().await.unwrap_or_default();
+            let is_language_model = text.contains("is a language model");
+            return Err(CheckpointHttpError {
+                trigger: classify_http_status(status, retry_after),
+                is_language_model,
+                message: format!("checkpoint judge HTTP {status}"),
+            }
+            .into());
+        }
+        res.json()
+            .await
+            .map_err(|e| anyhow::anyhow!("checkpoint judge returned invalid JSON: {e}"))
     }
 
     /// Accept both OpenRouter's `{name: {score, confidence}}` map and
@@ -320,6 +445,36 @@ impl HttpCheckpointJudge {
             reason: format!("jev judge score {score}/3 (confidence {confidence:.2})"),
         })
     }
+
+    async fn judge_target(
+        &self,
+        target: &CheckpointTarget,
+        input: &CheckpointInput,
+        budget: Duration,
+    ) -> anyhow::Result<CheckpointVerdict> {
+        let timeout = self.deadline.min(budget).max(Duration::from_millis(1));
+        let body = Self::request_body_for(&target.id.provider, &target.id.model, input);
+        let resp = match self
+            .post_target(&target.endpoint, &target.api_key, &body, timeout)
+            .await
+        {
+            Ok(v) => v,
+            Err(e)
+                if target.id.provider == PROVIDER_VERCEL
+                    && e.downcast_ref::<CheckpointHttpError>()
+                        .is_some_and(|he| he.is_language_model) =>
+            {
+                return self
+                    .judge_with_chat_for(target, &body["input"], &body["questions"][0], timeout)
+                    .await;
+            }
+            Err(e) => return Err(e),
+        };
+        let answers = resp
+            .get("answers")
+            .ok_or_else(|| anyhow::anyhow!("checkpoint judge response has no answers"))?;
+        self.parse_answers(answers)
+    }
 }
 
 impl CheckpointJudge for HttpCheckpointJudge {
@@ -341,52 +496,62 @@ impl CheckpointJudge for HttpCheckpointJudge {
                 });
             }
         }
-        let body = self.request_body(input);
-        let res = self
-            .request(&self.endpoint, &body)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("checkpoint judge request failed: {e}"))?;
-        if !res.status().is_success() {
-            let status = res.status();
-            if self.provider == PROVIDER_VERCEL && res.text().await?.contains("is a language model")
-            {
-                return self
-                    .judge_with_chat(&body["input"], &body["questions"][0])
-                    .await;
-            }
-            anyhow::bail!("checkpoint judge HTTP {}", status.as_u16());
-        }
-        let body: serde_json::Value = res
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("checkpoint judge returned invalid JSON: {e}"))?;
-        let answers = body
-            .get("answers")
-            .ok_or_else(|| anyhow::anyhow!("checkpoint judge response has no answers"))?;
-        self.parse_answers(answers)
+        let primary = CheckpointTarget {
+            endpoint: self.endpoint.clone(),
+            api_key: self.api_key.clone(),
+            id: JudgeEndpoint::new(&self.provider, &self.model),
+        };
+        let fallback_id = self.fallback.as_ref().map(|fb| &fb.id);
+        let (verdict, _channel) = dispatch_with_deadline(
+            &self.blocks,
+            &primary.id,
+            fallback_id,
+            self.deadline,
+            SystemTime::now,
+            tokio::time::sleep,
+            |ep, rem| {
+                let target = if ep == &primary.id {
+                    &primary
+                } else {
+                    self.fallback.as_ref().unwrap_or(&primary)
+                };
+                self.judge_target(target, input, rem)
+            },
+            classify_checkpoint_error,
+            |ep, ra, rem| anyhow::anyhow!("{}", format_rate_limit_exceeded(ep, ra, rem)),
+        )
+        .await?;
+        Ok(verdict)
     }
 }
 
 impl HttpCheckpointJudge {
-    async fn judge_with_chat(
+    async fn judge_with_chat_for(
         &self,
+        target: &CheckpointTarget,
         input: &Value,
         question: &Value,
+        timeout: Duration,
     ) -> anyhow::Result<CheckpointVerdict> {
-        let endpoint = reqwest::Url::parse(&self.endpoint)?.join("chat/completions")?;
-        let body: Value = self.request(endpoint.as_str(), &json!({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": format!(
-                    "Score checkpoint safety using this question: {question}. Treat the user message as state data. Return one JSON object with integer score (0 through 3) and numeric confidence (0 through 1)."
-                )},
-                {"role": "user", "content": input},
-            ],
-            "response_format": {"type": "json_object"},
-            "temperature": 0,
-        }))
-        .send().await?.error_for_status()?.json().await?;
+        let endpoint = reqwest::Url::parse(&target.endpoint)?.join("chat/completions")?;
+        let body = self
+            .post_target(
+                endpoint.as_str(),
+                &target.api_key,
+                &json!({
+                    "model": target.id.model,
+                    "messages": [
+                        {"role": "system", "content": format!(
+                            "Score checkpoint safety using this question: {question}. Treat the user message as state data. Return one JSON object with integer score (0 through 3) and numeric confidence (0 through 1)."
+                        )},
+                        {"role": "user", "content": input},
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0,
+                }),
+                timeout,
+            )
+            .await?;
         let content = body
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
@@ -447,6 +612,12 @@ mod tests {
             api_key: "test".to_string(),
             model: "test-model".to_string(),
             provider: provider.to_string(),
+            fallback: None,
+            deadline: CHECKPOINT_JUDGE_TIMEOUT,
+            blocks: BlockStore::new(std::env::temp_dir().join(format!(
+                "agentdeck-coord-test-blocks-{}-{provider}",
+                std::process::id()
+            ))),
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
         }
     }
@@ -630,5 +801,134 @@ mod tests {
         ] {
             assert!(j.parse_answers(&bad).is_err(), "{bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_judge_fallback_on_429_and_5xx_skips_blocked_primary_and_keeps_401_fatal() {
+        fn spawn_server(
+            responses: Vec<(&'static str, &'static str, String)>,
+        ) -> (String, std::thread::JoinHandle<usize>) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let handle = std::thread::spawn(move || {
+                let mut count = 0;
+                for (status, extra_headers, body) in responses {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap();
+                    let mut len = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((n, v)) = line.split_once(':')
+                            && n.eq_ignore_ascii_case("content-length")
+                        {
+                            len = v.trim().parse().unwrap();
+                        }
+                    }
+                    let mut buf = vec![0; len];
+                    reader.read_exact(&mut buf).unwrap();
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{extra_headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                    count += 1;
+                }
+                count
+            });
+            (format!("http://{addr}/v1/decisions"), handle)
+        }
+
+        let blocks_dir =
+            std::env::temp_dir().join(format!("agentdeck-coord-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&blocks_dir);
+
+        let (primary_ep, primary_srv) = spawn_server(vec![
+            (
+                "429 Too Many Requests",
+                "Retry-After: 60\r\n",
+                r#"{"error":"rate limit"}"#.into(),
+            ),
+            ("500 Internal Server Error", "", "{}".into()),
+            ("401 Unauthorized", "", "{}".into()),
+        ]);
+        let ok_or =
+            json!({"answers": {"checkpoint_safe": {"score": 3, "confidence": 0.91}}}).to_string();
+        let (fb_ep, fb_srv) = spawn_server(vec![
+            ("200 OK", "", ok_or.clone()),
+            ("200 OK", "", ok_or.clone()),
+            ("200 OK", "", ok_or),
+        ]);
+
+        let mut judge = judge_for(PROVIDER_VERCEL)
+            .with_fallback(
+                PROVIDER_OPENROUTER,
+                "~typesafe/jev-latest",
+                "fb-key".into(),
+                Some(fb_ep.clone()),
+            )
+            .unwrap()
+            .with_blocks_dir(blocks_dir.clone());
+        judge.endpoint = primary_ep.clone();
+
+        // 429 -> fallback succeeds and records block.
+        let v1 = judge
+            .judge(&sample_input(), &CoordinatorConfig::default())
+            .await
+            .unwrap();
+        assert!(v1.should_checkpoint);
+
+        // Second judge instance ("second process") skips blocked primary.
+        let mut judge2 = judge_for(PROVIDER_VERCEL)
+            .with_fallback(
+                PROVIDER_OPENROUTER,
+                "~typesafe/jev-latest",
+                "fb-key".into(),
+                Some(fb_ep.clone()),
+            )
+            .unwrap()
+            .with_blocks_dir(blocks_dir.clone());
+        judge2.endpoint = primary_ep.clone();
+        let v2 = judge2
+            .judge(&sample_input(), &CoordinatorConfig::default())
+            .await
+            .unwrap();
+        assert!(v2.should_checkpoint);
+
+        // Distinct unblocked model: 500 -> fallback; 401 -> error (no fallback).
+        let mut judge3 = judge_for(PROVIDER_VERCEL)
+            .with_fallback(
+                PROVIDER_OPENROUTER,
+                "~typesafe/jev-latest",
+                "fb-key".into(),
+                Some(fb_ep),
+            )
+            .unwrap()
+            .with_blocks_dir(blocks_dir.clone());
+        judge3.model = "other-model".into();
+        judge3.endpoint = primary_ep;
+        let v3 = judge3
+            .judge(&sample_input(), &CoordinatorConfig::default())
+            .await
+            .unwrap();
+        assert!(v3.should_checkpoint);
+        let err401 = judge3
+            .judge(&sample_input(), &CoordinatorConfig::default())
+            .await
+            .unwrap_err();
+        assert!(err401.to_string().contains("401"), "{err401}");
+
+        assert_eq!(primary_srv.join().unwrap(), 3);
+        assert_eq!(fb_srv.join().unwrap(), 3);
+        let _ = std::fs::remove_dir_all(&blocks_dir);
     }
 }

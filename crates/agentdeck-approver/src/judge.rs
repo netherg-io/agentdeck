@@ -7,8 +7,13 @@
 
 use std::fmt;
 use std::future::Future;
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
+use agentdeck_core::judge::{
+    BlockStore, FallbackTrigger, JudgeChannel, JudgeEndpoint, classify_http_status,
+    dispatch_with_deadline, parse_retry_after,
+};
 use agentdeck_core::settings::{DEFAULT_DECISION_MODEL, PROVIDER_OPENROUTER, PROVIDER_VERCEL};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -17,6 +22,8 @@ use serde_json::{Value, json};
 use crate::perimeter::{ApprovalRequest, MandateContext};
 
 pub const JUDGE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Default end-to-end deadline for approver judge evaluation (including 429 wait / fallback).
+pub const DEFAULT_JUDGE_DEADLINE: Duration = Duration::from_secs(10);
 const OPENROUTER_BASE: &str = "https://openrouter.ai";
 const VERCEL_BASE: &str = "https://ai-gateway.vercel.sh";
 
@@ -25,6 +32,9 @@ const VERCEL_BASE: &str = "https://ai-gateway.vercel.sh";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JudgeError {
     Network,
+    RateLimited {
+        retry_after: Duration,
+    },
     HttpStatus {
         status: u16,
         is_language_model: bool,
@@ -32,10 +42,22 @@ pub enum JudgeError {
     Parse,
 }
 
+impl JudgeError {
+    pub fn trigger(self) -> FallbackTrigger {
+        match self {
+            Self::Network => FallbackTrigger::Transient,
+            Self::RateLimited { retry_after } => FallbackTrigger::RateLimited { retry_after },
+            Self::HttpStatus { status, .. } => classify_http_status(status, None),
+            Self::Parse => FallbackTrigger::None,
+        }
+    }
+}
+
 impl fmt::Display for JudgeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Network => write!(f, "judge_error_network"),
+            Self::RateLimited { .. } => write!(f, "judge_http_status_429"),
             Self::HttpStatus { status, .. } => write!(f, "judge_http_status_{status}"),
             Self::Parse => write!(f, "judge_error_parse"),
         }
@@ -49,6 +71,8 @@ pub struct JudgeVerdict {
     pub allow: bool,
     pub confidence: f64,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<JudgeChannel>,
 }
 
 /// Fail-closed auto-approval predicate. Any NaN, infinite, out-of-range, or
@@ -104,29 +128,25 @@ pub fn build_judge_prompt(req: &ApprovalRequest, mandate: &MandateContext) -> (S
 }
 
 #[derive(Clone)]
-pub struct HttpPolicyJudge {
-    client: reqwest::Client,
-    provider: String,
-    model: String,
+struct JudgeTarget {
+    endpoint: JudgeEndpoint,
     api_key: String,
     base_url: Option<String>,
-    timeout: Duration,
 }
 
-impl fmt::Debug for HttpPolicyJudge {
+impl fmt::Debug for JudgeTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HttpPolicyJudge")
-            .field("provider", &self.provider)
-            .field("model", &self.model)
+        f.debug_struct("JudgeTarget")
+            .field("provider", &self.endpoint.provider)
+            .field("model", &self.endpoint.model)
             .field("api_key", &"[REDACTED]")
             .field("base_url", &self.base_url)
-            .field("timeout", &self.timeout)
             .finish()
     }
 }
 
-impl HttpPolicyJudge {
-    pub fn new(provider: Option<String>, model: Option<String>, api_key: String) -> Result<Self> {
+impl JudgeTarget {
+    fn new(provider: Option<String>, model: Option<String>, api_key: String) -> Result<Self> {
         let provider = provider.unwrap_or_else(|| PROVIDER_OPENROUTER.to_string());
         if provider != PROVIDER_OPENROUTER && provider != PROVIDER_VERCEL {
             bail!("unsupported policy judge provider {provider:?}");
@@ -141,26 +161,83 @@ impl HttpPolicyJudge {
         if api_key.trim().is_empty() {
             bail!("policy judge api_key must not be empty");
         }
+        Ok(Self {
+            endpoint: JudgeEndpoint::new(provider, model),
+            api_key,
+            base_url: None,
+        })
+    }
+
+    fn effective_base(&self) -> &str {
+        if let Some(base) = &self.base_url {
+            return base;
+        }
+        if self.endpoint.provider == PROVIDER_VERCEL {
+            VERCEL_BASE
+        } else {
+            OPENROUTER_BASE
+        }
+    }
+}
+
+fn is_loopback(url: &str) -> bool {
+    url.starts_with("http://127.0.0.1")
+        || url.starts_with("http://[::1]")
+        || url.starts_with("http://localhost")
+}
+
+#[derive(Clone)]
+pub struct HttpPolicyJudge {
+    client: reqwest::Client,
+    primary: JudgeTarget,
+    fallback: Option<JudgeTarget>,
+    timeout: Duration,
+    deadline: Duration,
+    blocks: BlockStore,
+}
+
+impl fmt::Debug for HttpPolicyJudge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpPolicyJudge")
+            .field("primary", &self.primary)
+            .field("fallback", &self.fallback)
+            .field("timeout", &self.timeout)
+            .field("deadline", &self.deadline)
+            .finish()
+    }
+}
+
+impl HttpPolicyJudge {
+    pub fn new(provider: Option<String>, model: Option<String>, api_key: String) -> Result<Self> {
+        let primary = JudgeTarget::new(provider, model, api_key)?;
         let client = reqwest::Client::builder()
             .timeout(JUDGE_TIMEOUT)
             .build()
             .context("failed to build policy judge HTTP client")?;
         Ok(Self {
             client,
-            provider,
-            model,
-            api_key,
-            base_url: None,
+            primary,
+            fallback: None,
             timeout: JUDGE_TIMEOUT,
+            deadline: DEFAULT_JUDGE_DEADLINE,
+            blocks: BlockStore::default_runtime(),
         })
+    }
+
+    pub fn with_fallback(
+        mut self,
+        provider: &str,
+        model: Option<String>,
+        api_key: String,
+    ) -> Result<Self> {
+        let target = JudgeTarget::new(Some(provider.to_string()), model, api_key)?;
+        self.fallback = Some(target);
+        Ok(self)
     }
 
     pub fn with_base_url(mut self, base_url: String) -> Self {
         let trimmed = base_url.trim_end_matches('/').to_string();
-        let is_loopback = trimmed.starts_with("http://127.0.0.1")
-            || trimmed.starts_with("http://[::1]")
-            || trimmed.starts_with("http://localhost");
-        if is_loopback
+        if is_loopback(&trimmed)
             && let Ok(client) = reqwest::Client::builder()
                 .timeout(self.timeout)
                 .no_proxy()
@@ -168,7 +245,23 @@ impl HttpPolicyJudge {
         {
             self.client = client;
         }
-        self.base_url = Some(trimmed);
+        self.primary.base_url = Some(trimmed);
+        self
+    }
+
+    pub fn with_fallback_base_url(mut self, base_url: String) -> Self {
+        let trimmed = base_url.trim_end_matches('/').to_string();
+        if is_loopback(&trimmed)
+            && let Ok(client) = reqwest::Client::builder()
+                .timeout(self.timeout)
+                .no_proxy()
+                .build()
+        {
+            self.client = client;
+        }
+        if let Some(fb) = &mut self.fallback {
+            fb.base_url = Some(trimmed);
+        }
         self
     }
 
@@ -177,23 +270,28 @@ impl HttpPolicyJudge {
         self
     }
 
-    fn effective_base(&self) -> &str {
-        if let Some(base) = &self.base_url {
-            return base;
-        }
-        if self.provider == PROVIDER_VERCEL {
-            VERCEL_BASE
-        } else {
-            OPENROUTER_BASE
-        }
+    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
     }
 
-    async fn post_json(&self, url: &str, body: &Value) -> Result<Value> {
+    pub fn with_blocks_dir(mut self, dir: PathBuf) -> Self {
+        self.blocks = BlockStore::new(dir);
+        self
+    }
+
+    async fn post_json(
+        &self,
+        api_key: &str,
+        url: &str,
+        body: &Value,
+        timeout: Duration,
+    ) -> Result<Value> {
         let res = self
             .client
             .post(url)
-            .timeout(self.timeout)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .timeout(timeout)
+            .header("Authorization", format!("Bearer {api_key}"))
             .header("Content-Type", "application/json")
             .json(body)
             .send()
@@ -201,18 +299,84 @@ impl HttpPolicyJudge {
             .map_err(|_| JudgeError::Network)?;
         let status = res.status();
         if !status.is_success() {
+            let code = status.as_u16();
+            if code == 429 {
+                let retry_after = parse_retry_after(
+                    res.headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok()),
+                );
+                return Err(JudgeError::RateLimited { retry_after }.into());
+            }
             // Inspect body only for the Vercel chat fallback sentinel; never leak body text.
             let is_language_model = res
                 .text()
                 .await
                 .is_ok_and(|text| text.contains("is a language model"));
             return Err(JudgeError::HttpStatus {
-                status: status.as_u16(),
+                status: code,
                 is_language_model,
             }
             .into());
         }
         res.json().await.map_err(|_| JudgeError::Parse.into())
+    }
+
+    async fn evaluate_target(
+        &self,
+        target: &JudgeTarget,
+        system: &str,
+        input: &Value,
+        budget: Duration,
+    ) -> Result<JudgeVerdict> {
+        let base = target.effective_base();
+        let req_timeout = self.timeout.min(budget).max(Duration::from_millis(1));
+
+        if target.endpoint.provider == PROVIDER_VERCEL {
+            let decisions_url = format!("{base}/v1/decisions");
+            let body = vercel_decisions_body(&target.endpoint.model, system, input);
+            match self
+                .post_json(&target.api_key, &decisions_url, &body, req_timeout)
+                .await
+            {
+                Ok(v) => return parse_decisions_verdict(&v),
+                Err(e)
+                    if e.downcast_ref::<JudgeError>().is_some_and(|je| {
+                        matches!(
+                            je,
+                            JudgeError::HttpStatus {
+                                is_language_model: true,
+                                ..
+                            }
+                        )
+                    }) => {}
+                Err(e) => return Err(e),
+            }
+            let chat_url = format!("{base}/v1/chat/completions");
+            let chat_body = chat_completions_body(&target.endpoint.model, system, input);
+            let v = self
+                .post_json(&target.api_key, &chat_url, &chat_body, req_timeout)
+                .await?;
+            return parse_chat_verdict(&v);
+        }
+
+        // OpenRouter: decision models (`~...` like `~typesafe/jev-latest`) use
+        // `/api/alpha/decisions`; standard chat models use `/api/v1/chat/completions`.
+        if target.endpoint.model.starts_with('~') {
+            let url = format!("{base}/api/alpha/decisions");
+            let body = openrouter_decisions_body(&target.endpoint.model, system, input);
+            let v = self
+                .post_json(&target.api_key, &url, &body, req_timeout)
+                .await?;
+            parse_decisions_verdict(&v)
+        } else {
+            let url = format!("{base}/api/v1/chat/completions");
+            let body = chat_completions_body(&target.endpoint.model, system, input);
+            let v = self
+                .post_json(&target.api_key, &url, &body, req_timeout)
+                .await?;
+            parse_chat_verdict(&v)
+        }
     }
 }
 
@@ -314,6 +478,7 @@ pub fn parse_decisions_verdict(response: &Value) -> Result<JudgeVerdict> {
         allow,
         confidence,
         reason,
+        channel: None,
     })
 }
 
@@ -348,6 +513,7 @@ pub fn parse_chat_verdict(response: &Value) -> Result<JudgeVerdict> {
         } else {
             "judge_denied".to_string()
         },
+        channel: None,
     })
 }
 
@@ -358,44 +524,31 @@ impl PolicyJudge for HttpPolicyJudge {
         mandate: &MandateContext,
     ) -> Result<JudgeVerdict> {
         let (system, input) = build_judge_prompt(req, mandate);
-        let base = self.effective_base();
-
-        if self.provider == PROVIDER_VERCEL {
-            let decisions_url = format!("{base}/v1/decisions");
-            let body = vercel_decisions_body(&self.model, &system, &input);
-            match self.post_json(&decisions_url, &body).await {
-                Ok(v) => return parse_decisions_verdict(&v),
-                Err(e)
-                    if e.downcast_ref::<JudgeError>().is_some_and(|je| {
-                        matches!(
-                            je,
-                            JudgeError::HttpStatus {
-                                is_language_model: true,
-                                ..
-                            }
-                        )
-                    }) => {}
-                Err(e) => return Err(e),
-            }
-            let chat_url = format!("{base}/v1/chat/completions");
-            let chat_body = chat_completions_body(&self.model, &system, &input);
-            let v = self.post_json(&chat_url, &chat_body).await?;
-            return parse_chat_verdict(&v);
-        }
-
-        // OpenRouter: decision models (`~...` like `~typesafe/jev-latest`) use
-        // `/api/alpha/decisions`; standard chat models use `/api/v1/chat/completions`.
-        if self.model.starts_with('~') {
-            let url = format!("{base}/api/alpha/decisions");
-            let body = openrouter_decisions_body(&self.model, &system, &input);
-            let v = self.post_json(&url, &body).await?;
-            parse_decisions_verdict(&v)
-        } else {
-            let url = format!("{base}/api/v1/chat/completions");
-            let body = chat_completions_body(&self.model, &system, &input);
-            let v = self.post_json(&url, &body).await?;
-            parse_chat_verdict(&v)
-        }
+        let fallback_ep = self.fallback.as_ref().map(|fb| &fb.endpoint);
+        let (mut verdict, channel) = dispatch_with_deadline(
+            &self.blocks,
+            &self.primary.endpoint,
+            fallback_ep,
+            self.deadline,
+            SystemTime::now,
+            tokio::time::sleep,
+            |ep, rem| {
+                let target = if ep == &self.primary.endpoint {
+                    &self.primary
+                } else {
+                    self.fallback.as_ref().unwrap_or(&self.primary)
+                };
+                self.evaluate_target(target, &system, &input, rem)
+            },
+            |err| {
+                err.downcast_ref::<JudgeError>()
+                    .map_or(FallbackTrigger::None, |je| je.trigger())
+            },
+            |_ep, retry_after, _rem| JudgeError::RateLimited { retry_after }.into(),
+        )
+        .await?;
+        verdict.channel = Some(channel);
+        Ok(verdict)
     }
 }
 
@@ -464,6 +617,7 @@ mod tests {
                 allow: true,
                 confidence: 0.85,
                 reason: "ok".into(),
+                channel: None,
             },
             0.85
         ));
@@ -472,6 +626,7 @@ mod tests {
                 allow: true,
                 confidence: 0.849,
                 reason: "low".into(),
+                channel: None,
             },
             0.85
         ));
@@ -480,6 +635,7 @@ mod tests {
                 allow: true,
                 confidence: f64::NAN,
                 reason: "nan".into(),
+                channel: None,
             },
             0.85
         ));
@@ -488,6 +644,7 @@ mod tests {
                 allow: false,
                 confidence: 1.0,
                 reason: "deny".into(),
+                channel: None,
             },
             0.85
         ));
@@ -496,6 +653,7 @@ mod tests {
                 allow: true,
                 confidence: 0.99,
                 reason: "bad threshold".into(),
+                channel: None,
             },
             f64::NAN
         ));
@@ -663,5 +821,221 @@ mod tests {
         let paths = server.await.unwrap();
         assert!(paths[2].contains("/v1/decisions"));
         assert!(paths[3].contains("/v1/chat/completions"));
+    }
+
+    async fn mock_judge_server_with_headers(
+        responses: Vec<(&'static str, &'static str, String)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<(String, Value)>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for (status, extra_headers, body) in responses {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut first = String::new();
+                stream.read_line(&mut first).await.unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        size = value.trim().parse().unwrap();
+                    }
+                }
+                let mut req_body = vec![0; size];
+                stream.read_exact(&mut req_body).await.unwrap();
+                let parsed: Value = serde_json::from_slice(&req_body).unwrap_or(Value::Null);
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                seen.push((first, parsed));
+            }
+            seen
+        });
+        (base, task)
+    }
+
+    #[tokio::test]
+    async fn fallback_on_429_uses_provider_body_and_honours_cross_process_block() {
+        let blocks_dir =
+            std::env::temp_dir().join(format!("agentdeck-approver-blocks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&blocks_dir);
+
+        // Primary (Vercel) replies 429 Retry-After: 60 once; must NOT be called a second time.
+        let (primary_base, primary_srv) = mock_judge_server_with_headers(vec![(
+            "429 Too Many Requests",
+            "Retry-After: 60\r\n",
+            r#"{"error":"rate limit"}"#.to_string(),
+        )])
+        .await;
+        // Fallback (OpenRouter chat model) answers both requests via chat/completions.
+        let chat_ok = json!({
+            "choices": [{"message": {"content": r#"{"allow": true, "confidence": 0.94, "reason": "ok"}"#}}]
+        })
+        .to_string();
+        let (fb_base, fb_srv) = mock_judge_server_with_headers(vec![
+            ("200 OK", "", chat_ok.clone()),
+            ("200 OK", "", chat_ok),
+        ])
+        .await;
+
+        let req: ApprovalRequest = serde_json::from_value(json!({
+            "kind": "confirm",
+            "title": "Redeploy",
+            "text": "staging",
+            "host": "local",
+            "thread_id": "t-1"
+        }))
+        .unwrap();
+        let mandate = MandateContext {
+            active_autonomous_run: true,
+            owner_granted: true,
+            thread_id: Some("t-1".into()),
+            ..Default::default()
+        };
+
+        let judge1 = HttpPolicyJudge::new(
+            Some(PROVIDER_VERCEL.into()),
+            Some("perplexity/pplx-decider-v1.2".into()),
+            "primary-key".into(),
+        )
+        .unwrap()
+        .with_fallback(
+            PROVIDER_OPENROUTER,
+            Some("openai/gpt-4o-mini".into()),
+            "fb-key".into(),
+        )
+        .unwrap()
+        .with_base_url(primary_base.clone())
+        .with_fallback_base_url(fb_base.clone())
+        .with_blocks_dir(blocks_dir.clone());
+
+        // Debug must redact fallback key too.
+        let dbg = format!("{judge1:?}");
+        assert!(!dbg.contains("primary-key") && !dbg.contains("fb-key"));
+
+        let v1 = judge1.evaluate(&req, &mandate).await.unwrap();
+        assert!(v1.allow);
+        assert_eq!(v1.channel, Some(JudgeChannel::Fallback));
+
+        // Second independent judge instance ("second process") sees the cross-process block
+        // and goes straight to fallback without calling primary.
+        let judge2 = HttpPolicyJudge::new(
+            Some(PROVIDER_VERCEL.into()),
+            Some("perplexity/pplx-decider-v1.2".into()),
+            "primary-key".into(),
+        )
+        .unwrap()
+        .with_fallback(
+            PROVIDER_OPENROUTER,
+            Some("openai/gpt-4o-mini".into()),
+            "fb-key".into(),
+        )
+        .unwrap()
+        .with_base_url(primary_base)
+        .with_fallback_base_url(fb_base)
+        .with_blocks_dir(blocks_dir.clone());
+
+        let v2 = judge2.evaluate(&req, &mandate).await.unwrap();
+        assert!(v2.allow);
+        assert_eq!(v2.channel, Some(JudgeChannel::Fallback));
+
+        let primary_seen = primary_srv.await.unwrap();
+        assert_eq!(primary_seen.len(), 1);
+        assert!(primary_seen[0].0.contains("/v1/decisions"));
+        assert!(
+            primary_seen[0].1.get("input").is_some(),
+            "Vercel decisions shape"
+        );
+
+        let fb_seen = fb_srv.await.unwrap();
+        assert_eq!(fb_seen.len(), 2);
+        assert!(fb_seen[0].0.contains("/api/v1/chat/completions"));
+        assert_eq!(fb_seen[0].1["model"], "openai/gpt-4o-mini");
+        assert!(
+            fb_seen[0].1.get("messages").is_some(),
+            "OpenRouter chat shape"
+        );
+
+        let _ = std::fs::remove_dir_all(&blocks_dir);
+    }
+
+    #[tokio::test]
+    async fn approver_falls_back_on_5xx_but_not_on_401_or_parse() {
+        let blocks_dir = std::env::temp_dir().join(format!(
+            "agentdeck-approver-classify-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&blocks_dir);
+
+        let (primary_base, primary_srv) = mock_judge_server_with_headers(vec![
+            ("502 Bad Gateway", "", "{}".into()),
+            ("401 Unauthorized", "", "{}".into()),
+            ("200 OK", "", "not-json".into()),
+        ])
+        .await;
+        let (fb_base, fb_srv) = mock_judge_server_with_headers(vec![(
+            "200 OK",
+            "",
+            json!({"answers": {"permit": {"score": 1, "confidence": 0.93}}}).to_string(),
+        )])
+        .await;
+
+        let req: ApprovalRequest = serde_json::from_value(json!({
+            "kind": "confirm",
+            "title": "Redeploy",
+            "text": "staging",
+            "host": "local",
+            "thread_id": "t-1"
+        }))
+        .unwrap();
+        let mandate = MandateContext {
+            active_autonomous_run: true,
+            owner_granted: true,
+            thread_id: Some("t-1".into()),
+            ..Default::default()
+        };
+
+        let judge = HttpPolicyJudge::new(
+            Some(PROVIDER_VERCEL.into()),
+            Some("perplexity/pplx-decider-v1.2".into()),
+            "k1".into(),
+        )
+        .unwrap()
+        .with_fallback(PROVIDER_OPENROUTER, None, "k2".into())
+        .unwrap()
+        .with_base_url(primary_base)
+        .with_fallback_base_url(fb_base)
+        .with_blocks_dir(blocks_dir.clone());
+
+        // 502 -> fallback succeeds.
+        let v = judge.evaluate(&req, &mandate).await.unwrap();
+        assert_eq!(v.channel, Some(JudgeChannel::Fallback));
+
+        // 401 -> no fallback.
+        let err401 = judge.evaluate(&req, &mandate).await.unwrap_err();
+        assert_eq!(err401.to_string(), "judge_http_status_401");
+
+        // Parse error -> no fallback.
+        let err_parse = judge.evaluate(&req, &mandate).await.unwrap_err();
+        assert_eq!(err_parse.to_string(), "judge_error_parse");
+
+        assert_eq!(primary_srv.await.unwrap().len(), 3);
+        assert_eq!(fb_srv.await.unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&blocks_dir);
     }
 }

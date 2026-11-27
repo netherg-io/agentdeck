@@ -99,6 +99,7 @@ pub fn format_utc_rfc3339(secs: i64) -> String {
 /// Convert `[coordinator]` registry settings into `agentdeck_coordinator::CoordinatorConfig`.
 pub fn coordinator_config(reg: &Registry) -> anyhow::Result<CoordinatorConfig> {
     let s = settings::read_coordinator(reg)?;
+    let judge_fallback = settings::read_judge_fallback(reg)?;
     Ok(CoordinatorConfig {
         pool: s
             .pool
@@ -122,6 +123,7 @@ pub fn coordinator_config(reg: &Registry) -> anyhow::Result<CoordinatorConfig> {
         t3_token_file: s.t3_token_file,
         judge_provider: s.judge_provider,
         judge_model: s.judge_model,
+        judge_fallback,
     })
 }
 

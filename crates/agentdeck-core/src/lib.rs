@@ -7,6 +7,7 @@ pub mod claude;
 pub mod codex;
 pub mod harness;
 pub mod imagegen;
+pub mod judge;
 pub mod launch;
 pub mod login;
 pub mod manage;

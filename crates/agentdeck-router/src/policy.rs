@@ -4,7 +4,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use agentdeck_core::settings::UserRules;
+use agentdeck_core::settings::{JudgeFallbackSettings, UserRules};
 
 pub const MIN_FIT: f64 = 0.7;
 pub const TARGET_MARGIN: f64 = 0.02;
@@ -327,6 +327,8 @@ pub struct RouterConfig {
     pub decision_model: Option<String>,
     /// `"vercel"` sends the judgment through Vercel AI Gateway; else OpenRouter.
     pub decision_provider: Option<String>,
+    /// Shared optional `[judge_fallback]` channel; absent means no fallback.
+    pub judge_fallback: JudgeFallbackSettings,
     /// Opt-in automatic evaluation of settled workflow tasks; default off.
     pub workflow_eval: WorkflowEvalConfig,
     /// Persistent user model restrictions; defaults preserve the Argon
@@ -498,6 +500,8 @@ pub(crate) fn parse_router_config(data: Value, source: &str) -> anyhow::Result<R
             .get("decisionProvider")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        judge_fallback: JudgeFallbackSettings::from_json(data.get("judgeFallback"))
+            .map_err(|e| fail(format!("bad judgeFallback: {e}")))?,
         workflow_eval: parse_workflow_eval(&data),
         user_rules: UserRules::from_json(data.get("userRules"))
             .map_err(|e| fail(format!("bad userRules: {e}")))?,
@@ -1410,6 +1414,7 @@ mod unknown_models_tests {
                 usage_state_path: None,
                 decision_model: None,
                 decision_provider: None,
+                judge_fallback: JudgeFallbackSettings::default(),
                 workflow_eval: WorkflowEvalConfig::default(),
                 user_rules: UserRules::default(),
                 account: std::collections::HashMap::new(),
@@ -1539,6 +1544,7 @@ mod legacy_suite_edges {
             usage_state_path: None,
             decision_model: None,
             decision_provider: None,
+            judge_fallback: JudgeFallbackSettings::default(),
             workflow_eval: WorkflowEvalConfig::default(),
             user_rules: UserRules::default(),
             account: accounts

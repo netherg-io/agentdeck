@@ -182,6 +182,7 @@ impl<J: PolicyJudge> PolicyJudge for DynamicPolicyJudge<J> {
                 allow: false,
                 confidence: 0.0,
                 reason: "mandate_not_granted".to_string(),
+                channel: None,
             });
         }
         let Some(inner) = &self.inner else {
@@ -189,6 +190,7 @@ impl<J: PolicyJudge> PolicyJudge for DynamicPolicyJudge<J> {
                 allow: false,
                 confidence: 0.0,
                 reason: "judge_unconfigured".to_string(),
+                channel: None,
             });
         };
         inner.evaluate(req, mandate).await
@@ -362,6 +364,8 @@ struct ApproverSpec {
     bot_token: String,
     owner_id: i64,
     judge_key: Option<String>,
+    judge_fallback: agentdeck_core::settings::JudgeFallbackSettings,
+    fallback_judge_key: Option<String>,
 }
 
 enum SupervisorState<S> {
@@ -416,20 +420,33 @@ fn load_approver_spec(paths: &Paths) -> SupervisorState<ApproverSpec> {
             secrets_path.display()
         ));
     };
+    let judge_fallback = match agentdeck_core::settings::read_judge_fallback(&reg) {
+        Ok(fb) => fb,
+        Err(e) => {
+            return SupervisorState::KeepCurrent(format!(
+                "agentdeck approver: invalid [judge_fallback] config: {e:#}"
+            ));
+        }
+    };
     let provider = cfg.judge_provider.as_deref().unwrap_or(PROVIDER_OPENROUTER);
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let judge_key = secrets
-        .judge_api_key(provider)
-        .map(str::to_string)
-        .or_else(|| {
+    let resolve_key = |prov: &str| {
+        secrets.judge_api_key(prov).map(str::to_string).or_else(|| {
             home.as_deref()
-                .and_then(|h| agentdeck_core::imagegen::gateway_key(&reg, h, provider))
-        });
+                .and_then(|h| agentdeck_core::imagegen::gateway_key(&reg, h, prov))
+        })
+    };
+    let judge_key = resolve_key(provider);
+    let fallback_judge_key = judge_fallback
+        .endpoint()
+        .and_then(|ep| resolve_key(&ep.provider));
     SupervisorState::Active(ApproverSpec {
         cfg,
         bot_token,
         owner_id,
         judge_key,
+        judge_fallback,
+        fallback_judge_key,
     })
 }
 
@@ -448,7 +465,34 @@ fn spawn_prod_broker(paths: &Paths, spec: &ApproverSpec) -> anyhow::Result<Runni
             spec.cfg.judge_model.clone(),
             key.clone(),
         ) {
-            Ok(j) => Some(j),
+            Ok(mut j) => {
+                if let Some(fb) = spec.judge_fallback.endpoint() {
+                    match &spec.fallback_judge_key {
+                        Some(fb_key) => {
+                            match j.with_fallback(&fb.provider, Some(fb.model), fb_key.clone()) {
+                                Ok(with_fb) => j = with_fb,
+                                Err(e) => {
+                                    eprintln!(
+                                        "agentdeck approver: Policy Judge fallback disabled ({e:#})"
+                                    );
+                                    j = HttpPolicyJudge::new(
+                                        spec.cfg.judge_provider.clone(),
+                                        spec.cfg.judge_model.clone(),
+                                        key.clone(),
+                                    )?;
+                                }
+                            }
+                        }
+                        None => {
+                            eprintln!(
+                                "agentdeck approver: no API key for fallback judge {}; fallback disabled",
+                                fb.provider
+                            );
+                        }
+                    }
+                }
+                Some(j)
+            }
             Err(e) => {
                 eprintln!(
                     "agentdeck approver: Policy Judge disabled ({e:#}); escalating to Telegram"
@@ -775,6 +819,7 @@ struct CachedController {
 struct JudgeKey {
     provider: Option<String>,
     model: Option<String>,
+    fallback: agentdeck_core::settings::JudgeFallbackSettings,
 }
 
 struct CachedCheckpointJudge {
@@ -843,6 +888,7 @@ async fn run_watchdog_task(paths: Paths, mut shutdown: watch::Receiver<bool>) {
         let judge_key = JudgeKey {
             provider: cfg.judge_provider.clone(),
             model: cfg.judge_model.clone(),
+            fallback: cfg.judge_fallback.clone(),
         };
         if cached_judge.as_ref().is_none_or(|j| j.key != judge_key) {
             cached_judge =
@@ -1016,6 +1062,7 @@ mod tests {
                 allow: true,
                 confidence: 0.99,
                 reason: "mock_allow".to_string(),
+                channel: None,
             })
         }
     }
@@ -1042,6 +1089,7 @@ mod tests {
                 allow: true,
                 confidence: 0.99,
                 reason: "mock_allow".to_string(),
+                channel: None,
             })
         }
     }

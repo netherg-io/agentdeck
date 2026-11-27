@@ -308,6 +308,10 @@ pub fn router_json_value(reg: &Registry) -> anyhow::Result<Value> {
     if let Some(model) = settings.decision_model {
         root.insert("decisionModel".into(), Value::String(model));
     }
+    let fallback = crate::settings::read_judge_fallback(reg)?;
+    if let Some(fb) = fallback.to_json() {
+        root.insert("judgeFallback".into(), fb);
+    }
     // Visible to the GUI and route output; invalid rules fail closed here so
     // a bad edit never ships a router.json that silently drops the ban.
     // Excluded from `content_version` on purpose: rules change eligibility,

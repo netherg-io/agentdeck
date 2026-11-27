@@ -1234,44 +1234,116 @@ fn gateway_answers(response: &Value) -> anyhow::Result<Value> {
     serde_json::from_str(json).map_err(|e| anyhow::anyhow!("gateway answer is not JSON: {e}"))
 }
 
-async fn post_json(url: &str, key: &str, body: String) -> anyhow::Result<Value> {
-    let res = reqwest::Client::new()
+const OPENROUTER_BASE: &str = "https://openrouter.ai";
+const VERCEL_BASE: &str = "https://ai-gateway.vercel.sh";
+const JEV_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Debug)]
+struct JevHttpError {
+    trigger: agentdeck_core::judge::FallbackTrigger,
+    is_language_model: bool,
+    message: String,
+}
+
+impl std::fmt::Display for JevHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for JevHttpError {}
+
+fn classify_jev_error(err: &anyhow::Error) -> agentdeck_core::judge::FallbackTrigger {
+    if let Some(http) = err.downcast_ref::<JevHttpError>() {
+        return http.trigger;
+    }
+    if let Some(rl) = err.downcast_ref::<crate::jev_queue::RateLimited>() {
+        return agentdeck_core::judge::FallbackTrigger::RateLimited {
+            retry_after: rl.retry_after,
+        };
+    }
+    agentdeck_core::judge::FallbackTrigger::None
+}
+
+#[derive(Clone, Debug)]
+struct JevBases {
+    openrouter: String,
+    vercel: String,
+}
+
+impl Default for JevBases {
+    fn default() -> Self {
+        Self {
+            openrouter: OPENROUTER_BASE.to_string(),
+            vercel: VERCEL_BASE.to_string(),
+        }
+    }
+}
+
+fn is_loopback_url(url: &str) -> bool {
+    url.starts_with("http://127.0.0.1")
+        || url.starts_with("http://[::1]")
+        || url.starts_with("http://localhost")
+}
+
+async fn post_json(
+    url: &str,
+    key: &str,
+    body: String,
+    timeout: std::time::Duration,
+) -> anyhow::Result<Value> {
+    let mut builder = reqwest::Client::builder();
+    if is_loopback_url(url) {
+        builder = builder.no_proxy();
+    }
+    let client = builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("Jev client build failed: {e}"))?;
+    let res = client
         .post(url)
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(timeout)
         .header("Authorization", format!("Bearer {key}"))
         .header("Content-Type", "application/json")
         .body(body)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("Jev request failed: {e}"))?;
+        .map_err(|e| JevHttpError {
+            trigger: agentdeck_core::judge::FallbackTrigger::Transient,
+            is_language_model: false,
+            message: format!("Jev request failed: {e}"),
+        })?;
     if !res.status().is_success() {
         let status = res.status().as_u16();
-        let retry_after = res
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok()?.trim().parse::<u64>().ok());
+        let retry_after = (status == 429).then(|| {
+            agentdeck_core::judge::parse_retry_after(
+                res.headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+            )
+        });
         let text = res.text().await.unwrap_or_default();
+        let is_language_model = text.contains("is a language model");
         let snippet: String = text.chars().take(300).collect();
         let message = format!("Jev HTTP {status}: {snippet}");
-        if status == 429 {
-            return Err(crate::jev_queue::RateLimited {
-                retry_after: std::time::Duration::from_secs(retry_after.unwrap_or(30)),
-                message,
-            }
-            .into());
+        return Err(JevHttpError {
+            trigger: agentdeck_core::judge::classify_http_status(status, retry_after),
+            is_language_model,
+            message,
         }
-        return Err(anyhow::anyhow!(message));
+        .into());
     }
     res.json()
         .await
         .map_err(|e| anyhow::anyhow!("Jev returned invalid JSON: {e}"))
 }
 
-async fn jev_fetch(
-    provider: Option<&str>,
+async fn jev_fetch_endpoint(
+    endpoint: &agentdeck_core::judge::JudgeEndpoint,
     request: &Value,
     request_body: &str,
     key: Option<&str>,
+    timeout: std::time::Duration,
+    bases: &JevBases,
 ) -> anyhow::Result<(Value, Option<f64>)> {
     if let Ok(mock) = std::env::var("AGENTDECK_ROUTE_MOCK_JEV") {
         let text = std::fs::read_to_string(mock)?;
@@ -1283,15 +1355,32 @@ async fn jev_fetch(
                 .and_then(Value::as_f64),
         ));
     }
-    if provider == Some(agentdeck_core::settings::PROVIDER_VERCEL) {
+    let req_timeout = timeout
+        .min(JEV_REQUEST_TIMEOUT)
+        .max(std::time::Duration::from_millis(1));
+    // Rewrite only the outbound model when falling back so the caller's primary
+    // request (and Jev cache key) stay untouched.
+    let rewritten = (request.get("model").and_then(Value::as_str) != Some(endpoint.model.as_str()))
+        .then(|| {
+            let mut r = request.clone();
+            if let Some(o) = r.as_object_mut() {
+                o.insert("model".into(), Value::from(endpoint.model.as_str()));
+            }
+            r
+        });
+    let eff_request = rewritten.as_ref().unwrap_or(request);
+
+    if endpoint.provider == agentdeck_core::settings::PROVIDER_VERCEL {
         let key = match key {
             Some(k) => k.to_string(),
             None => decision_key("AI_GATEWAY_API_KEY", "vercel.key")?,
         };
+        let decisions_url = format!("{}/v1/decisions", bases.vercel.trim_end_matches('/'));
         match post_json(
-            "https://ai-gateway.vercel.sh/v1/decisions",
+            &decisions_url,
             &key,
-            decisions_body(request).to_string(),
+            decisions_body(eff_request).to_string(),
+            req_timeout,
         )
         .await
         {
@@ -1301,13 +1390,17 @@ async fn jev_fetch(
                     .and_then(|c| c.as_f64().or_else(|| c.as_str()?.parse().ok()));
                 return Ok((decisions_answers(&v), cost));
             }
-            Err(e) if e.to_string().contains("is a language model") => {}
+            Err(e)
+                if e.downcast_ref::<JevHttpError>()
+                    .is_some_and(|he| he.is_language_model) => {}
             Err(e) => return Err(e),
         }
+        let chat_url = format!("{}/v1/chat/completions", bases.vercel.trim_end_matches('/'));
         let v = post_json(
-            "https://ai-gateway.vercel.sh/v1/chat/completions",
+            &chat_url,
             &key,
-            gateway_body(request).to_string(),
+            gateway_body(eff_request).to_string(),
+            req_timeout,
         )
         .await?;
         // shortcut: the chat completion's cost is not read, so Jev cost reports as unknown.
@@ -1317,12 +1410,15 @@ async fn jev_fetch(
         Some(k) => k.to_string(),
         None => decision_key("JEV_OPENROUTER_API_KEY", "openrouter.key")?,
     };
-    let v = post_json(
-        "https://openrouter.ai/api/alpha/decisions",
-        &key,
-        request_body.to_string(),
-    )
-    .await?;
+    let eff_body = match &rewritten {
+        Some(r) => stringify_like_node(r),
+        None => request_body.to_string(),
+    };
+    let url = format!(
+        "{}/api/alpha/decisions",
+        bases.openrouter.trim_end_matches('/')
+    );
+    let v = post_json(&url, &key, eff_body, req_timeout).await?;
     Ok((
         v.get("answers").cloned().unwrap_or(Value::Null),
         v.get("usage")
@@ -1331,47 +1427,101 @@ async fn jev_fetch(
     ))
 }
 
+fn primary_endpoint(cfg: &RouterConfig) -> anyhow::Result<agentdeck_core::judge::JudgeEndpoint> {
+    let provider = cfg
+        .decision_provider
+        .clone()
+        .unwrap_or_else(|| agentdeck_core::settings::PROVIDER_OPENROUTER.to_string());
+    if provider == agentdeck_core::settings::PROVIDER_VERCEL && cfg.decision_model.is_none() {
+        return Err(anyhow::anyhow!(
+            "decision provider vercel needs [router] decision_model"
+        ));
+    }
+    let model = cfg
+        .decision_model
+        .clone()
+        .unwrap_or_else(|| agentdeck_core::settings::DEFAULT_DECISION_MODEL.to_string());
+    Ok(agentdeck_core::judge::JudgeEndpoint::new(provider, model))
+}
+
 /// One live decision through the configured provider (explicit only).
 ///
 /// Builds a one-question Jev decision over caller-supplied `state` (task +
 /// evidence, already size-checked) and returns the raw `answers`, the reported
 /// judge cost (`None` when the provider reports none), and the judge identity
-/// (`provider` label, `model`). Reuses the routing decision provider, model and
-/// keys; adds no model settings. Honours `AGENTDECK_ROUTE_MOCK_JEV` like routing.
+/// (`provider` label, `model`). Reuses the routing decision provider, model,
+/// shared `[judge_fallback]`, cross-process 429 blocks, and keys.
+/// Honours `AGENTDECK_ROUTE_MOCK_JEV` like routing.
 pub async fn judge_evaluation(
     state: Value,
     questions: Value,
 ) -> anyhow::Result<(Value, Option<f64>, String, String)> {
     let env = Env::from_env()?;
     let cfg = load_router_config(&env)?;
-    let provider = cfg
-        .decision_provider
-        .clone()
-        .unwrap_or_else(|| agentdeck_core::settings::PROVIDER_OPENROUTER.to_string());
-    let model = cfg
-        .decision_model
-        .clone()
-        .unwrap_or_else(|| agentdeck_core::settings::DEFAULT_DECISION_MODEL.to_string());
-    if provider == agentdeck_core::settings::PROVIDER_VERCEL && cfg.decision_model.is_none() {
-        return Err(anyhow::anyhow!(
-            "decision provider vercel needs [router] decision_model"
-        ));
-    }
-    let request = serde_json::json!({"model": &model, "state": state, "questions": questions});
+    let primary = primary_endpoint(&cfg)?;
+    let fallback = cfg.judge_fallback.endpoint();
+    let request =
+        serde_json::json!({"model": &primary.model, "state": state, "questions": questions});
     let body = stringify_like_node(&request);
-    let (answers, cost) =
-        jev_fetch(cfg.decision_provider.as_deref(), &request, &body, None).await?;
-    Ok((answers, cost, provider, model))
+    if std::env::var_os("AGENTDECK_ROUTE_MOCK_JEV").is_some() {
+        let (answers, cost) = jev_fetch_endpoint(
+            &primary,
+            &request,
+            &body,
+            None,
+            JEV_REQUEST_TIMEOUT,
+            &JevBases::default(),
+        )
+        .await?;
+        return Ok((answers, cost, primary.provider, primary.model));
+    }
+    let blocks = agentdeck_core::judge::BlockStore::new(
+        env.runtime
+            .join(agentdeck_core::judge::JUDGE_BLOCKS_DIR_NAME),
+    );
+    let bases = JevBases::default();
+    let ((answers, cost), channel) = agentdeck_core::judge::dispatch_with_deadline(
+        &blocks,
+        &primary,
+        fallback.as_ref(),
+        crate::jev_queue::BUDGET,
+        std::time::SystemTime::now,
+        tokio::time::sleep,
+        |ep, rem| {
+            let ep = ep.clone();
+            let req = request.clone();
+            let body = body.clone();
+            let bases = bases.clone();
+            async move { jev_fetch_endpoint(&ep, &req, &body, None, rem, &bases).await }
+        },
+        classify_jev_error,
+        |ep, ra, rem| {
+            anyhow::anyhow!(
+                "{}",
+                agentdeck_core::judge::format_rate_limit_exceeded(ep, ra, rem)
+            )
+        },
+    )
+    .await?;
+    let used = match (channel, fallback) {
+        (agentdeck_core::judge::JudgeChannel::Fallback, Some(fb)) => fb,
+        _ => primary,
+    };
+    Ok((answers, cost, used.provider, used.model))
 }
 
-/// One live decision on a fixed small task, bypassing the cache: checks that
-/// the provider, model and key work. `key` overrides the stored key.
-/// Returns (size score, difficulty score, cost in USD when reported).
+/// One live decision on a fixed small task, bypassing the cache and fallback:
+/// checks that the specific provider, model and key work. `key` overrides the
+/// stored key. Returns (size score, difficulty score, cost in USD when reported).
 pub async fn probe_decision(
     provider: Option<&str>,
     model: &str,
     key: Option<&str>,
 ) -> anyhow::Result<(f64, f64, Option<f64>)> {
+    let endpoint = agentdeck_core::judge::JudgeEndpoint::new(
+        provider.unwrap_or(agentdeck_core::settings::PROVIDER_OPENROUTER),
+        model,
+    );
     let request = serde_json::json!({
         "model": model,
         "state": {"task": "Rename one local variable in a 20-line Python script.", "models": {}},
@@ -1381,7 +1531,15 @@ pub async fn probe_decision(
         },
     });
     let body = stringify_like_node(&request);
-    let (answers, cost) = jev_fetch(provider, &request, &body, key).await?;
+    let (answers, cost) = jev_fetch_endpoint(
+        &endpoint,
+        &request,
+        &body,
+        key,
+        JEV_REQUEST_TIMEOUT,
+        &JevBases::default(),
+    )
+    .await?;
     let score = |k: &str| {
         answers
             .get(k)
@@ -1763,22 +1921,10 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         models.insert(k.clone(), Value::from(c.clone()));
     }
     state.insert("models".into(), Value::Object(models));
+    let primary = primary_endpoint(&cfg)?;
+    let fallback = cfg.judge_fallback.endpoint();
     let mut request = serde_json::Map::new();
-    if cfg.decision_provider.as_deref() == Some(agentdeck_core::settings::PROVIDER_VERCEL)
-        && cfg.decision_model.is_none()
-    {
-        return Err(anyhow::anyhow!(
-            "decision provider vercel needs [router] decision_model"
-        ));
-    }
-    request.insert(
-        "model".into(),
-        Value::from(
-            cfg.decision_model
-                .as_deref()
-                .unwrap_or(agentdeck_core::settings::DEFAULT_DECISION_MODEL),
-        ),
-    );
+    request.insert("model".into(), Value::from(primary.model.as_str()));
     request.insert("state".into(), Value::Object(state));
     request.insert("questions".into(), Value::Object(questions));
     let request_value = Value::Object(request);
@@ -1798,116 +1944,24 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
                 .iter()
                 .all(|(k, _)| a.get(k).is_some_and(|x| valid_answer(x, true)))
     };
-    let cache_dir = env.runtime.join("model-route-jev-cache");
-    let mut hasher = Sha256::new();
-    hasher.update(hash_input.as_bytes());
-    let cache_file = cache_dir.join(format!("{:x}.json", hasher.finalize()));
-    let fresh = |t: f64| {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as f64)
-            .unwrap_or(0.0);
-        now_ms - t >= 0.0 && now_ms - t < 10.0 * 60e3
-    };
-    let mut cached: Option<Value> = None;
-    if let Ok(text) = std::fs::read_to_string(&cache_file)
-        && let Ok(entry) = serde_json::from_str::<Value>(&text)
-        && entry.get("t").and_then(Value::as_f64).is_some_and(fresh)
-        && complete(entry.get("answers").unwrap_or(&Value::Null))
-    {
-        cached = entry.get("answers").cloned();
-    }
-    let jev_hit = cached.is_some();
-    // A hit reuses the cached judgment; like the Node router it reports zero
-    // additional Jev cost for the reused answer.
-    let (answers, cost) = match cached {
-        Some(a) => (a, Some(0.0)),
-        None => {
-            let provider = cfg.decision_provider.clone();
-            let (answers, cost) = crate::jev_queue::ask(
-                &env.runtime.join("model-route-jev-queue"),
-                &request_value,
-                &body_json,
-                move |request, body| {
-                    let provider = provider.clone();
-                    async move { jev_fetch(provider.as_deref(), &request, &body, None).await }
-                },
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-            if !complete(&answers) {
-                return Err(anyhow::anyhow!(
-                    "Jev returned incomplete or out-of-range routing answers"
-                ));
-            }
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as f64)
-                .unwrap_or(0.0);
-            let _ = (|| {
-                std::fs::create_dir_all(&cache_dir)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &cache_dir,
-                        std::fs::Permissions::from_mode(0o700),
-                    );
-                }
-                for f in std::fs::read_dir(&cache_dir)? {
-                    let f = f?;
-                    let name = f.file_name().to_string_lossy().into_owned();
-                    if name.len() == 69
-                        && name.ends_with(".json")
-                        && name[..64]
-                            .chars()
-                            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
-                    {
-                        let stale = std::fs::metadata(f.path())
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .map(|t| {
-                                std::time::SystemTime::now()
-                                    .duration_since(t)
-                                    .map(|d| d.as_millis() as f64)
-                                    .unwrap_or(f64::NAN)
-                            });
-                        if stale.is_some_and(|age| !(0.0..10.0 * 60e3).contains(&age)) {
-                            let _ = std::fs::remove_file(f.path());
-                        }
-                    }
-                }
-                let tmp = cache_dir.join(format!(
-                    "{}.{}.tmp",
-                    cache_file
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("jev-cache"),
-                    std::process::id()
-                ));
-                std::fs::write(
-                    &tmp,
-                    serde_json::to_string(&serde_json::json!({"t": now_ms, "answers": answers}))?,
-                )?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-                }
-                std::fs::rename(&tmp, &cache_file)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &cache_file,
-                        std::fs::Permissions::from_mode(0o600),
-                    );
-                }
-                Ok::<(), anyhow::Error>(())
-            })();
-            (answers, cost)
-        }
-    };
+    let blocks = agentdeck_core::judge::BlockStore::new(
+        env.runtime
+            .join(agentdeck_core::judge::JUDGE_BLOCKS_DIR_NAME),
+    );
+    let (answers, cost, jev_hit, jev_channel) = fetch_jev_cached(
+        &env.runtime,
+        &hash_input,
+        &request_value,
+        &body_json,
+        &primary,
+        fallback.as_ref(),
+        crate::jev_queue::BUDGET,
+        &blocks,
+        &JevBases::default(),
+        None,
+        &complete,
+    )
+    .await?;
     let jev_cache = if jev_hit { "hit" } else { "miss" };
     // Re-read quota/load snapshots after Jev before ranking.
     let now = std::time::SystemTime::now()
@@ -2317,8 +2371,130 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
         out.insert("cost".into(), js_num(c));
     }
     out.insert("jevCache".into(), Value::from(jev_cache));
+    out.insert("jevChannel".into(), Value::from(jev_channel.as_str()));
     println!("{}", serde_json::to_string_pretty(&Value::Object(out))?);
     Ok(0)
+}
+
+/// Lookup or fetch a Jev routing judgment through the shared queue, storing
+/// answers (including fallback answers) under the primary request's cache key.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_jev_cached(
+    runtime_dir: &std::path::Path,
+    hash_input: &str,
+    request_value: &Value,
+    body_json: &str,
+    primary: &agentdeck_core::judge::JudgeEndpoint,
+    fallback: Option<&agentdeck_core::judge::JudgeEndpoint>,
+    budget: std::time::Duration,
+    blocks: &agentdeck_core::judge::BlockStore,
+    bases: &JevBases,
+    key_override: Option<&str>,
+    complete: &dyn Fn(&Value) -> bool,
+) -> anyhow::Result<(
+    Value,
+    Option<f64>,
+    bool,
+    agentdeck_core::judge::JudgeChannel,
+)> {
+    let cache_dir = runtime_dir.join("model-route-jev-cache");
+    let mut hasher = Sha256::new();
+    hasher.update(hash_input.as_bytes());
+    let cache_file = cache_dir.join(format!("{:x}.json", hasher.finalize()));
+    let fresh = |t: f64| {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0);
+        now_ms - t >= 0.0 && now_ms - t < 10.0 * 60e3
+    };
+    if let Ok(text) = std::fs::read_to_string(&cache_file)
+        && let Ok(entry) = serde_json::from_str::<Value>(&text)
+        && entry.get("t").and_then(Value::as_f64).is_some_and(fresh)
+        && let Some(answers) = entry.get("answers").filter(|a| complete(a)).cloned()
+    {
+        let channel = match entry.get("channel").and_then(Value::as_str) {
+            Some("fallback") => agentdeck_core::judge::JudgeChannel::Fallback,
+            _ => agentdeck_core::judge::JudgeChannel::Primary,
+        };
+        // A hit reuses the cached judgment; like the Node router it reports zero
+        // additional Jev cost for the reused answer.
+        return Ok((answers, Some(0.0), true, channel));
+    }
+
+    let bases = bases.clone();
+    let key_owned = key_override.map(str::to_string);
+    let queued = crate::jev_queue::ask_with_deadline(
+        &runtime_dir.join("model-route-jev-queue"),
+        request_value,
+        body_json,
+        budget,
+        blocks,
+        primary,
+        fallback,
+        move |endpoint, request, body, remaining| {
+            let bases = bases.clone();
+            let key_owned = key_owned.clone();
+            async move {
+                jev_fetch_endpoint(
+                    &endpoint,
+                    &request,
+                    &body,
+                    key_owned.as_deref(),
+                    remaining,
+                    &bases,
+                )
+                .await
+            }
+        },
+        classify_jev_error,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if !complete(&queued.answers) {
+        return Err(anyhow::anyhow!(
+            "Jev returned incomplete or out-of-range routing answers"
+        ));
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0);
+    let _ = (|| {
+        agentdeck_core::judge::create_private_dir(&cache_dir)?;
+        for f in std::fs::read_dir(&cache_dir)? {
+            let f = f?;
+            let name = f.file_name().to_string_lossy().into_owned();
+            if name.len() == 69
+                && name.ends_with(".json")
+                && name[..64]
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+            {
+                let stale = std::fs::metadata(f.path())
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map(|t| {
+                        std::time::SystemTime::now()
+                            .duration_since(t)
+                            .map(|d| d.as_millis() as f64)
+                            .unwrap_or(f64::NAN)
+                    });
+                if stale.is_some_and(|age| !(0.0..10.0 * 60e3).contains(&age)) {
+                    let _ = std::fs::remove_file(f.path());
+                }
+            }
+        }
+        let payload = serde_json::to_string(&serde_json::json!({
+            "t": now_ms,
+            "answers": queued.answers,
+            "channel": queued.channel.as_str(),
+        }))?;
+        agentdeck_core::judge::write_atomic(&cache_file, &payload)?;
+        Ok::<(), anyhow::Error>(())
+    })();
+    Ok((queued.answers, queued.cost, false, queued.channel))
 }
 
 /// Serialize exactly like `JSON.stringify` for the Jev body and the cache-key
@@ -2386,6 +2562,250 @@ mod gateway_tests {
         assert!(valid_answer(&a["size"], true));
         assert!(a.get("difficulty").is_none());
     }
+
+    async fn mock_http_server(
+        responses: Vec<(&'static str, &'static str, String)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<(String, Value)>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::task::spawn_blocking(move || {
+            let mut seen = Vec::new();
+            for (status, extra_headers, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        size = value.trim().parse().unwrap();
+                    }
+                }
+                let mut req_body = vec![0; size];
+                reader.read_exact(&mut req_body).unwrap();
+                let parsed: Value = serde_json::from_slice(&req_body).unwrap_or(Value::Null);
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                seen.push((first, parsed));
+            }
+            seen
+        });
+        (base, task)
+    }
+
+    #[tokio::test]
+    async fn cache_stores_fallback_answer_under_primary_key_and_honours_triggers() {
+        let rt = std::env::temp_dir().join(format!(
+            "agentdeck-route-fallback-cache-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(&rt).unwrap();
+
+        let ok_or = serde_json::json!({
+            "answers": {
+                "size": {"score": 1, "confidence": 0.9},
+                "difficulty": {"score": 1, "confidence": 0.9},
+            },
+            "usage": {"cost": 0.002}
+        })
+        .to_string();
+        // Primary (Vercel): first 429 Retry-After: 60 (triggers block + fallback),
+        // then on a separate model: 503 (fallback), 401 (no fallback), invalid JSON (no fallback).
+        let (vercel_base, vercel_srv) = mock_http_server(vec![
+            (
+                "429 Too Many Requests",
+                "Retry-After: 60\r\n",
+                r#"{"error":"rate limit"}"#.into(),
+            ),
+            ("503 Service Unavailable", "", "{}".into()),
+            ("401 Unauthorized", "", "{}".into()),
+            ("200 OK", "", "not-json".into()),
+        ])
+        .await;
+        let (or_base, or_srv) = mock_http_server(vec![
+            ("200 OK", "", ok_or.clone()),
+            ("200 OK", "", ok_or.clone()),
+            ("200 OK", "", ok_or),
+        ])
+        .await;
+
+        let bases = JevBases {
+            openrouter: or_base,
+            vercel: vercel_base,
+        };
+        let blocks = agentdeck_core::judge::BlockStore::new(
+            rt.join(agentdeck_core::judge::JUDGE_BLOCKS_DIR_NAME),
+        );
+        let primary = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_VERCEL,
+            "perplexity/pplx-decider-v1.2",
+        );
+        let fallback = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_OPENROUTER,
+            "~typesafe/jev-latest",
+        );
+        let req = serde_json::json!({
+            "model": primary.model,
+            "state": {"task": "fix bug", "models": {}},
+            "questions": {
+                "size": {"type": "score", "instructions": "size?", "criteria": SIZES},
+                "difficulty": {"type": "score", "instructions": "diff?", "criteria": DIFFICULTY},
+            }
+        });
+        let body = stringify_like_node(&req);
+        let hash_input = stringify_like_node(&serde_json::json!([Value::Null, 1, req]));
+        let complete = |a: &Value| {
+            a.get("size").is_some_and(|s| valid_answer(s, false))
+                && a.get("difficulty").is_some_and(|d| valid_answer(d, false))
+        };
+
+        // Call 1: primary 429 -> answered by fallback, cached under primary request's key.
+        let (a1, cost1, hit1, ch1) = fetch_jev_cached(
+            &rt,
+            &hash_input,
+            &req,
+            &body,
+            &primary,
+            Some(&fallback),
+            std::time::Duration::from_secs(10),
+            &blocks,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await
+        .unwrap();
+        assert!(!hit1);
+        assert_eq!(ch1, agentdeck_core::judge::JudgeChannel::Fallback);
+        assert_eq!(cost1, Some(0.002));
+        assert_eq!(a1["size"]["score"], 1);
+
+        // Call 2 (same primary key, even with NO fallback configured!): hits cache immediately!
+        let (a2, cost2, hit2, ch2) = fetch_jev_cached(
+            &rt,
+            &hash_input,
+            &req,
+            &body,
+            &primary,
+            None,
+            std::time::Duration::from_secs(10),
+            &blocks,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await
+        .unwrap();
+        assert!(hit2, "fallback answer must hit cache under primary key");
+        assert_eq!(ch2, agentdeck_core::judge::JudgeChannel::Fallback);
+        assert_eq!(cost2, Some(0.0));
+        assert_eq!(a2, a1);
+
+        // Call 3 (different task, same blocked primary, new BlockStore = second process):
+        // skips blocked primary and hits fallback directly.
+        let blocks2 = agentdeck_core::judge::BlockStore::new(
+            rt.join(agentdeck_core::judge::JUDGE_BLOCKS_DIR_NAME),
+        );
+        let (_, _, hit3, ch3) = fetch_jev_cached(
+            &rt,
+            "different-task-hash",
+            &req,
+            &body,
+            &primary,
+            Some(&fallback),
+            std::time::Duration::from_secs(10),
+            &blocks2,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await
+        .unwrap();
+        assert!(!hit3);
+        assert_eq!(ch3, agentdeck_core::judge::JudgeChannel::Fallback);
+
+        // Call 4..6 on an unblocked primary model: 503 -> fallback, 401 -> err, parse -> err.
+        let unblocked = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_VERCEL,
+            "perplexity/other-model",
+        );
+        let (_, _, _, ch4) = fetch_jev_cached(
+            &rt,
+            "hash-503",
+            &req,
+            &body,
+            &unblocked,
+            Some(&fallback),
+            std::time::Duration::from_secs(10),
+            &blocks,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ch4, agentdeck_core::judge::JudgeChannel::Fallback);
+
+        let err401 = fetch_jev_cached(
+            &rt,
+            "hash-401",
+            &req,
+            &body,
+            &unblocked,
+            Some(&fallback),
+            std::time::Duration::from_secs(10),
+            &blocks,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await
+        .unwrap_err();
+        assert!(err401.to_string().contains("401"), "{err401}");
+
+        let err_parse = fetch_jev_cached(
+            &rt,
+            "hash-parse",
+            &req,
+            &body,
+            &unblocked,
+            Some(&fallback),
+            std::time::Duration::from_secs(10),
+            &blocks,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err_parse.to_string().contains("invalid JSON"),
+            "{err_parse}"
+        );
+
+        let vercel_seen = vercel_srv.await.unwrap();
+        assert_eq!(vercel_seen.len(), 4);
+        let or_seen = or_srv.await.unwrap();
+        assert_eq!(or_seen.len(), 3);
+        assert_eq!(or_seen[0].1["model"], "~typesafe/jev-latest");
+        let _ = std::fs::remove_dir_all(&rt);
+    }
 }
 
 #[cfg(test)]
@@ -2404,6 +2824,7 @@ mod quota_estimate_tests {
             usage_state_path: None,
             decision_model: None,
             decision_provider: None,
+            judge_fallback: agentdeck_core::settings::JudgeFallbackSettings::default(),
             workflow_eval: crate::policy::WorkflowEvalConfig::default(),
             user_rules: agentdeck_core::settings::UserRules::default(),
             account: [("codex".to_string(), "codex".to_string())]
