@@ -1151,7 +1151,8 @@ fn compact_route_batch(results: Vec<Value>) -> Value {
 /// Only network-bound MCP tools run concurrently on spawned tasks; local tools
 /// (including `initialize`, notifications, and shared-file mutations like
 /// `instructions_edit`, `skill_*`, `state_write`, `backlog_*`) stay strictly
-/// ordered inline so concurrent edits never race on shared files or `.tmp` paths.
+/// ordered inline so concurrent edits never race on shared files or `.tmp`
+/// paths.
 fn is_concurrent_request(msg: &Value) -> bool {
     msg.get("method").and_then(Value::as_str) == Some("tools/call")
         && matches!(

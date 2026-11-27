@@ -684,7 +684,8 @@ pub fn record_outcome(
         .create(true)
         .append(true)
         .open(dir.join("checkpoint-outcomes.jsonl"))?;
-    writeln!(f, "{}", line)?;
+    // One write per record: O_APPEND keeps concurrent appends from interleaving.
+    f.write_all(format!("{line}\n").as_bytes())?;
     Ok(())
 }
 

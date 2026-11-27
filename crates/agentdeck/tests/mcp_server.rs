@@ -1574,10 +1574,27 @@ fn slow_route_batch_does_not_block_ping_on_same_stdio_session() {
     writeln!(stdin, "{slow}").unwrap();
     stdin.flush().unwrap();
 
-    let mut fifo_writer = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&mock_fifo)
-        .expect("route_batch must open mock FIFO");
+    // A non-blocking open fails with ENXIO until route_batch opens the FIFO for
+    // reading; poll with a deadline so a broken route_batch fails, not hangs.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut fifo_writer = loop {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&mock_fifo)
+        {
+            Ok(f) => break f,
+            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "route_batch never opened the mock FIFO"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => panic!("open mock FIFO: {e}"),
+        }
+    };
 
     // While route_batch is deterministically blocked reading the FIFO, send ping (id 11)
     // and assert ping replies BEFORE releasing the mock judge response.

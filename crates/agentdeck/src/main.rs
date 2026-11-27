@@ -287,8 +287,9 @@ fn main() -> anyhow::Result<()> {
         .build()?;
     let run_result = runtime.block_on(async_main(&paths, cmd));
     if is_mcp_server {
-        // `tokio::io::stdin()` reads on a blocking pool thread that cannot be cancelled;
-        // shut down in the background so stdout write errors exit without waiting for stdin EOF.
+        // `tokio::io::stdin()` reads on a blocking pool thread that cannot be
+        // cancelled; shut down in the background so stdout write errors exit
+        // without waiting for stdin EOF.
         runtime.shutdown_background();
     }
     match run_result {
