@@ -281,10 +281,17 @@ fn main() -> anyhow::Result<()> {
         return agentdeck_core::launch::run_cli(&paths, id, args);
     }
     agentdeck_usage::daemon::load_agentdeck_secrets(&paths.config_dir)?;
+    let is_mcp_server = matches!(cmd, Cmd::McpServer);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    match runtime.block_on(async_main(&paths, cmd)) {
+    let run_result = runtime.block_on(async_main(&paths, cmd));
+    if is_mcp_server {
+        // `tokio::io::stdin()` reads on a blocking pool thread that cannot be cancelled;
+        // shut down in the background so stdout write errors exit without waiting for stdin EOF.
+        runtime.shutdown_background();
+    }
+    match run_result {
         Ok(()) => Ok(()),
         Err(error) => {
             // Single-writer lock and old-service refusal need stable exit codes.

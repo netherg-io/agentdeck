@@ -1105,8 +1105,13 @@ fn route_batch_lists_schema_handles_invalid_and_warms_hook_cache() {
     assert_eq!(routed["jevCache"], "hit", "{routed}");
 
     // 3b. Routing the identical launch through the actual hook (`agentdeck route hook --harness claude`)
-    // also succeeds with zero judge calls (cache hit!).
-    let hint = agentdeck_router::policy::hint_of_on("codex", "gpt-6.1-sol").unwrap_or_default();
+    // also succeeds with zero judge calls (cache hit!), using ONLY data from the compact MCP reply.
+    let hint_idx = results[0]["briefHintIndex"]
+        .as_u64()
+        .expect("compact route_batch result must reference briefHints") as usize;
+    let hint = batch["briefHints"][hint_idx]
+        .as_str()
+        .expect("compact route_batch must return deduplicated briefHints");
     let hook_payload = json!({
         "tool_name": "mcp__t3-code__delegate_task",
         "tool_input": {
@@ -1358,8 +1363,14 @@ fn route_batch_resolves_secondary_account_via_t3_thread_and_hits_hook_cache() {
     std::fs::remove_file(&mock_jev).unwrap();
 
     // Run actual hook for secondary Codex account with ONLY CODEX_HOME (no T3CODE_THREAD_ID),
-    // verifying cross-mechanism source parity and cache hit with zero judge calls.
-    let hint = agentdeck_router::policy::hint_of_on("codex", "gpt-6.1-sol").unwrap_or_default();
+    // verifying cross-mechanism source parity and cache hit with zero judge calls,
+    // using ONLY data returned by the compact MCP response.
+    let hint_idx = results[0]["briefHintIndex"]
+        .as_u64()
+        .expect("compact route_batch result must reference briefHints") as usize;
+    let hint = batch["briefHints"][hint_idx]
+        .as_str()
+        .expect("compact route_batch must return deduplicated briefHints");
     let hook_payload = json!({
         "tool_name": "mcp__t3-code__delegate_task",
         "tool_input": {
@@ -1479,32 +1490,32 @@ fn setup_route_batch_fixture(
 
 #[test]
 fn slow_route_batch_does_not_block_ping_on_same_stdio_session() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
     let dir = std::env::temp_dir().join(format!(
         "agentdeck-mcp-concurrent-ping-{}",
         std::process::id()
     ));
-    let (runtime, router_json, mock_jev) = setup_route_batch_fixture(
-        &dir,
-        json!({
-            "answers": {
-                "size": {"score": 1, "confidence": 0.9},
-                "difficulty": {"score": 1, "confidence": 0.9},
-                "review": {"score": 0, "confidence": 0.95},
-                "codex_gpt_6_1_sol": {"score": 2.8, "confidence": 0.9, "probabilities": {"0": 0.0, "1": 0.05, "2": 0.15, "3": 0.8}},
-                "claudeagent_claude_opus_5_5": {"score": 2.2, "confidence": 0.85, "probabilities": {"0": 0.0, "1": 0.1, "2": 0.7, "3": 0.2}}
-            },
-            "usage": {"cost": 0.003}
-        }),
-    );
+    let mock_body = json!({
+        "answers": {
+            "size": {"score": 1, "confidence": 0.9},
+            "difficulty": {"score": 1, "confidence": 0.9},
+            "review": {"score": 0, "confidence": 0.95},
+            "codex_gpt_6_1_sol": {"score": 2.8, "confidence": 0.9, "probabilities": {"0": 0.0, "1": 0.05, "2": 0.15, "3": 0.8}},
+            "claudeagent_claude_opus_5_5": {"score": 2.2, "confidence": 0.85, "probabilities": {"0": 0.0, "1": 0.1, "2": 0.7, "3": 0.2}}
+        },
+        "usage": {"cost": 0.003}
+    })
+    .to_string();
+    let (runtime, router_json, _mock_jev) = setup_route_batch_fixture(&dir, json!({}));
 
-    // Hold route_batch for ~2 s via the judge 429 block store while ping runs concurrently.
-    let blocks = agentdeck_core::judge::BlockStore::for_runtime_dir(&runtime);
-    blocks
-        .record_rate_limit(
-            &agentdeck_core::judge::JudgeEndpoint::new("openrouter", "~typesafe/jev-latest"),
-            std::time::Duration::from_secs(2),
-        )
-        .unwrap();
+    // Replace mock jev file with a named pipe: opening O_WRONLY blocks until route_batch
+    // actually opens it for reading, giving a deterministic barrier without timers.
+    let mock_fifo = dir.join("jev.fifo");
+    let _ = std::fs::remove_file(&mock_fifo);
+    let c_fifo = CString::new(mock_fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_agentdeck"))
         .arg("mcp-server")
@@ -1519,7 +1530,7 @@ fn slow_route_batch_does_not_block_ping_on_same_stdio_session() {
         .env("XDG_STATE_HOME", dir.join("xdg-state"))
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("MODEL_ROUTE_ROUTER_JSON", &router_json)
-        .env("AGENTDECK_ROUTE_MOCK_JEV", &mock_jev)
+        .env("AGENTDECK_ROUTE_MOCK_JEV", &mock_fifo)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1548,7 +1559,7 @@ fn slow_route_batch_does_not_block_ping_on_same_stdio_session() {
     let init_reply: Value = serde_json::from_str(&init_line).unwrap();
     assert_eq!(init_reply["id"], 1);
 
-    // Send slow route_batch (id 10) followed immediately by ping (id 11) on the same stdio session.
+    // Send slow route_batch (id 10), wait until route_batch actually opens the mock FIFO.
     let slow = call(
         10,
         "route_batch",
@@ -1560,14 +1571,33 @@ fn slow_route_batch_does_not_block_ping_on_same_stdio_session() {
             }]
         }),
     );
-    let ping = json!({"jsonrpc": "2.0", "id": 11, "method": "ping"});
     writeln!(stdin, "{slow}").unwrap();
+    stdin.flush().unwrap();
+
+    let mut fifo_writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&mock_fifo)
+        .expect("route_batch must open mock FIFO");
+
+    // While route_batch is deterministically blocked reading the FIFO, send ping (id 11)
+    // and assert ping replies BEFORE releasing the mock judge response.
+    let ping = json!({"jsonrpc": "2.0", "id": 11, "method": "ping"});
     writeln!(stdin, "{ping}").unwrap();
     stdin.flush().unwrap();
 
     let mut first_line = String::new();
     stdout.read_line(&mut first_line).unwrap();
     let first: Value = serde_json::from_str(&first_line).unwrap();
+    assert_eq!(
+        first["id"], 11,
+        "ping must answer while route_batch is still blocked on FIFO; got {first}"
+    );
+    assert_eq!(first["result"], json!({}));
+
+    // Now release the mock judge response and verify route_batch succeeds with a real target.
+    fifo_writer.write_all(mock_body.as_bytes()).unwrap();
+    drop(fifo_writer);
+
     let mut second_line = String::new();
     stdout.read_line(&mut second_line).unwrap();
     let second: Value = serde_json::from_str(&second_line).unwrap();
@@ -1576,16 +1606,25 @@ fn slow_route_batch_does_not_block_ping_on_same_stdio_session() {
     let status = child.wait().unwrap();
     assert!(status.success());
 
-    assert_eq!(
-        first["id"], 11,
-        "ping must answer before the slow route_batch call; got first={first}, second={second}"
-    );
-    assert_eq!(first["result"], json!({}));
     assert_eq!(second["id"], 10);
     assert!(
         second["result"].get("isError").is_none(),
         "{}",
         text(&second)
+    );
+    let batch: Value = serde_json::from_str(&text(&second)).unwrap();
+    let res = &batch["results"][0];
+    assert!(
+        res.get("error").is_none(),
+        "route_batch entry must succeed, not error: {res}"
+    );
+    assert_eq!(
+        res["target"]["providerInstanceId"], "codex",
+        "route_batch must resolve real target: {res}"
+    );
+    assert!(
+        res["briefHintIndex"].is_u64() && batch["briefHints"].is_array(),
+        "compact reply must include briefHints reference: {batch}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -1626,6 +1665,13 @@ fn route_batch_default_compact_under_4000_chars_and_verbose_returns_full() {
         {"tool": "mcp__t3-code__delegate_task", "input": {"task": "Fix edge case C in parser"}}
     ]);
 
+    let long_tool = "x".repeat(1400);
+    let bad_launches = json!([
+        {"tool": format!("{long_tool}_1"), "input": {"task": "t1"}},
+        {"tool": format!("{long_tool}_2"), "input": {"task": "t2"}},
+        {"tool": format!("{long_tool}_3"), "input": {"task": "t3"}}
+    ]);
+
     let replies = session_env(
         &dir,
         &env,
@@ -1640,6 +1686,16 @@ fn route_batch_default_compact_under_4000_chars_and_verbose_returns_full() {
                 3,
                 "route_batch",
                 json!({ "harness": "claude", "launches": launches, "verbose": true }),
+            ),
+            call(
+                4,
+                "route_batch",
+                json!({ "harness": "claude", "launches": bad_launches }),
+            ),
+            call(
+                5,
+                "route_batch",
+                json!({ "harness": "claude", "launches": bad_launches, "verbose": true }),
             ),
         ],
     );
@@ -1662,6 +1718,18 @@ fn route_batch_default_compact_under_4000_chars_and_verbose_returns_full() {
         compact_raw.len()
     );
     let compact: Value = serde_json::from_str(&compact_raw).unwrap();
+    let hints = compact["briefHints"]
+        .as_array()
+        .expect("compact output must include deduplicated briefHints");
+    assert_eq!(
+        hints.len(),
+        1,
+        "identical briefHint across 3 launches must be deduplicated once"
+    );
+    assert!(
+        hints[0].as_str().is_some_and(|s| !s.is_empty()),
+        "{compact}"
+    );
     let results = compact["results"].as_array().unwrap();
     assert_eq!(results.len(), 3);
     for r in results {
@@ -1670,10 +1738,11 @@ fn route_batch_default_compact_under_4000_chars_and_verbose_returns_full() {
         assert_eq!(r["jevChannel"], "primary", "{r}");
         assert_eq!(r["jevCache"], "miss", "{r}");
         assert!(r["confidence"].is_object(), "{r}");
+        assert_eq!(r["briefHintIndex"], 0, "{r}");
         assert!(r.get("ranking").is_none(), "compact must omit ranking: {r}");
         assert!(
             r.get("briefHint").is_none(),
-            "compact must omit briefHint: {r}"
+            "compact must not duplicate briefHint per item: {r}"
         );
         assert!(
             r.get("coefficients").is_none(),
@@ -1687,6 +1756,29 @@ fn route_batch_default_compact_under_4000_chars_and_verbose_returns_full() {
     assert_eq!(v_results.len(), 3);
     assert!(v_results[0]["ranking"].is_array(), "{}", v_results[0]);
     assert!(v_results[0]["briefHint"].is_string(), "{}", v_results[0]);
+
+    // 3 oversized error strings stay bounded (< 4000 chars) in compact mode and preserve order;
+    // verbose: true returns the full unclipped error text.
+    let err_compact_raw = text(&replies[3]);
+    assert!(
+        err_compact_raw.len() < 4000,
+        "3-error compact output must stay under 4000 chars, got {} chars",
+        err_compact_raw.len()
+    );
+    let err_compact: Value = serde_json::from_str(&err_compact_raw).unwrap();
+    let err_results = err_compact["results"].as_array().unwrap();
+    assert_eq!(err_results.len(), 3);
+    for r in err_results {
+        assert!(
+            r["error"].as_str().is_some_and(|s| s.ends_with('…')),
+            "oversized compact error must be truncated cleanly: {r}"
+        );
+    }
+    let err_verbose_raw = text(&replies[4]);
+    assert!(
+        err_verbose_raw.len() > 4000,
+        "verbose mode must retain full unclipped error text"
+    );
 
     // Low confidence + unknown source carry warning messages without candidate tables.
     std::fs::write(
@@ -1734,5 +1826,152 @@ fn route_batch_default_compact_under_4000_chars_and_verbose_returns_full() {
         "compact confidenceWarning should carry message string only: {wr}"
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pipelined_instructions_edits_and_invalid_utf8_preserve_all_writes_and_replies() {
+    let dir = std::env::temp_dir().join(format!(
+        "agentdeck-mcp-serial-edits-utf8-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(dir.join("config")).unwrap();
+    std::fs::write(
+        dir.join("config/instances.toml"),
+        "version = 1\n\n[plugins]\nmcp-server = true\n",
+    )
+    .unwrap();
+    let agents_md = home.join("AGENTS.md");
+    std::fs::write(
+        &agents_md,
+        "# Shared\nSLOT0\nSLOT1\nSLOT2\nSLOT3\nSLOT4\nSLOT5\nSLOT6\nSLOT7\n",
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentdeck"))
+        .arg("mcp-server")
+        .env_remove("T3CODE_THREAD_ID")
+        .env("AGENTDECK_T3_DIR", dir.join("no-t3"))
+        .env("HOME", &home)
+        .env("AGENTDECK_CONFIG_DIR", dir.join("config"))
+        .env("AGENTDECK_STATE_DIR", dir.join("state"))
+        .env("XDG_STATE_HOME", dir.join("xdg-state"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+    )
+    .unwrap();
+    for i in 0..8u64 {
+        writeln!(
+            stdin,
+            "{}",
+            call(
+                10 + i,
+                "instructions_edit",
+                json!({ "old": format!("SLOT{i}"), "new": format!("DONE{i}") })
+            )
+        )
+        .unwrap();
+    }
+    // Raw invalid UTF-8 line must return a -32700 parse error without aborting earlier or later requests.
+    stdin.write_all(b"\xff\xfeinvalid-utf8\n").unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "id": 99, "method": "ping"})
+    )
+    .unwrap();
+    drop(stdin);
+
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let replies: Vec<Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        replies.len(),
+        11,
+        "expected init + 8 edits + utf8 err + ping: {replies:?}"
+    );
+    for i in 0..8usize {
+        let r = &replies[1 + i];
+        assert_eq!(r["id"], 10 + i as u64, "{r}");
+        assert!(r["result"].get("isError").is_none(), "edit {i} failed: {r}");
+    }
+    assert_eq!(replies[9]["error"]["code"], -32700, "{}", replies[9]);
+    assert_eq!(replies[10]["id"], 99, "{}", replies[10]);
+
+    let final_md = std::fs::read_to_string(&agents_md).unwrap();
+    for i in 0..8 {
+        assert!(
+            final_md.contains(&format!("DONE{i}")),
+            "pipelined instructions_edit {i} lost: {final_md}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stdout_write_error_exits_promptly_without_waiting_for_stdin_eof() {
+    let Ok(dev_full) = std::fs::OpenOptions::new().write(true).open("/dev/full") else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("agentdeck-mcp-dev-full-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("home")).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentdeck"))
+        .arg("mcp-server")
+        .env_remove("T3CODE_THREAD_ID")
+        .env("AGENTDECK_T3_DIR", dir.join("no-t3"))
+        .env("HOME", dir.join("home"))
+        .env("AGENTDECK_CONFIG_DIR", dir.join("config"))
+        .env("AGENTDECK_STATE_DIR", dir.join("state"))
+        .env("XDG_STATE_HOME", dir.join("xdg-state"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(dev_full))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // Keep stdin open on purpose: server must exit promptly on stdout ENOSPC.
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mcp-server hung waiting for stdin EOF after stdout write failure"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    drop(stdin);
+    assert!(
+        !status.success(),
+        "stdout write failure must exit non-zero, got {status}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

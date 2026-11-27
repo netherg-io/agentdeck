@@ -243,7 +243,7 @@ fn tools() -> Value {
         },
         {
             "name": "route_batch",
-            "description": "Pre-route a wave of 2 or more delegate launches in batched judge requests and warm the 10-minute routing cache. Call before launching 2+ delegates in one turn with the exact tool names and input payloads you will launch, then launch with the same payloads (a changed payload misses the cache). Returns compact per-launch results (target, source, jevChannel, jevCache, confidence, warnings/confidenceWarning messages, validation, or error) in input order; pass `verbose: true` for the full `agentdeck route` JSON.",
+            "description": "Pre-route a wave of 2 or more delegate launches in batched judge requests and warm the 10-minute routing cache. Call before launching 2+ delegates in one turn with the exact tool names and input payloads you will launch, then launch with the same payloads (a changed payload misses the cache). Returns compact per-launch results (target, source, jevChannel, jevCache, confidence, briefHintIndex, warnings/confidenceWarning messages, validation, or truncated error) plus deduplicated top-level briefHints in input order; append briefHints[briefHintIndex] verbatim to the task when present. Pass `verbose: true` for the full `agentdeck route` JSON.",
             "inputSchema": {
                 "type": "object",
                 "required": ["launches"],
@@ -519,12 +519,11 @@ async fn call(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> 
                 budget: agentdeck_router::route::BATCH_BUDGET,
             };
             let results = agentdeck_router::route::route_batch(&env, launches, opts).await?;
-            let results = if verbose {
-                results
+            if verbose {
+                Ok(json!({ "results": results }))
             } else {
-                results.into_iter().map(compact_route_result).collect()
-            };
-            Ok(json!({ "results": results }))
+                Ok(compact_route_batch(results))
+            }
         }
         "state_read" => {
             let id = thread_arg(args)?;
@@ -1057,9 +1056,28 @@ async fn handle(paths: &Paths, msg: &Value) -> Option<Value> {
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
-fn compact_route_result(v: Value) -> Value {
+const COMPACT_TEXT_LIMIT: usize = 240;
+
+fn truncate_compact_text(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
+fn truncate_compact_value(v: &Value) -> Value {
+    match v.as_str() {
+        Some(s) => Value::from(truncate_compact_text(s, COMPACT_TEXT_LIMIT)),
+        None => v.clone(),
+    }
+}
+
+fn compact_route_result(v: Value, brief_hints: &mut Vec<String>) -> Value {
     if let Some(err) = v.get("error") {
-        return json!({ "error": err });
+        return json!({ "error": truncate_compact_value(err) });
     }
     let mut out = serde_json::Map::new();
     for key in [
@@ -1069,8 +1087,6 @@ fn compact_route_result(v: Value) -> Value {
         "jevCache",
         "confidence",
         "validation",
-        "sourceWarning",
-        "warnings",
     ] {
         if let Some(val) = v.get(key)
             && (key == "target" || !val.is_null())
@@ -1078,10 +1094,31 @@ fn compact_route_result(v: Value) -> Value {
             out.insert(key.into(), val.clone());
         }
     }
+    if let Some(hint) = v
+        .get("briefHint")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        let idx = match brief_hints.iter().position(|existing| existing == hint) {
+            Some(i) => i,
+            None => {
+                brief_hints.push(hint.to_string());
+                brief_hints.len() - 1
+            }
+        };
+        out.insert("briefHintIndex".into(), Value::from(idx));
+    }
+    if let Some(sw) = v.get("sourceWarning").filter(|val| !val.is_null()) {
+        out.insert("sourceWarning".into(), truncate_compact_value(sw));
+    }
+    if let Some(warnings) = v.get("warnings").and_then(Value::as_array) {
+        let truncated: Vec<Value> = warnings.iter().map(truncate_compact_value).collect();
+        out.insert("warnings".into(), Value::Array(truncated));
+    }
     if v.get("target").is_some_and(Value::is_null)
         && let Some(reason) = v.get("reason")
     {
-        out.insert("reason".into(), reason.clone());
+        out.insert("reason".into(), truncate_compact_value(reason));
     }
     if let Some(cw) = v.get("confidenceWarning") {
         let msg = cw
@@ -1089,10 +1126,38 @@ fn compact_route_result(v: Value) -> Value {
             .and_then(Value::as_str)
             .or_else(|| cw.as_str());
         if let Some(msg) = msg {
-            out.insert("confidenceWarning".into(), Value::from(msg));
+            out.insert(
+                "confidenceWarning".into(),
+                Value::from(truncate_compact_text(msg, COMPACT_TEXT_LIMIT)),
+            );
         }
     }
     Value::Object(out)
+}
+
+fn compact_route_batch(results: Vec<Value>) -> Value {
+    let mut brief_hints = Vec::new();
+    let compact: Vec<Value> = results
+        .into_iter()
+        .map(|r| compact_route_result(r, &mut brief_hints))
+        .collect();
+    if brief_hints.is_empty() {
+        json!({ "results": compact })
+    } else {
+        json!({ "results": compact, "briefHints": brief_hints })
+    }
+}
+
+/// Only network-bound MCP tools run concurrently on spawned tasks; local tools
+/// (including `initialize`, notifications, and shared-file mutations like
+/// `instructions_edit`, `skill_*`, `state_write`, `backlog_*`) stay strictly
+/// ordered inline so concurrent edits never race on shared files or `.tmp` paths.
+fn is_concurrent_request(msg: &Value) -> bool {
+    msg.get("method").and_then(Value::as_str) == Some("tools/call")
+        && matches!(
+            msg.pointer("/params/name").and_then(Value::as_str),
+            Some("route_batch" | "coordinator_checkpoint_check")
+        )
 }
 
 async fn write_reply<W: AsyncWrite + Unpin>(
@@ -1107,40 +1172,83 @@ async fn write_reply<W: AsyncWrite + Unpin>(
     out.flush().await
 }
 
-async fn serve_with<R, W, F, Fut>(reader: R, writer: W, handler: F) -> anyhow::Result<()>
+async fn serve_with<R, W, F, Fut, P>(
+    mut reader: R,
+    writer: W,
+    is_concurrent: P,
+    handler: F,
+) -> anyhow::Result<()>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
     F: Fn(Value) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Option<Value>> + Send + 'static,
+    P: Fn(&Value) -> bool,
 {
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
     let handler = Arc::new(handler);
-    let mut lines = reader.lines();
+    let mut buf = Vec::new();
     let mut tasks: tokio::task::JoinSet<std::io::Result<()>> = tokio::task::JoinSet::new();
+    let mut read_err: Option<std::io::Error> = None;
     loop {
-        let line = tokio::select! {
+        let read_res = tokio::select! {
             biased;
             Some(res) = tasks.join_next(), if !tasks.is_empty() => {
-                res??;
+                match res {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(e)) => {
+                        tasks.abort_all();
+                        return Err(e.into());
+                    }
+                    Err(e) => {
+                        tasks.abort_all();
+                        return Err(e.into());
+                    }
+                }
+            }
+            res = reader.read_until(b'\n', &mut buf) => res,
+        };
+        let raw = match read_res {
+            Ok(0) if buf.is_empty() => break,
+            Ok(_) => std::mem::take(&mut buf),
+            Err(e) => {
+                // Drain already-accepted in-flight requests before reporting the read error.
+                read_err = Some(e);
+                break;
+            }
+        };
+        let mut raw = raw;
+        while matches!(raw.last(), Some(b'\n' | b'\r')) {
+            raw.pop();
+        }
+        let line = match std::str::from_utf8(&raw) {
+            Ok(line) => line,
+            Err(e) => {
+                let err = json!({
+                    "jsonrpc": "2.0", "id": null,
+                    "error": { "code": -32700, "message": format!("parse error: {e}") }
+                });
+                if let Err(io_err) = write_reply(&writer, &err).await {
+                    tasks.abort_all();
+                    return Err(io_err.into());
+                }
                 continue;
             }
-            line = lines.next_line() => match line? {
-                Some(line) => line,
-                None => break,
-            },
         };
         if line.trim().is_empty() {
             continue;
         }
-        let msg = match serde_json::from_str::<Value>(&line) {
+        let msg = match serde_json::from_str::<Value>(line) {
             Ok(msg) => msg,
             Err(e) => {
                 let err = json!({
                     "jsonrpc": "2.0", "id": null,
                     "error": { "code": -32700, "message": format!("parse error: {e}") }
                 });
-                write_reply(&writer, &err).await?;
+                if let Err(io_err) = write_reply(&writer, &err).await {
+                    tasks.abort_all();
+                    return Err(io_err.into());
+                }
                 continue;
             }
         };
@@ -1148,10 +1256,12 @@ where
         if msg.get("id").is_none() {
             continue;
         }
-        // Complete `initialize` before reading later lines so the handshake stays ordered.
-        if msg.get("method").and_then(Value::as_str) == Some("initialize") {
-            if let Some(reply) = handler(msg).await {
-                write_reply(&writer, &reply).await?;
+        if !is_concurrent(&msg) {
+            if let Some(reply) = handler(msg).await
+                && let Err(io_err) = write_reply(&writer, &reply).await
+            {
+                tasks.abort_all();
+                return Err(io_err.into());
             }
             continue;
         }
@@ -1165,7 +1275,20 @@ where
         });
     }
     while let Some(res) = tasks.join_next().await {
-        res??;
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tasks.abort_all();
+                return Err(e.into());
+            }
+            Err(e) => {
+                tasks.abort_all();
+                return Err(e.into());
+            }
+        }
+    }
+    if let Some(e) = read_err {
+        return Err(e.into());
     }
     Ok(())
 }
@@ -1175,6 +1298,7 @@ pub async fn run(paths: &Paths) -> anyhow::Result<()> {
     serve_with(
         tokio::io::BufReader::new(tokio::io::stdin()),
         tokio::io::stdout(),
+        is_concurrent_request,
         move |msg| {
             let paths = paths.clone();
             async move { handle(&paths, &msg).await }
@@ -1201,6 +1325,12 @@ mod tests {
         let server = tokio::spawn(serve_with(
             tokio::io::BufReader::new(server_in),
             server_out,
+            |msg| {
+                matches!(
+                    msg.pointer("/params/name").and_then(Value::as_str),
+                    Some("slow" | "bulk")
+                )
+            },
             move |msg| {
                 let entered = Arc::clone(&entered);
                 let release = Arc::clone(&release);
