@@ -1001,112 +1001,6 @@ fn quota_estimate_json(c: &Candidate) -> Value {
     })
 }
 
-// --- source detection --------------------------------------------------------
-
-fn proc_stat_ppid(pid: u32) -> Option<u32> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after = text.split(") ").nth(1)?;
-    after.split(' ').nth(1)?.parse().ok()
-}
-
-fn detect_source(settings: &Value) -> Option<String> {
-    let mut pid = proc_stat_ppid(std::process::id())?;
-    let mut saw_agy = false;
-    for _ in 0..12 {
-        if pid <= 1 {
-            break;
-        }
-        let Some(cmd) = std::fs::read(format!("/proc/{pid}/cmdline")).ok() else {
-            break;
-        };
-        let parts: Vec<&str> = cmd
-            .split(|b| *b == 0)
-            .map(|b| std::str::from_utf8(b).unwrap_or_default())
-            .collect();
-        let names: Vec<String> = parts
-            .iter()
-            .take(2)
-            .map(|c| c.rsplit('/').next().unwrap_or_default().to_string())
-            .collect();
-        if names.iter().any(|n| n == "codex") {
-            let env = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
-            let codex_home = env.split(|b| *b == 0).find_map(|e| {
-                std::str::from_utf8(e)
-                    .ok()
-                    .and_then(|s| s.strip_prefix("CODEX_HOME=").map(str::to_string))
-            });
-            let found = settings
-                .get("providerInstances")
-                .and_then(Value::as_object)
-                .map(|insts| {
-                    insts
-                        .iter()
-                        .find(|(_, v)| {
-                            codex_home.is_some()
-                                && v.get("driver").and_then(Value::as_str) == Some("codex")
-                                && v.get("config")
-                                    .and_then(|c| c.get("shadowHomePath"))
-                                    .and_then(Value::as_str)
-                                    == codex_home.as_deref()
-                        })
-                        .map(|(k, _)| k.clone())
-                })
-                .unwrap_or(None);
-            return Some(found.unwrap_or_else(|| "codex".into()));
-        }
-        if names.iter().any(|n| n == "claude") {
-            let claude_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
-            let found = settings
-                .get("providerInstances")
-                .and_then(Value::as_object)
-                .and_then(|insts| {
-                    insts
-                        .iter()
-                        .find(|(_, v)| {
-                            v.get("driver").and_then(Value::as_str) == Some("claudeAgent")
-                                && claude_dir.is_some()
-                                && v.get("config")
-                                    .and_then(|c| c.get("homePath"))
-                                    .and_then(Value::as_str)
-                                    == claude_dir.as_deref()
-                        })
-                        .map(|(k, _)| k.clone())
-                });
-            return Some(found.unwrap_or_else(|| {
-                if claude_dir.is_some_and(|d| d.contains(".claude-openrouter")) {
-                    "claudeAgent_openrouter".into()
-                } else {
-                    "claudeAgent".into()
-                }
-            }));
-        }
-        if names.iter().any(|n| n == "opencode") {
-            return Some("opencode".into());
-        }
-        if names.iter().any(|n| n == "agy")
-            || parts
-                .first()
-                .is_some_and(|c| c.contains("/.t3/tools/antigravity-acp/"))
-        {
-            let env: Vec<String> = std::fs::read(format!("/proc/{pid}/environ"))
-                .unwrap_or_default()
-                .split(|b| *b == 0)
-                .map(|e| String::from_utf8_lossy(e).into_owned())
-                .collect();
-            let argv: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
-            if let Some(id) = crate::policy::antigravity_instance(settings, &env, &argv) {
-                return Some(id);
-            }
-            saw_agy = true;
-        }
-        let Some(parent) = proc_stat_ppid(pid) else {
-            break;
-        };
-        pid = parent;
-    }
-    saw_agy.then(|| "antigravity".into())
-}
-
 // --- Jev ---------------------------------------------------------------------
 
 /// Reads a key from `env` or `~/.config/model-route/<file>`.
@@ -1122,10 +1016,16 @@ fn decision_key(env: &str, file: &str) -> anyhow::Result<String> {
                 .filter(|k| !k.is_empty())
         })
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "decision key not found: set {env} or write {}",
-                key_file.display()
-            )
+            JevHttpError {
+                trigger: agentdeck_core::judge::FallbackTrigger::None,
+                is_language_model: false,
+                channel_wide: true,
+                message: format!(
+                    "decision key not found: set {env} or write {}",
+                    key_file.display()
+                ),
+            }
+            .into()
         })
 }
 
@@ -1242,6 +1142,7 @@ const JEV_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 struct JevHttpError {
     trigger: agentdeck_core::judge::FallbackTrigger,
     is_language_model: bool,
+    channel_wide: bool,
     message: String,
 }
 
@@ -1263,6 +1164,14 @@ fn classify_jev_error(err: &anyhow::Error) -> agentdeck_core::judge::FallbackTri
         };
     }
     agentdeck_core::judge::FallbackTrigger::None
+}
+
+fn is_channel_wide_jev_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<JevHttpError>()
+        .is_some_and(|e| e.channel_wide)
+        || err
+            .downcast_ref::<crate::jev_queue::RateLimited>()
+            .is_some()
 }
 
 #[derive(Clone, Debug)]
@@ -1290,15 +1199,26 @@ async fn post_json(
     url: &str,
     key: &str,
     body: String,
-    timeout: std::time::Duration,
+    deadline: std::time::Instant,
+    check_language_model: bool,
 ) -> anyhow::Result<Value> {
+    let Some(timeout) = agentdeck_core::judge::request_timeout(JEV_REQUEST_TIMEOUT, deadline)
+    else {
+        return Err(JevHttpError {
+            trigger: agentdeck_core::judge::FallbackTrigger::Transient,
+            is_language_model: false,
+            channel_wide: true,
+            message: "jev_error_timeout".into(),
+        }
+        .into());
+    };
     let mut builder = reqwest::Client::builder();
     if is_loopback_url(url) {
         builder = builder.no_proxy();
     }
     let client = builder
         .build()
-        .map_err(|e| anyhow::anyhow!("Jev client build failed: {e}"))?;
+        .map_err(|_| anyhow::anyhow!("jev_error_client"))?;
     let res = client
         .post(url)
         .timeout(timeout)
@@ -1310,31 +1230,59 @@ async fn post_json(
         .map_err(|e| JevHttpError {
             trigger: agentdeck_core::judge::FallbackTrigger::Transient,
             is_language_model: false,
-            message: format!("Jev request failed: {e}"),
+            channel_wide: true,
+            message: if e.is_timeout() {
+                "jev_error_timeout".into()
+            } else {
+                "jev_error_network".into()
+            },
         })?;
     if !res.status().is_success() {
         let status = res.status().as_u16();
-        let retry_after = (status == 429).then(|| {
-            agentdeck_core::judge::parse_retry_after(
+        // Decide 429 on status + Retry-After before reading the body, and never
+        // let a 429 body trigger the Vercel language-model chat retry.
+        if status == 429 {
+            let retry_after = agentdeck_core::judge::parse_retry_after(
                 res.headers()
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|v| v.to_str().ok()),
-            )
-        });
-        let text = res.text().await.unwrap_or_default();
-        let is_language_model = text.contains("is a language model");
-        let snippet: String = text.chars().take(300).collect();
-        let message = format!("Jev HTTP {status}: {snippet}");
+            );
+            return Err(JevHttpError {
+                trigger: agentdeck_core::judge::classify_http_status(429, Some(retry_after)),
+                is_language_model: false,
+                channel_wide: true,
+                message: "jev_http_status_429".into(),
+            }
+            .into());
+        }
+        // Only inspect non-429 4xx body for the Vercel language-model sentinel;
+        // never copy provider HTTP body text into errors or logs.
+        let is_language_model = check_language_model
+            && (400..500).contains(&status)
+            && res
+                .text()
+                .await
+                .is_ok_and(|text| text.contains("is a language model"));
+        let channel_wide = matches!(status, 401 | 403 | 404) || (500..=599).contains(&status);
         return Err(JevHttpError {
-            trigger: agentdeck_core::judge::classify_http_status(status, retry_after),
+            trigger: agentdeck_core::judge::classify_http_status(status, None),
             is_language_model,
-            message,
+            channel_wide,
+            message: format!("jev_http_status_{status}"),
         }
         .into());
     }
-    res.json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Jev returned invalid JSON: {e}"))
+    let bytes = res.bytes().await.map_err(|e| JevHttpError {
+        trigger: agentdeck_core::judge::FallbackTrigger::Transient,
+        is_language_model: false,
+        channel_wide: true,
+        message: if e.is_timeout() {
+            "jev_error_timeout".into()
+        } else {
+            "jev_error_network".into()
+        },
+    })?;
+    serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("Jev returned invalid JSON"))
 }
 
 async fn jev_fetch_endpoint(
@@ -1342,7 +1290,7 @@ async fn jev_fetch_endpoint(
     request: &Value,
     request_body: &str,
     key: Option<&str>,
-    timeout: std::time::Duration,
+    deadline: std::time::Instant,
     bases: &JevBases,
 ) -> anyhow::Result<(Value, Option<f64>)> {
     if bases.openrouter == OPENROUTER_BASE
@@ -1378,9 +1326,6 @@ async fn jev_fetch_endpoint(
                 .and_then(Value::as_f64),
         ));
     }
-    let req_timeout = timeout
-        .min(JEV_REQUEST_TIMEOUT)
-        .max(std::time::Duration::from_millis(1));
     // Rewrite only the outbound model when falling back so the caller's primary
     // request (and Jev cache key) stay untouched.
     let rewritten = (request.get("model").and_then(Value::as_str) != Some(endpoint.model.as_str()))
@@ -1403,7 +1348,8 @@ async fn jev_fetch_endpoint(
             &decisions_url,
             &key,
             decisions_body(eff_request).to_string(),
-            req_timeout,
+            deadline,
+            true,
         )
         .await
         {
@@ -1423,7 +1369,8 @@ async fn jev_fetch_endpoint(
             &chat_url,
             &key,
             gateway_body(eff_request).to_string(),
-            req_timeout,
+            deadline,
+            false,
         )
         .await?;
         // shortcut: the chat completion's cost is not read, so Jev cost reports as unknown.
@@ -1441,7 +1388,7 @@ async fn jev_fetch_endpoint(
         "{}/api/alpha/decisions",
         bases.openrouter.trim_end_matches('/')
     );
-    let v = post_json(&url, &key, eff_body, req_timeout).await?;
+    let v = post_json(&url, &key, eff_body, deadline, false).await?;
     Ok((
         v.get("answers").cloned().unwrap_or(Value::Null),
         v.get("usage")
@@ -1492,30 +1439,28 @@ pub async fn judge_evaluation(
             &request,
             &body,
             None,
-            JEV_REQUEST_TIMEOUT,
+            std::time::Instant::now() + JEV_REQUEST_TIMEOUT,
             &JevBases::default(),
         )
         .await?;
         return Ok((answers, cost, primary.provider, primary.model));
     }
-    let blocks = agentdeck_core::judge::BlockStore::new(
-        env.runtime
-            .join(agentdeck_core::judge::JUDGE_BLOCKS_DIR_NAME),
-    );
+    let blocks = agentdeck_core::judge::BlockStore::for_runtime_dir(&env.runtime);
     let bases = JevBases::default();
     let ((answers, cost), channel) = agentdeck_core::judge::dispatch_with_deadline(
         &blocks,
         &primary,
         fallback.as_ref(),
         crate::jev_queue::BUDGET,
+        std::time::Instant::now,
         std::time::SystemTime::now,
         tokio::time::sleep,
-        |ep, rem| {
+        |ep, attempt_deadline| {
             let ep = ep.clone();
             let req = request.clone();
             let body = body.clone();
             let bases = bases.clone();
-            async move { jev_fetch_endpoint(&ep, &req, &body, None, rem, &bases).await }
+            async move { jev_fetch_endpoint(&ep, &req, &body, None, attempt_deadline, &bases).await }
         },
         classify_jev_error,
         |ep, ra, rem| {
@@ -1534,12 +1479,24 @@ pub async fn judge_evaluation(
 }
 
 /// One live decision on a fixed small task, bypassing the cache and fallback:
-/// checks that the specific provider, model and key work. `key` overrides the
+/// checks that the specific provider, model and key work while honouring and
+/// updating the shared cross-process 429 block store. `key` overrides the
 /// stored key. Returns (size score, difficulty score, cost in USD when reported).
 pub async fn probe_decision(
     provider: Option<&str>,
     model: &str,
     key: Option<&str>,
+) -> anyhow::Result<(f64, f64, Option<f64>)> {
+    let blocks = agentdeck_core::judge::BlockStore::default_runtime();
+    probe_decision_with_bases(provider, model, key, &blocks, &JevBases::default()).await
+}
+
+async fn probe_decision_with_bases(
+    provider: Option<&str>,
+    model: &str,
+    key: Option<&str>,
+    blocks: &agentdeck_core::judge::BlockStore,
+    bases: &JevBases,
 ) -> anyhow::Result<(f64, f64, Option<f64>)> {
     let endpoint = agentdeck_core::judge::JudgeEndpoint::new(
         provider.unwrap_or(agentdeck_core::settings::PROVIDER_OPENROUTER),
@@ -1554,15 +1511,55 @@ pub async fn probe_decision(
         },
     });
     let body = stringify_like_node(&request);
-    let (answers, cost) = jev_fetch_endpoint(
+    let deadline = std::time::Instant::now() + JEV_REQUEST_TIMEOUT;
+    let step = agentdeck_core::judge::dispatch_once(
+        blocks,
         &endpoint,
-        &request,
-        &body,
-        key,
-        JEV_REQUEST_TIMEOUT,
-        &JevBases::default(),
+        None,
+        deadline,
+        std::time::Instant::now,
+        std::time::SystemTime::now,
+        |ep, attempt_deadline| {
+            let ep = ep.clone();
+            let req = request.clone();
+            let body = body.clone();
+            let bases = bases.clone();
+            let key_owned = key.map(str::to_string);
+            async move {
+                jev_fetch_endpoint(
+                    &ep,
+                    &req,
+                    &body,
+                    key_owned.as_deref(),
+                    attempt_deadline,
+                    &bases,
+                )
+                .await
+            }
+        },
+        classify_jev_error,
+        |ep, ra, _rem| {
+            anyhow::anyhow!(
+                "{}",
+                agentdeck_core::judge::format_blocked_until(ep, ra, std::time::SystemTime::now())
+            )
+        },
     )
-    .await?;
+    .await;
+    let (answers, cost) = match step {
+        agentdeck_core::judge::DispatchStep::Done(v, _) => v,
+        agentdeck_core::judge::DispatchStep::Wait(rem) => {
+            return Err(anyhow::anyhow!(
+                "{}",
+                agentdeck_core::judge::format_blocked_until(
+                    &endpoint,
+                    rem,
+                    std::time::SystemTime::now(),
+                )
+            ));
+        }
+        agentdeck_core::judge::DispatchStep::Fail(e) => return Err(e),
+    };
     let score = |k: &str| {
         answers
             .get(k)
@@ -1570,7 +1567,7 @@ pub async fn probe_decision(
             .and_then(|a| a.get("score"))
             .and_then(Value::as_f64)
             .ok_or_else(|| {
-                anyhow::anyhow!("the model answered, but {k} is missing or out of range: {answers}")
+                anyhow::anyhow!("the model answered, but {k} is missing or out of range")
             })
     };
     Ok((score("size")?, score("difficulty")?, cost))
@@ -2294,55 +2291,6 @@ fn build_route_output(
     Value::Object(out)
 }
 
-fn build_user_choice_output(
-    cfg: &RouterConfig,
-    current_cfg: &RouterConfig,
-    source: Option<&str>,
-    source_warning: Option<&str>,
-    requested: &ValidatedTarget,
-    raw_target: Option<&Value>,
-) -> Value {
-    let target = raw_target.cloned().unwrap_or_else(
-        || serde_json::json!({"providerInstanceId": requested.provider, "model": requested.model}),
-    );
-    let mut out = serde_json::Map::new();
-    out.insert("target".into(), target.clone());
-    if let Some(h) = hint_of_on(&requested.provider, &requested.model) {
-        out.insert("briefHint".into(), Value::from(h.clone()));
-        out.insert("requestedBriefHint".into(), Value::from(h));
-    }
-    out.insert(
-        "source".into(),
-        source.map(Value::from).unwrap_or(Value::Null),
-    );
-    out.insert(
-        "sourceAccount".into(),
-        source
-            .and_then(|s| cfg.account.get(s))
-            .cloned()
-            .map(Value::String)
-            .unwrap_or(Value::Null),
-    );
-    if let Some(w) = source_warning {
-        out.insert("sourceWarning".into(), Value::from(w));
-    }
-    out.insert("reason".into(), Value::from("user-requested target"));
-    out.insert("userChoice".into(), Value::from(true));
-    out.insert("requestedTarget".into(), target);
-    out.insert(
-        "requestedNoReview".into(),
-        Value::from(current_cfg.user_rules.is_no_review(&requested.model)),
-    );
-    out.insert(
-        "validation".into(),
-        serde_json::json!({"allowed": true, "reason": "user-requested target"}),
-    );
-    out.insert("userRules".into(), current_cfg.user_rules.to_json());
-    out.insert("jevCache".into(), Value::from("skipped"));
-    out.insert("jevChannel".into(), Value::from("skipped"));
-    Value::Object(out)
-}
-
 /// Pre-route a wave of planned launches in as few Jev calls as possible (up to
 /// `jev_queue::MAX_TASKS` per call), warming the Jev cache so later hook
 /// invocations hit the cache. Returns one JSON object per input launch in order:
@@ -2368,13 +2316,26 @@ async fn route_batch_with_bases(
     let settings =
         read_settings(&env.home).map_err(|e| anyhow::anyhow!("cannot read T3 settings: {e}"))?;
     let harness = opts.harness.as_deref().unwrap_or_default();
-    let source = if let Some(s) = opts.source.as_deref().filter(|s| !s.is_empty()) {
-        Some(s.to_string())
-    } else if !harness.is_empty() {
-        let chain = crate::hook::process_ancestors();
-        crate::hook::resolve_instance(harness, &env.home, &chain, None)?
-    } else {
-        detect_source(&settings)
+    let ancestors = crate::hook::process_ancestors_full();
+    let source = match crate::hook::resolve_source(
+        &env.home,
+        &ancestors,
+        crate::hook::SourceQuery {
+            harness: opts.harness.as_deref(),
+            explicit_source: opts.source.as_deref(),
+            thread_id: None,
+            from_hook: false,
+        },
+    ) {
+        Ok(Some(s)) if !s.is_empty() => Some(s),
+        Ok(_) => {
+            let msg = "cannot determine routing source unambiguously; pass source or run with T3CODE_THREAD_ID";
+            return Ok(vec![serde_json::json!({"error": msg}); launches.len()]);
+        }
+        Err(e) => {
+            let msg = format!("cannot resolve routing source: {e}");
+            return Ok(vec![serde_json::json!({"error": msg}); launches.len()]);
+        }
     };
     let cfg = load_router_config(env)?;
     let source_warning = match &source {
@@ -2397,10 +2358,6 @@ async fn route_batch_with_bases(
 
     enum BatchSlot {
         Error(String),
-        UserChoice {
-            target: ValidatedTarget,
-            raw_target: Option<Value>,
-        },
         Cached {
             task: String,
             requested: Option<ValidatedTarget>,
@@ -2502,19 +2459,9 @@ async fn route_batch_with_bases(
         }
 
         let mut exclude = parsed.markers.exclude.clone();
-        let (task, markers) = normalize_task(&parsed.brief, &known_hints, &mut exclude);
+        let (task, _) = normalize_task(&parsed.brief, &known_hints, &mut exclude);
         if task.is_empty() {
             slots.push(BatchSlot::Error("empty task brief".into()));
-            continue;
-        }
-        // User-chosen explicit targets skip the judge and do not consume batch slots.
-        if (parsed.markers.user_choice || markers.user_choice)
-            && let Some(target) = parsed.target
-        {
-            slots.push(BatchSlot::UserChoice {
-                target,
-                raw_target: parsed.raw_target,
-            });
             continue;
         }
 
@@ -2554,10 +2501,7 @@ async fn route_batch_with_bases(
 
     let mut fetched: Vec<anyhow::Result<crate::jev_queue::QueueAnswer>> = Vec::new();
     if !to_fetch.is_empty() {
-        let blocks = agentdeck_core::judge::BlockStore::new(
-            env.runtime
-                .join(agentdeck_core::judge::JUDGE_BLOCKS_DIR_NAME),
-        );
+        let blocks = agentdeck_core::judge::BlockStore::for_runtime_dir(&env.runtime);
         let queue_items: Vec<(Value, String)> = to_fetch
             .iter()
             .map(|(_, req, body)| (req.clone(), body.clone()))
@@ -2571,7 +2515,7 @@ async fn route_batch_with_bases(
             &blocks,
             &primary,
             fallback.as_ref(),
-            move |endpoint, request, body, remaining| {
+            move |endpoint, request, body, attempt_deadline| {
                 let bases = bases_owned.clone();
                 let key_owned = key_owned.clone();
                 async move {
@@ -2580,13 +2524,14 @@ async fn route_batch_with_bases(
                         &request,
                         &body,
                         key_owned.as_deref(),
-                        remaining,
+                        attempt_deadline,
                         &bases,
                     )
                     .await
                 }
             },
             classify_jev_error,
+            is_channel_wide_jev_error,
         )
         .await;
         for (idx, outcome) in raw_outcomes.into_iter().enumerate() {
@@ -2608,12 +2553,9 @@ async fn route_batch_with_bases(
         }
     }
 
-    let needs_snapshot = slots.iter().any(|s| {
-        matches!(
-            s,
-            BatchSlot::Cached { .. } | BatchSlot::Pending { .. } | BatchSlot::UserChoice { .. }
-        )
-    });
+    let needs_snapshot = slots
+        .iter()
+        .any(|s| matches!(s, BatchSlot::Cached { .. } | BatchSlot::Pending { .. }));
     if !needs_snapshot {
         return Ok(slots
             .into_iter()
@@ -2630,16 +2572,6 @@ async fn route_batch_with_bases(
     for slot in slots {
         match slot {
             BatchSlot::Error(msg) => out.push(serde_json::json!({"error": msg})),
-            BatchSlot::UserChoice { target, raw_target } => {
-                out.push(build_user_choice_output(
-                    &cfg,
-                    &snapshot.current_cfg,
-                    source.as_deref(),
-                    source_warning.as_deref(),
-                    &target,
-                    raw_target.as_ref(),
-                ));
-            }
             BatchSlot::Cached {
                 task,
                 requested,
@@ -2791,7 +2723,11 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     let settings =
         read_settings(&env.home).map_err(|e| anyhow::anyhow!("cannot read T3 settings: {e}"))?;
     if source.is_none() {
-        source = detect_source(&settings);
+        let ancestors = crate::hook::process_ancestors_full();
+        source =
+            crate::hook::resolve_source(&env.home, &ancestors, crate::hook::SourceQuery::default())
+                .ok()
+                .flatten();
     }
     let cfg = match load_router_config(&env) {
         Ok(c) => c,
@@ -2910,10 +2846,7 @@ async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
     let (request_value, body_json) = build_jev_request(&primary.model, &task, &criteria);
     let hash_input = jev_cache_key(source.as_deref(), &cfg.version, &request_value);
     let complete = |a: &Value| answers_complete(a, &criteria);
-    let blocks = agentdeck_core::judge::BlockStore::new(
-        env.runtime
-            .join(agentdeck_core::judge::JUDGE_BLOCKS_DIR_NAME),
-    );
+    let blocks = agentdeck_core::judge::BlockStore::for_runtime_dir(&env.runtime);
     let (answers, cost, jev_hit, jev_channel) = fetch_jev_cached(
         &env.runtime,
         &hash_input,
@@ -3070,7 +3003,7 @@ async fn fetch_jev_cached(
         blocks,
         primary,
         fallback,
-        move |endpoint, request, body, remaining| {
+        move |endpoint, request, body, attempt_deadline| {
             let bases = bases.clone();
             let key_owned = key_owned.clone();
             async move {
@@ -3079,13 +3012,14 @@ async fn fetch_jev_cached(
                     &request,
                     &body,
                     key_owned.as_deref(),
-                    remaining,
+                    attempt_deadline,
                     &bases,
                 )
                 .await
             }
         },
         classify_jev_error,
+        is_channel_wide_jev_error,
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -3724,25 +3658,533 @@ mod gateway_tests {
         .await
         .unwrap();
         let seen = srv.await.unwrap();
-        assert_eq!(seen.len(), 2, "10 judged launches must use 2 requests");
+        assert_eq!(seen.len(), 2, "11 judged launches must use 2 requests");
         assert_eq!(seen[0]["state"]["tasks"].as_object().unwrap().len(), 8);
-        assert_eq!(seen[1]["state"]["tasks"].as_object().unwrap().len(), 2);
+        assert_eq!(seen[1]["state"]["tasks"].as_object().unwrap().len(), 3);
         assert_eq!(results.len(), 12);
         assert!(
             results[4].get("error").is_some(),
             "invalid launch must yield {{error}}: {}",
             results[4]
         );
-        assert_eq!(results[7]["userChoice"], true);
-        assert_eq!(results[7]["jevCache"], "skipped");
-        assert_eq!(results[7]["target"]["model"], "claude-opus-5-5");
+        assert_eq!(results[7]["jevCache"], "miss");
+        assert!(results[7].get("validation").is_some());
         for (idx, r) in results.iter().enumerate() {
-            if idx != 4 && idx != 7 {
+            if idx != 4 {
                 assert!(r.get("error").is_none(), "unexpected error at {idx}: {r}");
                 assert_eq!(r["jevCache"], "miss");
                 assert_eq!(r["target"]["providerInstanceId"], "codex");
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn route_batch_returns_per_launch_error_when_source_ambiguous_or_unknown() {
+        let (dir, env) = setup_batch_env("ambig-src");
+        // Configure two codex instances so harness="codex" without CODEX_HOME or T3CODE_THREAD_ID is ambiguous.
+        std::fs::write(
+            env.home.join(".t3/userdata/settings.json"),
+            serde_json::json!({
+                "providerInstances": {
+                    "codex": {"driver": "codex", "config": {}},
+                    "codex_b": {"driver": "codex", "config": {"shadowHomePath": "/tmp/codex-b"}}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let dead_bases = JevBases {
+            openrouter: "http://127.0.0.1:1".into(),
+            vercel: "http://127.0.0.1:1".into(),
+        };
+        let launches = vec![serde_json::json!({
+            "tool": "mcp__t3-code__delegate_task",
+            "input": {"task": "Refactor auth"}
+        })];
+        // Neither source nor thread binding nor CODEX_HOME -> ambiguous -> per-launch error, 0 judge calls.
+        let res = route_batch_with_bases(
+            &env,
+            &launches,
+            BatchOptions {
+                harness: Some("codex".into()),
+                source: None,
+                budget: BATCH_BUDGET,
+            },
+            &dead_bases,
+            Some("test-key"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.len(), 1);
+        let err = res[0]["error"]
+            .as_str()
+            .expect("ambiguous source must return per-launch error");
+        assert!(
+            err.to_lowercase().contains("source"),
+            "error must explain missing/ambiguous source, not network failure: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn http_errors_never_leak_provider_body_in_route_or_batch() {
+        let (dir, env) = setup_batch_env("no-body-leak");
+        let (or_base, or_srv) = mock_http_server(vec![(
+            "401 Unauthorized",
+            "",
+            r#"{"error":"echoed SECRET_PROXY_REFLECTION_999"}"#.into(),
+        )])
+        .await;
+        let bases = JevBases {
+            openrouter: or_base,
+            vercel: VERCEL_BASE.into(),
+        };
+        let launches = vec![serde_json::json!({
+            "tool": "mcp__t3-code__delegate_task",
+            "input": {"task": "Test body redaction"}
+        })];
+        let results = route_batch_with_bases(
+            &env,
+            &launches,
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: Some("claudeAgent".into()),
+                budget: BATCH_BUDGET,
+            },
+            &bases,
+            Some("test-key"),
+        )
+        .await
+        .unwrap();
+        or_srv.await.unwrap();
+        let err = results[0]["error"].as_str().expect("must error on 401");
+        assert!(
+            !err.contains("SECRET_PROXY_REFLECTION_999"),
+            "provider HTTP body must never leak into error: {err}"
+        );
+        assert!(
+            err.contains("jev_http_status_401"),
+            "error must return fixed status code: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn route_body_abort_falls_back_and_429_language_model_does_not_retry_chat() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let rt =
+            std::env::temp_dir().join(format!("agentdeck-route-body-429-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(&rt).unwrap();
+
+        let vercel_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let vercel_base = format!("http://{}", vercel_listener.local_addr().unwrap());
+        let vercel_paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let vp = vercel_paths.clone();
+        let vercel_srv = std::thread::spawn(move || {
+            for idx in 0..2 {
+                let (mut stream, _) = vercel_listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        size = v.trim().parse().unwrap();
+                    }
+                }
+                let mut buf = vec![0; size];
+                reader.read_exact(&mut buf).unwrap();
+                vp.lock().unwrap().push(first);
+                if idx == 0 {
+                    // Truncated 200 body -> body-read error -> transient -> fallback.
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\nConnection: close\r\n\r\n{\"answers\":",
+                    );
+                } else {
+                    // 429 with "is a language model" body must NOT trigger /v1/chat/completions.
+                    let body = r#"{"error":"model is a language model"}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            }
+        });
+
+        let ok_or = serde_json::json!({
+            "answers": {
+                "size": {"score": 1, "confidence": 0.9},
+                "difficulty": {"score": 1, "confidence": 0.9},
+            },
+            "usage": {"cost": 0.002}
+        })
+        .to_string();
+        let or_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let or_base = format!("http://{}", or_listener.local_addr().unwrap());
+        let or_srv = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = or_listener.accept().unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        size = v.trim().parse().unwrap();
+                    }
+                }
+                let mut buf = vec![0; size];
+                reader.read_exact(&mut buf).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok_or}",
+                    ok_or.len()
+                )
+                .unwrap();
+            }
+        });
+
+        let bases = JevBases {
+            openrouter: or_base,
+            vercel: vercel_base,
+        };
+        let blocks = agentdeck_core::judge::BlockStore::new(rt.join("blocks"));
+        let primary = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_VERCEL,
+            "perplexity/pplx-decider-v1.2",
+        );
+        let fallback = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_OPENROUTER,
+            "~typesafe/jev-latest",
+        );
+        let req = serde_json::json!({
+            "model": primary.model,
+            "state": {"task": "fix bug", "models": {}},
+            "questions": {
+                "size": {"type": "score", "instructions": "size?", "criteria": SIZES},
+                "difficulty": {"type": "score", "instructions": "diff?", "criteria": DIFFICULTY},
+            }
+        });
+        let body = stringify_like_node(&req);
+        let complete = |a: &Value| {
+            a.get("size").is_some_and(|s| valid_answer(s, false))
+                && a.get("difficulty").is_some_and(|d| valid_answer(d, false))
+        };
+
+        let (_, _, _, ch1) = fetch_jev_cached(
+            &rt,
+            "h-trunc",
+            &req,
+            &body,
+            &primary,
+            Some(&fallback),
+            std::time::Duration::from_secs(10),
+            &blocks,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ch1, agentdeck_core::judge::JudgeChannel::Fallback);
+
+        let (_, _, _, ch2) = fetch_jev_cached(
+            &rt,
+            "h-429-lm",
+            &req,
+            &body,
+            &primary,
+            Some(&fallback),
+            std::time::Duration::from_secs(10),
+            &blocks,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ch2, agentdeck_core::judge::JudgeChannel::Fallback);
+
+        vercel_srv.join().unwrap();
+        or_srv.join().unwrap();
+        let seen = vercel_paths.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            2,
+            "must not retry /v1/chat/completions on 429: {seen:?}"
+        );
+        assert!(seen.iter().all(|p| p.contains("/v1/decisions")));
+        assert!(blocks.remaining(&primary).is_some());
+        let _ = std::fs::remove_dir_all(&rt);
+    }
+
+    #[tokio::test]
+    async fn vercel_language_model_retry_and_fallback_share_single_deadline() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let rt =
+            std::env::temp_dir().join(format!("agentdeck-route-deadline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&rt);
+        std::fs::create_dir_all(&rt).unwrap();
+
+        // Hanging Vercel server (stalls 2s) + fast OpenRouter fallback with 800ms overall deadline.
+        let vercel_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let vercel_base = format!("http://{}", vercel_listener.local_addr().unwrap());
+        let _vercel_srv = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = vercel_listener.accept() {
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        });
+        let ok_or = serde_json::json!({
+            "answers": {
+                "size": {"score": 1, "confidence": 0.9},
+                "difficulty": {"score": 1, "confidence": 0.9},
+            },
+            "usage": {"cost": 0.002}
+        })
+        .to_string();
+        let or_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let or_base = format!("http://{}", or_listener.local_addr().unwrap());
+        let or_srv = std::thread::spawn(move || {
+            let (mut stream, _) = or_listener.accept().unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            let mut size = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((n, v)) = line.split_once(':')
+                    && n.eq_ignore_ascii_case("content-length")
+                {
+                    size = v.trim().parse().unwrap();
+                }
+            }
+            let mut buf = vec![0; size];
+            reader.read_exact(&mut buf).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok_or}",
+                ok_or.len()
+            )
+            .unwrap();
+        });
+
+        let bases = JevBases {
+            openrouter: or_base,
+            vercel: vercel_base,
+        };
+        let blocks = agentdeck_core::judge::BlockStore::new(rt.join("blocks"));
+        let primary = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_VERCEL,
+            "perplexity/pplx-decider-v1.2",
+        );
+        let fallback = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_OPENROUTER,
+            "~typesafe/jev-latest",
+        );
+        let req = serde_json::json!({
+            "model": primary.model,
+            "state": {"task": "fix bug", "models": {}},
+            "questions": {
+                "size": {"type": "score", "instructions": "size?", "criteria": SIZES},
+                "difficulty": {"type": "score", "instructions": "diff?", "criteria": DIFFICULTY},
+            }
+        });
+        let body = stringify_like_node(&req);
+        let complete = |a: &Value| {
+            a.get("size").is_some_and(|s| valid_answer(s, false))
+                && a.get("difficulty").is_some_and(|d| valid_answer(d, false))
+        };
+
+        let started = std::time::Instant::now();
+        let (_, _, _, ch) = fetch_jev_cached(
+            &rt,
+            "h-deadline",
+            &req,
+            &body,
+            &primary,
+            Some(&fallback),
+            std::time::Duration::from_millis(800),
+            &blocks,
+            &bases,
+            Some("test-key"),
+            &complete,
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(ch, agentdeck_core::judge::JudgeChannel::Fallback);
+        assert!(
+            elapsed < std::time::Duration::from_millis(1200),
+            "fallback must succeed within single 800ms deadline, took {elapsed:?}"
+        );
+        or_srv.join().unwrap();
+
+        // Also check Vercel /decisions (450ms delay) -> /chat/completions (hangs) respects single 800ms deadline.
+        let v2_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let v2_base = format!("http://{}", v2_listener.local_addr().unwrap());
+        let _v2_srv = std::thread::spawn(move || {
+            for idx in 0..2 {
+                let Ok((mut stream, _)) = v2_listener.accept() else {
+                    break;
+                };
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                let _ = reader.read_line(&mut first);
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        size = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut buf = vec![0; size];
+                let _ = reader.read_exact(&mut buf);
+                if idx == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(450));
+                    let b = r#"{"error":"model is a language model"}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+                        b.len()
+                    );
+                } else {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            }
+        });
+        let bases2 = JevBases {
+            openrouter: "http://127.0.0.1:1".into(),
+            vercel: v2_base,
+        };
+        let started2 = std::time::Instant::now();
+        let res2 = fetch_jev_cached(
+            &rt,
+            "h-vercel-chat-deadline",
+            &req,
+            &body,
+            &primary,
+            None,
+            std::time::Duration::from_millis(800),
+            &blocks,
+            &bases2,
+            Some("test-key"),
+            &complete,
+        )
+        .await;
+        let elapsed2 = started2.elapsed();
+        assert!(res2.is_err());
+        assert!(
+            elapsed2 < std::time::Duration::from_millis(1100),
+            "Vercel /decisions + /chat/completions must share one 800ms deadline, took {elapsed2:?}"
+        );
+        let _ = std::fs::remove_dir_all(&rt);
+    }
+
+    #[tokio::test]
+    async fn route_batch_user_choice_warms_cache_and_fails_when_judge_down() {
+        let (dir, env) = setup_batch_env("user-choice-warm");
+        let launch = serde_json::json!({
+            "tool": "mcp__t3-code__delegate_task",
+            "input": {
+                "task": "[route:user-choice] Audit auth with chosen model",
+                "target": {"providerInstanceId": "claudeAgent", "model": "claude-opus-5-5"}
+            }
+        });
+
+        // 1. With judge down, route_batch must NOT falsely claim allowed: true.
+        let dead_bases = JevBases {
+            openrouter: "http://127.0.0.1:1".into(),
+            vercel: "http://127.0.0.1:1".into(),
+        };
+        let down = route_batch_with_bases(
+            &env,
+            std::slice::from_ref(&launch),
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: Some("claudeAgent".into()),
+                budget: std::time::Duration::from_secs(5),
+            },
+            &dead_bases,
+            Some("test-key"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            down[0].get("error").is_some(),
+            "[route:user-choice] must fail when judge is down, not fabricate allowed:true: {}",
+            down[0]
+        );
+
+        // 2. With judge up, route_batch calls judge, returns normal route output, and warms cache.
+        let (or_base, srv) = dynamic_openrouter_server(1).await;
+        let bases = JevBases {
+            openrouter: or_base,
+            vercel: VERCEL_BASE.into(),
+        };
+        let warmed = route_batch_with_bases(
+            &env,
+            std::slice::from_ref(&launch),
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: Some("claudeAgent".into()),
+                budget: BATCH_BUDGET,
+            },
+            &bases,
+            Some("test-key"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(srv.await.unwrap().len(), 1);
+        assert_eq!(warmed[0]["jevCache"], "miss", "{}", warmed[0]);
+        assert!(warmed[0].get("ranking").is_some(), "{}", warmed[0]);
+
+        // 3. Re-running with judge down now hits the warmed cache!
+        let hit = route_batch_with_bases(
+            &env,
+            std::slice::from_ref(&launch),
+            BatchOptions {
+                harness: Some("claude".into()),
+                source: Some("claudeAgent".into()),
+                budget: std::time::Duration::from_secs(5),
+            },
+            &dead_bases,
+            Some("test-key"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hit[0]["jevCache"], "hit", "{}", hit[0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -4206,12 +4648,112 @@ mod probe_tests {
             r#"{"answers":{"size":{"score":0,"confidence":0.9},"difficulty":{"score":0,"confidence":0.8}},"usage":{"cost":0.001}}"#,
         )
         .unwrap();
+        let blocks = agentdeck_core::judge::BlockStore::new(dir.join("blocks"));
         // SAFETY: test-only env override read by jev_fetch.
         unsafe { std::env::set_var("AGENTDECK_ROUTE_MOCK_JEV", &mock) };
-        let r = super::probe_decision(None, "m", Some("k")).await;
+        let r = super::probe_decision_with_bases(
+            None,
+            "m",
+            Some("k"),
+            &blocks,
+            &super::JevBases::default(),
+        )
+        .await;
         unsafe { std::env::remove_var("AGENTDECK_ROUTE_MOCK_JEV") };
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(r.unwrap(), (0.0, 0.0, Some(0.001)));
+    }
+
+    #[tokio::test]
+    async fn probe_decision_records_429_block_and_honours_active_block() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let dir = std::env::temp_dir().join(format!("agentdeck-probe-429-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_bg = hits.clone();
+        let srv = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            hits_bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut reader = BufReader::new(&mut stream);
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            let mut size = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((n, v)) = line.split_once(':')
+                    && n.eq_ignore_ascii_case("content-length")
+                {
+                    size = v.trim().parse().unwrap();
+                }
+            }
+            let mut buf = vec![0; size];
+            reader.read_exact(&mut buf).unwrap();
+            let body = r#"{"error":"rate limited"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        let blocks = agentdeck_core::judge::BlockStore::new(dir.join("blocks"));
+        let bases = super::JevBases {
+            openrouter: base,
+            vercel: "http://127.0.0.1:1".into(),
+        };
+
+        // 1. First probe hits 429 -> records block and returns blocked-until error.
+        let err1 =
+            super::probe_decision_with_bases(None, "probe-model", Some("k"), &blocks, &bases)
+                .await
+                .unwrap_err();
+        assert!(
+            err1.to_string().contains("blocked until"),
+            "expected blocked-until error: {err1}"
+        );
+        let ep = agentdeck_core::judge::JudgeEndpoint::new(
+            agentdeck_core::settings::PROVIDER_OPENROUTER,
+            "probe-model",
+        );
+        assert!(
+            blocks.remaining(&ep).is_some(),
+            "probe 429 must persist cross-process block"
+        );
+
+        // 2. Second probe sees active block -> 0 HTTP requests, returns blocked-until error.
+        let err2 =
+            super::probe_decision_with_bases(None, "probe-model", Some("k"), &blocks, &bases)
+                .await
+                .unwrap_err();
+        assert!(
+            err2.to_string().contains("blocked until"),
+            "expected blocked-until error on cached block: {err2}"
+        );
+        srv.join().unwrap();
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "second probe must not hit network while 429 block is active"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn router_and_core_block_stores_resolve_same_dir() {
+        let rt = crate::runtime_dir();
+        assert_eq!(
+            agentdeck_core::judge::BlockStore::default_runtime().dir(),
+            agentdeck_core::judge::BlockStore::for_runtime_dir(&rt).dir()
+        );
     }
 }
 

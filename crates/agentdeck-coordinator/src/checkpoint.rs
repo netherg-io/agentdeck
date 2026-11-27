@@ -4,11 +4,11 @@
 //! so a stale state or a quiet turn never pays for a reset.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use agentdeck_core::judge::{
     BlockStore, FallbackTrigger, JudgeEndpoint, classify_http_status, dispatch_with_deadline,
-    format_rate_limit_exceeded, parse_retry_after,
+    format_rate_limit_exceeded, parse_retry_after, request_timeout,
 };
 use agentdeck_core::settings::{DEFAULT_DECISION_MODEL, PROVIDER_OPENROUTER, PROVIDER_VERCEL};
 use serde::{Deserialize, Serialize};
@@ -357,8 +357,17 @@ impl HttpCheckpointJudge {
         endpoint: &str,
         api_key: &str,
         body: &Value,
-        timeout: Duration,
+        deadline: Instant,
+        check_language_model: bool,
     ) -> anyhow::Result<Value> {
+        let Some(timeout) = request_timeout(self.deadline, deadline) else {
+            return Err(CheckpointHttpError {
+                trigger: FallbackTrigger::Transient,
+                is_language_model: false,
+                message: "checkpoint judge request timed out".into(),
+            }
+            .into());
+        };
         let res = self
             .client
             .post(endpoint)
@@ -374,24 +383,38 @@ impl HttpCheckpointJudge {
             })?;
         if !res.status().is_success() {
             let status = res.status().as_u16();
-            let retry_after = (status == 429).then(|| {
-                parse_retry_after(
+            if status == 429 {
+                let retry_after = parse_retry_after(
                     res.headers()
                         .get(reqwest::header::RETRY_AFTER)
                         .and_then(|v| v.to_str().ok()),
-                )
-            });
-            let text = res.text().await.unwrap_or_default();
-            let is_language_model = text.contains("is a language model");
+                );
+                return Err(CheckpointHttpError {
+                    trigger: classify_http_status(429, Some(retry_after)),
+                    is_language_model: false,
+                    message: "checkpoint judge HTTP 429".into(),
+                }
+                .into());
+            }
+            let is_language_model = check_language_model
+                && (400..500).contains(&status)
+                && res
+                    .text()
+                    .await
+                    .is_ok_and(|text| text.contains("is a language model"));
             return Err(CheckpointHttpError {
-                trigger: classify_http_status(status, retry_after),
+                trigger: classify_http_status(status, None),
                 is_language_model,
                 message: format!("checkpoint judge HTTP {status}"),
             }
             .into());
         }
-        res.json()
-            .await
+        let bytes = res.bytes().await.map_err(|e| CheckpointHttpError {
+            trigger: FallbackTrigger::Transient,
+            is_language_model: false,
+            message: format!("checkpoint judge response read failed: {e}"),
+        })?;
+        serde_json::from_slice(&bytes)
             .map_err(|e| anyhow::anyhow!("checkpoint judge returned invalid JSON: {e}"))
     }
 
@@ -450,22 +473,22 @@ impl HttpCheckpointJudge {
         &self,
         target: &CheckpointTarget,
         input: &CheckpointInput,
-        budget: Duration,
+        deadline: Instant,
     ) -> anyhow::Result<CheckpointVerdict> {
-        let timeout = self.deadline.min(budget).max(Duration::from_millis(1));
         let body = Self::request_body_for(&target.id.provider, &target.id.model, input);
+        let check_lm = target.id.provider == PROVIDER_VERCEL;
         let resp = match self
-            .post_target(&target.endpoint, &target.api_key, &body, timeout)
+            .post_target(&target.endpoint, &target.api_key, &body, deadline, check_lm)
             .await
         {
             Ok(v) => v,
             Err(e)
-                if target.id.provider == PROVIDER_VERCEL
+                if check_lm
                     && e.downcast_ref::<CheckpointHttpError>()
                         .is_some_and(|he| he.is_language_model) =>
             {
                 return self
-                    .judge_with_chat_for(target, &body["input"], &body["questions"][0], timeout)
+                    .judge_with_chat_for(target, &body["input"], &body["questions"][0], deadline)
                     .await;
             }
             Err(e) => return Err(e),
@@ -507,15 +530,16 @@ impl CheckpointJudge for HttpCheckpointJudge {
             &primary.id,
             fallback_id,
             self.deadline,
+            Instant::now,
             SystemTime::now,
             tokio::time::sleep,
-            |ep, rem| {
+            |ep, attempt_deadline| {
                 let target = if ep == &primary.id {
                     &primary
                 } else {
                     self.fallback.as_ref().unwrap_or(&primary)
                 };
-                self.judge_target(target, input, rem)
+                self.judge_target(target, input, attempt_deadline)
             },
             classify_checkpoint_error,
             |ep, ra, rem| anyhow::anyhow!("{}", format_rate_limit_exceeded(ep, ra, rem)),
@@ -531,7 +555,7 @@ impl HttpCheckpointJudge {
         target: &CheckpointTarget,
         input: &Value,
         question: &Value,
-        timeout: Duration,
+        deadline: Instant,
     ) -> anyhow::Result<CheckpointVerdict> {
         let endpoint = reqwest::Url::parse(&target.endpoint)?.join("chat/completions")?;
         let body = self
@@ -549,7 +573,8 @@ impl HttpCheckpointJudge {
                     "response_format": {"type": "json_object"},
                     "temperature": 0,
                 }),
-                timeout,
+                deadline,
+                false,
             )
             .await?;
         let content = body
@@ -929,6 +954,127 @@ mod tests {
 
         assert_eq!(primary_srv.join().unwrap(), 3);
         assert_eq!(fb_srv.join().unwrap(), 3);
+        let _ = std::fs::remove_dir_all(&blocks_dir);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_body_abort_falls_back_and_429_language_model_does_not_retry_chat() {
+        let blocks_dir =
+            std::env::temp_dir().join(format!("agentdeck-coord-body-429-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&blocks_dir);
+
+        let primary_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+        let primary_paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let pp = primary_paths.clone();
+        let primary_srv = std::thread::spawn(move || {
+            for idx in 0..2 {
+                let (mut stream, _) = primary_listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        len = v.trim().parse().unwrap();
+                    }
+                }
+                let mut buf = vec![0; len];
+                reader.read_exact(&mut buf).unwrap();
+                pp.lock().unwrap().push(first);
+                if idx == 0 {
+                    // Truncated 200 body -> body-read error -> transient -> fallback.
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 500\r\nconnection: close\r\n\r\n{\"answers\":",
+                    );
+                } else {
+                    // 429 whose body says "is a language model": must NOT call /v1/chat/completions.
+                    let body = r#"{"error":"test-model is a language model"}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            }
+        });
+
+        let fb_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fb_addr = fb_listener.local_addr().unwrap();
+        let ok_or =
+            json!({"answers": {"checkpoint_safe": {"score": 3, "confidence": 0.91}}}).to_string();
+        let fb_srv = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = fb_listener.accept().unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        len = v.trim().parse().unwrap();
+                    }
+                }
+                let mut buf = vec![0; len];
+                reader.read_exact(&mut buf).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{ok_or}",
+                    ok_or.len()
+                )
+                .unwrap();
+            }
+        });
+
+        let mut judge = judge_for(PROVIDER_VERCEL)
+            .with_fallback(
+                PROVIDER_OPENROUTER,
+                "~typesafe/jev-latest",
+                "fb-key".into(),
+                Some(format!("http://{fb_addr}/api/alpha/decisions")),
+            )
+            .unwrap()
+            .with_blocks_dir(blocks_dir.clone());
+        judge.endpoint = format!("http://{primary_addr}/v1/decisions");
+
+        let v1 = judge
+            .judge(&sample_input(), &CoordinatorConfig::default())
+            .await
+            .unwrap();
+        assert!(v1.should_checkpoint);
+
+        let v2 = judge
+            .judge(&sample_input(), &CoordinatorConfig::default())
+            .await
+            .unwrap();
+        assert!(v2.should_checkpoint);
+
+        primary_srv.join().unwrap();
+        fb_srv.join().unwrap();
+        let seen = primary_paths.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            2,
+            "429 with 'is a language model' must not trigger /v1/chat/completions: {seen:?}"
+        );
+        assert!(seen.iter().all(|p| p.contains("/v1/decisions")));
         let _ = std::fs::remove_dir_all(&blocks_dir);
     }
 }

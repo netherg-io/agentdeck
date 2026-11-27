@@ -612,18 +612,34 @@ fn proc_ppid(pid: u32) -> anyhow::Result<u32> {
         .map_err(|_| anyhow::anyhow!("bad stat"))
 }
 
-pub(crate) fn process_ancestors() -> Vec<Vec<String>> {
+fn proc_environ(pid: u32) -> Vec<String> {
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .unwrap_or_default()
+        .split(|b| *b == 0)
+        .filter(|e| !e.is_empty())
+        .map(|e| String::from_utf8_lossy(e).into_owned())
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProcessAncestor {
+    pub cmdline: Vec<String>,
+    pub environ: Vec<String>,
+}
+
+pub(crate) fn process_ancestors_full() -> Vec<ProcessAncestor> {
     let mut out = Vec::new();
     let mut pid = std::os::unix::process::parent_id();
     for _ in 0..12 {
         if pid <= 1 {
             break;
         }
-        let cmd = match proc_cmdline(pid) {
+        let cmdline = match proc_cmdline(pid) {
             Ok(c) => c,
             Err(_) => break,
         };
-        out.push(cmd);
+        let environ = proc_environ(pid);
+        out.push(ProcessAncestor { cmdline, environ });
         pid = match proc_ppid(pid) {
             Ok(p) => p,
             Err(_) => break,
@@ -632,54 +648,217 @@ pub(crate) fn process_ancestors() -> Vec<Vec<String>> {
     out
 }
 
-/// Resolve the caller's T3 provider instance id from harness, environment and
-/// process ancestry — shared between the launch hook and `route_batch`.
-pub fn resolve_instance(
-    harness: &str,
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SourceQuery<'a> {
+    pub harness: Option<&'a str>,
+    pub explicit_source: Option<&'a str>,
+    pub thread_id: Option<&'a str>,
+    /// True when invoked from the pre-tool hook launched directly by the harness
+    /// (where own env belongs to the harness instance).
+    pub from_hook: bool,
+}
+
+fn ancestor_harness(cmdline: &[String]) -> Option<&'static str> {
+    let names: Vec<&str> = cmdline
+        .iter()
+        .take(2)
+        .filter_map(|c| c.rsplit('/').next())
+        .collect();
+    if names.contains(&"codex") {
+        Some("codex")
+    } else if names.contains(&"claude") {
+        Some("claude")
+    } else if names.contains(&"opencode") {
+        Some("opencode")
+    } else if names.contains(&"agy")
+        || cmdline
+            .first()
+            .is_some_and(|c| c.contains("/.t3/tools/antigravity-acp/"))
+    {
+        Some("agy")
+    } else {
+        None
+    }
+}
+
+fn env_var_from(key: &str, ancestor: Option<&ProcessAncestor>) -> Option<String> {
+    if let Some(v) = std::env::var_os(key) {
+        let s = v.to_string_lossy().into_owned();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    let prefix = format!("{key}=");
+    ancestor.and_then(|a| {
+        a.environ
+            .iter()
+            .find_map(|e| e.strip_prefix(&prefix).filter(|v| !v.is_empty()))
+            .map(str::to_string)
+    })
+}
+
+fn has_secondary_driver_instance(settings: &Value, driver: &str, default_id: &str) -> bool {
+    settings
+        .get("providerInstances")
+        .and_then(Value::as_object)
+        .is_some_and(|m| {
+            m.iter().any(|(id, v)| {
+                v.get("driver").and_then(Value::as_str) == Some(driver) && id != default_id
+            })
+        })
+}
+
+fn read_settings_required(home: &std::path::Path) -> anyhow::Result<Value> {
+    let text = std::fs::read_to_string(home.join(".t3/userdata/settings.json"))?;
+    Ok(serde_json::from_str(&text)?)
+}
+
+fn read_settings_optional(home: &std::path::Path) -> Option<Value> {
+    read_settings_required(home).ok()
+}
+
+/// Shared caller source-instance resolver used by the launch hook, `route_batch`,
+/// and `agentdeck route` CLI.
+///
+/// Precedence:
+/// 1. Explicit `source` (and `shell` harness always requires explicit source).
+/// 2. Authoritative T3 thread binding (`thread_id` / `T3CODE_THREAD_ID` in `statev2.sqlite`).
+/// 3. Harness + own/ancestor environment (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, Antigravity profile)
+///    matched against `~/.t3/userdata/settings.json`.
+///
+/// Returns `Ok(None)` when the caller source cannot be determined unambiguously
+/// (e.g. multiple accounts configured for a harness with no thread binding or
+/// disambiguating environment/ancestor), so `route_batch` can report a per-launch
+/// error rather than warming the wrong cache key.
+pub(crate) fn resolve_source(
     home: &std::path::Path,
-    chain: &[Vec<String>],
-    explicit_source: Option<&str>,
+    ancestors: &[ProcessAncestor],
+    query: SourceQuery<'_>,
 ) -> anyhow::Result<Option<String>> {
-    let mut instance: Option<String> = default_instance(harness).map(str::to_string);
-    if harness == "claude"
-        && let Some(dir) =
-            std::env::var_os("CLAUDE_CONFIG_DIR").map(|d| d.to_string_lossy().into_owned())
-        && !dir.is_empty()
+    let harness = query.harness.filter(|s| !s.is_empty());
+    if harness == Some("shell") {
+        return Ok(Some(query.explicit_source.unwrap_or_default().to_string()));
+    }
+    if let Some(src) = query.explicit_source.filter(|s| !s.is_empty()) {
+        return Ok(Some(src.to_string()));
+    }
+
+    // Prefer authoritative T3 thread binding (`threadId` or `T3CODE_THREAD_ID`).
+    let thread_id = query
+        .thread_id
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var(agentdeck_core::thread_state::THREAD_ENV)
+                .ok()
+                .filter(|s| !s.is_empty())
+        });
+    if let Some(tid) = thread_id.as_deref()
+        && let Some(inst) =
+            crate::load::thread_provider_instance(tid, &home.join(".t3/userdata/statev2.sqlite"))
     {
-        let text = std::fs::read_to_string(home.join(".t3/userdata/settings.json"))?;
-        let settings: Value = serde_json::from_str(&text)?;
-        if let Some(id) = settings_instance(&settings, "claudeAgent", "homePath", &dir) {
-            instance = Some(id);
+        return Ok(Some(inst));
+    }
+
+    let (eff_harness, matching_anc) = match harness {
+        Some(h) => (
+            h,
+            ancestors
+                .iter()
+                .find(|a| ancestor_harness(&a.cmdline) == Some(h)),
+        ),
+        None => {
+            let Some((h, anc)) = ancestors
+                .iter()
+                .find_map(|a| ancestor_harness(&a.cmdline).map(|h| (h, a)))
+            else {
+                return Ok(None);
+            };
+            (h, Some(anc))
         }
-    }
-    if harness == "agy" {
-        // Missing or unreadable settings keep the `antigravity` default.
-        let settings = std::fs::read_to_string(home.join(".t3/userdata/settings.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str::<Value>(&t).ok());
-        let environ: Vec<String> = std::env::vars_os()
-            .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
-            .collect();
-        if let Some(id) = settings
-            .and_then(|s| crate::policy::antigravity_instance(&s, &environ, &chain.concat()))
-        {
-            instance = Some(id);
+    };
+
+    match eff_harness {
+        "claude" => {
+            if let Some(dir) = env_var_from("CLAUDE_CONFIG_DIR", matching_anc) {
+                let settings = read_settings_required(home)?;
+                if let Some(id) = settings_instance(&settings, "claudeAgent", "homePath", &dir) {
+                    return Ok(Some(id));
+                }
+                if dir.contains(".claude-openrouter") {
+                    return Ok(Some("claudeAgent_openrouter".into()));
+                }
+                if has_secondary_driver_instance(&settings, "claudeAgent", "claudeAgent")
+                    && !query.from_hook
+                {
+                    return Ok(None);
+                }
+                return Ok(Some("claudeAgent".into()));
+            }
+            if !query.from_hook
+                && matching_anc.is_none()
+                && read_settings_optional(home).is_some_and(|s| {
+                    has_secondary_driver_instance(&s, "claudeAgent", "claudeAgent")
+                })
+            {
+                return Ok(None);
+            }
+            Ok(Some("claudeAgent".into()))
         }
-    }
-    if harness == "shell" {
-        instance = Some(explicit_source.unwrap_or_default().to_string());
-    }
-    if harness == "codex"
-        && let Some(dir) = std::env::var_os("CODEX_HOME").map(|d| d.to_string_lossy().into_owned())
-        && !dir.is_empty()
-    {
-        let text = std::fs::read_to_string(home.join(".t3/userdata/settings.json"))?;
-        let settings: Value = serde_json::from_str(&text)?;
-        if let Some(id) = settings_instance(&settings, "codex", "shadowHomePath", &dir) {
-            instance = Some(id);
+        "codex" => {
+            if let Some(dir) = env_var_from("CODEX_HOME", matching_anc) {
+                let settings = read_settings_required(home)?;
+                if let Some(id) = settings_instance(&settings, "codex", "shadowHomePath", &dir) {
+                    return Ok(Some(id));
+                }
+                if has_secondary_driver_instance(&settings, "codex", "codex") && !query.from_hook {
+                    return Ok(None);
+                }
+                return Ok(Some("codex".into()));
+            }
+            if !query.from_hook
+                && matching_anc.is_none()
+                && read_settings_optional(home)
+                    .is_some_and(|s| has_secondary_driver_instance(&s, "codex", "codex"))
+            {
+                return Ok(None);
+            }
+            Ok(Some("codex".into()))
         }
+        "agy" => {
+            let settings = read_settings_optional(home);
+            if let Some(s) = settings.as_ref() {
+                let own_env: Vec<String> = std::env::vars_os()
+                    .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
+                    .collect();
+                let all_argv: Vec<String> = ancestors
+                    .iter()
+                    .flat_map(|a| a.cmdline.iter().cloned())
+                    .collect();
+                if let Some(id) = crate::policy::antigravity_instance(s, &own_env, &all_argv) {
+                    return Ok(Some(id));
+                }
+                for anc in ancestors
+                    .iter()
+                    .filter(|a| ancestor_harness(&a.cmdline) == Some("agy"))
+                {
+                    if let Some(id) =
+                        crate::policy::antigravity_instance(s, &anc.environ, &anc.cmdline)
+                    {
+                        return Ok(Some(id));
+                    }
+                }
+                if !query.from_hook
+                    && has_secondary_driver_instance(s, "antigravity", "antigravity")
+                {
+                    return Ok(None);
+                }
+            }
+            Ok(Some("antigravity".into()))
+        }
+        "opencode" => Ok(Some("opencode".into())),
+        _ => Ok(None),
     }
-    Ok(instance)
 }
 
 /// Older T3 ran a Node server; current T3 is a native `t3 serve` binary.
@@ -834,24 +1013,6 @@ impl Ctx {
     }
 }
 
-fn default_instance(harness: &str) -> Option<&str> {
-    match harness {
-        "claude" => Some(
-            if std::env::var_os("CLAUDE_CONFIG_DIR")
-                .is_some_and(|d| d.to_string_lossy().contains(".claude-openrouter"))
-            {
-                "claudeAgent_openrouter"
-            } else {
-                "claudeAgent"
-            },
-        ),
-        "codex" => Some("codex"),
-        "agy" => Some("antigravity"),
-        "opencode" => Some("opencode"),
-        _ => None,
-    }
-}
-
 /// Find the T3 provider instance id whose driver/config path matches.
 fn settings_instance(settings: &Value, driver: &str, key: &str, path: &str) -> Option<String> {
     settings
@@ -980,7 +1141,8 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
         ctx.emit(true, "");
         return Ok(());
     }
-    let chain = process_ancestors();
+    let ancestors = process_ancestors_full();
+    let chain: Vec<Vec<String>> = ancestors.iter().map(|a| a.cmdline.clone()).collect();
     // delegate_task exists only in T3, so it is always routed: a missed T3
     // detection must not skip routing.
     if !delegate && !in_t3(&harness, &chain, &input) {
@@ -1006,7 +1168,16 @@ fn run_inner(ctx: &mut Ctx) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    let instance = resolve_instance(&harness, &home, &chain, str_field(&input, "source"))?;
+    let instance = resolve_source(
+        &home,
+        &ancestors,
+        SourceQuery {
+            harness: Some(&harness),
+            explicit_source: str_field(&input, "source"),
+            thread_id,
+            from_hook: true,
+        },
+    )?;
     if harness == "shell" {
         let source = instance.as_deref().unwrap_or_default();
         let catalog = read_catalog(&state_dir()?)?;

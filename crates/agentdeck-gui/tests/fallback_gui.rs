@@ -326,3 +326,60 @@ fn vercel_without_model_shows_inline_validation_error_and_blocks_save() {
             .expect("fallback probe error visible");
     }
 }
+
+#[test]
+fn fallback_check_honours_active_429_block_and_displays_error() {
+    let _env = lock();
+    agentdeck_gui::i18n::set_language("en");
+    let (paths, guard) = fixture_paths("probe-blocked");
+    Registry::update(&paths, |_| Ok(())).unwrap();
+    let rt = guard.0.join("rt");
+    std::fs::create_dir_all(&rt).unwrap();
+
+    let prev_rt = std::env::var_os("XDG_RUNTIME_DIR");
+    // SAFETY: serialized by `lock()` across tests in this test binary.
+    unsafe { std::env::set_var("XDG_RUNTIME_DIR", &rt) };
+
+    let ep = agentdeck_core::judge::JudgeEndpoint::new(
+        settings::PROVIDER_OPENROUTER,
+        settings::DEFAULT_DECISION_MODEL,
+    );
+    let blocks = agentdeck_core::judge::BlockStore::default_runtime();
+    blocks
+        .record_rate_limit(&ep, std::time::Duration::from_secs(60))
+        .unwrap();
+
+    let mut state = loaded_state(&paths);
+    let _ = settings_page::update(
+        &mut state,
+        paths.clone(),
+        Msg::FallbackProvider(FallbackProvider::OpenRouter),
+    );
+    let msgs = drain(settings_page::update(
+        &mut state,
+        paths.clone(),
+        Msg::TestFallback,
+    ));
+    for m in msgs {
+        let _ = settings_page::update(&mut state, paths.clone(), m);
+    }
+
+    // Restore XDG_RUNTIME_DIR before assertions so failure doesn't poison env.
+    match prev_rt {
+        Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
+        None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
+    }
+
+    let (text, is_err) = state
+        .fallback_test
+        .clone()
+        .expect("fallback probe should finish with blocked-until error");
+    assert!(is_err, "active 429 block must surface as an error: {text}");
+    assert!(
+        text.contains("429") && text.to_lowercase().contains("blocked"),
+        "expected blocked-until 429 error, got: {text}"
+    );
+    let mut ui = iced_test::simulator(settings_page::router_view(&state));
+    ui.find(text.as_str())
+        .expect("blocked-until error visible in fallback card");
+}

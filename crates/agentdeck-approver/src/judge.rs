@@ -8,11 +8,11 @@
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use agentdeck_core::judge::{
     BlockStore, FallbackTrigger, JudgeChannel, JudgeEndpoint, classify_http_status,
-    dispatch_with_deadline, parse_retry_after,
+    dispatch_with_deadline, parse_retry_after, request_timeout,
 };
 use agentdeck_core::settings::{DEFAULT_DECISION_MODEL, PROVIDER_OPENROUTER, PROVIDER_VERCEL};
 use anyhow::{Context, Result, bail};
@@ -285,8 +285,12 @@ impl HttpPolicyJudge {
         api_key: &str,
         url: &str,
         body: &Value,
-        timeout: Duration,
+        deadline: Instant,
+        check_language_model: bool,
     ) -> Result<Value> {
+        let Some(timeout) = request_timeout(self.timeout, deadline) else {
+            return Err(JudgeError::Network.into());
+        };
         let res = self
             .client
             .post(url)
@@ -308,18 +312,21 @@ impl HttpPolicyJudge {
                 );
                 return Err(JudgeError::RateLimited { retry_after }.into());
             }
-            // Inspect body only for the Vercel chat fallback sentinel; never leak body text.
-            let is_language_model = res
-                .text()
-                .await
-                .is_ok_and(|text| text.contains("is a language model"));
+            // Inspect body only for the Vercel chat fallback sentinel on non-429 4xx; never leak body text.
+            let is_language_model = check_language_model
+                && (400..500).contains(&code)
+                && res
+                    .text()
+                    .await
+                    .is_ok_and(|text| text.contains("is a language model"));
             return Err(JudgeError::HttpStatus {
                 status: code,
                 is_language_model,
             }
             .into());
         }
-        res.json().await.map_err(|_| JudgeError::Parse.into())
+        let bytes = res.bytes().await.map_err(|_| JudgeError::Network)?;
+        serde_json::from_slice(&bytes).map_err(|_| JudgeError::Parse.into())
     }
 
     async fn evaluate_target(
@@ -327,16 +334,15 @@ impl HttpPolicyJudge {
         target: &JudgeTarget,
         system: &str,
         input: &Value,
-        budget: Duration,
+        deadline: Instant,
     ) -> Result<JudgeVerdict> {
         let base = target.effective_base();
-        let req_timeout = self.timeout.min(budget).max(Duration::from_millis(1));
 
         if target.endpoint.provider == PROVIDER_VERCEL {
             let decisions_url = format!("{base}/v1/decisions");
             let body = vercel_decisions_body(&target.endpoint.model, system, input);
             match self
-                .post_json(&target.api_key, &decisions_url, &body, req_timeout)
+                .post_json(&target.api_key, &decisions_url, &body, deadline, true)
                 .await
             {
                 Ok(v) => return parse_decisions_verdict(&v),
@@ -355,7 +361,7 @@ impl HttpPolicyJudge {
             let chat_url = format!("{base}/v1/chat/completions");
             let chat_body = chat_completions_body(&target.endpoint.model, system, input);
             let v = self
-                .post_json(&target.api_key, &chat_url, &chat_body, req_timeout)
+                .post_json(&target.api_key, &chat_url, &chat_body, deadline, false)
                 .await?;
             return parse_chat_verdict(&v);
         }
@@ -366,14 +372,14 @@ impl HttpPolicyJudge {
             let url = format!("{base}/api/alpha/decisions");
             let body = openrouter_decisions_body(&target.endpoint.model, system, input);
             let v = self
-                .post_json(&target.api_key, &url, &body, req_timeout)
+                .post_json(&target.api_key, &url, &body, deadline, false)
                 .await?;
             parse_decisions_verdict(&v)
         } else {
             let url = format!("{base}/api/v1/chat/completions");
             let body = chat_completions_body(&target.endpoint.model, system, input);
             let v = self
-                .post_json(&target.api_key, &url, &body, req_timeout)
+                .post_json(&target.api_key, &url, &body, deadline, false)
                 .await?;
             parse_chat_verdict(&v)
         }
@@ -530,15 +536,16 @@ impl PolicyJudge for HttpPolicyJudge {
             &self.primary.endpoint,
             fallback_ep,
             self.deadline,
+            Instant::now,
             SystemTime::now,
             tokio::time::sleep,
-            |ep, rem| {
+            |ep, attempt_deadline| {
                 let target = if ep == &self.primary.endpoint {
                     &self.primary
                 } else {
                     self.fallback.as_ref().unwrap_or(&self.primary)
                 };
-                self.evaluate_target(target, &system, &input, rem)
+                self.evaluate_target(target, &system, &input, attempt_deadline)
             },
             |err| {
                 err.downcast_ref::<JudgeError>()
@@ -1036,6 +1043,110 @@ mod tests {
 
         assert_eq!(primary_srv.await.unwrap().len(), 3);
         assert_eq!(fb_srv.await.unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&blocks_dir);
+    }
+
+    #[tokio::test]
+    async fn approver_body_read_abort_triggers_fallback_and_primary_timeout_reserves_fallback_budget()
+     {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let blocks_dir = std::env::temp_dir().join(format!(
+            "agentdeck-approver-body-timeout-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&blocks_dir);
+
+        // Primary server:
+        //   req 1: sends 200 OK with Content-Length: 500, partial body, then drops connection.
+        //   req 2: stalls for 2s (exceeds reserved budget of 800ms deadline).
+        let primary_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_base = format!("http://{}", primary_listener.local_addr().unwrap());
+        let primary_srv = tokio::spawn(async move {
+            for idx in 0..2 {
+                let (stream, _) = primary_listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut first = String::new();
+                stream.read_line(&mut first).await.unwrap();
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((n, v)) = line.split_once(':')
+                        && n.eq_ignore_ascii_case("content-length")
+                    {
+                        size = v.trim().parse().unwrap();
+                    }
+                }
+                let mut buf = vec![0; size];
+                stream.read_exact(&mut buf).await.unwrap();
+                if idx == 0 {
+                    // Truncated 200 body -> body-read error, NOT JSON parse error.
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\nConnection: close\r\n\r\n{\"answers\":",
+                        )
+                        .await;
+                } else {
+                    // Hang longer than the overall 800ms deadline.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        });
+
+        let ok_fb = json!({"answers": {"permit": {"score": 1, "confidence": 0.95}}}).to_string();
+        let (fb_base, fb_srv) = mock_judge_server_with_headers(vec![
+            ("200 OK", "", ok_fb.clone()),
+            ("200 OK", "", ok_fb),
+        ])
+        .await;
+
+        let req: ApprovalRequest = serde_json::from_value(json!({
+            "kind": "confirm",
+            "title": "Redeploy",
+            "text": "staging",
+            "host": "local",
+            "thread_id": "t-1"
+        }))
+        .unwrap();
+        let mandate = MandateContext {
+            active_autonomous_run: true,
+            owner_granted: true,
+            thread_id: Some("t-1".into()),
+            ..Default::default()
+        };
+
+        let judge = HttpPolicyJudge::new(
+            Some(PROVIDER_VERCEL.into()),
+            Some("perplexity/pplx-decider-v1.2".into()),
+            "k1".into(),
+        )
+        .unwrap()
+        .with_fallback(PROVIDER_OPENROUTER, None, "k2".into())
+        .unwrap()
+        .with_base_url(primary_base)
+        .with_fallback_base_url(fb_base)
+        .with_deadline(Duration::from_millis(800))
+        .with_blocks_dir(blocks_dir.clone());
+
+        // 1. Truncated 200 body must trigger fallback (transient body read error).
+        let v1 = judge.evaluate(&req, &mandate).await.unwrap();
+        assert_eq!(v1.channel, Some(JudgeChannel::Fallback));
+
+        // 2. Hanging primary must time out early enough for fallback to succeed within 800ms.
+        let started = std::time::Instant::now();
+        let v2 = judge.evaluate(&req, &mandate).await.unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(v2.channel, Some(JudgeChannel::Fallback));
+        assert!(
+            elapsed < Duration::from_millis(1200),
+            "must finish near 800ms deadline, took {elapsed:?}"
+        );
+
+        assert_eq!(fb_srv.await.unwrap().len(), 2);
+        primary_srv.abort();
         let _ = std::fs::remove_dir_all(&blocks_dir);
     }
 }

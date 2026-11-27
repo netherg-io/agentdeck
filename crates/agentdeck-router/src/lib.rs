@@ -48,9 +48,7 @@ pub fn home_dir() -> anyhow::Result<std::path::PathBuf> {
 }
 
 pub fn runtime_dir() -> std::path::PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+    agentdeck_core::judge::default_runtime_base()
 }
 
 pub fn state_home() -> anyhow::Result<std::path::PathBuf> {

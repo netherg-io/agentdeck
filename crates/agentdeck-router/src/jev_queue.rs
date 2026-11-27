@@ -7,7 +7,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentdeck_core::judge::{
     BlockStore, DispatchStep, FallbackTrigger, JudgeChannel, JudgeEndpoint, create_private_dir,
@@ -24,6 +24,19 @@ pub const MAX_TASKS: usize = 8;
 const POLL: Duration = Duration::from_millis(150);
 const STALE: Duration = Duration::from_secs(600);
 const MAX_WAIT_RETRIES: usize = 8;
+
+/// Internal marker for rate-limit-exceeded errors synthesized by the dispatcher
+/// so `lead` always treats them as channel-wide for the batch.
+#[derive(Debug)]
+struct ChannelWideRateLimit(String);
+
+impl std::fmt::Display for ChannelWideRateLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ChannelWideRateLimit {}
 
 fn next_request_id() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -63,7 +76,7 @@ pub struct QueueAnswer {
 
 /// Asks Jev through the shared queue with the default hook-path budget ([`BUDGET`]).
 #[allow(clippy::too_many_arguments)]
-pub async fn ask<F, Fut, C>(
+pub async fn ask<F, Fut, C, Cw>(
     spool: &Path,
     request: &Value,
     body: &str,
@@ -72,22 +85,33 @@ pub async fn ask<F, Fut, C>(
     fallback: Option<&JudgeEndpoint>,
     fetch: F,
     classify: C,
+    is_channel_wide: Cw,
 ) -> anyhow::Result<QueueAnswer>
 where
-    F: FnMut(JudgeEndpoint, Value, String, Duration) -> Fut,
+    F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
+    Cw: Fn(&anyhow::Error) -> bool,
 {
     ask_with_deadline(
-        spool, request, body, BUDGET, blocks, primary, fallback, fetch, classify,
+        spool,
+        request,
+        body,
+        BUDGET,
+        blocks,
+        primary,
+        fallback,
+        fetch,
+        classify,
+        is_channel_wide,
     )
     .await
 }
 
 /// Asks Jev through the shared queue with an explicit `budget` deadline (so
-/// callers such as a future `route_batch` can pass e.g. 120 s).
+/// callers such as `route_batch` can pass e.g. 120 s).
 #[allow(clippy::too_many_arguments)]
-pub async fn ask_with_deadline<F, Fut, C>(
+pub async fn ask_with_deadline<F, Fut, C, Cw>(
     spool: &Path,
     request: &Value,
     body: &str,
@@ -97,11 +121,13 @@ pub async fn ask_with_deadline<F, Fut, C>(
     fallback: Option<&JudgeEndpoint>,
     fetch: F,
     classify: C,
+    is_channel_wide: Cw,
 ) -> anyhow::Result<QueueAnswer>
 where
-    F: FnMut(JudgeEndpoint, Value, String, Duration) -> Fut,
+    F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
+    Cw: Fn(&anyhow::Error) -> bool,
 {
     ask_inner(
         spool,
@@ -111,11 +137,13 @@ where
         blocks,
         primary,
         fallback,
+        Instant::now,
         SystemTime::now,
         tokio::time::sleep,
         true,
         fetch,
         classify,
+        is_channel_wide,
     )
     .await
 }
@@ -124,7 +152,7 @@ where
 /// leader batches up to [`MAX_TASKS`] compatible requests per judge call within
 /// the shared `budget` deadline. Returns one result per input item in order.
 #[allow(clippy::too_many_arguments)]
-pub async fn ask_many_with_deadline<F, Fut, C>(
+pub async fn ask_many_with_deadline<F, Fut, C, Cw>(
     spool: &Path,
     items: &[(Value, String)],
     budget: Duration,
@@ -133,11 +161,13 @@ pub async fn ask_many_with_deadline<F, Fut, C>(
     fallback: Option<&JudgeEndpoint>,
     fetch: F,
     classify: C,
+    is_channel_wide: Cw,
 ) -> Vec<anyhow::Result<QueueAnswer>>
 where
-    F: FnMut(JudgeEndpoint, Value, String, Duration) -> Fut,
+    F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
+    Cw: Fn(&anyhow::Error) -> bool,
 {
     ask_many_inner(
         spool,
@@ -146,17 +176,19 @@ where
         blocks,
         primary,
         fallback,
+        Instant::now,
         SystemTime::now,
         tokio::time::sleep,
         true,
         fetch,
         classify,
+        is_channel_wide,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn ask_inner<Now, Sleep, SleepFut, F, Fut, C>(
+async fn ask_inner<MonoNow, WallNow, Sleep, SleepFut, F, Fut, C, Cw>(
     spool: &Path,
     request: &Value,
     body: &str,
@@ -164,19 +196,23 @@ async fn ask_inner<Now, Sleep, SleepFut, F, Fut, C>(
     blocks: &BlockStore,
     primary: &JudgeEndpoint,
     fallback: Option<&JudgeEndpoint>,
-    now: Now,
+    mono_now: MonoNow,
+    wall_now: WallNow,
     sleep: Sleep,
     add_jitter: bool,
     fetch: F,
     classify: C,
+    is_channel_wide: Cw,
 ) -> anyhow::Result<QueueAnswer>
 where
-    Now: FnMut() -> SystemTime,
+    MonoNow: FnMut() -> Instant,
+    WallNow: FnMut() -> SystemTime,
     Sleep: FnMut(Duration) -> SleepFut,
     SleepFut: Future<Output = ()>,
-    F: FnMut(JudgeEndpoint, Value, String, Duration) -> Fut,
+    F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
+    Cw: Fn(&anyhow::Error) -> bool,
 {
     ask_many_inner(
         spool,
@@ -185,11 +221,13 @@ where
         blocks,
         primary,
         fallback,
-        now,
+        mono_now,
+        wall_now,
         sleep,
         add_jitter,
         fetch,
         classify,
+        is_channel_wide,
     )
     .await
     .into_iter()
@@ -198,31 +236,35 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn ask_many_inner<Now, Sleep, SleepFut, F, Fut, C>(
+async fn ask_many_inner<MonoNow, WallNow, Sleep, SleepFut, F, Fut, C, Cw>(
     spool: &Path,
     items: &[(Value, String)],
     budget: Duration,
     blocks: &BlockStore,
     primary: &JudgeEndpoint,
     fallback: Option<&JudgeEndpoint>,
-    mut now: Now,
+    mut mono_now: MonoNow,
+    mut wall_now: WallNow,
     mut sleep: Sleep,
     add_jitter: bool,
     mut fetch: F,
     classify: C,
+    is_channel_wide: Cw,
 ) -> Vec<anyhow::Result<QueueAnswer>>
 where
-    Now: FnMut() -> SystemTime,
+    MonoNow: FnMut() -> Instant,
+    WallNow: FnMut() -> SystemTime,
     Sleep: FnMut(Duration) -> SleepFut,
     SleepFut: Future<Output = ()>,
-    F: FnMut(JudgeEndpoint, Value, String, Duration) -> Fut,
+    F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
+    Cw: Fn(&anyhow::Error) -> bool,
 {
     if items.is_empty() {
         return Vec::new();
     }
-    let started = now();
+    let deadline = mono_now() + budget;
     if let Err(e) = create_private_dir(spool) {
         let msg = e.to_string();
         return (0..items.len())
@@ -240,8 +282,11 @@ where
         let id = next_request_id();
         let req_path = spool.join(format!("{id}.req"));
         let done_path = spool.join(format!("{id}.done"));
-        let entry =
-            serde_json::json!({"group": group_of(request), "request": request, "body": body});
+        let entry = serde_json::json!({
+            "group": group_of(request, primary, fallback),
+            "request": request,
+            "body": body,
+        });
         if let Err(e) = write_atomic(&req_path, &entry.to_string()) {
             results[i] = Some(Err(e.into()));
         }
@@ -278,8 +323,7 @@ where
         let Some(first) = results.iter().position(Option::is_none) else {
             break;
         };
-        let elapsed = now().duration_since(started).unwrap_or(Duration::ZERO);
-        if elapsed >= budget {
+        if mono_now() >= deadline {
             for (i, slot) in results.iter_mut().enumerate() {
                 if slot.is_none() {
                     let _ = std::fs::remove_file(&req_paths[i]);
@@ -298,16 +342,17 @@ where
                 let led = lead(
                     spool,
                     &ids[first],
-                    started,
-                    budget,
+                    deadline,
                     blocks,
                     primary,
                     fallback,
-                    &mut now,
+                    &mut mono_now,
+                    &mut wall_now,
                     &mut sleep,
                     add_jitter,
                     &mut fetch,
                     &classify,
+                    &is_channel_wide,
                 )
                 .await;
                 let _ = lock.unlock();
@@ -374,27 +419,30 @@ fn with_bounded_jitter(wait: Duration, remaining: Duration, add_jitter: bool) ->
 /// (no fallback, block ends before deadline), loops back so newcomers join the
 /// retried batch.
 #[allow(clippy::too_many_arguments)]
-async fn lead<Now, Sleep, SleepFut, F, Fut, C>(
+async fn lead<MonoNow, WallNow, Sleep, SleepFut, F, Fut, C, Cw>(
     spool: &Path,
     own: &str,
-    started: SystemTime,
-    budget: Duration,
+    deadline: Instant,
     blocks: &BlockStore,
     primary: &JudgeEndpoint,
     fallback: Option<&JudgeEndpoint>,
-    now: &mut Now,
+    mono_now: &mut MonoNow,
+    wall_now: &mut WallNow,
     sleep: &mut Sleep,
     add_jitter: bool,
     fetch: &mut F,
     classify: &C,
+    is_channel_wide: &Cw,
 ) -> anyhow::Result<()>
 where
-    Now: FnMut() -> SystemTime,
+    MonoNow: FnMut() -> Instant,
+    WallNow: FnMut() -> SystemTime,
     Sleep: FnMut(Duration) -> SleepFut,
     SleepFut: Future<Output = ()>,
-    F: FnMut(JudgeEndpoint, Value, String, Duration) -> Fut,
+    F: FnMut(JudgeEndpoint, Value, String, Instant) -> Fut,
     Fut: Future<Output = anyhow::Result<(Value, Option<f64>)>>,
     C: Fn(&anyhow::Error) -> FallbackTrigger,
+    Cw: Fn(&anyhow::Error) -> bool,
 {
     for attempt in 0..=MAX_WAIT_RETRIES {
         let batch = collect(spool, own);
@@ -408,18 +456,18 @@ where
             let b = crate::route::stringify_like_node(&r);
             (r, b)
         };
-        let cur = now();
-        let elapsed = cur.duration_since(started).unwrap_or(Duration::ZERO);
-        let remaining = budget.saturating_sub(elapsed);
         let step = dispatch_once(
             blocks,
             primary,
             fallback,
-            cur,
-            remaining,
-            |ep| fetch(ep.clone(), request.clone(), body.clone(), remaining),
+            deadline,
+            &mut *mono_now,
+            &mut *wall_now,
+            |ep, attempt_deadline| {
+                fetch(ep.clone(), request.clone(), body.clone(), attempt_deadline)
+            },
             classify,
-            |ep, ra, rem| anyhow::anyhow!("{}", format_rate_limit_exceeded(ep, ra, rem)),
+            |ep, ra, rem| ChannelWideRateLimit(format_rate_limit_exceeded(ep, ra, rem)).into(),
         )
         .await;
         match step {
@@ -445,26 +493,35 @@ where
                 return Ok(());
             }
             DispatchStep::Wait(wait) => {
+                let remaining = deadline.saturating_duration_since(mono_now());
                 if attempt == MAX_WAIT_RETRIES {
-                    finish(
-                        spool,
-                        &batch[0],
-                        &serde_json::json!({
-                            "error": format_rate_limit_exceeded(primary, wait, remaining),
-                        }),
-                    );
+                    let err_payload = serde_json::json!({
+                        "error": format_rate_limit_exceeded(primary, wait, remaining),
+                    });
+                    for p in &batch {
+                        finish(spool, p, &err_payload);
+                    }
                     return Ok(());
                 }
                 sleep(with_bounded_jitter(wait, remaining, add_jitter)).await;
             }
             DispatchStep::Fail(e) => {
-                // Only this request fails: a combined body may be what the
-                // judge rejected, and others still have their own budget.
-                finish(
-                    spool,
-                    &batch[0],
-                    &serde_json::json!({"error": e.to_string()}),
-                );
+                let channel_wide = e.downcast_ref::<ChannelWideRateLimit>().is_some()
+                    || !matches!(classify(&e), FallbackTrigger::None)
+                    || is_channel_wide(&e);
+                let err_payload = serde_json::json!({"error": e.to_string()});
+                if channel_wide {
+                    // Channel-wide failure (401/403, missing key, fallback exhausted,
+                    // rate-limit exceeded): fail the whole batch at once instead of
+                    // making N separate failing requests for a wave of N.
+                    for p in &batch {
+                        finish(spool, p, &err_payload);
+                    }
+                } else {
+                    // Request-specific failure (400 / invalid JSON): only this request
+                    // fails; a combined body may be what the judge rejected.
+                    finish(spool, &batch[0], &err_payload);
+                }
                 return Ok(());
             }
         }
@@ -526,9 +583,19 @@ fn collect(spool: &Path, own: &str) -> Vec<Pending> {
     all.into_iter().take(MAX_TASKS).map(|(_, p, _)| p).collect()
 }
 
-/// Requests can share a decision when judge model and candidate profiles match.
-fn group_of(request: &Value) -> String {
-    let key = serde_json::json!([request["model"], request["state"]["models"]]);
+/// Requests can share a decision only when primary provider/model, fallback
+/// provider/model, judge model and candidate profiles all match.
+fn group_of(request: &Value, primary: &JudgeEndpoint, fallback: Option<&JudgeEndpoint>) -> String {
+    let fb = fallback
+        .filter(|f| *f != primary)
+        .map(|f| (&f.provider, &f.model));
+    let key = serde_json::json!([
+        &primary.provider,
+        &primary.model,
+        fb,
+        request["model"],
+        request["state"]["models"],
+    ]);
     format!("{:x}", Sha256::digest(key.to_string().as_bytes()))
 }
 
@@ -637,6 +704,11 @@ mod tests {
         }
     }
 
+    fn is_channel_wide_test(e: &anyhow::Error) -> bool {
+        let msg = e.to_string();
+        msg.contains("401") || msg.contains("403") || msg.contains("decision key not found")
+    }
+
     #[test]
     fn combine_points_each_question_at_its_task() {
         let batch: Vec<Pending> = ["one", "two"]
@@ -666,19 +738,26 @@ mod tests {
     async fn rate_limit_waits_and_batches_newcomers() {
         let (dir, blocks) = temp_dirs("wait-batch");
         let sent: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let primary = JudgeEndpoint::new("vercel", "judge");
         let other = request("queued");
-        let other_entry =
-            serde_json::json!({"group": group_of(&other), "request": other, "body": "x"});
+        let other_entry = serde_json::json!({
+            "group": group_of(&other, &primary, None),
+            "request": other,
+            "body": "x"
+        });
         write_atomic(
             &dir.join(format!("{}-1.req", std::process::id())),
             &other_entry.to_string(),
         )
         .unwrap();
-        let primary = JudgeEndpoint::new("vercel", "judge");
         let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let clock = Rc::new(Cell::new(t0));
-        let c_now = clock.clone();
-        let c_sleep = clock.clone();
+        let m0 = Instant::now();
+        let wall = Rc::new(Cell::new(t0));
+        let mono = Rc::new(Cell::new(m0));
+        let m_now = mono.clone();
+        let w_now = wall.clone();
+        let m_sleep = mono.clone();
+        let w_sleep = wall.clone();
         let log = sent.clone();
         let answer = ask_inner(
             &dir,
@@ -688,9 +767,11 @@ mod tests {
             &blocks,
             &primary,
             None,
-            move || c_now.get(),
+            move || m_now.get(),
+            move || w_now.get(),
             move |d| {
-                c_sleep.set(c_sleep.get() + d);
+                m_sleep.set(m_sleep.get() + d);
+                w_sleep.set(w_sleep.get() + d);
                 async {}
             },
             false,
@@ -714,6 +795,7 @@ mod tests {
                 }
             },
             classify_rl,
+            is_channel_wide_test,
         )
         .await
         .unwrap();
@@ -739,10 +821,13 @@ mod tests {
         let primary = JudgeEndpoint::new("vercel", "perplexity/pplx-decider-v1.2");
         let fallback = JudgeEndpoint::new("openrouter", "~typesafe/jev-latest");
         let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let clock = Rc::new(Cell::new(t0));
+        let m0 = Instant::now();
+        let wall = Rc::new(Cell::new(t0));
+        let mono = Rc::new(Cell::new(m0));
 
         // Without fallback, 60s > 50s BUDGET fails fast with clear error and no sleep.
-        let c1 = clock.clone();
+        let m1 = mono.clone();
+        let w1 = wall.clone();
         let slept = Rc::new(Cell::new(false));
         let s1 = slept.clone();
         let err = ask_inner(
@@ -753,7 +838,8 @@ mod tests {
             &blocks,
             &primary,
             None,
-            move || c1.get(),
+            move || m1.get(),
+            move || w1.get(),
             move |_| {
                 s1.set(true);
                 async {}
@@ -769,6 +855,7 @@ mod tests {
                 )
             },
             classify_rl,
+            is_channel_wide_test,
         )
         .await
         .unwrap_err();
@@ -777,7 +864,8 @@ mod tests {
         assert!(err.to_string().contains("50s"), "{err}");
 
         // With fallback configured, subsequent request skips blocked primary immediately.
-        let c2 = clock.clone();
+        let m2 = mono.clone();
+        let w2 = wall.clone();
         let providers: Arc<Mutex<Vec<String>>> = Arc::default();
         let p2 = providers.clone();
         let ans = ask_inner(
@@ -788,7 +876,8 @@ mod tests {
             &blocks,
             &primary,
             Some(&fallback),
-            move || c2.get(),
+            move || m2.get(),
+            move || w2.get(),
             |_| async {},
             false,
             move |ep, _r, _, _| {
@@ -799,6 +888,7 @@ mod tests {
                 }
             },
             classify_rl,
+            is_channel_wide_test,
         )
         .await
         .unwrap();
@@ -829,6 +919,7 @@ mod tests {
                 }
             },
             classify_rl,
+            is_channel_wide_test,
         )
         .await
         .unwrap();
@@ -844,7 +935,7 @@ mod tests {
         let calls: Arc<Mutex<Vec<usize>>> = Arc::default();
 
         let make_fetch = |log: Arc<Mutex<Vec<usize>>>| {
-            move |_ep: JudgeEndpoint, req: Value, _body: String, _rem: Duration| {
+            move |_ep: JudgeEndpoint, req: Value, _body: String, _deadline: Instant| {
                 let log = log.clone();
                 async move {
                     let count = req
@@ -893,6 +984,7 @@ mod tests {
             None,
             make_fetch(calls.clone()),
             classify_rl,
+            is_channel_wide_test,
         )
         .await;
         assert_eq!(*calls.lock().unwrap(), vec![3]);
@@ -919,6 +1011,7 @@ mod tests {
             None,
             make_fetch(calls.clone()),
             classify_rl,
+            is_channel_wide_test,
         )
         .await;
         let counts = calls.lock().unwrap().clone();
@@ -928,6 +1021,152 @@ mod tests {
             assert_eq!(r.as_ref().unwrap().answers["size"]["score"], i as i64);
         }
 
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn different_primary_or_fallback_config_never_share_queue_group() {
+        let (dir, blocks) = temp_dirs("group-isolation");
+        let primary = JudgeEndpoint::new("vercel", "judge");
+        let fallback = JudgeEndpoint::new("openrouter", "fb-judge");
+        let other = request("no-fallback-task");
+        let other_id = format!("{}-999", std::process::id());
+        // Pre-seed a request enqueued with fallback = None.
+        let other_entry = serde_json::json!({
+            "group": group_of(&other, &primary, None),
+            "request": other,
+            "body": "x"
+        });
+        write_atomic(
+            &dir.join(format!("{other_id}.req")),
+            &other_entry.to_string(),
+        )
+        .unwrap();
+
+        let sent: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let s = sent.clone();
+        let ans = ask_inner(
+            &dir,
+            &request("with-fallback-task"),
+            "body",
+            Duration::from_secs(30),
+            &blocks,
+            &primary,
+            Some(&fallback),
+            Instant::now,
+            SystemTime::now,
+            |_| async {},
+            false,
+            move |_ep, req, _, _| {
+                let s = s.clone();
+                async move {
+                    s.lock().unwrap().push(req);
+                    Ok((serde_json::json!({"size": {"score": 1}}), Some(0.01)))
+                }
+            },
+            classify_rl,
+            is_channel_wide_test,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ans.answers["size"]["score"], 1);
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0].pointer("/state/tasks").is_none(),
+            "leader with fallback must not batch a request queued under a different fallback config: {:?}",
+            sent[0]
+        );
+        // Also verify distinct primary providers produce distinct groups even for identical model strings.
+        let alt_primary = JudgeEndpoint::new("openrouter", "judge");
+        assert_ne!(
+            group_of(&other, &primary, None),
+            group_of(&other, &alt_primary, None)
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn channel_wide_error_fails_whole_batch_in_one_call() {
+        let (dir, blocks) = temp_dirs("channel-wide");
+        let primary = JudgeEndpoint::new("vercel", "judge");
+        let items: Vec<(Value, String)> = (0..8)
+            .map(|i| {
+                let r = request(&format!("task-{i}"));
+                let b = r.to_string();
+                (r, b)
+            })
+            .collect();
+        let calls = Arc::new(Mutex::new(0usize));
+        let c = calls.clone();
+        let outcomes = ask_many_with_deadline(
+            &dir,
+            &items,
+            Duration::from_secs(30),
+            &blocks,
+            &primary,
+            None,
+            move |_ep, _req, _body, _deadline| {
+                let c = c.clone();
+                async move {
+                    *c.lock().unwrap() += 1;
+                    Err::<(Value, Option<f64>), anyhow::Error>(anyhow::anyhow!(
+                        "jev_http_status_401"
+                    ))
+                }
+            },
+            classify_rl,
+            is_channel_wide_test,
+        )
+        .await;
+        assert_eq!(outcomes.len(), 8);
+        assert!(outcomes.iter().all(Result::is_err));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "channel-wide 401 must fail the entire wave of 8 in 1 judge call, not 8"
+        );
+
+        // Request-specific error (400): fails only the first task so remaining tasks retry and succeed!
+        let three: Vec<(Value, String)> = (0..3)
+            .map(|i| {
+                let r = request(&format!("req-{i}"));
+                let b = r.to_string();
+                (r, b)
+            })
+            .collect();
+        let req_calls = Arc::new(Mutex::new(0usize));
+        let rc = req_calls.clone();
+        let res_req = ask_many_with_deadline(
+            &dir,
+            &three,
+            Duration::from_secs(30),
+            &blocks,
+            &primary,
+            None,
+            move |_ep, req, _body, _deadline| {
+                let rc = rc.clone();
+                async move {
+                    let mut n = rc.lock().unwrap();
+                    *n += 1;
+                    if *n == 1 {
+                        return Err(anyhow::anyhow!("jev_http_status_400"));
+                    }
+                    let mut answers = Map::new();
+                    for (k, _) in req["questions"].as_object().unwrap() {
+                        answers.insert(k.clone(), serde_json::json!({"score": 1}));
+                    }
+                    Ok((Value::Object(answers), Some(0.01)))
+                }
+            },
+            classify_rl,
+            is_channel_wide_test,
+        )
+        .await;
+        assert_eq!(*req_calls.lock().unwrap(), 2);
+        assert!(res_req[0].is_err(), "first request fails on 400");
+        assert!(res_req[1].is_ok(), "second request must retry and succeed");
+        assert!(res_req[2].is_ok(), "third request must retry and succeed");
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }

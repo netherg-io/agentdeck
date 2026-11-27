@@ -7,21 +7,23 @@
 //! no consumer process hammers the blocked pair until the block expires.
 
 use std::future::Future;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Default `Retry-After` when a 429 response omits the header or sends a non-integer.
 pub const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(30);
-/// Subdirectory under `$XDG_RUNTIME_DIR` (or temp dir) storing per-pair 429 blocks.
+/// Base directory name under `$XDG_RUNTIME_DIR` (or temp dir) storing per-pair 429 blocks.
 pub const JUDGE_BLOCKS_DIR_NAME: &str = "agentdeck-judge-blocks";
 /// Upper bound on rate-limit wait loops within one deadline so a broken server
 /// replying `Retry-After: 0` cannot spin forever.
 const MAX_RATE_LIMIT_RETRIES: usize = 8;
+/// Maximum byte length accepted when reading a block file.
+const MAX_BLOCK_FILE_BYTES: u64 = 64 * 1024;
 
 /// Which judge channel produced a decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,15 +104,292 @@ pub fn format_rate_limit_exceeded(
     )
 }
 
-/// Ensure `dir` exists with private `0700` permissions.
-pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+/// Format an active 429 block with its UTC `blocked until` timestamp and
+/// remaining seconds (used by interactive probes such as GUI/CLI checks).
+pub fn format_blocked_until(
+    endpoint: &JudgeEndpoint,
+    remaining: Duration,
+    now: SystemTime,
+) -> String {
+    let until = now + remaining;
+    let secs = remaining.as_secs().max(u64::from(!remaining.is_zero()));
+    format!(
+        "judge {}/{} rate limited (429): blocked until {} ({secs}s remaining)",
+        endpoint.provider,
+        endpoint.model,
+        format_utc_iso(until),
+    )
+}
+
+fn format_utc_iso(t: SystemTime) -> String {
+    let secs = t
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut days = secs.div_euclid(86400);
+    let tod = secs.rem_euclid(86400);
+    let (mut y, mut m, mut d) = (1970i64, 1i64, 1i64);
+    while days >= 365 {
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let len = if leap { 366 } else { 365 };
+        if days < len {
+            break;
+        }
+        days -= len;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    for (i, len) in [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if days < len {
+            m = i as i64 + 1;
+            d = days + 1;
+            break;
+        }
+        days -= len;
+    }
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    )
+}
+
+/// Remaining per-request HTTP timeout bounded by both the endpoint's own
+/// timeout and the caller's single absolute monotonic deadline. Returns `None`
+/// once the deadline has already passed.
+pub fn request_timeout(own_timeout: Duration, deadline: Instant) -> Option<Duration> {
+    let rem = deadline.saturating_duration_since(Instant::now());
+    (!rem.is_zero()).then(|| own_timeout.min(rem))
+}
+
+/// Compute the primary attempt's monotonic deadline. When an unblocked fallback
+/// is configured, reserve half of the remaining budget for it so a hanging
+/// primary cannot starve the fallback.
+pub fn primary_attempt_deadline(
+    now: Instant,
+    deadline: Instant,
+    reserve_for_fallback: bool,
+) -> Instant {
+    if !reserve_for_fallback {
+        return deadline;
+    }
+    let remaining = deadline.saturating_duration_since(now);
+    if remaining.is_zero() {
+        return now;
+    }
+    let share = (remaining / 2).max(Duration::from_millis(1)).min(remaining);
+    now + share
+}
+
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    // SAFETY: `geteuid` has no preconditions and never fails.
+    unsafe { libc::geteuid() }
+}
+
+/// Base runtime directory shared across all consumers (`$XDG_RUNTIME_DIR` when
+/// set and non-empty, otherwise `std::env::temp_dir()`).
+pub fn default_runtime_base() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Per-user subdirectory name for cross-process 429 block files so falling back
+/// to `/tmp` never collides with another local user.
+pub fn blocks_dir_name() -> String {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        format!("{JUDGE_BLOCKS_DIR_NAME}-{}", current_euid())
+    }
+    #[cfg(not(unix))]
+    {
+        JUDGE_BLOCKS_DIR_NAME.to_string()
+    }
+}
+
+/// Resolve the per-user judge block directory inside a runtime base directory.
+pub fn blocks_dir_for_runtime(runtime_base: &Path) -> PathBuf {
+    runtime_base.join(blocks_dir_name())
+}
+
+#[cfg(unix)]
+fn verify_owner_and_private_mode(
+    meta: &std::fs::Metadata,
+    expected_uid: u32,
+    must_be_dir: bool,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing symlink in judge block store",
+        ));
+    }
+    if must_be_dir && !ft.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "judge block store path is not a directory",
+        ));
+    }
+    if !must_be_dir && !ft.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "judge block entry is not a regular file",
+        ));
+    }
+    if meta.uid() != expected_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "judge block store owned by uid {}, expected {expected_uid}",
+                meta.uid()
+            ),
+        ));
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("judge block store permissions {mode:o} are accessible to group/others"),
+        ));
     }
     Ok(())
+}
+
+/// Ensure `dir` exists as a real, current-user-owned directory with `0700`
+/// permissions (never following a symlink or accepting another user's dir).
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        let euid = current_euid();
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) => {
+                if !meta.file_type().is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "judge private dir is not a real directory",
+                    ));
+                }
+                if meta.uid() != euid {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "judge private dir is owned by another user",
+                    ));
+                }
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = dir.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(parent)?;
+                }
+                match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(err) => return Err(err),
+                }
+                let meta = std::fs::symlink_metadata(dir)?;
+                if !meta.file_type().is_dir() || meta.uid() != euid {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "judge private dir failed ownership/type check after creation",
+                    ));
+                }
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            }
+            Err(e) => return Err(e),
+        }
+        let verified = std::fs::symlink_metadata(dir)?;
+        verify_owner_and_private_mode(&verified, euid, true)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+fn verify_private_dir_for_read(dir: &Path) -> std::io::Result<bool> {
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    #[cfg(unix)]
+    {
+        verify_owner_and_private_mode(&meta, current_euid(), true)?;
+    }
+    #[cfg(not(unix))]
+    {
+        if !meta.file_type().is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "judge block store path is not a directory",
+            ));
+        }
+    }
+    Ok(true)
+}
+
+fn read_private_file(path: &Path) -> std::io::Result<Option<String>> {
+    let mut opts = std::fs::File::options();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match opts.open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let meta = file.metadata()?;
+    #[cfg(unix)]
+    {
+        verify_owner_and_private_mode(&meta, current_euid(), false)?;
+    }
+    #[cfg(not(unix))]
+    {
+        if !meta.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "judge block entry is not a regular file",
+            ));
+        }
+    }
+    let mut text = String::new();
+    file.take(MAX_BLOCK_FILE_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_BLOCK_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "judge block entry exceeds size cap",
+        ));
+    }
+    Ok(Some(text))
 }
 
 /// Atomically write `text` to `path` with private `0600` permissions via a
@@ -124,21 +403,32 @@ pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let mut opts = std::fs::File::options();
-    opts.create(true).truncate(true).write(true);
+    opts.create_new(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut f = opts.open(&tmp)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    f.write_all(text.as_bytes())?;
+    let write_res = (|| -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.write_all(text.as_bytes())?;
+        Ok(())
+    })();
     drop(f);
-    std::fs::rename(&tmp, path)
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -162,12 +452,14 @@ pub struct BlockStore {
 
 impl BlockStore {
     pub fn default_runtime() -> Self {
-        let base = std::env::var_os("XDG_RUNTIME_DIR")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+        Self::for_runtime_dir(&default_runtime_base())
+    }
+
+    /// Resolve the shared per-user block directory inside `runtime_dir` so all
+    /// consumers (router, approver, coordinator, probes) share one location.
+    pub fn for_runtime_dir(runtime_dir: &Path) -> Self {
         Self {
-            dir: base.join(JUDGE_BLOCKS_DIR_NAME),
+            dir: blocks_dir_for_runtime(runtime_dir),
         }
     }
 
@@ -179,16 +471,48 @@ impl BlockStore {
         &self.dir
     }
 
-    pub fn block_path(&self, endpoint: &JudgeEndpoint) -> PathBuf {
+    fn endpoint_stem(endpoint: &JudgeEndpoint) -> String {
         let mut h = Sha256::new();
         h.update(endpoint.provider.as_bytes());
         h.update([0u8]);
         h.update(endpoint.model.as_bytes());
-        self.dir.join(format!("{:x}.json", h.finalize()))
+        format!("{:x}", h.finalize())
+    }
+
+    pub fn block_path(&self, endpoint: &JudgeEndpoint) -> PathBuf {
+        self.dir
+            .join(format!("{}.json", Self::endpoint_stem(endpoint)))
+    }
+
+    fn lock_path(&self, endpoint: &JudgeEndpoint) -> PathBuf {
+        self.dir
+            .join(format!("{}.lock", Self::endpoint_stem(endpoint)))
     }
 
     fn read_until_ms(&self, endpoint: &JudgeEndpoint) -> Option<u64> {
-        let text = std::fs::read_to_string(self.block_path(endpoint)).ok()?;
+        match verify_private_dir_for_read(&self.dir) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(e) => {
+                eprintln!(
+                    "agentdeck: refusing untrusted judge block dir {}: {e}",
+                    self.dir.display()
+                );
+                return None;
+            }
+        }
+        let path = self.block_path(endpoint);
+        let text = match read_private_file(&path) {
+            Ok(Some(t)) => t,
+            Ok(None) => return None,
+            Err(e) => {
+                eprintln!(
+                    "agentdeck: refusing untrusted judge block file {}: {e}",
+                    path.display()
+                );
+                return None;
+            }
+        };
         let rec: BlockRecord = serde_json::from_str(&text).ok()?;
         Some(rec.blocked_until_ms)
     }
@@ -205,27 +529,62 @@ impl BlockStore {
     }
 
     /// Record a 429 block for `endpoint` until `now + retry_after`.
-    /// Never shortens an already-longer active block.
+    /// Updates the block file under a per-pair exclusive file lock so concurrent
+    /// writers never shorten a longer active block.
     pub fn record_rate_limit_at(
         &self,
         endpoint: &JudgeEndpoint,
         retry_after: Duration,
         now: SystemTime,
     ) -> std::io::Result<()> {
+        create_private_dir(&self.dir)?;
+        let lock_path = self.lock_path(endpoint);
+        let mut lock_opts = std::fs::File::options();
+        lock_opts.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            lock_opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let lock_file = lock_opts.open(&lock_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = lock_file.metadata()?;
+            // Lock file may have just been created or already exist; enforce owner + regular file first,
+            // then tighten perms to 0600 before locking.
+            if !meta.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "judge block lock path is not a regular file",
+                ));
+            }
+            use std::os::unix::fs::MetadataExt;
+            if meta.uid() != current_euid() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "judge block lock file owned by another user",
+                ));
+            }
+            lock_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        lock_file.lock()?;
+
         let now_ms = system_time_ms(now);
         let add_ms = retry_after.as_millis().min(u64::MAX as u128) as u64;
         let new_until = now_ms.saturating_add(add_ms);
         let blocked_until_ms = self
             .read_until_ms(endpoint)
             .map_or(new_until, |existing| existing.max(new_until));
-        create_private_dir(&self.dir)?;
         let rec = BlockRecord {
             provider: endpoint.provider.clone(),
             model: endpoint.model.clone(),
             blocked_until_ms,
         };
         let text = serde_json::to_string(&rec).map_err(std::io::Error::other)?;
-        write_atomic(&self.block_path(endpoint), &text)
+        let res = write_atomic(&self.block_path(endpoint), &text);
+        drop(lock_file);
+        res
     }
 
     pub fn record_rate_limit(
@@ -234,6 +593,20 @@ impl BlockStore {
         retry_after: Duration,
     ) -> std::io::Result<()> {
         self.record_rate_limit_at(endpoint, retry_after, SystemTime::now())
+    }
+}
+
+fn record_block_logged(
+    blocks: &BlockStore,
+    endpoint: &JudgeEndpoint,
+    retry_after: Duration,
+    at: SystemTime,
+) {
+    if let Err(err) = blocks.record_rate_limit_at(endpoint, retry_after, at) {
+        eprintln!(
+            "agentdeck: failed to persist 429 block for {}/{}: {err}",
+            endpoint.provider, endpoint.model
+        );
     }
 }
 
@@ -259,158 +632,186 @@ fn distinct_fallback<'a>(
 }
 
 /// Execute one dispatch round against `primary` and optional `fallback`,
-/// honouring and updating cross-process 429 blocks in `blocks`.
+/// honouring and updating cross-process 429 blocks in `blocks` under a single
+/// absolute monotonic `deadline`.
+///
+/// - Reserves half of the remaining budget for an unblocked fallback when
+///   calling `primary` so a hanging primary cannot starve the fallback.
+/// - Records 429 blocks using `wall_now()` measured at 429 receipt.
+/// - After any fallback failure (including 429), records the fallback's block
+///   (if 429) and returns `DispatchStep::Fail` without looping back to primary.
 #[allow(clippy::too_many_arguments)]
-pub async fn dispatch_once<T, E, Call, Fut, Classify, RateLimitErr>(
+pub async fn dispatch_once<T, E, MonoNow, WallNow, Call, Fut, Classify, RateLimitErr>(
     blocks: &BlockStore,
     primary: &JudgeEndpoint,
     fallback: Option<&JudgeEndpoint>,
-    now: SystemTime,
-    remaining_budget: Duration,
+    deadline: Instant,
+    mut mono_now: MonoNow,
+    mut wall_now: WallNow,
     mut call: Call,
     classify: Classify,
     rate_limit_err: RateLimitErr,
 ) -> DispatchStep<T, E>
 where
-    Call: FnMut(&JudgeEndpoint) -> Fut,
+    MonoNow: FnMut() -> Instant,
+    WallNow: FnMut() -> SystemTime,
+    Call: FnMut(&JudgeEndpoint, Instant) -> Fut,
     Fut: Future<Output = Result<T, E>>,
     Classify: Fn(&E) -> FallbackTrigger,
     RateLimitErr: Fn(&JudgeEndpoint, Duration, Duration) -> E,
 {
     let fb = distinct_fallback(primary, fallback);
+    let start_m = mono_now();
+    let start_w = wall_now();
+    let remaining = deadline.saturating_duration_since(start_m);
 
     // 1. Primary already blocked: never send to it.
-    if let Some(primary_rem) = blocks.remaining_at(primary, now) {
+    if let Some(primary_rem) = blocks.remaining_at(primary, start_w) {
         if let Some(fb) = fb {
-            if let Some(fb_rem) = blocks.remaining_at(fb, now) {
+            if let Some(fb_rem) = blocks.remaining_at(fb, start_w) {
                 let wait = primary_rem.min(fb_rem);
-                return if wait < remaining_budget {
+                return if wait < remaining {
                     DispatchStep::Wait(wait)
                 } else {
-                    DispatchStep::Fail(rate_limit_err(primary, wait, remaining_budget))
+                    DispatchStep::Fail(rate_limit_err(primary, wait, remaining))
                 };
             }
-            return match call(fb).await {
+            return match call(fb, deadline).await {
                 Ok(v) => DispatchStep::Done(v, JudgeChannel::Fallback),
                 Err(fb_err) => {
                     if let FallbackTrigger::RateLimited { retry_after } = classify(&fb_err) {
-                        let _ = blocks.record_rate_limit_at(fb, retry_after, now);
-                        let wait = primary_rem.min(retry_after);
-                        if wait < remaining_budget {
-                            return DispatchStep::Wait(wait);
-                        }
-                        return DispatchStep::Fail(rate_limit_err(fb, wait, remaining_budget));
+                        record_block_logged(blocks, fb, retry_after, wall_now());
                     }
+                    // Never wait and loop back to primary after a fallback failure.
                     DispatchStep::Fail(fb_err)
                 }
             };
         }
-        return if primary_rem < remaining_budget {
+        return if primary_rem < remaining {
             DispatchStep::Wait(primary_rem)
         } else {
-            DispatchStep::Fail(rate_limit_err(primary, primary_rem, remaining_budget))
+            DispatchStep::Fail(rate_limit_err(primary, primary_rem, remaining))
         };
     }
 
-    // 2. Primary unblocked: send to primary first.
-    match call(primary).await {
+    // 2. Primary unblocked: send to primary first, reserving time if fallback is available.
+    let fb_available = fb.is_some_and(|f| blocks.remaining_at(f, start_w).is_none());
+    let primary_deadline = primary_attempt_deadline(start_m, deadline, fb_available);
+    match call(primary, primary_deadline).await {
         Ok(v) => DispatchStep::Done(v, JudgeChannel::Primary),
-        Err(err) => match classify(&err) {
-            FallbackTrigger::None => DispatchStep::Fail(err),
-            FallbackTrigger::Transient => {
-                let Some(fb) = fb else {
-                    return DispatchStep::Fail(err);
-                };
-                if blocks.remaining_at(fb, now).is_some() {
-                    return DispatchStep::Fail(err);
-                }
-                match call(fb).await {
-                    Ok(v) => DispatchStep::Done(v, JudgeChannel::Fallback),
-                    Err(fb_err) => {
-                        if let FallbackTrigger::RateLimited { retry_after } = classify(&fb_err) {
-                            let _ = blocks.record_rate_limit_at(fb, retry_after, now);
-                        }
-                        DispatchStep::Fail(fb_err)
+        Err(err) => {
+            let received_w = wall_now();
+            let received_m = mono_now();
+            let remaining_after = deadline.saturating_duration_since(received_m);
+            match classify(&err) {
+                FallbackTrigger::None => DispatchStep::Fail(err),
+                FallbackTrigger::Transient => {
+                    let Some(fb) = fb else {
+                        return DispatchStep::Fail(err);
+                    };
+                    if blocks.remaining_at(fb, received_w).is_some() || remaining_after.is_zero() {
+                        return DispatchStep::Fail(err);
                     }
-                }
-            }
-            FallbackTrigger::RateLimited { retry_after } => {
-                let _ = blocks.record_rate_limit_at(primary, retry_after, now);
-                if let Some(fb) = fb {
-                    if let Some(fb_rem) = blocks.remaining_at(fb, now) {
-                        let wait = retry_after.min(fb_rem);
-                        return if wait < remaining_budget {
-                            DispatchStep::Wait(wait)
-                        } else {
-                            DispatchStep::Fail(rate_limit_err(primary, wait, remaining_budget))
-                        };
-                    }
-                    return match call(fb).await {
+                    match call(fb, deadline).await {
                         Ok(v) => DispatchStep::Done(v, JudgeChannel::Fallback),
                         Err(fb_err) => {
-                            if let FallbackTrigger::RateLimited { retry_after: fb_ra } =
-                                classify(&fb_err)
+                            if let FallbackTrigger::RateLimited { retry_after } = classify(&fb_err)
                             {
-                                let _ = blocks.record_rate_limit_at(fb, fb_ra, now);
-                                let wait = retry_after.min(fb_ra);
-                                if wait < remaining_budget {
-                                    return DispatchStep::Wait(wait);
-                                }
-                                return DispatchStep::Fail(rate_limit_err(
-                                    fb,
-                                    wait,
-                                    remaining_budget,
-                                ));
+                                record_block_logged(blocks, fb, retry_after, wall_now());
                             }
                             DispatchStep::Fail(fb_err)
                         }
-                    };
+                    }
                 }
-                if retry_after < remaining_budget {
-                    DispatchStep::Wait(retry_after)
-                } else {
-                    DispatchStep::Fail(rate_limit_err(primary, retry_after, remaining_budget))
+                FallbackTrigger::RateLimited { retry_after } => {
+                    record_block_logged(blocks, primary, retry_after, received_w);
+                    if let Some(fb) = fb {
+                        if let Some(fb_rem) = blocks.remaining_at(fb, received_w) {
+                            let wait = retry_after.min(fb_rem);
+                            return if wait < remaining_after {
+                                DispatchStep::Wait(wait)
+                            } else {
+                                DispatchStep::Fail(rate_limit_err(primary, wait, remaining_after))
+                            };
+                        }
+                        if remaining_after.is_zero() {
+                            return DispatchStep::Fail(rate_limit_err(
+                                primary,
+                                retry_after,
+                                Duration::ZERO,
+                            ));
+                        }
+                        return match call(fb, deadline).await {
+                            Ok(v) => DispatchStep::Done(v, JudgeChannel::Fallback),
+                            Err(fb_err) => {
+                                if let FallbackTrigger::RateLimited { retry_after: fb_ra } =
+                                    classify(&fb_err)
+                                {
+                                    record_block_logged(blocks, fb, fb_ra, wall_now());
+                                }
+                                // Never wait and loop back to primary after a fallback failure.
+                                DispatchStep::Fail(fb_err)
+                            }
+                        };
+                    }
+                    if retry_after < remaining_after {
+                        DispatchStep::Wait(retry_after)
+                    } else {
+                        DispatchStep::Fail(rate_limit_err(primary, retry_after, remaining_after))
+                    }
                 }
             }
-        },
+        }
     }
 }
 
-/// Run [`dispatch_once`] in a loop up to `deadline`, sleeping via caller-provided
-/// `sleep` when a rate-limit block fits before the deadline.
+/// Run [`dispatch_once`] in a loop up to a single monotonic `budget` deadline,
+/// sleeping via caller-provided `sleep` when a rate-limit block fits before the
+/// deadline.
 #[allow(clippy::too_many_arguments)]
-pub async fn dispatch_with_deadline<T, E, Now, Sleep, SleepFut, Call, Fut, Classify, RateLimitErr>(
+pub async fn dispatch_with_deadline<
+    T,
+    E,
+    MonoNow,
+    WallNow,
+    Sleep,
+    SleepFut,
+    Call,
+    Fut,
+    Classify,
+    RateLimitErr,
+>(
     blocks: &BlockStore,
     primary: &JudgeEndpoint,
     fallback: Option<&JudgeEndpoint>,
-    deadline: Duration,
-    mut now: Now,
+    budget: Duration,
+    mut mono_now: MonoNow,
+    mut wall_now: WallNow,
     mut sleep: Sleep,
     mut call: Call,
     classify: Classify,
     rate_limit_err: RateLimitErr,
 ) -> Result<(T, JudgeChannel), E>
 where
-    Now: FnMut() -> SystemTime,
+    MonoNow: FnMut() -> Instant,
+    WallNow: FnMut() -> SystemTime,
     Sleep: FnMut(Duration) -> SleepFut,
     SleepFut: Future<Output = ()>,
-    Call: FnMut(&JudgeEndpoint, Duration) -> Fut,
+    Call: FnMut(&JudgeEndpoint, Instant) -> Fut,
     Fut: Future<Output = Result<T, E>>,
     Classify: Fn(&E) -> FallbackTrigger,
     RateLimitErr: Fn(&JudgeEndpoint, Duration, Duration) -> E,
 {
-    let start = now();
+    let deadline = mono_now() + budget;
     for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
-        let cur = now();
-        let elapsed = cur.duration_since(start).unwrap_or(Duration::ZERO);
-        let remaining = deadline.saturating_sub(elapsed);
         match dispatch_once(
             blocks,
             primary,
             fallback,
-            cur,
-            remaining,
-            |ep| call(ep, remaining),
+            deadline,
+            &mut mono_now,
+            &mut wall_now,
+            &mut call,
             &classify,
             &rate_limit_err,
         )
@@ -420,7 +821,8 @@ where
             DispatchStep::Fail(e) => return Err(e),
             DispatchStep::Wait(wait) => {
                 if attempt == MAX_RATE_LIMIT_RETRIES {
-                    return Err(rate_limit_err(primary, wait, remaining));
+                    let rem = deadline.saturating_duration_since(mono_now());
+                    return Err(rate_limit_err(primary, wait, rem));
                 }
                 sleep(wait).await;
             }
@@ -477,12 +879,15 @@ mod tests {
     fn rate_limit_60s_no_fallback_fails_fast_under_50s_and_waits_under_120s() {
         let (dir, blocks) = temp_blocks("deadline");
         let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let clock = Rc::new(Cell::new(t0));
+        let m0 = Instant::now();
+        let wall = Rc::new(Cell::new(t0));
+        let mono = Rc::new(Cell::new(m0));
         let slept = Rc::new(Mutex::new(Vec::new()));
         let calls = Rc::new(Mutex::new(0usize));
 
         // 60s Retry-After > 50s deadline: fails fast with clear error, zero sleep.
-        let c1 = clock.clone();
+        let m1 = mono.clone();
+        let w1 = wall.clone();
         let s1 = slept.clone();
         let n1 = calls.clone();
         let err = run_block(dispatch_with_deadline(
@@ -490,12 +895,13 @@ mod tests {
             &primary(),
             None,
             Duration::from_secs(50),
-            move || c1.get(),
+            move || m1.get(),
+            move || w1.get(),
             move |d| {
                 s1.lock().unwrap().push(d);
                 async {}
             },
-            move |_ep, _rem| {
+            move |_ep, _deadline| {
                 *n1.lock().unwrap() += 1;
                 async {
                     Err::<&str, TestErr>(TestErr {
@@ -520,17 +926,20 @@ mod tests {
 
         // Second request at t0 + 5s with 50s deadline sees block (55s left > 50s):
         // fails fast WITHOUT calling primary again.
-        clock.set(t0 + Duration::from_secs(5));
-        let c2 = clock.clone();
+        wall.set(t0 + Duration::from_secs(5));
+        mono.set(m0 + Duration::from_secs(5));
+        let m2 = mono.clone();
+        let w2 = wall.clone();
         let n2 = calls.clone();
         let err2 = run_block(dispatch_with_deadline(
             &blocks,
             &primary(),
             None,
             Duration::from_secs(50),
-            move || c2.get(),
+            move || m2.get(),
+            move || w2.get(),
             |_| async {},
-            move |_ep, _rem| {
+            move |_ep, _deadline| {
                 *n2.lock().unwrap() += 1;
                 async { Ok::<&str, TestErr>("should not run") }
             },
@@ -545,8 +954,10 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), 1, "must not hammer blocked primary");
 
         // Request with 120s deadline waits out remaining 55s (via injected clock) and succeeds!
-        let c3 = clock.clone();
-        let c3_sleep = clock.clone();
+        let m3 = mono.clone();
+        let w3 = wall.clone();
+        let m3_sleep = mono.clone();
+        let w3_sleep = wall.clone();
         let s3 = slept.clone();
         let n3 = calls.clone();
         let (val, ch) = run_block(dispatch_with_deadline(
@@ -554,13 +965,15 @@ mod tests {
             &primary(),
             None,
             Duration::from_secs(120),
-            move || c3.get(),
+            move || m3.get(),
+            move || w3.get(),
             move |d| {
                 s3.lock().unwrap().push(d);
-                c3_sleep.set(c3_sleep.get() + d);
+                m3_sleep.set(m3_sleep.get() + d);
+                w3_sleep.set(w3_sleep.get() + d);
                 async {}
             },
-            move |_ep, _rem| {
+            move |_ep, _deadline| {
                 *n3.lock().unwrap() += 1;
                 async { Ok::<&str, TestErr>("ok-after-wait") }
             },
@@ -582,18 +995,22 @@ mod tests {
     fn rate_limit_with_fallback_uses_fallback_immediately_and_skips_blocked_primary() {
         let (dir, blocks) = temp_blocks("fallback");
         let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let clock = Rc::new(Cell::new(t0));
+        let m0 = Instant::now();
+        let wall = Rc::new(Cell::new(t0));
+        let mono = Rc::new(Cell::new(m0));
         let seen = Rc::new(Mutex::new(Vec::<String>::new()));
 
         // Request 1: primary returns 429 -> immediately answered by fallback.
-        let c1 = clock.clone();
+        let m1 = mono.clone();
+        let w1 = wall.clone();
         let s1 = seen.clone();
         let (val, ch) = run_block(dispatch_with_deadline(
             &blocks,
             &primary(),
             Some(&fallback()),
             Duration::from_secs(10),
-            move || c1.get(),
+            move || m1.get(),
+            move || w1.get(),
             |_| async {},
             move |ep, _| {
                 s1.lock().unwrap().push(ep.provider.clone());
@@ -624,16 +1041,19 @@ mod tests {
 
         // Request 2 from a second BlockStore ("second process") at t0 + 10s:
         // skips blocked primary completely and goes straight to fallback.
-        clock.set(t0 + Duration::from_secs(10));
+        wall.set(t0 + Duration::from_secs(10));
+        mono.set(m0 + Duration::from_secs(10));
         let second_process_blocks = BlockStore::new(dir.clone());
-        let c2 = clock.clone();
+        let m2 = mono.clone();
+        let w2 = wall.clone();
         let s2 = seen.clone();
         let (val2, ch2) = run_block(dispatch_with_deadline(
             &second_process_blocks,
             &primary(),
             Some(&fallback()),
             Duration::from_secs(10),
-            move || c2.get(),
+            move || m2.get(),
+            move || w2.get(),
             |_| async {},
             move |ep, _| {
                 s2.lock().unwrap().push(ep.provider.clone());
@@ -654,15 +1074,18 @@ mod tests {
         );
 
         // Request 3 at t0 + 61s (block expired): tries primary again and succeeds.
-        clock.set(t0 + Duration::from_secs(61));
-        let c3 = clock.clone();
+        wall.set(t0 + Duration::from_secs(61));
+        mono.set(m0 + Duration::from_secs(61));
+        let m3 = mono.clone();
+        let w3 = wall.clone();
         let s3 = seen.clone();
         let (val3, ch3) = run_block(dispatch_with_deadline(
             &second_process_blocks,
             &primary(),
             Some(&fallback()),
             Duration::from_secs(10),
-            move || c3.get(),
+            move || m3.get(),
+            move || w3.get(),
             |_| async {},
             move |ep, _| {
                 s3.lock().unwrap().push(ep.provider.clone());
@@ -701,6 +1124,7 @@ mod tests {
     fn transient_triggers_fallback_without_blocking_while_non_fallback_does_not() {
         let (dir, blocks) = temp_blocks("classify");
         let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let m0 = Instant::now();
 
         // 5xx / network -> fallback, and primary is NOT blocked.
         let (v, ch) = run_block(dispatch_with_deadline(
@@ -708,6 +1132,7 @@ mod tests {
             &primary(),
             Some(&fallback()),
             Duration::from_secs(10),
+            || m0,
             || t0,
             |_| async {},
             |ep, _| {
@@ -746,6 +1171,7 @@ mod tests {
                 &primary(),
                 Some(&fallback()),
                 Duration::from_secs(10),
+                || m0,
                 || t0,
                 |_| async {},
                 move |ep, _| {
@@ -783,5 +1209,328 @@ mod tests {
         assert_eq!(parse_retry_after(Some("bogus")), Duration::from_secs(30));
         assert_eq!(parse_retry_after(Some(" 60 ")), Duration::from_secs(60));
         assert_eq!(parse_retry_after(Some("0")), Duration::from_secs(0));
+    }
+
+    #[test]
+    fn dispatch_shares_single_monotonic_deadline_and_reserves_budget_for_fallback() {
+        let (dir, blocks) = temp_blocks("mono-reserve");
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let m0 = Instant::now();
+        let wall = Rc::new(Cell::new(t0));
+        let mono = Rc::new(Cell::new(m0));
+        let deadlines = Rc::new(Mutex::new(Vec::<(String, Duration)>::new()));
+
+        let m_now = mono.clone();
+        let w_now = wall.clone();
+        let m_call = mono.clone();
+        let dl = deadlines.clone();
+
+        let (val, ch) = run_block(dispatch_with_deadline(
+            &blocks,
+            &primary(),
+            Some(&fallback()),
+            Duration::from_secs(10),
+            move || m_now.get(),
+            move || w_now.get(),
+            |_| async {},
+            move |ep, attempt_deadline| {
+                let now_m = m_call.get();
+                let rem = attempt_deadline.saturating_duration_since(now_m);
+                dl.lock().unwrap().push((ep.provider.clone(), rem));
+                let is_primary = ep.provider == "vercel";
+                if is_primary {
+                    // Simulate primary consuming its entire reserved 5s share and timing out.
+                    m_call.set(now_m + rem);
+                }
+                async move {
+                    if is_primary {
+                        Err(TestErr {
+                            trigger: FallbackTrigger::Transient,
+                            msg: "timeout".into(),
+                        })
+                    } else {
+                        Ok("fb-ok")
+                    }
+                }
+            },
+            |e| e.trigger,
+            |ep, ra, rem| TestErr {
+                trigger: FallbackTrigger::None,
+                msg: format_rate_limit_exceeded(ep, ra, rem),
+            },
+        ))
+        .unwrap();
+        assert_eq!(val, "fb-ok");
+        assert_eq!(ch, JudgeChannel::Fallback);
+        assert_eq!(
+            *deadlines.lock().unwrap(),
+            vec![
+                ("vercel".into(), Duration::from_secs(5)),
+                ("openrouter".into(), Duration::from_secs(5)),
+            ],
+            "primary must reserve half the deadline for fallback, and fallback must get only the remainder"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rate_limit_block_uses_receipt_time_not_pre_request_time() {
+        let (dir, blocks) = temp_blocks("receipt-time");
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let m0 = Instant::now();
+        let wall = Rc::new(Cell::new(t0));
+        let mono = Rc::new(Cell::new(m0));
+        let m_now = mono.clone();
+        let w_now = wall.clone();
+        let w_call = wall.clone();
+        let m_call = mono.clone();
+
+        let _ = run_block(dispatch_with_deadline(
+            &blocks,
+            &primary(),
+            None,
+            Duration::from_secs(20),
+            move || m_now.get(),
+            move || w_now.get(),
+            |_| async {},
+            move |_ep, _deadline| {
+                // Request took 10s in flight before 429 arrived with Retry-After: 30s.
+                w_call.set(w_call.get() + Duration::from_secs(10));
+                m_call.set(m_call.get() + Duration::from_secs(10));
+                async {
+                    Err::<&str, TestErr>(TestErr {
+                        trigger: FallbackTrigger::RateLimited {
+                            retry_after: Duration::from_secs(30),
+                        },
+                        msg: "429".into(),
+                    })
+                }
+            },
+            |e| e.trigger,
+            |ep, ra, rem| TestErr {
+                trigger: FallbackTrigger::None,
+                msg: format_rate_limit_exceeded(ep, ra, rem),
+            },
+        ))
+        .unwrap_err();
+
+        // Block must expire at t0 + 10s + 30s = t0 + 40s, so at t0 + 35s 5s remain.
+        let rem = blocks.remaining_at(&primary(), t0 + Duration::from_secs(35));
+        assert_eq!(rem, Some(Duration::from_secs(5)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_record_rate_limit_uses_per_pair_lock_and_keeps_max() {
+        let (dir, blocks) = temp_blocks("lock-max");
+        let ep = primary();
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        // Seed initial state so the per-pair directory exists.
+        blocks
+            .record_rate_limit_at(&ep, Duration::from_secs(1), t0)
+            .unwrap();
+        let lock_path = blocks.lock_path(&ep);
+        let lock_file = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        lock_file.lock().unwrap();
+
+        let blocks_bg = blocks.clone();
+        let ep_bg = ep.clone();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_bg = done.clone();
+        let handle = std::thread::spawn(move || {
+            blocks_bg
+                .record_rate_limit_at(&ep_bg, Duration::from_secs(5), t0)
+                .unwrap();
+            done_bg.store(true, Ordering::SeqCst);
+        });
+
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "record_rate_limit_at must wait on the per-pair lock file"
+        );
+        // While holding the lock, simulate a longer block written before releasing.
+        let long_rec = BlockRecord {
+            provider: ep.provider.clone(),
+            model: ep.model.clone(),
+            blocked_until_ms: system_time_ms(t0) + 60_000,
+        };
+        write_atomic(
+            &blocks.block_path(&ep),
+            &serde_json::to_string(&long_rec).unwrap(),
+        )
+        .unwrap();
+        drop(lock_file);
+        handle.join().unwrap();
+
+        assert_eq!(
+            blocks.remaining_at(&ep, t0),
+            Some(Duration::from_secs(60)),
+            "shorter concurrent write must never overwrite a longer block"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fallback_429_records_block_and_never_retries_primary() {
+        let (dir, blocks) = temp_blocks("fb-429-no-loop");
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let m0 = Instant::now();
+        // Primary is blocked for only 1s (well inside 10s deadline).
+        blocks
+            .record_rate_limit_at(&primary(), Duration::from_secs(1), t0)
+            .unwrap();
+
+        let wall = Rc::new(Cell::new(t0));
+        let mono = Rc::new(Cell::new(m0));
+        let m_now = mono.clone();
+        let w_now = wall.clone();
+        let m_sleep = mono.clone();
+        let w_sleep = wall.clone();
+        let seen = Rc::new(Mutex::new(Vec::<String>::new()));
+        let s1 = seen.clone();
+
+        let res = run_block(dispatch_with_deadline(
+            &blocks,
+            &primary(),
+            Some(&fallback()),
+            Duration::from_secs(10),
+            move || m_now.get(),
+            move || w_now.get(),
+            move |d| {
+                m_sleep.set(m_sleep.get() + d);
+                w_sleep.set(w_sleep.get() + d);
+                async {}
+            },
+            move |ep, _deadline| {
+                s1.lock().unwrap().push(ep.provider.clone());
+                let is_fb = ep.provider == "openrouter";
+                async move {
+                    if is_fb {
+                        Err(TestErr {
+                            trigger: FallbackTrigger::RateLimited {
+                                retry_after: Duration::from_secs(60),
+                            },
+                            msg: "fb-429".into(),
+                        })
+                    } else {
+                        Ok("primary-must-not-be-retried")
+                    }
+                }
+            },
+            |e| e.trigger,
+            |ep, ra, rem| TestErr {
+                trigger: FallbackTrigger::None,
+                msg: format_rate_limit_exceeded(ep, ra, rem),
+            },
+        ));
+        assert!(
+            res.is_err(),
+            "fallback 429 must fail, not retry primary: {res:?}"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["openrouter"],
+            "must never loop back to primary after fallback 429"
+        );
+        assert_eq!(
+            blocks.remaining_at(&fallback(), t0),
+            Some(Duration::from_secs(60)),
+            "fallback 429 block must be persisted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn block_store_refuses_symlinks_and_loose_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let (dir, blocks) = temp_blocks("unsafe-perms");
+        let ep = primary();
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        blocks
+            .record_rate_limit_at(&ep, Duration::from_secs(60), t0)
+            .unwrap();
+
+        // 1. Loose file permissions (0644) must not be trusted on read.
+        let p = blocks.block_path(&ep);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            blocks.remaining_at(&ep, t0).is_none(),
+            "world/group-readable block file must be refused"
+        );
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // 2. Symlinked block file must be refused on read.
+        let decoy = dir.join("decoy.json");
+        std::fs::copy(&p, &decoy).unwrap();
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_file(&p).unwrap();
+        symlink(&decoy, &p).unwrap();
+        assert!(
+            blocks.remaining_at(&ep, t0).is_none(),
+            "symlinked block file must be refused on read"
+        );
+        std::fs::remove_file(&p).unwrap();
+        std::fs::rename(&decoy, &p).unwrap();
+
+        // 3. Loose directory permissions (0755) must not be trusted on read.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            blocks.remaining_at(&ep, t0).is_none(),
+            "world/group-accessible block dir must be refused"
+        );
+
+        // 4. Symlinked block directory must be refused on both read and write.
+        let link_dir = dir.with_extension("link");
+        let _ = std::fs::remove_file(&link_dir);
+        symlink(&dir, &link_dir).unwrap();
+        let link_store = BlockStore::new(link_dir.clone());
+        assert!(
+            link_store
+                .record_rate_limit_at(&ep, Duration::from_secs(60), t0)
+                .is_err(),
+            "symlinked block directory must be refused on write"
+        );
+
+        // 5. Foreign UID must be refused by the owner check.
+        let meta = std::fs::symlink_metadata(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let private_meta = std::fs::symlink_metadata(&dir).unwrap();
+        assert!(verify_owner_and_private_mode(&private_meta, current_euid(), true).is_ok());
+        assert!(
+            verify_owner_and_private_mode(&private_meta, current_euid().wrapping_add(1), true)
+                .is_err()
+        );
+        let _ = meta;
+
+        let _ = std::fs::remove_file(&link_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_runtime_without_xdg_uses_per_user_dir() {
+        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        // SAFETY: isolated unit test reading/restoring XDG_RUNTIME_DIR.
+        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
+        let store = BlockStore::default_runtime();
+        let via_base = BlockStore::for_runtime_dir(&default_runtime_base());
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) };
+        }
+        let shared = std::env::temp_dir().join(JUDGE_BLOCKS_DIR_NAME);
+        assert_ne!(
+            store.dir(),
+            shared.as_path(),
+            "BlockStore::default_runtime() without XDG_RUNTIME_DIR must use a per-user directory, not shared {}",
+            shared.display()
+        );
+        assert_eq!(store.dir(), via_base.dir());
     }
 }

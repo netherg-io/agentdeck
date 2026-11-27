@@ -1139,3 +1139,251 @@ fn route_batch_lists_schema_handles_invalid_and_warms_hook_cache() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn route_batch_resolves_secondary_account_via_t3_thread_and_hits_hook_cache() {
+    let dir = std::env::temp_dir().join(format!(
+        "agentdeck-mcp-route-batch-secondary-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let home = dir.join("home");
+    let runtime = dir.join("runtime");
+    let xdg_state = dir.join("xdg-state");
+    let codex_b_home = dir.join("codex-b-shadow");
+    for p in [
+        dir.join("config"),
+        home.join(".t3/userdata"),
+        home.join(".local/state/ai-usage"),
+        xdg_state.join("model-route"),
+        runtime.clone(),
+        codex_b_home.clone(),
+    ] {
+        std::fs::create_dir_all(p).unwrap();
+    }
+    std::fs::write(
+        dir.join("config/instances.toml"),
+        "version = 1\n\n[plugins]\nmcp-server = true\nrouter = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".t3/userdata/settings.json"),
+        json!({
+            "providerInstances": {
+                "codex": {"driver": "codex", "config": {}},
+                "codex_b": {"driver": "codex", "config": {"shadowHomePath": codex_b_home.to_string_lossy()}}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // Seed statev2.sqlite binding thread-codex-b to secondary instance `codex_b`.
+    let db = rusqlite::Connection::open(home.join(".t3/userdata/statev2.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE orchestration_v2_projection_threads (
+            thread_id TEXT PRIMARY KEY,
+            title TEXT,
+            updated_at TEXT,
+            payload_json TEXT,
+            provider_instance_id TEXT
+         );
+         CREATE TABLE orchestration_v2_projection_runs (
+            run_id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            provider TEXT NOT NULL,
+            provider_thread_id TEXT,
+            status TEXT NOT NULL,
+            requested_at TEXT NOT NULL,
+            completed_at TEXT,
+            payload_json TEXT NOT NULL,
+            provider_instance_id TEXT
+         );
+         CREATE TABLE orchestration_v2_projection_subagents (
+            subagent_id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            run_id TEXT,
+            parent_node_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            provider_thread_id TEXT,
+            child_thread_id TEXT,
+            origin TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at TEXT,
+            completed_at TEXT,
+            updated_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            driver TEXT,
+            provider_instance_id TEXT
+         );
+         CREATE TABLE orchestration_v2_projection_provider_threads (
+            provider_thread_id TEXT PRIMARY KEY,
+            thread_id TEXT,
+            owner_node_id TEXT,
+            provider TEXT NOT NULL,
+            provider_session_id TEXT,
+            status TEXT NOT NULL,
+            first_run_ordinal INTEGER,
+            last_run_ordinal INTEGER,
+            updated_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            driver TEXT,
+            provider_instance_id TEXT
+         );
+         INSERT INTO orchestration_v2_projection_threads (thread_id, title, payload_json, provider_instance_id)
+            VALUES ('thread-codex-b', 'Secondary', '{}', 'codex_b');
+         INSERT INTO orchestration_v2_projection_runs (run_id, thread_id, ordinal, provider, status, requested_at, payload_json, provider_instance_id)
+            VALUES ('run-1', 'thread-codex-b', 1, 'codex', 'running', '2026-11-27T00:00:00Z', '{}', 'codex_b');",
+    )
+    .unwrap();
+    drop(db);
+
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/catalog.fixture.json"),
+        xdg_state.join("model-route/catalog.json"),
+    )
+    .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64() as i64;
+    let usage = json!({"accounts": [
+        {"provider": "claude", "id": "claude-main", "plan": "Max 5x", "status": "ok", "updated_at": now, "balances": [],
+         "windows": [
+            {"key": "weekly_all", "label": "Week", "remaining_percent": 90, "duration_mins": 10080, "resets_at": now + 5 * 86400},
+            {"key": "session", "label": "5h", "remaining_percent": 90, "duration_mins": 300, "resets_at": now + 3 * 3600}
+         ]},
+        {"provider": "codex", "id": "codex-main", "plan": "Pro 5x", "status": "ok", "updated_at": now, "balances": [],
+         "windows": [
+            {"key": "weekly", "label": "Week", "remaining_percent": 90, "duration_mins": 10080, "resets_at": now + 5 * 86400},
+            {"key": "5h", "label": "5h", "remaining_percent": 90, "duration_mins": 300, "resets_at": now + 3 * 3600}
+         ]},
+        {"provider": "codex", "id": "codex-b", "plan": "Pro 5x", "status": "ok", "updated_at": now, "balances": [],
+         "windows": [
+            {"key": "weekly", "label": "Week", "remaining_percent": 90, "duration_mins": 10080, "resets_at": now + 5 * 86400},
+            {"key": "5h", "label": "5h", "remaining_percent": 90, "duration_mins": 300, "resets_at": now + 3 * 3600}
+         ]}
+    ]});
+    std::fs::write(
+        home.join(".local/state/ai-usage/state.json"),
+        usage.to_string(),
+    )
+    .unwrap();
+    let router_json = dir.join("router.json");
+    let router_cfg = json!({
+        "version": 1,
+        "decisionProvider": "openrouter",
+        "decisionModel": "~typesafe/jev-latest",
+        "pool": [
+            {"providerInstanceId": "codex", "model": "gpt-6.1-sol", "enabled": true},
+            {"providerInstanceId": "claudeAgent", "model": "claude-opus-5-5", "enabled": true}
+        ],
+        "accounts": {
+            "codex": {"instances": ["codex"], "usageProvider": "codex", "usageId": "codex-main"},
+            "codex_b": {"instances": ["codex_b"], "usageProvider": "codex", "usageId": "codex-b"},
+            "claude": {"instances": ["claudeAgent"], "usageProvider": "claude", "usageId": "claude-main"}
+        }
+    });
+    std::fs::write(&router_json, router_cfg.to_string()).unwrap();
+    let mock_jev = dir.join("jev.json");
+    std::fs::write(
+        &mock_jev,
+        json!({
+            "answers": {
+                "size": {"score": 1, "confidence": 0.9},
+                "difficulty": {"score": 1, "confidence": 0.9},
+                "review": {"score": 0, "confidence": 0.95},
+                "codex_gpt_6_1_sol": {"score": 2.8, "confidence": 0.9, "probabilities": {"0": 0.0, "1": 0.05, "2": 0.15, "3": 0.8}},
+                "claudeagent_claude_opus_5_5": {"score": 2.2, "confidence": 0.85, "probabilities": {"0": 0.0, "1": 0.1, "2": 0.7, "3": 0.2}}
+            },
+            "usage": {"cost": 0.003}
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let runtime_s = runtime.to_string_lossy().into_owned();
+    let router_s = router_json.to_string_lossy().into_owned();
+    let mock_s = mock_jev.to_string_lossy().into_owned();
+    // Notice: NO CODEX_HOME, NO explicit harness or source in route_batch! Only T3CODE_THREAD_ID.
+    let env = [
+        ("T3CODE_THREAD_ID", "thread-codex-b"),
+        ("XDG_RUNTIME_DIR", runtime_s.as_str()),
+        ("MODEL_ROUTE_ROUTER_JSON", router_s.as_str()),
+        ("AGENTDECK_ROUTE_MOCK_JEV", mock_s.as_str()),
+    ];
+    let launch = json!({
+        "tool": "mcp__t3-code__delegate_task",
+        "input": {
+            "task": "Add unit tests for secondary account cache",
+            "target": {"providerInstanceId": "codex", "model": "gpt-6.1-sol", "options": {"reasoningEffort": "high"}}
+        }
+    });
+    let replies = session_env(
+        &dir,
+        &env,
+        &[call(2, "route_batch", json!({ "launches": [launch] }))],
+    );
+    assert!(
+        replies[0]["result"].get("isError").is_none(),
+        "{}",
+        text(&replies[0])
+    );
+    let batch: Value = serde_json::from_str(&text(&replies[0])).unwrap();
+    let results = batch["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0]["source"], "codex_b",
+        "route_batch must resolve secondary account via T3 thread binding: {}",
+        results[0]
+    );
+    assert_eq!(results[0]["jevCache"], "miss");
+
+    // Remove mock Jev & keys so any cache miss fails closed.
+    std::fs::remove_file(&mock_jev).unwrap();
+
+    // Run actual hook for secondary Codex account with ONLY CODEX_HOME (no T3CODE_THREAD_ID),
+    // verifying cross-mechanism source parity and cache hit with zero judge calls.
+    let hint = results[0]["briefHint"].as_str().unwrap_or_default();
+    let hook_payload = json!({
+        "tool_name": "mcp__t3-code__delegate_task",
+        "tool_input": {
+            "task": format!("Add unit tests for secondary account cache\n\n{hint}"),
+            "target": results[0]["target"]
+        }
+    });
+    let mut hook_cmd = Command::new(env!("CARGO_BIN_EXE_agentdeck"))
+        .args(["route", "hook", "--harness", "codex"])
+        .env("HOME", &home)
+        .env("AGENTDECK_CONFIG_DIR", dir.join("config"))
+        .env("AGENTDECK_STATE_DIR", dir.join("state"))
+        .env("XDG_STATE_HOME", &xdg_state)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("MODEL_ROUTE_ROUTER_JSON", &router_json)
+        .env("CODEX_HOME", &codex_b_home)
+        .env_remove("T3CODE_THREAD_ID")
+        .env_remove("AGENTDECK_ROUTE_MOCK_JEV")
+        .env_remove("JEV_OPENROUTER_API_KEY")
+        .env_remove("AI_GATEWAY_API_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    hook_cmd
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(hook_payload.to_string().as_bytes())
+        .unwrap();
+    let hook_out = hook_cmd.wait_with_output().unwrap();
+    assert!(hook_out.status.success());
+    let decision_log =
+        std::fs::read_to_string(xdg_state.join("model-route/decisions.jsonl")).unwrap();
+    assert!(
+        decision_log.contains("\"instance\":\"codex_b\"")
+            && decision_log.contains("\"decision\":\"allow:delegate\""),
+        "hook for secondary account must hit route_batch cache with zero judge calls; log={decision_log}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
