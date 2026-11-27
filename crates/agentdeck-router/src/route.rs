@@ -3431,22 +3431,40 @@ mod gateway_tests {
             "providers": [
                 {
                     "providerInstanceId": "codex",
+                    "driverKind": "codex",
                     "models": [
                         {
                             "id": "gpt-6.1-sol",
                             "options": [
-                                {"id": "reasoningEffort", "type": "select", "values": ["medium", "high", "xhigh"]}
+                                {
+                                    "id": "reasoningEffort",
+                                    "type": "select",
+                                    "options": [
+                                        {"id": "medium"},
+                                        {"id": "high"},
+                                        {"id": "xhigh"}
+                                    ]
+                                }
                             ]
                         }
                     ]
                 },
                 {
                     "providerInstanceId": "claudeAgent",
+                    "driverKind": "claudeAgent",
                     "models": [
                         {
                             "id": "claude-opus-5-5",
                             "options": [
-                                {"id": "effort", "type": "select", "values": ["medium", "high", "xhigh"]}
+                                {
+                                    "id": "effort",
+                                    "type": "select",
+                                    "options": [
+                                        {"id": "medium"},
+                                        {"id": "high"},
+                                        {"id": "xhigh"}
+                                    ]
+                                }
                             ]
                         }
                     ]
