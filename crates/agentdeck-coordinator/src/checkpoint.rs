@@ -485,6 +485,13 @@ impl HttpCheckpointJudge {
         input: &CheckpointInput,
         deadline: Instant,
     ) -> anyhow::Result<CheckpointVerdict> {
+        // OpenRouter chat models (no `~` decision-model prefix) only answer on chat completions.
+        if target.id.provider == PROVIDER_OPENROUTER && !target.id.model.starts_with('~') {
+            let body = Self::request_body_for(PROVIDER_VERCEL, &target.id.model, input);
+            return self
+                .judge_with_chat_for(target, &body["input"], &body["questions"][0], deadline)
+                .await;
+        }
         let body = Self::request_body_for(&target.id.provider, &target.id.model, input);
         let check_lm = target.id.provider == PROVIDER_VERCEL;
         let resp = match self
@@ -567,7 +574,13 @@ impl HttpCheckpointJudge {
         question: &Value,
         deadline: Instant,
     ) -> anyhow::Result<CheckpointVerdict> {
-        let endpoint = reqwest::Url::parse(&target.endpoint)?.join("chat/completions")?;
+        // Vercel: /v1/decisions -> /v1/chat/completions; OpenRouter: /api/alpha/decisions -> /api/v1/chat/completions.
+        let chat_path = if target.id.provider == PROVIDER_OPENROUTER {
+            "../v1/chat/completions"
+        } else {
+            "chat/completions"
+        };
+        let endpoint = reqwest::Url::parse(&target.endpoint)?.join(chat_path)?;
         let body = self
             .post_target(
                 endpoint.as_str(),
@@ -706,6 +719,58 @@ mod tests {
                 .to_string()
                 .contains("requires an explicit judge_model")
         );
+    }
+
+    #[tokio::test]
+    async fn openrouter_chat_model_uses_chat_completions() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut judge = judge_for(PROVIDER_OPENROUTER);
+        judge.endpoint = format!(
+            "http://{}/api/alpha/decisions",
+            listener.local_addr().unwrap()
+        );
+        judge.model = "openai/gpt-4o-mini".to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let mut len = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.strip_prefix("content-length:") {
+                    len = value.trim().parse().unwrap();
+                }
+            }
+            let mut bytes = vec![0; len];
+            reader.read_exact(&mut bytes).unwrap();
+            let response = json!({"choices": [{"message": {"content": r#"{"score": 3, "confidence": 0.9}"#}}]}).to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+            (request, serde_json::from_slice::<Value>(&bytes).unwrap())
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            judge.judge(&sample_input(), &CoordinatorConfig::default()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (route, chat) = server.join().unwrap();
+        assert!(
+            route.starts_with("POST /api/v1/chat/completions "),
+            "{route}"
+        );
+        assert_eq!(chat["model"], "openai/gpt-4o-mini");
+        assert!(result.should_checkpoint);
     }
 
     #[tokio::test]

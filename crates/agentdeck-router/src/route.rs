@@ -1428,6 +1428,22 @@ async fn jev_fetch_endpoint(
         Some(k) => k.to_string(),
         None => decision_key("JEV_OPENROUTER_API_KEY", "openrouter.key")?,
     };
+    // OpenRouter chat models (no `~` decision-model prefix) only answer on chat completions.
+    if !endpoint.model.starts_with('~') {
+        let url = format!(
+            "{}/api/v1/chat/completions",
+            bases.openrouter.trim_end_matches('/')
+        );
+        let v = post_json(
+            &url,
+            &key,
+            gateway_body(&eff_request).to_string(),
+            deadline,
+            false,
+        )
+        .await?;
+        return Ok((gateway_answers(&v)?, None));
+    }
     let eff_body = match eff_request {
         std::borrow::Cow::Owned(r) => stringify_like_node(&r),
         std::borrow::Cow::Borrowed(_) => request_body.to_string(),
@@ -3180,6 +3196,68 @@ fn format_js(v: f64) -> String {
 #[cfg(test)]
 mod gateway_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn openrouter_chat_model_uses_chat_completions() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            let mut len = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((n, v)) = line.split_once(':')
+                    && n.eq_ignore_ascii_case("content-length")
+                {
+                    len = v.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; len];
+            reader.read_exact(&mut body).unwrap();
+            let content = r#"{"size":{"score":1,"confidence":0.9}}"#;
+            let response =
+                serde_json::json!({"choices": [{"message": {"content": content}}]}).to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+            (first, serde_json::from_slice::<Value>(&body).unwrap())
+        });
+        let request = serde_json::json!({"model": "~typesafe/jev-latest", "state": {"task": "t"}, "questions": {"size": {}}});
+        let body = stringify_like_node(&request);
+        let ep = agentdeck_core::judge::JudgeEndpoint::new("openrouter", "openai/gpt-4o-mini");
+        let (answers, _) = jev_fetch_endpoint(
+            &ep,
+            &request,
+            &body,
+            Some("test-key"),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            &JevBases {
+                openrouter: base,
+                vercel: "http://127.0.0.1:1".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let (first, sent) = server.join().unwrap();
+        assert!(
+            first.starts_with("POST /api/v1/chat/completions "),
+            "{first}"
+        );
+        assert_eq!(sent["model"], "openai/gpt-4o-mini");
+        assert_eq!(answers["size"]["score"], 1);
+    }
 
     #[test]
     fn gateway_round_trip_shapes() {
